@@ -4,6 +4,13 @@ import matplotlib.pyplot as plt
 from multiprocessing import Process, Queue
 import time
 import queue as pyqueue
+from typing import cast
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+import scipy.fft as fft  
+#import dpnp as dp
+
+
 
 # --- CONFIGURAZIONE FISICA ---
 FS = 10e6
@@ -23,7 +30,7 @@ X_FRAMES = 1  # Accumula 1 frame prima di processare (attenzione alla latenza!)
 BYTES_PER_FRAME = CHIRPS * SAMPLES * RX * 4 # (4 byte per complesso I+Q int16)
 
 # Zero Padding
-NFFT_RANGE = 1024
+NFFT_RANGE = 256
 NFFT_ANGLE = 128
 
 # Parametri Grafica
@@ -216,8 +223,9 @@ def process_buffer(raw_buffer, w_range, w_angle, heatmap_ema, alpha, gui_queue):
     range_axis_m = np.arange(NFFT_RANGE//2) * dr   # solo metà spettro
     max_bin = int(np.floor(RANGE_MAX_DISPLAY / dr))
     max_bin = max(1, min(max_bin, NFFT_RANGE // 2))
-
-    
+    F = X_FRAMES
+    L = CHIRPS // TX
+        
     try:
         # A. Reshape
         # [Frames, Chirps, Samples, RX]
@@ -232,13 +240,16 @@ def process_buffer(raw_buffer, w_range, w_angle, heatmap_ema, alpha, gui_queue):
         # C. DSP
         data = data - np.mean(data, axis=-1, keepdims=True)
         data = data * w_range
-        range_fft = np.fft.fft(data, n=NFFT_RANGE, axis=-1)
-        
-        virtual_array = range_fft.transpose(0, 1, 4, 2, 3).reshape(X_FRAMES, CHIRPS//TX, NFFT_RANGE, VIRTUAL_ANT)
-        
+        range_fft = fft.fft(data, n=NFFT_RANGE, axis=-1,workers=6)
+        range_fft = np.asarray(range_fft)
+
+
+        tmp = np.moveaxis(range_fft, -1, 2)
+        virtual_array = tmp.reshape(F, L, NFFT_RANGE, VIRTUAL_ANT)
+
         virtual_array = virtual_array * w_angle
-        angle_fft = np.fft.fft(virtual_array, n=NFFT_ANGLE, axis=-1)
-        angle_fft = np.fft.fftshift(angle_fft, axes=-1)
+        angle_fft = fft.fft(virtual_array, n=NFFT_ANGLE, axis=-1,workers=6)
+        angle_fft = fft.fftshift(angle_fft, axes=-1)
         
         heatmap = np.mean(np.abs(angle_fft)**2, axis=(0, 1))
         
@@ -268,8 +279,8 @@ def process_buffer(raw_buffer, w_range, w_angle, heatmap_ema, alpha, gui_queue):
 
 # --- MAIN (Gestione Grafica) ---
 if __name__ == "__main__":
-    frame_q = Queue(maxsize=32)   # frame completi (bytes)
-    gui_q   = Queue(maxsize=2)   # heatmap per GUI
+    frame_q = Queue(maxsize=100)   # frame completi (bytes)
+    gui_q   = Queue(maxsize=5)   # heatmap per GUI
 
     p_rx  = Process(target=radar_processing_core, args=(frame_q,))
     p_dsp = Process(target=dsp_worker, args=(frame_q, gui_q))
@@ -306,7 +317,9 @@ if __name__ == "__main__":
                     vmin=VMIN,
                     vmax=VMAX,
                     interpolation="bilinear",
-                    origin='lower')
+                    origin='lower',
+                    animated=True)
+
 
     
     plt.colorbar(img, ax=ax, label='Power (dB)')
@@ -318,24 +331,40 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.show(block=False) # Non bloccante per poter aggiornare il loop
     
-    # Loop grafico principale
+    # 1. Salva lo sfondo statico (assi, titoli, colorbar già disegnati)
+    canvas = cast(FigureCanvasAgg, fig.canvas)
+    fig.canvas.draw()
+    background = canvas.copy_from_bbox(ax.bbox)
+    # Loop grafico principale (BLITTING)
     try:
         while True:
-            # Controlla se ci sono nuovi dati
             try:
-                heatmap = gui_q.get_nowait()    
+                # Prendi solo l'ultimo dato disponibile (svuota la coda)
+                heatmap = gui_q.get_nowait()
+                while not gui_q.empty():
+                    heatmap = gui_q.get_nowait()
+
+                # 2. Ripristina lo sfondo
+                canvas.restore_region(background)
+                ax.draw_artist(img)
+                canvas.blit(ax.bbox)
+                canvas.flush_events()
+
+                # 3. Aggiorna solo i dati dell'immagine
                 img.set_data(heatmap)
-                img.set_extent([ang_axis[0], ang_axis[-1], 0, RANGE_MAX_DISPLAY])
-                img.set_clim(VMIN, VMAX)
+
+                # 4. Disegna solo l'immagine (non gli assi)
+                ax.draw_artist(img)
+
+                # 5. Aggiorna solo la bounding box dell'asse
+                fig.canvas.blit(ax.bbox)
+
+                # Flusha eventi GUI
+                fig.canvas.flush_events()
+
             except pyqueue.Empty:
-                pass
-            # Ridisegna efficientemente
-            fig.canvas.draw_idle()
-            fig.canvas.flush_events()
-            
-            # Sleep piccolo per non saturare la CPU del main thread
-            time.sleep(0.10) 
-            
+                time.sleep(0.01)
+
     except KeyboardInterrupt:
         print("Chiusura...")
         p_rx.terminate()
