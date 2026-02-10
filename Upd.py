@@ -1,214 +1,342 @@
 import socket
-import struct
-import threading
-import queue
 import numpy as np
 import matplotlib.pyplot as plt
+from multiprocessing import Process, Queue
+import time
+import queue as pyqueue
 
-
-
-# --- CONFIGURAZIONE FISICA (Controlla su mmWave Studio) ---
-FS = 10e6            # 10 Msps (10000 ksps)
-SLOPE = 60.012e12        # 70 MHz/us -> 70e12 Hz/s
-C = 3e8              # Velocità luce
-FC = 77e9            # 77 GHz
+# --- CONFIGURAZIONE FISICA ---
+FS = 10e6
+SLOPE = 60.012e12
+C = 3e8
+FC = 77e9
 LAMBDA = C / FC
-D = LAMBDA / 2       # Spaziatura antenna (standard)
+D = LAMBDA / 2
 
-# --- CONFIGURAZIONE ---
+# --- CONFIGURAZIONE ACQUISIZIONE ---
 SAMPLES = 256
 CHIRPS = 128
 RX = 4
 TX = 2
-VIRTUAL_ANT = TX * RX # 8 antenne virtuali per TDM-MIMO
-X_FRAMES = 5  # Elabora e visualizza ogni 5 frame
-BUF_SIZE = (X_FRAMES, CHIRPS // TX, TX, RX, SAMPLES)
+VIRTUAL_ANT = TX * RX
+X_FRAMES = 1  # Accumula 1 frame prima di processare (attenzione alla latenza!)
+BYTES_PER_FRAME = CHIRPS * SAMPLES * RX * 4 # (4 byte per complesso I+Q int16)
 
 # Zero Padding
-NFFT_RANGE = 512
+NFFT_RANGE = 1024
 NFFT_ANGLE = 128
 
-# --- PARAMETRI VISUALIZZAZIONE ---
-VMIN = -35  # Soglia minima dB (regola per pulire il rumore)
-VMAX = 0 # Soglia massima dB
-RANGE_MAX_DISPLAY = 15 # Visualizza solo i primi 15 metri
+# Parametri Grafica
+VMIN = -30
+VMAX = 0
+RANGE_MAX_DISPLAY = 3
 
 
 
 
-# Code di comunicazione
-raw_q = queue.Queue(maxsize=10)       # Raw UDP -> Parser
-pre_proc_q = queue.Queue(maxsize=5)   # Parser -> Pre-Proc (ogni X frame)
-proc_q = queue.Queue(maxsize=5)       # Pre-Proc -> Proc
-post_proc_q = queue.Queue(maxsize=5)  # Proc -> Post-Proc
-plot_q = queue.Queue(maxsize=5)       # Post-Proc -> GUI
+def radar_processing_core(frame_queue):
+    PC_IP = "192.168.33.30"
+    PORT = 4098
+    HEADER_LEN = 10
+    RCVBUF_BYTES = 256 * 1024 * 1024
+    ZERO_CHUNK = b"\x00" * 65536
 
-def thread_receiver():
-    """Ricezione UDP standard dalla DCA1000[cite: 1462, 1972]."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("192.168.33.30", 4098))
-    while True:
-        packet, _ = sock.recvfrom(2048)
-        raw_q.put(packet[10:]) # Salta header DCA1000 [cite: 2049]
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF_BYTES)
+    sock.bind((PC_IP, PORT))
+    sock.settimeout(0.2)
 
-def thread_parser():
-    """Converte raw in complessi e accumula X frame[cite: 452, 610]."""
-    accum_buffer = np.zeros(BUF_SIZE, dtype=complex)
-    f_idx, c_idx, s_idx = 0, 0, 0
-    while True:
-        data = raw_q.get()
-        num_sets = len(data) // 16 # 4 lane I/Q = 16 byte [cite: 453]
-        for i in range(num_sets):
-            v = struct.unpack('<8h', data[i*16:(i+1)*16])
-            
-            # Calcolo indici
-            tx_id = (c_idx % TX)
-            loop_id = (c_idx // TX)
-            
-            for r in range(RX):
-                accum_buffer[f_idx, loop_id, tx_id, r, s_idx] = complex(v[r], v[r+4])
-            
-            s_idx += 1
-            if s_idx == SAMPLES:
-                s_idx = 0
-                c_idx += 1
-                if c_idx == CHIRPS:
-                    c_idx = 0
-                    f_idx += 1
-                    # Se abbiamo accumulato X frame, invia alla pipeline
-                    if f_idx == X_FRAMES:
-                        pre_proc_q.put(accum_buffer.copy())
-                        f_idx = 0
+    frame = bytearray(BYTES_PER_FRAME)
+    w = 0
 
-def thread_pre_processing():
-    """Stadio 1: Rimozione DC e Windowing di Hann."""
-    
-    # Pre-generiamo la finestra di Hann per la dimensione dei campioni (SAMPLES)
-    # La portiamo alla stessa forma dei dati per il broadcasting (1, 1, 1, 1, 256)
-    window = np.hanning(SAMPLES).reshape(1, 1, 1, 1, SAMPLES)
-    
+    last_seq = None
+    payload_len_ref = None
+
+
+    lost_pkts = 0
+    total_pkts = 0
+    t0 = time.time()
+
+    frames_out = 0
+    t_stat = time.perf_counter()
+
+    print("[RX] Avviato (bytes-only, zero-fill).")
+
     while True:
-        data = pre_proc_q.get()
+        try:
+            pkt, _ = sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+
+        if len(pkt) <= HEADER_LEN:
+            continue
+
+        seq = int.from_bytes(pkt[0:4], "little", signed=False)
+        payload = memoryview(pkt)[HEADER_LEN:]
+        plen = len(payload)
+        if plen == 0:
+            continue
+
+        if payload_len_ref is None:
+            payload_len_ref = plen
+
+        # ---- zero fill per pacchetti persi (in bytes) ----
+        if last_seq is not None:
+            gap = seq - last_seq - 1
+            if gap > 0:
+                zbytes = gap * payload_len_ref
+                lost_pkts += gap
+                while zbytes > 0:
+                    take = min(zbytes, BYTES_PER_FRAME - w)
+                    frame[w:w+take] = ZERO_CHUNK[:take]     # <-- zero-fill reale
+                    w += take
+                    zbytes -= take
+                    if w == BYTES_PER_FRAME:
+                        try:
+                            frame_queue.put_nowait(bytes(frame))
+                            frames_out += 1
+                        except pyqueue.Full:
+                            pass
+                        #frame[:] = ZERO_CHUNK[:BYTES_PER_FRAME]
+                        w = 0
+
+        last_seq = seq
+    
+
+
+        # Aggiorna statistiche ogni 10 secondi
+        total_pkts += 1
+        if total_pkts % 5000 == 0:
+            dt = time.time() - t0
+            print(f"[RX] pkts={total_pkts} lost={lost_pkts} ({lost_pkts/max(total_pkts,1)*100:.3f}%)")
         
-        # 1. Rimozione DC (Sottrazione della media lungo l'asse dei campioni)
-        # Questo elimina il picco di "rumore" a distanza zero
-        data_dc_removed = data - np.mean(data, axis=-1, keepdims=True)
-        
-        # 2. Applicazione Finestra di Hann
-        # Riduce lo spectral leakage e i lobi secondari nella Range FFT
-        processed = data_dc_removed * window
-        
-        proc_q.put(processed)
+        now = time.perf_counter()
+        if now - t_stat >= 1.0:
+            print(f"[RX] frames_out={frames_out}  qsize~={getattr(frame_queue, 'qsize', lambda: -1)()}")
+            t_stat = now
+            frames_out = 0
+
+
+        # ---- copia payload nel frame ----
+        off = 0
+        while off < plen:
+            take = min(plen - off, BYTES_PER_FRAME - w)
+            frame[w:w+take] = payload[off:off+take]
+            w += take
+            off += take
+
+            if w == BYTES_PER_FRAME:
+                try:
+                    frame_queue.put_nowait(bytes(frame))
+                    frames_out += 1
+                except pyqueue.Full:
+                    pass
+                #frame[:] = ZERO_CHUNK[:BYTES_PER_FRAME]
+                w = 0
 
 
 
-def thread_processing():
-    """Stadio 2: FFT (Range/Doppler) con Zero Padding."""
-    
-    # --- FISSA QUI: Inizializzazione fuori dal loop ---
-    heatmap_ema = None 
-    # --------------------------------------------------
+
+
+
+def dsp_worker(frame_queue, gui_queue):
+    window_range = np.blackman(SAMPLES).reshape(1,1,1,1,SAMPLES)
+    window_angle = np.hanning(VIRTUAL_ANT).astype(np.float32).reshape(1, 1, 1, VIRTUAL_ANT)
+
+    heatmap_ema = None
+    batch = []
+
+    frames_proc = 0
+    t_stat = time.perf_counter()
+
+    print("[DSP] Avviato.")
 
     while True:
-        data = proc_q.get()
+        try:
+            fb = frame_queue.get(timeout=0.5)
+        except pyqueue.Empty:
+            continue
+        
+        # svuota la queue e tieni SOLO l'ultimo frame (low-latency)
+        last = fb
+        while True:
+            try:
+                last = frame_queue.get_nowait()
+            except pyqueue.Empty:
+                break
+        fb = last
+
+        batch.append(fb)
+        if len(batch) < X_FRAMES:
+            continue
+
+        if len(batch) > X_FRAMES:
+            batch = batch[-X_FRAMES:]
+
+        # qui converti UNA VOLTA
+        raw = b"".join(batch)
+        i16 = np.frombuffer(raw, dtype=np.int16)
+
+        n_blocks = i16.size // 8
+        if n_blocks == 0:
+            batch.clear()
+            continue
+
+        i16 = i16[:n_blocks * 8].reshape(n_blocks, 8)
+        raw_chunk = i16  # (N, 8)
+
+        re = raw_chunk[:, :4].astype(np.float32, copy=False)
+        im = raw_chunk[:, 4:].astype(np.float32, copy=False)
+        complex_data = (re + 1j * im).astype(np.complex64, copy=False).reshape(-1)
+
+        # riempi raw_buffer per process_buffer
+        total_samples_needed = X_FRAMES * CHIRPS * SAMPLES * RX
+        if complex_data.size < total_samples_needed:
+            batch.clear()
+            continue
+
+        raw_buffer = complex_data[:total_samples_needed]  # view
+        heatmap_ema = process_buffer(raw_buffer, window_range, window_angle, heatmap_ema, alpha=0.2, gui_queue=gui_queue)
+        frames_proc += X_FRAMES
+
+        now = time.perf_counter()
+        if now - t_stat >= 1.0:
+            print(f"[DSP] frames_proc={frames_proc}")
+            t_stat = now
+            frames_proc = 0
+
+        batch.clear()
+
+
+
+def process_buffer(raw_buffer, w_range, w_angle, heatmap_ema, alpha, gui_queue):
+    """ Funzione helper per elaborare il buffer quando è pieno (sia di dati che di zeri) """
+    # calcolo asse range locale (serve anche in subprocess)
+    dr = C * FS / (2.0 * SLOPE * NFFT_RANGE)
+    range_axis_m = np.arange(NFFT_RANGE//2) * dr   # solo metà spettro
+    max_bin = int(np.floor(RANGE_MAX_DISPLAY / dr))
+    max_bin = max(1, min(max_bin, NFFT_RANGE // 2))
+
     
-        # 2. Range FFT
+    try:
+        # A. Reshape
+        # [Frames, Chirps, Samples, RX]
+        data = raw_buffer.reshape(X_FRAMES, CHIRPS, SAMPLES, RX)
+        
+        # B. TDM-MIMO & Transpose
+        # [Frames, Chirps, TX, Samples, RX]
+        data = data.reshape(X_FRAMES, CHIRPS // TX, TX, SAMPLES, RX)
+        # [Frames, Loops, TX, RX, Samples] -> Ready for Range FFT
+        data = data.transpose(0, 1, 2, 4, 3) 
+        
+        # C. DSP
+        data = data - np.mean(data, axis=-1, keepdims=True)
+        data = data * w_range
         range_fft = np.fft.fft(data, n=NFFT_RANGE, axis=-1)
-
-        # MTI / clutter remove: togli la media lungo i chirp (asse loop/chirp)
-        # range_fft shape: (X_FRAMES, loops, TX, RX, NFFT_RANGE) dopo fft?
-        # Nel tuo caso è (X_FRAMES, loops, TX, RX, NFFT_RANGE) perché axis=-1
-        range_fft = range_fft - np.mean(range_fft, axis=1, keepdims=True)
-
-        # 3. Costruzione Array Virtuale (MIMO)
+        
         virtual_array = range_fft.transpose(0, 1, 4, 2, 3).reshape(X_FRAMES, CHIRPS//TX, NFFT_RANGE, VIRTUAL_ANT)
-
-        # Window sulle antenne (riduce sidelobes in angolo)
-        w_ang = np.hanning(VIRTUAL_ANT).astype(np.float32)
-        virtual_array = virtual_array * w_ang.reshape(1, 1, 1, VIRTUAL_ANT)
-
-        # 4. Angle FFT
+        
+        virtual_array = virtual_array * w_angle
         angle_fft = np.fft.fft(virtual_array, n=NFFT_ANGLE, axis=-1)
         angle_fft = np.fft.fftshift(angle_fft, axes=-1)
-
-        # 5. Generazione Heatmap (Potenza media)
-        heatmap = np.mean(np.abs(angle_fft)**2, axis=(0, 1)).astype(np.float32)
-
-        # 6. Media mobile esponenziale (EMA)
-        alpha = 0.2
-        if heatmap_ema is None or heatmap_ema.shape != heatmap.shape:
-            heatmap_ema = heatmap.copy()
+        
+        heatmap = np.mean(np.abs(angle_fft)**2, axis=(0, 1))
+        
+        # EMA
+        if heatmap_ema is None:
+            heatmap_ema = heatmap
         else:
-            # Formula EMA corretta: EMA = (1-alpha)*vecchia + alpha*nuova
             heatmap_ema = (1.0 - alpha) * heatmap_ema + alpha * heatmap
-
-        post_proc_q.put(heatmap_ema)
-
-
-
-def thread_post_processing():
-    """Stadio 3: Conversione dB e Debug Valori."""
-    while True:
-        data = post_proc_q.get()
         
-        # Conversione in dB
-        # Nota: usiamo 10*log10 perché 'data' è già la potenza (quadrato della magnitudo)
-        mag_db = 10 * np.log10(data + 1e-12) 
-        mag_db = mag_db - np.max(mag_db)   # 0 dB = massimo del frame (o batch)
+        # Output
+        heatmap_db = 10 * np.log10(heatmap_ema + 1e-12)
+        heatmap_db -= np.max(heatmap_db[:max_bin, :])
+        heatmap_db = heatmap_db[:max_bin, :]
 
-        plot_q.put(mag_db)
+        try:
+            gui_queue.put_nowait(heatmap_db)
+        except pyqueue.Full:
+            pass
+            
+        return heatmap_ema
 
-def thread_graphics():
-    plt.ion()
-    fig, ax = plt.subplots(figsize=(10, 7))
+    except ValueError as ve:
+        print(f"[DSP ERR] {ve}")
+        return heatmap_ema
     
-    # Assi
-    # fb_bin = k * Fs/Nfft,  R = c*fb/(2*SLOPE)
-    k = np.arange(NFFT_RANGE)
-    range_axis = (C * FS * k) / (2.0 * SLOPE * NFFT_RANGE)
-    max_range = range_axis[-1]
 
-    # bin FFT shiftati in [-0.5, 0.5)
-    u = np.fft.fftshift(np.fft.fftfreq(NFFT_ANGLE, d=1.0))  # cicli/campione
-    # per ULA: u = (d/λ) * sin(theta)  -> sin(theta) = u * (λ/d)
-    sin_theta = u * (LAMBDA / D)
-    angles_deg = np.degrees(np.arcsin(np.clip(sin_theta, -1.0, 1.0)))
 
-    # Inizializzazione plot con vmin e vmax
-    dummy_data = np.ones((NFFT_RANGE, NFFT_ANGLE)) * VMIN
-    img = ax.imshow(dummy_data, 
-                    extent=(angles_deg[0], angles_deg[-1], 0, max_range),
-                    aspect='auto', cmap='jet', origin='lower',
-                    vmin=VMIN, vmax=VMAX)
+# --- MAIN (Gestione Grafica) ---
+if __name__ == "__main__":
+    frame_q = Queue(maxsize=32)   # frame completi (bytes)
+    gui_q   = Queue(maxsize=2)   # heatmap per GUI
+
+    p_rx  = Process(target=radar_processing_core, args=(frame_q,))
+    p_dsp = Process(target=dsp_worker, args=(frame_q, gui_q))
+
+    p_rx.daemon = True
+    p_dsp.daemon = True
+    p_rx.start()
+    p_dsp.start()
+
+    # --- SETUP GRAFICA (Main Thread) ---
+    print("[MAIN] Avvio grafica...")
     
-    cbar = fig.colorbar(img, ax=ax)
-    cbar.set_label('Intensità (dB)')
+    fig, ax = plt.subplots(figsize=(10, 8))
     
-    ax.set_xlabel("Angolo (Gradi)")
-    ax.set_ylabel("Distanza (Metri)")
-    ax.set_ylim(0, RANGE_MAX_DISPLAY) # Limita la vista ai metri interessanti
-    ax.set_title("MIMO Radar: Range-Angle Heatmap")
+    # Calcolo assi
+    range_res = C / (2 * (FS * SAMPLES / SLOPE)) # Risoluzione teorica
+    k_axis = np.arange(NFFT_RANGE)
+    range_axis_meters = (np.arange(NFFT_RANGE) * C * FS) / (2 * SLOPE * SAMPLES)
+    
+    # Angoli (approssimazione small angle)
+    ang_axis = np.linspace(-90, 90, NFFT_ANGLE)
+    
+    # Inizializza immagine vuota
+    dr_plot = (C * FS) / (2.0 * SLOPE * NFFT_RANGE)
+    max_bin_plot = int(np.floor(RANGE_MAX_DISPLAY / dr_plot))
+    max_bin_plot = max(1, min(max_bin_plot, NFFT_RANGE // 2))
+    dummy_data = np.zeros((max_bin_plot, NFFT_ANGLE), dtype=np.float32)
 
-    while True:
-        heatmap_db = plot_q.get()
-        img.set_data(heatmap_db)
-        
-        # Opzionale: aggiornamento dinamico vmin/vmax se vuoi
-        # img.set_clim(vmin=VMIN, vmax=VMAX) 
-        
-        plt.pause(0.01)
+    
+    img = ax.imshow(dummy_data,
+                    extent=[ang_axis[0], ang_axis[-1], 0, RANGE_MAX_DISPLAY],
+                    aspect='auto',
+                    cmap='jet',
+                    vmin=VMIN,
+                    vmax=VMAX,
+                    interpolation="bilinear",
+                    origin='lower')
 
-
-
-# Start Threads
-threads = [
-    threading.Thread(target=thread_receiver, daemon=True),
-    threading.Thread(target=thread_parser, daemon=True),
-    threading.Thread(target=thread_pre_processing, daemon=True),
-    threading.Thread(target=thread_processing, daemon=True),
-    threading.Thread(target=thread_post_processing, daemon=True),
-    threading.Thread(target=thread_graphics, daemon=True)
-]
-
-for t in threads: t.start()
-input("Premi INVIO per fermare...\n")
+    
+    plt.colorbar(img, ax=ax, label='Power (dB)')
+    ax.set_xlabel("Azimuth (deg)")
+    ax.set_ylabel("Range (m)")
+    ax.set_ylim(0, RANGE_MAX_DISPLAY)
+    ax.set_title("Real-Time MIMO Radar Heatmap")
+    
+    plt.tight_layout()
+    plt.show(block=False) # Non bloccante per poter aggiornare il loop
+    
+    # Loop grafico principale
+    try:
+        while True:
+            # Controlla se ci sono nuovi dati
+            try:
+                heatmap = gui_q.get_nowait()    
+                img.set_data(heatmap)
+                img.set_extent([ang_axis[0], ang_axis[-1], 0, RANGE_MAX_DISPLAY])
+                img.set_clim(VMIN, VMAX)
+            except pyqueue.Empty:
+                pass
+            # Ridisegna efficientemente
+            fig.canvas.draw_idle()
+            fig.canvas.flush_events()
+            
+            # Sleep piccolo per non saturare la CPU del main thread
+            time.sleep(0.10) 
+            
+    except KeyboardInterrupt:
+        print("Chiusura...")
+        p_rx.terminate()
+        p_dsp.terminate()
