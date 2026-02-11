@@ -1,0 +1,28 @@
+physical:
+  c: 3e8
+  fs: 10e6
+  slope: 60.012e12
+  fc: 77e9
+
+capture:
+  samples: 256
+  chirps: 64
+  rx: 4
+  tx: 2
+  x_frames: 1
+
+fft:
+  nfft_range: 1024
+  nfft_angle: 256
+
+display:
+  vmin: -20
+  vmax: 0
+  range_max: 5.0
+
+dsp:
+  window_range: blackman
+  window_angle: hanning
+
+debug:
+  debug_stats: true
