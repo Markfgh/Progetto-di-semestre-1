@@ -7,9 +7,8 @@ import queue as pyqueue
 import scipy.fft as fft 
 from pathlib import Path
 from multiprocessing import Process, Queue, Value
-from multiprocessing.sharedctypes import Synchronized
-from Dsp_selection import selection_from_yaml_dict, build_windows
-
+from multiprocessing.sharedctypes import RawArray,Synchronized
+from dsp_selection import selection_from_yaml_dict, build_windows
 #import dpnp as dp
 
 
@@ -49,16 +48,22 @@ RANGE_MAX_DISPLAY = float(cfg["display"]["range_max"])
 # --- CODE QUEUE ---
 DEBUG_STATS = bool(cfg["debug"]["debug_stats"])
 
-# dimensioni code (in numero di frame/heatmap)
-FRAME_Q_MAX = 10
-GUI_Q_MAX = 5
+# --- WORKERS FFT ---
+FFT_WORKERS = int(cfg.get("dsp", {}).get("fft_workers", 6))
+
+
+FRAME_Q_MAX = 10 # dimensione coda frame tra RX e DSP (in numero di frame, non byte)
+GUI_Q_MAX = 5 # dimensione coda tra DSP e GUI (in numero di heatmap, non byte).
+
+
+
 
 
 # ----------------------------
 # FUNZIONI DI ELABORAZIONE
 # ----------------------------
-def radar_rx(frame_queue: Queue,lost_pkts: Synchronized,rx_put_drops: Synchronized,frame_put_ok: Synchronized):
-    """"
+def radar_rx(frame_queue: Queue,free_slots: Queue,shm_frames,lost_pkts: Synchronized,rx_put_drops: Synchronized,frame_put_ok: Synchronized):    
+    """
     Riceve UDP DCA1000 (porta data), ricostruisce frame fissi (BYTES_PER_FRAME).
     Se mancano pacchetti (gap seq), fa zero-fill dei byte mancanti.
     """
@@ -87,30 +92,67 @@ def radar_rx(frame_queue: Queue,lost_pkts: Synchronized,rx_put_drops: Synchroniz
     sock.settimeout(0.2) 
 
 
-    ####3. Buffer UDP e Frame ####
-    packet_buf = bytearray(2048) #buffer udp - size framentato (tipicamente < MTU)
-    packet_view = memoryview(packet_buf) # Crea una vista sul buffer senza copiarlo
+    ####3. Buffer UDP ####
+    packet_buf = bytearray(2048)
+    packet_mv  = memoryview(packet_buf)            # buffer per recvfrom_into (NO cast)
+    packet_view = packet_mv.cast("B")              # vista bytes per slicing/copy
     
-    frame = bytearray(BYTES_PER_FRAME)   # buffer per un frame completo (chirps * samples * rx * 4 byte)
-    frame_view = memoryview(frame)       # View per assegnazione veloce
-    
-    ####4. Chunk di zeri per il zero-fill  ####
-    ZERO_CHUNK = bytearray(64 * 1024)  # 64KB di zeri per zero-fill
+    # Shared-memory ring: buffer globale (n_slots * BYTES_PER_FRAME)
+    shm_view = memoryview(shm_frames).cast("B")   # 1D bytes
+    curr_slot = None
+    frame_view = None  # view sullo slot corrente (BYTES_PER_FRAME)
 
+    ####4. Chunk di zeri per il zero-fill  ####
+    ZERO_CHUNK = b"\x00" * 2048  
+    ZERO_VIEW = memoryview(ZERO_CHUNK).cast("B")
 
     w = 0 # write cursor all'interno del frame corrente (0..BYTES_PER_FRAME)
     last_seq = None # ultima sequenza ricevuta (per rilevare gap)
     payload_len_ref = None # lunghezza payload di riferimento (stima dal primo pacchetto valido)
+    # --- STATISTICHE REALI ---
+    if DEBUG_STATS:
+        pkts_rx = 0
+        t_stat = time.perf_counter()
 
     print("[RX] Avviato.")
+
+
+    def ensure_slot():
+        """Assicura che curr_slot/frame_view siano validi. Se non ci sono slot, droppa il più vecchio e ritorna False."""
+        nonlocal curr_slot, frame_view, w
+        if w != 0 or frame_view is not None:
+            return True
+        try:
+            curr_slot = free_slots.get_nowait()
+        except pyqueue.Empty:
+            # nessuno slot libero: prova a liberarne uno droppando il più vecchio
+            try:
+                old = frame_queue.get_nowait()
+                free_slots.put(old)
+            except pyqueue.Empty:
+                pass
+            return False
+        base = curr_slot * BYTES_PER_FRAME
+        frame_view = shm_view[base: base + BYTES_PER_FRAME]
+        return True
+
 
     ####5. Ricezione pacchetti UDP e controllo sequenza ####
     while True:
         try:
             # riceve direttamente nel buffer pre-allocato e ottiene il numero di byte ricevuti
-            n_bytes, _ = sock.recvfrom_into(packet_view) 
+            n_bytes, _ = sock.recvfrom_into(packet_mv)
+            if DEBUG_STATS:
+                pkts_rx += 1
         except socket.timeout:
             continue
+
+
+        #### LOGICA DI ASSEGNAZIONE SLOT E ZERO-FILL ###
+        # prima di usare frame_view in questo pacchetto
+        if not ensure_slot():
+            continue
+
 
         # Se il pacchetto è troppo corto per contenere header + payload, scarta
         if n_bytes <= HEADER_LEN:
@@ -118,7 +160,6 @@ def radar_rx(frame_queue: Queue,lost_pkts: Synchronized,rx_put_drops: Synchroniz
 
         # Estrae numero di sequenza (4 byte, little-endian, unsigned) 
         seq = int.from_bytes(packet_view[0:4], "little", signed=False)
-
 
         # Stima lunghezza payload per calcolare gap in byte in caso di pacchetti persi
         if payload_len_ref is None:
@@ -143,29 +184,42 @@ def radar_rx(frame_queue: Queue,lost_pkts: Synchronized,rx_put_drops: Synchroniz
                 # di zeri, quindi usiamo un loop per gestire questo caso.
                 bytes_missing = gap * payload_len_ref
                 while bytes_missing > 0: 
+                    if not ensure_slot():
+                        break
                     take = min(bytes_missing, BYTES_PER_FRAME - w) # n.byte da scrivere in questo frame
                     remaining = take # byte rimanenti da scrivere in questo frame
                     
                     # Scrive zeri nel frame usando chunk pre-allocati per efficienza
                     while remaining > 0:
+                        if not ensure_slot():
+                            remaining = 0
+                            break
                         t = min(remaining, len(ZERO_CHUNK))
-                        frame_view[w:w + t] = ZERO_CHUNK[:t]
+                        frame_view[w:w + t] = ZERO_VIEW[:t]
                         w += t
                         remaining -= t
 
                         # Se abbiamo completato un frame, pushiamolo nella coda e resettiamo il cursore
                         # se piena droppo il frame 
                         if w == BYTES_PER_FRAME:
+                            slot_to_push = curr_slot
                             try:
-                                frame_queue.put_nowait(bytes(frame))
-                                with frame_put_ok.get_lock():
-                                    frame_put_ok.value += 1
+                                frame_queue.put_nowait(slot_to_push) # manda solo l'indice (Shared-memory ring)
+                                if DEBUG_STATS:
+                                    with frame_put_ok.get_lock():
+                                        frame_put_ok.value += 1
+
                             except pyqueue.Full: 
                                 if DEBUG_STATS:
                                     with rx_put_drops.get_lock():
                                         rx_put_drops.value += 1
-                            w = 0
-
+                                # slot non consegnato -> restituiscilo
+                                free_slots.put(slot_to_push)
+                            # prepara slot nuovo
+                            w = 0  
+                            curr_slot = None
+                            frame_view = None
+          
                     bytes_missing -= take # aggiorna byte mancanti per il gap
 
         last_seq = seq # aggiorna ultima sequenza ricevuta
@@ -178,6 +232,9 @@ def radar_rx(frame_queue: Queue,lost_pkts: Synchronized,rx_put_drops: Synchroniz
 
 
         while payload_cursor < current_payload_len:
+            if not ensure_slot():
+                break
+
             # Calcola quanti byte possiamo copiare in questo frame (fino a completare BYTES_PER_FRAME)
             chunk_size = min(current_payload_len - payload_cursor, BYTES_PER_FRAME - w)
             # Copia chunk di dati dal pacchetto al frame usando memoryview per evitare copie intermedie
@@ -190,15 +247,43 @@ def radar_rx(frame_queue: Queue,lost_pkts: Synchronized,rx_put_drops: Synchroniz
 
             # Se abbiamo completato un frame, pushiamolo nella coda e resettiamo il cursore
             if w == BYTES_PER_FRAME: 
+                slot_to_push = curr_slot
                 try:
-                    frame_queue.put_nowait(bytes(frame))
-                    with frame_put_ok.get_lock():
-                        frame_put_ok.value += 1
+                    frame_queue.put_nowait(slot_to_push) # manda solo l'indice (Shared-memory ring)
+                    if DEBUG_STATS:
+                        with frame_put_ok.get_lock():
+                            frame_put_ok.value += 1
+
                 except pyqueue.Full:
                     if DEBUG_STATS:
                         with rx_put_drops.get_lock():
                             rx_put_drops.value += 1
-                w = 0
+                    # slot non consegnato -> restituiscilo
+                    free_slots.put(slot_to_push)
+                # prepara slot nuovo
+                w = 0  
+                curr_slot = None
+                frame_view = None
+
+
+        if DEBUG_STATS:
+            now = time.perf_counter()
+            if now - t_stat >= 2.0:
+
+                with lost_pkts.get_lock():
+                    lost = lost_pkts.value
+
+                total = pkts_rx + lost
+                loss_pct = (100.0 * lost / total) if total > 0 else 0.0
+                pkt_rate = pkts_rx / (now - t_stat)
+
+                print(
+                    f"[RX] pkts={pkts_rx} lost={lost} "
+                    f"loss={loss_pct:.3f}% rate={pkt_rate:.0f} pkt/s"
+                )
+
+                pkts_rx = 0
+                t_stat = now
 
 
 
@@ -206,21 +291,27 @@ def radar_rx(frame_queue: Queue,lost_pkts: Synchronized,rx_put_drops: Synchroniz
 # ----------------------------
 # WORKER DSP
 # ----------------------------
-def dsp_worker(frame_queue, gui_queue, gui_put_drops, frame_get_ok, gui_put_ok):
-   
+def dsp_worker(frame_queue,free_slots,shm_frames,gui_queue,gui_put_drops,frame_get_ok,gui_put_ok):   
+    
+    # Costruisci finestre DSP in base alla selezione (con reshape per broadcasting)
     selection = selection_from_yaml_dict(cfg)
     window_range, window_angle = build_windows(selection,samples=SAMPLES,virtual_ant=VIRTUAL_ANT,)
 
     heatmap_ema = None
-    batch = []
+    batch_slots = []
+    shm_view = memoryview(shm_frames).cast("B")   
+ 
+    # buffer locale contiguo per X_FRAMES (evita join di bytes)
+    i16_per_frame = BYTES_PER_FRAME // 2
+    i16_batch = np.empty((X_FRAMES, i16_per_frame), dtype=np.int16)
 
     print("[DSP] Avviato.")
-
     while True:
         try:
-            fb = frame_queue.get(timeout=0.5)
-            with frame_get_ok.get_lock():
-                frame_get_ok.value += 1
+            slot = frame_queue.get(timeout=0.5)
+            if DEBUG_STATS:  
+                with frame_get_ok.get_lock():
+                    frame_get_ok.value += 1
         except pyqueue.Empty:
             continue
 
@@ -229,45 +320,66 @@ def dsp_worker(frame_queue, gui_queue, gui_put_drops, frame_get_ok, gui_put_ok):
         # perché servono tutti in sequenza per l'elaborazione (es. Doppler).
         # Svuotiamo la coda solo se stiamo lavorando frame-by-frame (X_FRAMES=1).
         if X_FRAMES == 1:
-            last = fb
+            last = slot
             while True:
                 try:
-                    last = frame_queue.get_nowait()
-                    with frame_get_ok.get_lock():
-                        frame_get_ok.value += 1
+                    old = frame_queue.get_nowait()
+                    if DEBUG_STATS:
+                        with frame_get_ok.get_lock():
+                            frame_get_ok.value += 1
+                    
+                    # restituisci subito gli slot scartati
+                    free_slots.put(old)
+                    last = old
                 except pyqueue.Empty:
                     break
-            fb = last
+            slot = last
         # ### FINE FIX 1 ###
 
-        batch.append(fb)
+        batch_slots.append(slot)
         
         # Se non abbiamo ancora abbastanza frame, continua ad accumulare
-        if len(batch) < X_FRAMES:
+        if len(batch_slots) < X_FRAMES:
             continue
         
         # Se ne abbiamo troppi (caso raro/safety), teniamo gli ultimi X
-        if len(batch) > X_FRAMES:
-            batch = batch[-X_FRAMES:]
+        if len(batch_slots) > X_FRAMES:
+            # se teniamo solo gli ultimi, restituiamo quelli scartati
+            to_free = batch_slots[:-X_FRAMES]
+            for s in to_free:
+                free_slots.put(s)
+            batch_slots = batch_slots[-X_FRAMES:]
 
-        raw = b"".join(batch)
-        i16 = np.frombuffer(raw, dtype=np.int16)
+        # Copia una sola volta dal ring condiviso al buffer numpy locale contiguo
+        for k, s in enumerate(batch_slots):
+            base = s * BYTES_PER_FRAME
+            frame_mv = shm_view[base: base + BYTES_PER_FRAME]
+            i16_batch[k, :] = np.frombuffer(frame_mv, dtype=np.int16, count=i16_per_frame)
+ 
+        i16 = i16_batch.reshape(-1)  # contiguo
 
-        # ... (Il resto della funzione rimane identico fino alla fine) ...
+       
         n_blocks = i16.size // 8
         if n_blocks == 0:
-            batch.clear()
+            for s in batch_slots:
+                free_slots.put(s)
+            batch_slots.clear()
             continue
 
         i16 = i16[:n_blocks * 8].reshape(n_blocks, 8)
 
-        re = i16[:, :4].astype(np.float32, copy=False)
-        im = i16[:, 4:].astype(np.float32, copy=False)
-        complex_data = (re + 1j * im).astype(np.complex64, copy=False).reshape(-1)
-
+        # Conversione più efficiente: una sola allocazione complex64 e riempimento real/imag
+        re_i16 = i16[:, :4]
+        im_i16 = i16[:, 4:]
+        complex_data = np.empty(re_i16.size, dtype=np.complex64)
+        complex_data.real = re_i16.reshape(-1)
+        complex_data.imag = im_i16.reshape(-1)
+      
         total_samples_needed = X_FRAMES * CHIRPS * SAMPLES * RX
         if complex_data.size < total_samples_needed:
-            batch.clear()
+            for s in batch_slots:
+                free_slots.put(s)
+            batch_slots.clear()
             continue
 
         raw_buffer = complex_data[:total_samples_needed]
@@ -282,7 +394,10 @@ def dsp_worker(frame_queue, gui_queue, gui_put_drops, frame_get_ok, gui_put_ok):
             gui_put_ok=gui_put_ok,
         )
 
-        batch.clear()
+        # restituisci slot al RX
+        for s in batch_slots:
+            free_slots.put(s)
+        batch_slots.clear()
 
 
 def process_buffer(raw_buffer, w_range, w_angle, heatmap_ema, alpha, gui_queue, gui_put_drops, gui_put_ok):
@@ -296,18 +411,22 @@ def process_buffer(raw_buffer, w_range, w_angle, heatmap_ema, alpha, gui_queue, 
         # Creiamo una copia esplicita qui per garantire che i dati siano 
         # "C-Contiguous" in memoria. Questo è fondamentale per la velocità delle FFT successive.
         data = raw_buffer.reshape(X_FRAMES, CHIRPS // TX, TX, SAMPLES, RX) \
-                         .transpose(0, 1, 2, 4, 3).copy()
+                        .transpose(0, 1, 2, 4, 3)
+
+        # Se non contiguo, rendilo contiguo (ma solo se serve)
+        if not data.flags["C_CONTIGUOUS"]:
+            data = np.ascontiguousarray(data)
 
         # B. DSP IN-PLACE (Risparmia allocazioni)
         # Sottrai media
-        data -= np.mean(data, axis=-1, keepdims=True)
+        data -= data.mean(axis=-1, keepdims=True, dtype=np.complex64)
         # Finestra Range
         data *= w_range
         
         # C. RANGE FFT (Ottimizzata)
         # overwrite_x=True: distrugge 'data' per calcolare la FFT più velocemente
         # workers=-1 usa tutti i core disponibili automaticamente
-        range_fft = fft.fft(data, n=NFFT_RANGE, axis=-1, workers=-1, overwrite_x=True)
+        range_fft = fft.fft(data, n=NFFT_RANGE, axis=-1, workers=FFT_WORKERS, overwrite_x=True)
         
         # Preparazione Virtual Array
         # Nota: qui creiamo una nuova view/copia per il transpose necessario
@@ -319,12 +438,14 @@ def process_buffer(raw_buffer, w_range, w_angle, heatmap_ema, alpha, gui_queue, 
         virtual_array *= w_angle
         
         # D. ANGLE FFT (Ottimizzata)
-        angle_fft = fft.fft(virtual_array, n=NFFT_ANGLE, axis=-1, workers=-1, overwrite_x=True)
+        angle_fft = fft.fft(virtual_array, n=NFFT_ANGLE, axis=-1, workers=FFT_WORKERS, overwrite_x=True)
         angle_fft = fft.fftshift(angle_fft, axes=-1)
         
         # Modulo quadro e media
-        heatmap = np.mean(np.abs(angle_fft)**2, axis=(0, 1))
-        
+        re = angle_fft.real
+        im = angle_fft.imag
+        heatmap = (re * re + im * im).mean(axis=(0, 1))
+
         # E. EMA e Logaritmica
         if heatmap_ema is None:
             heatmap_ema = heatmap
@@ -339,17 +460,20 @@ def process_buffer(raw_buffer, w_range, w_angle, heatmap_ema, alpha, gui_queue, 
         # Normalizzazione e taglio
         view_db = heatmap_db[:max_bin, :]
         if view_db.size > 0:
-                    mx = np.max(view_db)
-                    view_db -= mx
+            mx = np.max(view_db)
+            view_db -= mx
 
         # push verso GUI
         try:
             gui_queue.put_nowait(view_db)
-            with gui_put_ok.get_lock():
-                gui_put_ok.value += 1
+            if DEBUG_STATS:
+                with gui_put_ok.get_lock():
+                    gui_put_ok.value += 1
+
         except pyqueue.Full:
-            with gui_put_drops.get_lock():
-                gui_put_drops.value += 1
+            if DEBUG_STATS:
+                with gui_put_drops.get_lock():
+                    gui_put_drops.value += 1
 
         return heatmap_ema
 
@@ -360,16 +484,24 @@ def process_buffer(raw_buffer, w_range, w_angle, heatmap_ema, alpha, gui_queue, 
 
 
 
-
-
-
-
 # ----------------------------
 # MAIN (GRAFICA)
 # ----------------------------
 if __name__ == "__main__":
+
+    # Queue di indici (slot) pronti per DSP
     frame_q = Queue(maxsize=FRAME_Q_MAX)
+    #Pool di slot liberi (evita overwrite e copie)
+    free_slots = Queue()
+
+    # Shared ring per i frame (byte)
+    N_SLOTS = FRAME_Q_MAX + X_FRAMES + 32 # un po' di margine
+    shm_frames = RawArray("B", N_SLOTS * BYTES_PER_FRAME)
+    for i in range(N_SLOTS):
+        free_slots.put(i)
+        
     gui_q = Queue(maxsize=GUI_Q_MAX)
+
 
     # stats condivise
     lost_pkts = Value("L", 0)
@@ -382,8 +514,8 @@ if __name__ == "__main__":
     gui_put_ok = Value("L", 0)
     gui_get_ok = Value("L", 0)
 
-    p_rx = Process(target=radar_rx, args=(frame_q, lost_pkts, rx_put_drops, frame_put_ok))
-    p_dsp = Process(target=dsp_worker, args=(frame_q, gui_q, gui_put_drops, frame_get_ok, gui_put_ok))
+    p_rx = Process(target=radar_rx, args=(frame_q, free_slots, shm_frames , lost_pkts, rx_put_drops, frame_put_ok))
+    p_dsp = Process(target=dsp_worker, args=(frame_q, free_slots, shm_frames, gui_q, gui_put_drops, frame_get_ok, gui_put_ok))
 
     p_rx.daemon = True
     p_dsp.daemon = True
@@ -430,11 +562,13 @@ if __name__ == "__main__":
     print("[MAIN] Loop grafico.")
 
     # monitor STATS (1 Hz)
+    t_mon = time.perf_counter()
     if DEBUG_STATS:
-        t_mon = time.perf_counter()
         # monitor UPDATE IMMAGINE (1 Hz) -> QUELLO CHE TI INTERESSA
         img_updates = 0
         t_img_start = time.perf_counter()
+        lost_prev = 0
+
 
     try:
         while True:
@@ -457,7 +591,10 @@ if __name__ == "__main__":
                     backlog_g = put_g - get_g
 
                     with lost_pkts.get_lock():
-                        lost = lost_pkts.value
+                        lost_now = lost_pkts.value
+                        lost_delta = lost_now - lost_prev
+                        lost_prev = lost_now
+
                     with rx_put_drops.get_lock():
                         drop_f = rx_put_drops.value
                     with gui_put_drops.get_lock():
@@ -467,10 +604,13 @@ if __name__ == "__main__":
                     sat_g = 100.0 * backlog_g / GUI_Q_MAX
 
                     print(
-                        f"[STATS] lost_pkts={lost} | "
+                        f"[STATS] lost_pkts={lost_now} (+{lost_delta}/s) | "
                         f"frame_q: backlog={backlog_f}/{FRAME_Q_MAX} ({sat_f:.0f}%) drops={drop_f} | "
                         f"gui_q: backlog={backlog_g}/{GUI_Q_MAX} ({sat_g:.0f}%) drops={drop_g}"
                     )
+
+
+
 
                     # ---- stampa frequenza update immagine (reale) ----
                     dt = now - t_img_start
@@ -482,32 +622,37 @@ if __name__ == "__main__":
                     t_img_start = now
                     t_mon = now
 
+               
 
-            try:
-                # prendi l'ultimo disponibile (svuota coda)
-                heatmap = gui_q.get_nowait()
-                with gui_get_ok.get_lock():
-                    gui_get_ok.value += 1
 
-                while not gui_q.empty():
+
+            
+
+# ---- prendi ultimo heatmap disponibile (senza empty()) ----
+            heatmap = None
+            while True:
+                try:
                     heatmap = gui_q.get_nowait()
-                    with gui_get_ok.get_lock():
-                        gui_get_ok.value += 1
+                    if DEBUG_STATS:
+                        with gui_get_ok.get_lock():
+                            gui_get_ok.value += 1
+                except pyqueue.Empty:
+                    break
 
-                # --- BLIT veloce ---
-                fig.canvas.restore_region(background)
-                img.set_data(heatmap)
+            if heatmap is None:
+                time.sleep(0.002)
+                continue
 
-                if DEBUG_STATS:
-                    img_updates += 1  
+            # ---- BLIT ----
+            fig.canvas.restore_region(background)
+            img.set_data(heatmap)
 
-                ax.draw_artist(img)
-                fig.canvas.blit(ax.bbox)
-                fig.canvas.flush_events()
+            if DEBUG_STATS:
+                img_updates += 1
 
-            except pyqueue.Empty:
-                fig.canvas.blit(ax.bbox)
-                time.sleep(0.01)
+            ax.draw_artist(img)
+            fig.canvas.blit(ax.bbox)
+            fig.canvas.flush_events()
 
     except KeyboardInterrupt:
         print("Chiusura...")

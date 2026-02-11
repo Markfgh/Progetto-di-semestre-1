@@ -6,7 +6,7 @@ physical:
 
 capture:
   samples: 256
-  chirps: 64
+  chirps: 64 # (2 frame/s) 
   rx: 4
   tx: 2
   x_frames: 1
@@ -21,6 +21,7 @@ display:
   range_max: 5.0
 
 dsp:
+  fft_workers: 8
   window_range: blackman
   window_angle: hanning
 
