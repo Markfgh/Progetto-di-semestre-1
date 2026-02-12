@@ -1,14 +1,16 @@
 import socket
-import yaml
 import time
-import numpy as np
-import matplotlib.pyplot as plt
 import queue as pyqueue
-import scipy.fft as fft 
 from pathlib import Path
 from multiprocessing import Process, Queue, Value
-from multiprocessing.sharedctypes import RawArray,Synchronized
-from dsp_selection import selection_from_yaml_dict, build_windows
+from multiprocessing.sharedctypes import RawArray, Synchronized
+
+import yaml
+import numpy as np
+import matplotlib.pyplot as plt
+import scipy.fft as fft
+
+from dsp_processing import selection_from_yaml_dict, build_windows
 #import dpnp as dp
 
 
@@ -62,7 +64,15 @@ GUI_Q_MAX = 5 # dimensione coda tra DSP e GUI (in numero di heatmap, non byte).
 # ----------------------------
 # FUNZIONI DI ELABORAZIONE
 # ----------------------------
-def radar_rx(frame_queue: Queue,free_slots: Queue,shm_frames,lost_pkts: Synchronized,rx_put_drops: Synchronized,frame_put_ok: Synchronized):    
+def radar_rx(
+    frame_queue: Queue,
+    free_slots: Queue,
+    shm_frames,
+    lost_pkts: Synchronized,
+    rx_pkts: Synchronized,
+    rx_put_drops: Synchronized,
+    frame_put_ok: Synchronized,
+):
     """
     Riceve UDP DCA1000 (porta data), ricostruisce frame fissi (BYTES_PER_FRAME).
     Se mancano pacchetti (gap seq), fa zero-fill dei byte mancanti.
@@ -76,16 +86,7 @@ def radar_rx(frame_queue: Queue,free_slots: Queue,shm_frames,lost_pkts: Synchron
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF_BYTES)
 
-    ### VERIFICA BUFFER AUMENTATO se il sistema lo supporta ###
-    if DEBUG_STATS:
-        actual_buf = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
-        if actual_buf < RCVBUF_BYTES // 2:
-            print(f"[RX WARNING] Buffer UDP richiesto: {RCVBUF_BYTES}, ottenuto dal sistema: {actual_buf}")
-            print("[RX WARNING] Esegui: sudo sysctl -w net.core.rmem_max=268435456")
-        else:
-            print(f"[RX] Buffer UDP OK: {actual_buf}")
-   
-
+    # Nota: niente print qui (lo stato lo mostra il monitor nel MAIN)
     ####2. Associa socket a IP e porta ####
     sock.bind((PC_IP, PORT))
     #timeout breve per evitare blocchi infiniti su recvfrom
@@ -109,12 +110,11 @@ def radar_rx(frame_queue: Queue,free_slots: Queue,shm_frames,lost_pkts: Synchron
     w = 0 # write cursor all'interno del frame corrente (0..BYTES_PER_FRAME)
     last_seq = None # ultima sequenza ricevuta (per rilevare gap)
     payload_len_ref = None # lunghezza payload di riferimento (stima dal primo pacchetto valido)
-    # --- STATISTICHE REALI ---
-    if DEBUG_STATS:
-        pkts_rx = 0
-        t_stat = time.perf_counter()
 
-    print("[RX] Avviato.")
+    # Contatore pacchetti RX locale (flush periodico su Value condiviso per minimizzare lock)
+    pkts_local = 0
+    t_flush = time.perf_counter()
+    # stats RX condivise (conteggi monotoni, aggiornati in modo lock-free)
 
 
     def ensure_slot():
@@ -142,8 +142,15 @@ def radar_rx(frame_queue: Queue,free_slots: Queue,shm_frames,lost_pkts: Synchron
         try:
             # riceve direttamente nel buffer pre-allocato e ottiene il numero di byte ricevuti
             n_bytes, _ = sock.recvfrom_into(packet_mv)
-            if DEBUG_STATS:
-                pkts_rx += 1
+            pkts_local += 1
+
+            # flush periodico sul contatore condiviso (riduce overhead lock)
+            now = time.perf_counter()
+            if now - t_flush >= 0.1:
+                with rx_pkts.get_lock():
+                    rx_pkts.value += pkts_local
+                pkts_local = 0
+                t_flush = now
         except socket.timeout:
             continue
 
@@ -174,10 +181,9 @@ def radar_rx(frame_queue: Queue,free_slots: Queue,shm_frames,lost_pkts: Synchron
             gap = seq - last_seq - 1 #n. pacchetti persi 
             if gap > 0: 
 
-                # Debug: aggiorna contatore pacchetti persi
-                if DEBUG_STATS:
-                    with lost_pkts.get_lock(): 
-                        lost_pkts.value += gap 
+                # aggiorna contatore pacchetti persi (monotono)
+                with lost_pkts.get_lock():
+                    lost_pkts.value += gap
 
                 # Calcola quanti byte mancano per colmare il gap e scrivi zeri nel frame
                 # Nota: se il gap è molto grande, potremmo dover scrivere più di BYTES_PER_FRAME 
@@ -266,24 +272,6 @@ def radar_rx(frame_queue: Queue,free_slots: Queue,shm_frames,lost_pkts: Synchron
                 frame_view = None
 
 
-        if DEBUG_STATS:
-            now = time.perf_counter()
-            if now - t_stat >= 2.0:
-
-                with lost_pkts.get_lock():
-                    lost = lost_pkts.value
-
-                total = pkts_rx + lost
-                loss_pct = (100.0 * lost / total) if total > 0 else 0.0
-                pkt_rate = pkts_rx / (now - t_stat)
-
-                print(
-                    f"[RX] pkts={pkts_rx} lost={lost} "
-                    f"loss={loss_pct:.3f}% rate={pkt_rate:.0f} pkt/s"
-                )
-
-                pkts_rx = 0
-                t_stat = now
 
 
 
@@ -305,7 +293,7 @@ def dsp_worker(frame_queue,free_slots,shm_frames,gui_queue,gui_put_drops,frame_g
     i16_per_frame = BYTES_PER_FRAME // 2
     i16_batch = np.empty((X_FRAMES, i16_per_frame), dtype=np.int16)
 
-    print("[DSP] Avviato.")
+    # DSP worker avviato
     while True:
         try:
             slot = frame_queue.get(timeout=0.5)
@@ -505,6 +493,7 @@ if __name__ == "__main__":
 
     # stats condivise
     lost_pkts = Value("L", 0)
+    rx_pkts = Value("L", 0)
     rx_put_drops = Value("L", 0)
     gui_put_drops = Value("L", 0)
 
@@ -514,7 +503,10 @@ if __name__ == "__main__":
     gui_put_ok = Value("L", 0)
     gui_get_ok = Value("L", 0)
 
-    p_rx = Process(target=radar_rx, args=(frame_q, free_slots, shm_frames , lost_pkts, rx_put_drops, frame_put_ok))
+    p_rx = Process(
+        target=radar_rx,
+        args=(frame_q, free_slots, shm_frames, lost_pkts, rx_pkts, rx_put_drops, frame_put_ok),
+    )
     p_dsp = Process(target=dsp_worker, args=(frame_q, free_slots, shm_frames, gui_q, gui_put_drops, frame_get_ok, gui_put_ok))
 
     p_rx.daemon = True
@@ -522,7 +514,7 @@ if __name__ == "__main__":
     p_rx.start()
     p_dsp.start()
 
-    print("[MAIN] Avvio grafica...")
+    # Avvio grafica
 
     fig, ax = plt.subplots(figsize=(10, 8))
 
@@ -559,7 +551,7 @@ if __name__ == "__main__":
     # blitting setup
     fig.canvas.draw()
     background = fig.canvas.copy_from_bbox(ax.bbox)
-    print("[MAIN] Loop grafico.")
+    # Loop grafico
 
     # monitor STATS (1 Hz)
     t_mon = time.perf_counter()
@@ -568,6 +560,7 @@ if __name__ == "__main__":
         img_updates = 0
         t_img_start = time.perf_counter()
         lost_prev = 0
+        pkts_prev = 0
 
 
     try:
@@ -577,6 +570,7 @@ if __name__ == "__main__":
                 now = time.perf_counter()
                 # ----- stampa stats 1 Hz -----
                 if now - t_mon >= 1.0:
+                    dt_mon = now - t_mon
                
                     with frame_put_ok.get_lock():
                         put_f = frame_put_ok.value
@@ -595,6 +589,11 @@ if __name__ == "__main__":
                         lost_delta = lost_now - lost_prev
                         lost_prev = lost_now
 
+                    with rx_pkts.get_lock():
+                        pkts_now = rx_pkts.value
+                        pkts_delta = pkts_now - pkts_prev
+                        pkts_prev = pkts_now
+
                     with rx_put_drops.get_lock():
                         drop_f = rx_put_drops.value
                     with gui_put_drops.get_lock():
@@ -603,12 +602,15 @@ if __name__ == "__main__":
                     sat_f = 100.0 * backlog_f / FRAME_Q_MAX
                     sat_g = 100.0 * backlog_g / GUI_Q_MAX
 
+                    total = pkts_delta + lost_delta
+                    loss_pct = (100.0 * lost_delta / total) if total > 0 else 0.0
+                    pkt_rate = (pkts_delta / dt_mon) if dt_mon > 0 else 0.0
+
+                    print(f"loss={loss_pct:.3f}% rate={pkt_rate:.0f} pkt/s")
                     print(
-                        f"[STATS] lost_pkts={lost_now} (+{lost_delta}/s) | "
                         f"frame_q: backlog={backlog_f}/{FRAME_Q_MAX} ({sat_f:.0f}%) drops={drop_f} | "
                         f"gui_q: backlog={backlog_g}/{GUI_Q_MAX} ({sat_g:.0f}%) drops={drop_g}"
                     )
-
 
 
 
