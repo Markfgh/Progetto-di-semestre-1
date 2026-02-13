@@ -6,24 +6,24 @@ physical:
 
 capture:
   samples: 256
-  chirps: 64 # (2 frame/s) 
+  chirps: 128 # (2 frame/s) 
   rx: 4
   tx: 2
   x_frames: 1
 
 fft:
-  nfft_range: 1024
+  nfft_range: 256
   nfft_angle: 256
 
 display:
   vmin: -20
   vmax: 0
-  range_max: 5.0
+  range_max: 3.0
 
 dsp:
-  fft_workers: 8
+  fft_workers: 4
   window_range: blackman
   window_angle: hanning
 
 debug:
-  debug_stats: true
+  debug_stats: false
