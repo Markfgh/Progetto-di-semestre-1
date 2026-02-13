@@ -15,7 +15,6 @@ class DspSelection:
     window_range: WindowType = "blackman"
     window_angle: WindowType = "hanning"
 
-
 def _get_window_1d(win_type: str, size: int) -> np.ndarray:
     wt = win_type.lower()
     if wt == "rectangular":

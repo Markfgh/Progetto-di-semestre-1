@@ -58,9 +58,6 @@ FRAME_Q_MAX = 20 # dimensione coda frame tra RX e DSP (in numero di frame, non b
 GUI_Q_MAX = 5 # dimensione coda tra DSP e GUI (in numero di heatmap, non byte).
 
 
-
-
-
 # ----------------------------
 # FUNZIONI DI ELABORAZIONE
 # ----------------------------
