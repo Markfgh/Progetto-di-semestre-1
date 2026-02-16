@@ -3,28 +3,27 @@ physical:
   fs: 10e6
   slope: 60.012e12
   fc: 77e9
-
-
 capture:
   samples: 256
-  chirps: 128 # (2 frame/s) 
+  chirps: 128
   rx: 4
   tx: 2
   x_frames: 1
-
 fft:
   nfft_range: 256
   nfft_angle: 256
-
 display:
   vmin: -20
   vmax: 0
-  range_max: 3.0
-
+  range_max: 15.0
+  angle_max: 40.0
 dsp:
   fft_workers: 4
   window_range: blackman
   window_angle: hanning
-
 debug:
-  debug_stats: false
+  debug_stats: true
+  
+sar:
+  frames_per_position: 8
+  settling_delay_s: 0.4
