@@ -1,29 +1,34 @@
-physical:
+radar:
   c: 3e8
   fs: 10e6
   slope: 60.012e12
   fc: 77e9
+
 capture:
-  samples: 256
+  samples: 128
   chirps: 128
   rx: 4
   tx: 2
   x_frames: 1
+
 fft:
   nfft_range: 256
   nfft_angle: 256
+  workers: 4    
+
 display:
   vmin: -20
   vmax: 0
-  range_max: 15.0
-  angle_max: 40.0
+  range_max: 12.5
+  crossrange_max: 5.0
+
 dsp:
-  fft_workers: 4
   window_range: blackman
   window_angle: hanning
+
 debug:
   debug_stats: true
-  
+
 sar:
   frames_per_position: 8
   settling_delay_s: 0.4

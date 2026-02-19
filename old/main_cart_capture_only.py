@@ -102,10 +102,10 @@ with CFG_PATH.open("r", encoding="utf-8") as f:
 
 
 # --- CONFIGURAZIONE FISICA ---
-C = float(cfg["physical"]["c"])
-FS = float(cfg["physical"]["fs"])
-SLOPE = float(cfg["physical"]["slope"])
-FC = float(cfg["physical"]["fc"])
+C = float(cfg["radar"]["c"])
+FS = float(cfg["radar"]["fs"])
+SLOPE = float(cfg["radar"]["slope"])
+FC = float(cfg["radar"]["fc"])
 
 LAMBDA = C / FC
 
@@ -144,7 +144,7 @@ FRAMES_PER_POSITION = int(sar_cfg.get("frames_per_position", 8))
 # --- QUEUE SIZE ---
 FRAME_Q_MAX = 20 # dimensione coda frame tra RX e DSP (in numero di frame, non byte)
 GUI_Q_MAX = 5 # dimensione coda tra DSP e GUI (in numero di heatmap, non byte).
-LOG_RING_N = 2048 # numero di frame bufferizzabili per logging (deve essere >= FRAME_Q_MAX + X_FRAMES)
+
 
 
 # ----------------------------
@@ -152,8 +152,7 @@ LOG_RING_N = 2048 # numero di frame bufferizzabili per logging (deve essere >= F
 # ----------------------------
 def radar_rx(
     cmd_queue: Queue,
-    log_meta: RawArray,
-    log_head: Synchronized,
+    log_queue: Queue,
     free_slots: Queue,
     shm_frames,
     lost_pkts: Synchronized,
@@ -275,19 +274,9 @@ def radar_rx(
         - do_log=False: bypass diretto al DSP/GUI best-effort (non bloccare RX).
         """
         if do_log:
-            with log_head.get_lock():
-                idx = log_head.value % LOG_RING_N
-                base = idx * 5
-
-                log_meta[base + 0] = int(slot_to_push)
-                log_meta[base + 1] = int(ok)
-                log_meta[base + 2] = int(pos_id)
-                log_meta[base + 3] = int(frame_in_pos)
-                log_meta[base + 4] = int(ts_ns)
-
-                log_head.value += 1
+            # In modalità recording NON vogliamo perdere frame: backpressure sul logger.
+            log_queue.put((int(slot_to_push), int(ok), int(pos_id), int(frame_in_pos), int(ts_ns)))
             return
-
 
         try:
             frame_queue.put_nowait(int(slot_to_push))
@@ -402,9 +391,7 @@ def radar_rx(
                 frame_view = None
                 frame_ok = True
 def logger_worker(
-    log_meta: RawArray,
-    log_head: Synchronized,
-    log_tail: Synchronized,
+    log_queue: Queue,
     frame_queue: Queue,
     free_slots: Queue,
     shm_frames,
@@ -499,66 +486,54 @@ def logger_worker(
 
         while True:
             try:
-                while True:
+                item = log_queue.get(timeout=0.5)
+            except pyqueue.Empty:
+                continue
 
-                    if stop_evt.is_set() and log_tail.value == log_head.value:
-                        break
+            if item is None:
+                break
 
-                    if log_tail.value == log_head.value:
-                        time.sleep(0.001)
-                        continue
+            slot, ok, pos_id, frame_in_pos, ts_ns = item
 
-                    idx = log_tail.value % LOG_RING_N
-                    base = idx * 5
+            base = int(slot) * BYTES_PER_FRAME
+            fbin.write(shm_view[base : base + BYTES_PER_FRAME])
 
-                    slot        = log_meta[base + 0]
-                    ok          = log_meta[base + 1]
-                    pos_id      = log_meta[base + 2]
-                    frame_in_pos= log_meta[base + 3]
-                    ts_ns       = log_meta[base + 4]
+            rec = struct.pack(
+                REC_FMT,
+                int(frame_id),
+                int(pos_id) & 0xFFFFFFFF,
+                int(frame_in_pos) & 0xFFFF,
+                int(ok) & 0xFF,
+                0,
+                int(ts_ns),
+                0,
+                0,
+            )
+            fidx.write(rec)
 
-                    with log_tail.get_lock():
-                        log_tail.value += 1
+            frame_id += 1
+            if log_saved is not None:
+                with log_saved.get_lock():
+                    log_saved.value = frame_id
 
-                base = int(slot) * BYTES_PER_FRAME
-                fbin.write(shm_view[base : base + BYTES_PER_FRAME])
+            # Forward best-effort verso DSP
+            try:
+                frame_queue.put_nowait(int(slot))
+                if DEBUG_STATS:
+                    with frame_put_ok.get_lock():
+                        frame_put_ok.value += 1
+            except pyqueue.Full:
+                if DEBUG_STATS:
+                    with dsp_put_drops.get_lock():
+                        dsp_put_drops.value += 1
+                # DSP non lo userà: libera subito lo slot
+                free_slots.put(int(slot))
 
-                rec = struct.pack(
-                    REC_FMT,
-                    int(frame_id),
-                    int(pos_id) & 0xFFFFFFFF,
-                    int(frame_in_pos) & 0xFFFF,
-                    int(ok) & 0xFF,
-                    0,
-                    int(ts_ns),
-                    0,
-                    0,
-                )
-                fidx.write(rec)
-
-                frame_id += 1
-                if log_saved is not None:
-                    with log_saved.get_lock():
-                        log_saved.value = frame_id
-
-                # Forward best-effort verso DSP
-                try:
-                    frame_queue.put_nowait(int(slot))
-                    if DEBUG_STATS:
-                        with frame_put_ok.get_lock():
-                            frame_put_ok.value += 1
-                except pyqueue.Full:
-                    if DEBUG_STATS:
-                        with dsp_put_drops.get_lock():
-                            dsp_put_drops.value += 1
-                    # DSP non lo userà: libera subito lo slot
-                    free_slots.put(int(slot))
-
-                    try:
-                        fbin.flush()
-                        fidx.flush()
-                    except Exception:
-                        pass
+        try:
+            fbin.flush()
+            fidx.flush()
+        except Exception:
+            pass
 
 # ----------------------------
 # WORKER DSP
@@ -805,18 +780,8 @@ def main():
 
     # coda tra RX e logger (slot + metadati). La dimensione segue N_SLOTS per evitare deadlock.
     # NOTA: ogni elemento occupa pochissimo (solo indici+metadati), i bytes stanno in shm_frames.
+    log_q = Queue(maxsize=0)  # 0 -> best effort "unbounded" (in pratica: evita drop)
     cmd_q = Queue(maxsize=16)
-
-    # ----------------------------
-    # SHM ring per metadata logging (industriale)
-    # ----------------------------
-    # 5 campi per record:
-    # slot, ok, pos_id, frame_in_pos, ts_ns
-    log_meta = RawArray("Q", LOG_RING_N * 5)
-
-    log_head = Value("L", 0)
-    log_tail = Value("L", 0)
-
 
     # file di output (run_id unico)
     run_id = time.strftime("%Y%m%d_%H%M%S")
@@ -839,15 +804,13 @@ def main():
 
     p_rx = Process(
         target=radar_rx,
-        args=(cmd_q, log_meta, log_head, free_slots, shm_frames, lost_pkts, rx_pkts, rx_put_drops, frame_q, frame_put_ok, stop_evt, SETTLING_DELAY_S, FRAMES_PER_POSITION),
+        args=(cmd_q, log_q, free_slots, shm_frames, lost_pkts, rx_pkts, rx_put_drops, frame_q, frame_put_ok, stop_evt, SETTLING_DELAY_S, FRAMES_PER_POSITION),
     )
 
     p_log = Process(
         target=logger_worker,
         args=(
-            log_meta,
-            log_head,
-            log_tail,
+            log_q,
             frame_q,
             free_slots,
             shm_frames,
@@ -941,22 +904,6 @@ def main():
     tex_buf = array('f', [0.0]) * (tex_w * tex_h * 4)
     tex_np  = np.frombuffer(tex_buf, dtype=np.float32)
 
-    # --- COLORBAR TEXTURE (verticale) ---
-    CBAR_TEX_TAG = "cbar_tex"
-    cbar_w = 30
-    cbar_h = tex_h  # stessa altezza range
-
-    cbar_buf = array('f', [0.0]) * (cbar_w * cbar_h * 4)
-    cbar_np  = np.frombuffer(cbar_buf, dtype=np.float32)
-
-    # gradiente 0..1 verticale (top=1, bottom=0)
-    grad = np.linspace(1.0, 0.0, cbar_h, dtype=np.float32).reshape(cbar_h, 1)
-    grad = np.repeat(grad, cbar_w, axis=1)
-
-    rgba_cbar = _jet_rgba(grad)
-    cbar_np[:] = rgba_cbar.reshape(-1)
-
-
     def _shutdown():
         """Termina i processi figli in modo robusto e senza perdere gli ultimi frame nel log."""
         try:
@@ -976,6 +923,10 @@ def main():
             pass
 
         # 2) chiudi logger DOPO RX: così drena tutta la coda e fa flush
+        try:
+            log_q.put_nowait(None)
+        except Exception:
+            pass
         try:
             p_log.join(timeout=3.0)
         except Exception:
@@ -1027,6 +978,13 @@ def main():
 
         vis_vmin, vis_vmax, vis_rmax, vis_ang_abs = vmin, vmax, rmax, aabs
 
+        # aggiorna scala colori
+        try:
+            dpg.configure_item(CMAP_SCALE_TAG, min_scale=vis_vmin, max_scale=vis_vmax, colormap=dpg.mvPlotColormap_Jet)
+            dpg.bind_colormap(CMAP_SCALE_TAG, dpg.mvPlotColormap_Jet)
+        except Exception:
+            pass
+
         # aggiorna limiti assi (ZOOM/CROP):
         # - i bounds dell'immagine restano fissi ai limiti fisici da YAML
         # - qui cambiamo SOLO i limiti degli assi (come con ax.set_xlim/ylim in matplotlib)
@@ -1034,18 +992,6 @@ def main():
         x_min = float(max(ANG_MIN_CFG, -ang_abs))
         x_max = float(min(ANG_MAX_CFG, +ang_abs))
         y_max = float(min(max(0.05, vis_rmax), RANGE_MAX_DISPLAY))
-
-        # aggiorna colorbar con nuovi limiti
-        grad = np.linspace(vis_vmax, vis_vmin, cbar_h, dtype=np.float32)
-        grad = (grad - vis_vmin) / (vis_vmax - vis_vmin + 1e-6)
-        grad = grad.reshape(cbar_h, 1)
-        grad = np.repeat(grad, cbar_w, axis=1)
-
-        rgba_cbar = _jet_rgba(grad)
-        cbar_np[:] = rgba_cbar.reshape(-1)
-        dpg.set_value(CBAR_TEX_TAG, cbar_buf)
-
-
 
         try:
             dpg.set_axis_limits(XAXIS_TAG, x_min, x_max)
@@ -1059,7 +1005,6 @@ def main():
     # --- Layout GUI ---
     PLOT_H = 820
     CBAR_W = 90
-
 
     # ----------------------------
     # SAR capture-only controls (GUI)
@@ -1112,28 +1057,38 @@ def main():
             with dpg.plot(label="Heatmap", height=PLOT_H, width=-1, tag=HEAT_PLOT_TAG):
                 dpg.add_plot_axis(dpg.mvXAxis, label="Azimuth (deg)", tag=XAXIS_TAG)
                 dpg.add_plot_axis(dpg.mvYAxis, label="Range (m)", tag=YAXIS_TAG)
+
+                with dpg.texture_registry(tag=TEX_REG, show=False):
+                    _default = [0.0, 0.0, 0.0, 1.0] * (tex_w * tex_h)
+                    dpg.add_dynamic_texture(width=tex_w, height=tex_h, default_value=_default, tag=TEX_TAG)
+                dpg.add_image_series(
+                    TEX_TAG,
+                    bounds_min=(float(ANG_MIN_CFG), 0.0),
+                    bounds_max=(float(ANG_MAX_CFG), float(RANGE_MAX_DISPLAY)),
+                    tag=IMG_SERIES_TAG,
+                    parent=YAXIS_TAG,
+                )
+
                 dpg.set_axis_limits(XAXIS_TAG, float(ANG_MIN_CFG), float(ANG_MAX_CFG))
                 dpg.set_axis_limits(YAXIS_TAG, 0.0, float(RANGE_MAX_DISPLAY))
 
 
-            with dpg.texture_registry(tag=TEX_REG, show=False):
-                _default = [0.0, 0.0, 0.0, 1.0] * (tex_w * tex_h)
-                dpg.add_dynamic_texture(width=tex_w, height=tex_h, default_value=_default, tag=TEX_TAG)
-                dpg.add_dynamic_texture(
-                    width=cbar_w,
-                    height=cbar_h,
-                    default_value=cbar_buf,
-                    tag=CBAR_TEX_TAG
-                )
-
-           
-
-
             # --- destra: colorbar della stessa altezza del plot ---
             with dpg.child_window(width=CBAR_W, height=PLOT_H):
-                dpg.add_text("dB")
-                dpg.add_image(CBAR_TEX_TAG)
-
+                dpg.add_text("Jet")
+                dpg.add_colormap_scale(
+                    label="dB",
+                    colormap=dpg.mvPlotColormap_Jet,
+                    min_scale=vis_vmin,
+                    max_scale=vis_vmax,
+                    tag=CMAP_SCALE_TAG,
+                    height=PLOT_H - 30,
+                    width=CBAR_W - 10,
+                )
+                try:
+                    dpg.bind_colormap(CMAP_SCALE_TAG, dpg.mvPlotColormap_Jet)
+                except Exception:
+                    pass
 
     dpg.create_viewport(title="Radar Heatmap", width=1400, height=950)
     dpg.setup_dearpygui()
@@ -1182,15 +1137,6 @@ def main():
                     drop_f = rx_put_drops.value
                 with gui_put_drops.get_lock():
                     drop_g = gui_put_drops.value
-
-                with log_head.get_lock():
-                    h = log_head.value
-                with log_tail.get_lock():
-                    t = log_tail.value
-
-                fill = h - t
-                fill_pct = 100.0 * fill / LOG_RING_N
-
 
                 sat_f = 100.0 * backlog_f / FRAME_Q_MAX
                 sat_g = 100.0 * backlog_g / GUI_Q_MAX
@@ -1273,10 +1219,6 @@ def main():
                     # copia veloce senza allocazioni
                     tex_np[:] = rgba.reshape(-1)
                     dpg.set_value(TEX_TAG, tex_buf)
-
-
-
-
 
                     if DEBUG_STATS:
                         img_updates += 1
