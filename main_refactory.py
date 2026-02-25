@@ -10,77 +10,7 @@ import yaml
 import numpy as np
 import dearpygui.dearpygui as dpg
 import scipy.fft as fft
-# ----------------------------
-# RAM usage helper (per-process)
-# ----------------------------
 import os
-import sys
-
-def _rss_bytes_pid(pid: int) -> int:
-    """Return resident set size (RSS) in bytes for a given pid. Best-effort."""
-    if pid is None or pid <= 0:
-        return 0
-
-    # 1) psutil if available (fast + portable)
-    try:
-        import psutil  # type: ignore
-        p = psutil.Process(pid)
-        return int(p.memory_info().rss)
-    except Exception:
-        pass
-
-    # 2) Windows fallback via ctypes (no deps)
-    if os.name == "nt":
-        try:
-            import ctypes
-            import ctypes.wintypes as wt
-
-            PROCESS_QUERY_INFORMATION = 0x0400
-            PROCESS_VM_READ = 0x0010
-
-            class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
-                _fields_ = [
-                    ("cb", wt.DWORD),
-                    ("PageFaultCount", wt.DWORD),
-                    ("PeakWorkingSetSize", ctypes.c_size_t),
-                    ("WorkingSetSize", ctypes.c_size_t),
-                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                    ("PagefileUsage", ctypes.c_size_t),
-                    ("PeakPagefileUsage", ctypes.c_size_t),
-                ]
-
-            OpenProcess = ctypes.windll.kernel32.OpenProcess
-            GetProcessMemoryInfo = ctypes.windll.psapi.GetProcessMemoryInfo
-            CloseHandle = ctypes.windll.kernel32.CloseHandle
-
-            h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, int(pid))
-            if not h:
-                return 0
-            counters = PROCESS_MEMORY_COUNTERS()
-            counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
-            ok = GetProcessMemoryInfo(h, ctypes.byref(counters), counters.cb)
-            CloseHandle(h)
-            if ok:
-                return int(counters.WorkingSetSize)
-        except Exception:
-            return 0
-
-    # 3) Linux fallback via /proc
-    try:
-        if sys.platform.startswith("linux"):
-            with open(f"/proc/{int(pid)}/statm", "r", encoding="utf-8") as f:
-                parts = f.read().strip().split()
-            if len(parts) >= 2:
-                rss_pages = int(parts[1])
-                page = getattr(os, 'sysconf', lambda x: 4096)("SC_PAGE_SIZE") if hasattr(os, 'sysconf') else 4096
-                return rss_pages * page
-    except Exception:
-        pass
-
-    return 0
 
 
 def _cpu_percent_pid(pid: int, cpu_state: dict) -> float:
@@ -245,9 +175,12 @@ NFFT_RANGE = int(cfg["fft"]["nfft_range"])
 NFFT_ANGLE = int(cfg["fft"]["nfft_angle"])
 
 # --- DISPLAY ---
-# vmin/vmax: valori di BASE (default) per la scala colori (NON hard limit)
-VMIN = float(cfg["display"]["vmin"])
-VMAX = float(cfg["display"]["vmax"])
+# vmin/vmax: scala di base per modalita NON normalizzata (NON hard limit)
+VMIN_RAW = float(cfg["display"]["vmin"])
+VMAX_RAW = float(cfg["display"]["vmax"])
+# vmin_norm/vmax_norm: scala di base per modalita normalizzata (fallback su raw)
+VMIN_NORM = float(cfg.get("display", {}).get("vmin_norm", VMIN_RAW))
+VMAX_NORM = float(cfg.get("display", {}).get("vmax_norm", VMAX_RAW))
 
 # range_max / crossrange_max: HARD LIMIT (0 .. max config)
 RMAX_HARD_MAX = float(cfg["display"]["range_max"])
@@ -298,6 +231,8 @@ def radar_rx(
     rx_pkts: Synchronized,
     rx_put_drops: Synchronized,
     rx_frames_ok: Synchronized,
+    stall_events: Synchronized,
+    stream_resets: Synchronized,
     stop_evt,
     settling_delay_s: float,
 ):
@@ -327,6 +262,14 @@ def radar_rx(
     PORT = 4098
     HEADER_LEN = 10
     RCVBUF_BYTES = 256 * 1024 * 1024
+    STALL_TIMEOUT_S = float(cfg.get("rx", {}).get("stall_timeout_s", 2.0))
+    if STALL_TIMEOUT_S <= 0.0:
+        STALL_TIMEOUT_S = 2.0
+    SEQ_REORDER_MAX_BACK = int(cfg.get("rx", {}).get("seq_reorder_max_back", 32))
+    if SEQ_REORDER_MAX_BACK < 0:
+        SEQ_REORDER_MAX_BACK = 0
+    U32_MOD = 1 << 32
+    U32_HALF = 1 << 31
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF_BYTES)
@@ -355,12 +298,24 @@ def radar_rx(
     frame_ok = True
     pkts_local = 0
     t_flush = time.perf_counter()
+    last_packet_perf = t_flush
     publish_seq = 0
+    RX_RUNNING = 1
+    RX_STALLED = 0
+    rx_state = RX_RUNNING
 
     # Capture control
     pending = False
     pending_start_t = 0.0
     pending_pos_id = 0
+
+    def _bump_counter(counter: Synchronized) -> None:
+        try:
+            with counter.get_lock():
+                counter.value += 1
+        except Exception:
+            pass
+
     def _poll_commands(now_perf: float) -> None:
         nonlocal pending, pending_start_t, pending_pos_id
         while True:
@@ -402,6 +357,33 @@ def radar_rx(
         curr_slot = None
         frame_view = None
         have_slot = False
+
+    def _discard_partial_frame() -> None:
+        """Discard current in-progress frame and release acquired slot if any."""
+        nonlocal w, frame_ok
+        if have_slot and (curr_slot is not None):
+            slot = int(curr_slot)
+            slot_ok[slot] = 0
+            slot_usemask[slot] = 0
+            slot_pub_seq[slot] = 0
+            slot_state[slot] = 0
+            slot_pos_id[slot] = -1
+            try:
+                free_slots.put_nowait(slot)
+            except Exception:
+                pass
+        w = 0
+        frame_ok = True
+        _free_current_slot()
+
+    def _soft_reset_stream() -> None:
+        """Reset RX continuity trackers and release partial local resources."""
+        nonlocal payload_len_ref, last_seq, last_byte_count
+        _discard_partial_frame()
+        payload_len_ref = None
+        last_seq = None
+        last_byte_count = None
+        _bump_counter(stream_resets)
 
     def _acquire_slot_nonblocking() -> bool:
         """Prende uno slot senza mai bloccare. Se non disponibile -> drop frame (have_slot=False)."""
@@ -481,17 +463,26 @@ def radar_rx(
         try:
             n_bytes, _ = sock.recvfrom_into(packet_mv)
             pkts_local += 1
-            now = time.perf_counter()
-            if now - t_flush >= 0.1:
+            recv_perf = time.perf_counter()
+            if recv_perf - t_flush >= 0.1:
                 with rx_pkts.get_lock():
                     rx_pkts.value += pkts_local
                 pkts_local = 0
-                t_flush = now
+                t_flush = recv_perf
         except socket.timeout:
+            if rx_state == RX_RUNNING and (time.perf_counter() - last_packet_perf) >= STALL_TIMEOUT_S:
+                rx_state = RX_STALLED
+                _bump_counter(stall_events)
             continue
 
         if n_bytes <= HEADER_LEN:
             continue
+
+        last_packet_perf = time.perf_counter()
+
+        if rx_state == RX_STALLED:
+            _soft_reset_stream()
+            rx_state = RX_RUNNING
 
         if payload_len_ref is None:
             payload_len_ref = n_bytes - HEADER_LEN
@@ -502,10 +493,24 @@ def radar_rx(
         # uint48 little-endian
         bc = int.from_bytes(packet_view[4:10], "little", signed=False) & (MOD48 - 1)
 
-        # --- sanity: out-of-order ---
-        if last_seq is not None and seq <= last_seq:
-            # ignore old/reordered packet
-            continue
+        # --- seq continuity: forward, reorder, restart ---
+        seq_gap_pkts = 0
+        if last_seq is not None:
+            delta = (int(seq) - int(last_seq)) & (U32_MOD - 1)
+            if delta == 0:
+                # duplicate packet
+                continue
+            if delta < U32_HALF:
+                # forward progression (also handles uint32 wrap-around)
+                seq_gap_pkts = int(delta - 1)
+            else:
+                # backward packet: small back = reorder, large back = stream restart
+                back = (int(last_seq) - int(seq)) & (U32_MOD - 1)
+                if back <= SEQ_REORDER_MAX_BACK:
+                    continue
+                _soft_reset_stream()
+                payload_len_ref = n_bytes - HEADER_LEN
+                seq_gap_pkts = 0
 
         # --- byte_count check (robust alignment) ---
         if last_byte_count is not None and payload_len_ref is not None:
@@ -515,22 +520,20 @@ def radar_rx(
         last_byte_count = bc
 
         # --- GAP handling (consume missing bytes to keep frame alignment) ---
-        if last_seq is not None:
-            gap = seq - last_seq - 1
-            if gap > 0 and payload_len_ref is not None:
-                with lost_pkts.get_lock():
-                    lost_pkts.value += int(gap)
-                frame_ok = False
+        if seq_gap_pkts > 0 and payload_len_ref is not None:
+            with lost_pkts.get_lock():
+                lost_pkts.value += int(seq_gap_pkts)
+            frame_ok = False
 
-                bytes_missing = int(gap) * int(payload_len_ref)
-                while bytes_missing > 0 and (not stop_evt.is_set()):
-                    _ensure_slot()
-                    take = min(bytes_missing, BYTES_PER_FRAME - w)
-                    # consume without writing (keep alignment)
-                    w += take
-                    bytes_missing -= take
-                    if w == BYTES_PER_FRAME:
-                        _publish_frame()
+            bytes_missing = int(seq_gap_pkts) * int(payload_len_ref)
+            while bytes_missing > 0 and (not stop_evt.is_set()):
+                _ensure_slot()
+                take = min(bytes_missing, BYTES_PER_FRAME - w)
+                # consume without writing (keep alignment)
+                w += take
+                bytes_missing -= take
+                if w == BYTES_PER_FRAME:
+                    _publish_frame()
 
         last_seq = seq
 
@@ -623,7 +626,7 @@ def logger_worker(
         saved_local = 0
         pos_local = -1
 
-    def _open_file(pos_id: int, capid: int):
+    def _open_file(pos_id: int):
         nonlocal fbin, buf, buf_used, saved_local, pos_local
         _close_file()
         pos_local = int(pos_id)
@@ -691,7 +694,7 @@ def logger_worker(
             if pending_cap_id is None or int(cap_active.value) != 1:
                 time.sleep(0.002)
                 continue
-            _open_file(int(pending_pos_id), int(pending_cap_id))
+            _open_file(int(pending_pos_id))
             pending_cap_id = None
             pending_pos_id = None
 
@@ -771,6 +774,11 @@ def dsp_worker(
     dsp_skip: Synchronized,
     dsp_ms_avg: Synchronized,
     dsp_ms_p95: Synchronized,
+    norm_to_peak: Synchronized,
+    stat_raw_min_db: Synchronized,
+    stat_raw_max_db: Synchronized,
+    stat_norm_min_db: Synchronized,
+    stat_norm_max_db: Synchronized,
     stop_evt,
 ):
     # --- SETUP STATIC ---
@@ -881,6 +889,11 @@ def dsp_worker(
         complex_view.imag[:] = block_view[:, 4:].reshape(-1)  # type: ignore
         # --- 3. PROCESSING ---
         t0_proc = time.perf_counter()
+        try:
+            with norm_to_peak.get_lock():
+                normalize_to_peak = bool(norm_to_peak.value)
+        except Exception:
+            normalize_to_peak = True
         heatmap_ema = process_buffer(
             complex_view, 
             n_proc,
@@ -894,7 +907,12 @@ def dsp_worker(
             gui_latest_idx,
             gui_latest_seq,
             gui_lock,
-            max_bin
+            max_bin,
+            normalize_to_peak,
+            stat_raw_min_db,
+            stat_raw_max_db,
+            stat_norm_min_db,
+            stat_norm_max_db,
         )
         t1_proc = time.perf_counter()
         if n_proc > 0 and DEBUG_STATS:
@@ -922,6 +940,11 @@ def process_buffer(
     gui_latest_seq,
     gui_lock,
     max_bin,
+    normalize_to_peak: bool,
+    stat_raw_min_db: Synchronized,
+    stat_raw_max_db: Synchronized,
+    stat_norm_min_db: Synchronized,
+    stat_norm_max_db: Synchronized,
 ):
 
     try:
@@ -936,7 +959,7 @@ def process_buffer(
 
         # Clutter removal: sottrai la media lungo SAMPLES (axis=3)
 
-        #data -= data.mean(axis=2, keepdims=True, dtype=np.complex64)
+        data -= data.mean(axis=2, keepdims=True, dtype=np.complex64)
 
         # Finestra Range: w_range deve essere broadcastabile su axis=3 (shape: 1,1,1,SAMPLES,1)
 
@@ -949,15 +972,10 @@ def process_buffer(
 
 
         # Preparazione Virtual Array senza transpose+ascontiguousarray:
-
-        # range_fft: (F, C, TX, R, RX) con R=NFFT_RANGE
-
-        va = np.moveaxis(range_fft, 4, 3)     # -> (F, C, TX, RX, R)
-
-        va = np.moveaxis(va, 4, 2)           # -> (F, C, R, TX, RX)
-
+        # range_fft: (F, C, TX, R, RX)
+        va = range_fft.transpose(0, 1, 3, 2, 4)   # -> (F, C, R, TX, RX) view
+        va = np.ascontiguousarray(va)            # rende il reshape prevedibile (una copia al massimo)
         virtual_array = va.reshape(n_frames, CHIRPS // TX, NFFT_RANGE, VIRTUAL_ANT)
-
 
         # Limitiamo i range bin al solo intervallo visualizzato prima della angle-FFT.
         # Evita lavoro inutile su bin che verrebbero comunque scartati.
@@ -990,8 +1008,24 @@ def process_buffer(
         # Normalizzazione e taglio
         view_db = heatmap_db
         if view_db.size > 0:
-            mx = np.max(view_db)
-            view_db -= mx
+            raw_max = float(np.max(view_db))
+            if DEBUG_STATS:
+                raw_min = float(np.min(view_db))
+                norm_max = 0.0
+                norm_min = float(raw_min - raw_max)
+                try:
+                    with stat_raw_min_db.get_lock():
+                        stat_raw_min_db.value = raw_min
+                    with stat_raw_max_db.get_lock():
+                        stat_raw_max_db.value = raw_max
+                    with stat_norm_min_db.get_lock():
+                        stat_norm_min_db.value = norm_min
+                    with stat_norm_max_db.get_lock():
+                        stat_norm_max_db.value = norm_max
+                except Exception:
+                    pass
+            if normalize_to_peak:
+                view_db -= raw_max
 
         # publish verso GUI su double-buffer shared (latest-wins, lock breve)
         with gui_lock:
@@ -1070,10 +1104,17 @@ def main():
     rx_pkts = Value("L", 0)
     rx_put_drops = Value("L", 0)
     rx_frames_ok = Value("L", 0)
+    rx_stall_events = Value("L", 0)
+    rx_stream_resets = Value("L", 0)
     dsp_skip = Value("L", 0)
     dsp_ms_avg = Value("d", 0.0)
     dsp_ms_p95 = Value("d", 0.0)
     log_bytes = Value("L", 0)
+    norm_to_peak = Value("b", 1)
+    stat_raw_min_db = Value("d", float("nan"))
+    stat_raw_max_db = Value("d", float("nan"))
+    stat_norm_min_db = Value("d", float("nan"))
+    stat_norm_max_db = Value("d", float("nan"))
 
     run_id = time.strftime("%Y%m%d_%H%M%S")
     out_root = Path(__file__).with_name("logs")
@@ -1101,6 +1142,8 @@ def main():
             rx_pkts,
             rx_put_drops,
             rx_frames_ok,
+            rx_stall_events,
+            rx_stream_resets,
             stop_evt,
             SETTLING_DELAY_S,
         ),
@@ -1147,6 +1190,11 @@ def main():
             dsp_skip,
             dsp_ms_avg,
             dsp_ms_p95,
+            norm_to_peak,
+            stat_raw_min_db,
+            stat_raw_max_db,
+            stat_norm_min_db,
+            stat_norm_max_db,
             stop_evt,
         ),
     )
@@ -1169,11 +1217,16 @@ def main():
     # GUI SETUP (RESPONSIVE - CLEAN)
     # =========================================================================
 
-    dr_plot = C * FS / (2.0 * SLOPE * NFFT_RANGE)
-
     # display state (cartesian X-Y only)
-    vis_vmin = float(VMIN)
-    vis_vmax = float(VMAX)
+    norm_enabled_init = bool(norm_to_peak.value)
+    if norm_enabled_init:
+        vis_vmin = float(VMIN_NORM)
+        vis_vmax = float(VMAX_NORM)
+    else:
+        vis_vmin = float(VMIN_RAW)
+        vis_vmax = float(VMAX_RAW)
+    if vis_vmax <= vis_vmin:
+        vis_vmax = vis_vmin + 1.0
     vis_rmax = float(RANGE_MAX_DISPLAY)
     vis_xmax = float(CROSSRANGE_MAX_DISPLAY)
 
@@ -1204,17 +1257,17 @@ def main():
     IN_RMAX, IN_XMAX = "in_rmax", "in_xmax"
     TXT_POS_TAG = "txt_pos_counter"
     TXT_LOG_TAG = "txt_log"
+    BTN_NORM_TAG = "btn_norm_toggle"
 
     TEX_TAG = "heat_tex"
     HEAT_PLOT_TAG = "heat_plot"
     XAXIS_TAG, YAXIS_TAG = "xaxis", "yaxis"
     IMG_SERIES_TAG = "img_series"
     CMAP_SCALE_TAG = "cmap_scale"
+    CMAP_NUM_FMT = "%+6.1f"
 
-    # 4) Texture setup
-    max_bin_tex = int(np.floor(RANGE_MAX_DISPLAY / dr_plot))
-    max_bin_tex = max(1, min(max_bin_tex, NFFT_RANGE // 2))
-    tex_w, tex_h = int(NFFT_ANGLE), int(max_bin_tex)
+    # 4) Texture setup (1:1 con il buffer GUI, senza resampling)
+    tex_w, tex_h = int(gui_w), int(gui_h)
     tex_buf = array("f", [0.0]) * (tex_w * tex_h * 4)
     tex_np = np.frombuffer(tex_buf, dtype=np.float32)
 
@@ -1299,6 +1352,43 @@ def main():
             pass
         dpg.set_value(TXT_POS_TAG, f"Pos Counter: {pid}")
 
+    def _norm_toggle_label(enabled: bool) -> str:
+        return "NORM: ON" if enabled else "NORM: OFF"
+
+    def _base_vscale_for_mode(enabled: bool):
+        if enabled:
+            vmin = float(VMIN_NORM)
+            vmax = float(VMAX_NORM)
+        else:
+            vmin = float(VMIN_RAW)
+            vmax = float(VMAX_RAW)
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+        return vmin, vmax
+
+    def _get_norm_enabled() -> bool:
+        try:
+            with norm_to_peak.get_lock():
+                return bool(norm_to_peak.value)
+        except Exception:
+            return True
+
+    def _toggle_norm(sender=None, app_data=None):
+        try:
+            with norm_to_peak.get_lock():
+                norm_to_peak.value = 0 if int(norm_to_peak.value) else 1
+                enabled = bool(norm_to_peak.value)
+        except Exception:
+            enabled = True
+        if dpg.does_item_exist(BTN_NORM_TAG):
+            dpg.configure_item(BTN_NORM_TAG, label=_norm_toggle_label(enabled))
+        base_vmin, base_vmax = _base_vscale_for_mode(enabled)
+        if dpg.does_item_exist(IN_VMIN):
+            dpg.set_value(IN_VMIN, base_vmin)
+        if dpg.does_item_exist(IN_VMAX):
+            dpg.set_value(IN_VMAX, base_vmax)
+        _apply_params()
+
     def row(k, v):
         return f"| {k:<16} | {v:<18} |\n"
 
@@ -1307,10 +1397,10 @@ def main():
 
         with dpg.table(header_row=False, resizable=True, policy=dpg.mvTable_SizingStretchProp):
 
-            # Colonne: sidebar (fissa, min 320px), plot (stretch), colorbar (fissa, min 110px)
+            # Colonne: sidebar (fissa, min 320px), plot (stretch), colorbar (fissa)
             dpg.add_table_column(init_width_or_weight=320, width_fixed=True)   # sidebar MIN 320px
             dpg.add_table_column(init_width_or_weight=1.0)                     # plot stretch
-            dpg.add_table_column(init_width_or_weight=110, width_fixed=True)   # colorbar MIN 110px
+            dpg.add_table_column(init_width_or_weight=125, width_fixed=True)   # colorbar width
 
 
             with dpg.table_row():
@@ -1329,6 +1419,14 @@ def main():
                         dpg.add_input_float(label="Xmax (m)", tag=IN_XMAX, default_value=vis_xmax, step=0.5, width=CTRL_W,
                                           min_value=0.0, max_value=XMAX_HARD_MAX, min_clamped=True, max_clamped=True,
                                           callback=_apply_params, on_enter=False)
+                        dpg.add_spacer(height=8)
+                        dpg.add_button(
+                            label=_norm_toggle_label(_get_norm_enabled()),
+                            tag=BTN_NORM_TAG,
+                            callback=_toggle_norm,
+                            width=-1,
+                            height=32,
+                        )
                         dpg.add_spacer(height=14)
                         dpg.add_text("SAR CONTROL", color=(255, 200, 0))
                         dpg.add_separator()
@@ -1336,12 +1434,13 @@ def main():
                         dpg.add_text("Pos Counter: 0", tag=TXT_POS_TAG)
                         dpg.add_text("", tag=TXT_LOG_TAG, wrap=-1)
 
-                        dpg.add_spacer(height=14)
-                        dpg.add_text("SYSTEM STATS", color=(255, 200, 0))
-                        dpg.add_separator()
-                        dpg.add_text("Waiting for data...", tag=TXT_STATS_TAG, wrap=-1)
-                        if font_mono:
-                            dpg.bind_item_font(TXT_STATS_TAG, font_mono)
+                        if DEBUG_STATS:
+                            dpg.add_spacer(height=14)
+                            dpg.add_text("SYSTEM STATS", color=(255, 200, 0))
+                            dpg.add_separator()
+                            dpg.add_text("Waiting for data...", tag=TXT_STATS_TAG, wrap=-1)
+                            if font_mono:
+                                dpg.bind_item_font(TXT_STATS_TAG, font_mono)
 
                 # --- PLOT ---
                 with dpg.table_cell():
@@ -1349,11 +1448,11 @@ def main():
                         dpg.add_plot_axis(dpg.mvXAxis, label="X (m)", tag=XAXIS_TAG)
                         dpg.add_plot_axis(dpg.mvYAxis, label="Y (m)", tag=YAXIS_TAG)
 
-                        # bounds in metri (li aggiorneremo quando cambia rmax/ang)
+                        # bounds in metri fissi (full FOV): zoom/crop gestiti dagli assi
                         dpg.add_image_series(
                             TEX_TAG,
-                            bounds_min=(-vis_xmax, 0.0),
-                            bounds_max=(+vis_xmax, float(vis_rmax)),
+                            bounds_min=(-float(CROSSRANGE_MAX_DISPLAY), 0.0),
+                            bounds_max=(+float(CROSSRANGE_MAX_DISPLAY), float(RANGE_MAX_DISPLAY)),
                             tag=IMG_SERIES_TAG,
                             parent=YAXIS_TAG,
                         )
@@ -1366,10 +1465,13 @@ def main():
                             tag=CMAP_SCALE_TAG,
                             min_scale=vis_vmin,
                             max_scale=vis_vmax,
+                            format=CMAP_NUM_FMT,
                             width=-1,
                             height=-1,
                             colormap=dpg.mvPlotColormap_Jet,
                         )
+                        if font_mono:
+                            dpg.bind_item_font(CMAP_SCALE_TAG, font_mono)
 
     # Applicazione parametri DOPO creazione items
     _apply_params()
@@ -1382,17 +1484,19 @@ def main():
     dpg.set_viewport_min_height(500)
 
     # --- LOOP PRINCIPALE ---
-    t_mon = time.perf_counter()
-    img_updates = 0
-    t_img_start = time.perf_counter()
-    lost_prev = 0
-    pkts_prev = 0
-    frames_ok_prev = 0
-    log_bytes_prev = 0
+    if DEBUG_STATS:
+        t_mon = time.perf_counter()
+        img_updates = 0
+        t_img_start = time.perf_counter()
+        lost_prev = 0
+        pkts_prev = 0
+        frames_ok_prev = 0
+        log_bytes_prev = 0
     gui_last_seq = 0
     gui_frame = np.zeros((gui_h, gui_w), dtype=np.float32)
-    ring_hwm = 0
-    cpu_state = {}
+    if DEBUG_STATS:
+        ring_hwm = 0
+        cpu_state = {}
 
     try:
         while dpg.is_dearpygui_running():
@@ -1417,16 +1521,14 @@ def main():
                 vis_rmax = rmax
                 vis_xmax = xmax
 
-                # update plot bounds (meters)
-                if dpg.does_item_exist(IMG_SERIES_TAG):
-                    dpg.configure_item(IMG_SERIES_TAG, bounds_min=(-vis_xmax, 0.0), bounds_max=(+vis_xmax, float(vis_rmax)))
+                # update axis limits (meters). L'immagine resta su bounds fissi per mantenere texture 1:1.
                 if dpg.does_item_exist(XAXIS_TAG) and dpg.does_item_exist(YAXIS_TAG):
                     dpg.set_axis_limits(XAXIS_TAG, -vis_xmax, +vis_xmax)
                     dpg.set_axis_limits(YAXIS_TAG, 0.0, float(vis_rmax))
 
                 # colorbar
                 if dpg.does_item_exist(CMAP_SCALE_TAG):
-                    dpg.configure_item(CMAP_SCALE_TAG, min_scale=vis_vmin, max_scale=vis_vmax)
+                    dpg.configure_item(CMAP_SCALE_TAG, min_scale=vis_vmin, max_scale=vis_vmax, format=CMAP_NUM_FMT)
 
             
             # 1. STATS UPDATE (1Hz) - GESTIONE DATI STAMPATI
@@ -1476,23 +1578,40 @@ def main():
                 log_bytes_prev = log_bytes_now
                 cpu_dsp = _cpu_percent_pid(int(p_dsp.pid or 0), cpu_state)
                 cpu_log = _cpu_percent_pid(int(p_log.pid or 0), cpu_state)
+                with rx_stall_events.get_lock(): stall_events_now = int(rx_stall_events.value)
+                with rx_stream_resets.get_lock(): stream_resets_now = int(rx_stream_resets.value)
+                with stat_raw_min_db.get_lock(): raw_min_now = float(stat_raw_min_db.value)
+                with stat_raw_max_db.get_lock(): raw_max_now = float(stat_raw_max_db.value)
+                with stat_norm_min_db.get_lock(): norm_min_now = float(stat_norm_min_db.value)
+                with stat_norm_max_db.get_lock(): norm_max_now = float(stat_norm_max_db.value)
+                raw_minmax_str = f"{raw_min_now:.2f}/{raw_max_now:.2f}" if (np.isfinite(raw_min_now) and np.isfinite(raw_max_now)) else "n/a"
+                norm_minmax_str = f"{norm_min_now:.2f}/{norm_max_now:.2f}" if (np.isfinite(norm_min_now) and np.isfinite(norm_max_now)) else "n/a"
                 
                 # --- AGGIORNAMENTO TESTI GUI (FORMATO TABELLA ASCII) ---
+                stats_rows = [
+                    row("LOSS %", f"{loss_pct:.3f}%"),
+                    row("RX pkt/s", f"{pkt_rate:.0f}"),
+                    row("RX frames_ok", f"{frames_ok_rate:.1f}/s ({int(frames_ok_now)})"),
+                    row("RX drops_ring", f"{int(drop_f)}"),
+                    row("RING ready/slots", f"{ready_slots}/{N_SLOTS} HWM {ring_hwm}"),
+                    row("DSP ms avg/p95", f"{dsp_avg_now:.2f} / {dsp_p95_now:.2f}"),
+                    row("DSP skip", f"{dsp_skip_now}"),
+                    row("GUI Hz", f"{img_hz:.1f}"),
+                    row("GUI tex bins", f"{gui_w}x{gui_h} (1:1)"),
+                    row("RAW min/max dB", raw_minmax_str),
+                    row("NORM min/max dB", norm_minmax_str),
+                    row("CAP active pos", f"{int(cap_active.value)} {int(cap_pos_id.value)}"),
+                    row("CAP saved/target", f"{int(cap_saved.value)}/{FRAMES_PER_POSITION}"),
+                    row("LOG MB/s", f"{log_mbps:.2f}"),
+                    row("CPU dsp%", f"{cpu_dsp:.1f}%"),
+                    row("CPU log%", f"{cpu_log:.1f}%"),
+                    row("stall_events", f"{stall_events_now}"),
+                    row("stream_resets", f"{stream_resets_now}"),
+                ]
+
                 stats_str = (
                     "+------------------+--------------------+\n"
-                    + row("LOSS %", f"{loss_pct:.3f}%")
-                    + row("RX pkt/s", f"{pkt_rate:.0f}")
-                    + row("RX frames_ok", f"{frames_ok_rate:.1f}/s ({int(frames_ok_now)})")
-                    + row("RX drops_ring", f"{int(drop_f)}")
-                    + row("RING ready/slots", f"{ready_slots}/{N_SLOTS} HWM {ring_hwm}")
-                    + row("DSP ms avg/p95", f"{dsp_avg_now:.2f} / {dsp_p95_now:.2f}")
-                    + row("DSP skip", f"{dsp_skip_now}")
-                    + row("GUI Hz", f"{img_hz:.1f}")
-                    + row("CAP active pos", f"{int(cap_active.value)} {int(cap_pos_id.value)}")
-                    + row("CAP saved/target", f"{int(cap_saved.value)}/{FRAMES_PER_POSITION}")
-                    + row("LOG MB/s", f"{log_mbps:.2f}")
-                    + row("CPU dsp%", f"{cpu_dsp:.1f}%")
-                    + row("CPU log%", f"{cpu_log:.1f}%")
+                    + "".join(stats_rows)
                     + "+------------------+--------------------+\n"
                 )
 
@@ -1525,23 +1644,7 @@ def main():
                     denom = 1e-6
 
                 src = gui_frame
-                max_r_bin = int(vis_rmax / dr_plot)
-                max_r_bin = max(1, min(max_r_bin, src.shape[0]))
-
-                half_bins = src.shape[1] // 2
-                if CROSSRANGE_MAX_DISPLAY > 1e-6:
-                    keep = int(half_bins * (abs(vis_xmax) / float(CROSSRANGE_MAX_DISPLAY)))
-                else:
-                    keep = half_bins
-                keep = max(8, min(half_bins, keep))
-
-                x0 = half_bins - keep
-                x1 = half_bins + keep
-                win = src[:max_r_bin, x0:x1]
-
-                ys = np.linspace(0, win.shape[0] - 1, tex_h).astype(np.int32)
-                xs = np.linspace(0, win.shape[1] - 1, tex_w).astype(np.int32)
-                img = win[ys[:, None], xs[None, :]]
+                img = src
 
                 norm = (img - vis_vmin) / denom
                 norm = np.clip(norm, 0.0, 1.0)
@@ -1549,7 +1652,8 @@ def main():
                 rgba = rgba[::-1, :, :]
                 tex_np[:] = rgba.reshape(-1)
                 dpg.set_value(TEX_TAG, tex_buf)
-                img_updates += 1
+                if DEBUG_STATS:
+                    img_updates += 1
 
             dpg.render_dearpygui_frame()
 

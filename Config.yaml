@@ -5,26 +5,33 @@ radar:
   fc: 77e9
 
 capture:
-  samples: 64
-  chirps: 64
+  samples: 128
+  chirps: 256
   rx: 4
   tx: 2
   x_frames: 1
 
 fft:
-  nfft_range: 256
+  nfft_range: 512
   nfft_angle: 256
   workers: 4    
 
 display:
-  vmin: -20
-  vmax: 0
+  vmax: 90
+  vmin: 70
+  vmin_norm: -20
+  vmax_norm: 0
   range_max: 12.5
   crossrange_max: 5.0
 
 dsp:
   window_range: blackman
   window_angle: hanning
+
+rx:
+  stall_timeout_s: 2.0
+  seq_reorder_max_back: 32
+  telemetry_period_s: 0.2
 
 process:
   priority:
