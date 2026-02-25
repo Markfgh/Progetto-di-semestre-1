@@ -12,7 +12,7 @@ capture:
   x_frames: 1
 
 fft:
-  nfft_range: 512
+  nfft_range: 128
   nfft_angle: 256
   workers: 4    
 
@@ -23,6 +23,10 @@ display:
   vmax_norm: 0
   range_max: 12.5
   crossrange_max: 5.0
+  rangefft_db_min: 0
+  rangefft_db_max: 90
+  rangefft_lin_min: 0
+  rangefft_lin_max: 15e7
 
 dsp:
   window_range: blackman
