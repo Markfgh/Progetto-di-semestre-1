@@ -83,8 +83,137 @@ def _rss_bytes_pid(pid: int) -> int:
     return 0
 
 
-def _fmt_mb(nbytes: int) -> str:
-    return f"{(nbytes / (1024 * 1024)):.1f}MB"
+def _cpu_percent_pid(pid: int, cpu_state: dict) -> float:
+    """Best-effort process CPU% using psutil, non-blocking."""
+    if pid is None or pid <= 0:
+        return 0.0
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        return 0.0
+    p = cpu_state.get(int(pid))
+    if p is None:
+        try:
+            p = psutil.Process(int(pid))
+            p.cpu_percent(None)
+            cpu_state[int(pid)] = p
+            return 0.0
+        except Exception:
+            return 0.0
+    try:
+        return float(p.cpu_percent(None))
+    except Exception:
+        cpu_state.pop(int(pid), None)
+        return 0.0
+
+
+def _normalize_priority_level(level: str) -> str:
+    level_s = str(level).strip().lower()
+    aliases = {
+        "idle": "idle",
+        "lowest": "idle",
+        "background": "idle",
+        "low": "below_normal",
+        "below": "below_normal",
+        "below_normal": "below_normal",
+        "normal": "normal",
+        "above": "above_normal",
+        "above_normal": "above_normal",
+        "high": "high",
+        "higher": "high",
+        "realtime": "realtime",
+        "real_time": "realtime",
+        "real-time": "realtime",
+        "rt": "realtime",
+    }
+    return aliases.get(level_s, level_s)
+
+
+def _set_process_priority(pid: int, level: str):
+    if pid is None or int(pid) <= 0:
+        return False, "invalid pid"
+
+    level_n = _normalize_priority_level(level)
+    allowed = {"idle", "below_normal", "normal", "above_normal", "high", "realtime"}
+    if level_n not in allowed:
+        return False, f"unknown priority level '{level}'"
+
+    if os.name == "nt":
+        win_map = {
+            "idle": 0x00000040,
+            "below_normal": 0x00004000,
+            "normal": 0x00000020,
+            "above_normal": 0x00008000,
+            "high": 0x00000080,
+            "realtime": 0x00000100,
+        }
+        # Try psutil first (if present), then fallback to WinAPI.
+        try:
+            import psutil  # type: ignore
+
+            p = psutil.Process(int(pid))
+            p.nice(int(win_map[level_n]))
+            return True, level_n
+        except Exception:
+            try:
+                import ctypes
+                import ctypes.wintypes as wt
+
+                PROCESS_SET_INFORMATION = 0x0200
+                PROCESS_QUERY_INFORMATION = 0x0400
+                kernel32 = ctypes.windll.kernel32
+                OpenProcess = kernel32.OpenProcess
+                OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+                OpenProcess.restype = wt.HANDLE
+
+                SetPriorityClass = kernel32.SetPriorityClass
+                SetPriorityClass.argtypes = [wt.HANDLE, wt.DWORD]
+                SetPriorityClass.restype = wt.BOOL
+
+                CloseHandle = kernel32.CloseHandle
+                CloseHandle.argtypes = [wt.HANDLE]
+                CloseHandle.restype = wt.BOOL
+
+                h = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION, False, int(pid))
+                if not h:
+                    return False, "OpenProcess failed"
+                ok = SetPriorityClass(h, int(win_map[level_n]))
+                CloseHandle(h)
+                if not ok:
+                    return False, "SetPriorityClass failed"
+                return True, level_n
+            except Exception as e:
+                return False, f"windows priority error: {e}"
+
+    # Posix fallback via nice value.
+    if not hasattr(os, "setpriority") or not hasattr(os, "PRIO_PROCESS"):
+        return False, "os.setpriority unavailable on this platform"
+
+    nice_map = {
+        "idle": 19,
+        "below_normal": 10,
+        "normal": 0,
+        "above_normal": -5,
+        "high": -10,
+        "realtime": -15,
+    }
+    try:
+        os.setpriority(os.PRIO_PROCESS, int(pid), int(nice_map[level_n]))
+        return True, level_n
+    except PermissionError:
+        return False, f"permission denied for level '{level_n}'"
+    except Exception as e:
+        return False, f"setpriority error: {e}"
+
+
+def _apply_process_priority(label: str, pid: int, level: str, enabled: bool) -> None:
+    if not enabled:
+        return
+    ok, msg = _set_process_priority(int(pid), str(level))
+    if ok:
+        print(f"[PRIO] {label} pid={int(pid)} level={msg}")
+    else:
+        print(f"[PRIO WARN] {label} pid={int(pid)} requested={level} ({msg})")
 
 from Dsp_processing import selection_from_yaml_dict, build_windows
 #import dpnp as dp
@@ -100,9 +229,6 @@ with CFG_PATH.open("r", encoding="utf-8") as f:
 C = float(cfg["radar"]["c"])
 FS = float(cfg["radar"]["fs"])
 SLOPE = float(cfg["radar"]["slope"])
-FC = float(cfg["radar"]["fc"])
-
-LAMBDA = C / FC
 
 # --- CONFIGURAZIONE ACQUISIZIONE ---
 SAMPLES = int(cfg["capture"]["samples"])
@@ -134,18 +260,21 @@ CROSSRANGE_MAX_DISPLAY = float(cfg.get("display", {}).get("crossrange_max", RANG
 DEBUG_STATS = bool(cfg["debug"]["debug_stats"])
 
 # --- WORKERS FFT ---
-FFT_WORKERS = int(cfg.get("dsp", {}).get("fft_workers", 6))
+FFT_WORKERS = int(cfg.get("dsp", {}).get("fft_workers", cfg.get("fft", {}).get("workers", 6)))
+
+# --- PROCESS PRIORITY ---
+prio_cfg = cfg.get("process", {}).get("priority", {}) or {}
+PRIO_ENABLED = bool(prio_cfg.get("enabled", False))
+PRIO_MAIN = str(prio_cfg.get("main", "normal"))
+PRIO_RX = str(prio_cfg.get("rx", "normal"))
+PRIO_LOG = str(prio_cfg.get("logger", prio_cfg.get("log", "normal")))
+PRIO_DSP = str(prio_cfg.get("dsp", "normal"))
 
 # --- SAR capture-only parameters ---
 sar_cfg = cfg.get("sar", {}) or {}
 # Backward-compat: if not present, reuse old 'logger.settling_delay_s'
 SETTLING_DELAY_S = float(sar_cfg.get("settling_delay_s", 0.4))
 FRAMES_PER_POSITION = int(sar_cfg.get("frames_per_position", 8))
-
-
-# --- QUEUE SIZE ---
-FRAME_Q_MAX = 20 # dimensione coda frame tra RX e DSP (in numero di frame, non byte)
-
 
 
 # ----------------------------
@@ -160,8 +289,6 @@ def radar_rx(
     slot_pos_id,
     slot_usemask,
     slot_pub_seq,
-    latest_ready_seq: Synchronized,
-    latest_ready_slot: Synchronized,
     publish_lock,
     cap_active: Synchronized,
     cap_pos_id: Synchronized,
@@ -170,6 +297,7 @@ def radar_rx(
     lost_pkts: Synchronized,
     rx_pkts: Synchronized,
     rx_put_drops: Synchronized,
+    rx_frames_ok: Synchronized,
     stop_evt,
     settling_delay_s: float,
 ):
@@ -225,19 +353,16 @@ def radar_rx(
     MOD48 = 1 << 48
 
     frame_ok = True
-    in_gap = False  # True se stiamo consumando bytes mancanti (virtuali) per riallineamento
-
     pkts_local = 0
     t_flush = time.perf_counter()
+    publish_seq = 0
 
     # Capture control
     pending = False
     pending_start_t = 0.0
     pending_pos_id = 0
-    local_cap_id = 0
-
     def _poll_commands(now_perf: float) -> None:
-        nonlocal pending, pending_start_t, pending_pos_id, local_cap_id
+        nonlocal pending, pending_start_t, pending_pos_id
         while True:
             try:
                 cmd = cmd_queue.get_nowait()
@@ -259,7 +384,6 @@ def radar_rx(
                 # bump cap_id (unique capture session)
                 with cap_id.get_lock():
                     cap_id.value = (int(cap_id.value) + 1) & 0xFFFFFFFF
-                    local_cap_id = int(cap_id.value)
 
                 # not active until settling passes
                 with cap_active.get_lock():
@@ -302,8 +426,8 @@ def radar_rx(
         # prova ad allocare slot; se non c'Ã¨, restiamo in drop-mode ma manteniamo l'allineamento
         _acquire_slot_nonblocking()
 
-    def _publish_frame(ts_ns: int) -> None:
-        nonlocal w, frame_ok, in_gap
+    def _publish_frame() -> None:
+        nonlocal w, frame_ok, publish_seq
         # frame completo (w==BYTES_PER_FRAME)
         if have_slot and (curr_slot is not None):
             if frame_ok:
@@ -318,13 +442,15 @@ def radar_rx(
 
                 # --- ATOMIC PUBLISH (coherent READY+slot+seq) ---
                 with publish_lock:
-                    next_seq = int(latest_ready_seq.value) + 1
+                    next_seq = int(publish_seq) + 1
                     slot_ok[slot] = 1
                     slot_usemask[slot] = m
                     slot_pub_seq[slot] = next_seq
                     slot_state[slot] = 1  # READY (set before seq bump)
-                    latest_ready_slot.value = slot
-                    latest_ready_seq.value = next_seq
+                    publish_seq = next_seq
+                if DEBUG_STATS and rx_frames_ok is not None:
+                    with rx_frames_ok.get_lock():
+                        rx_frames_ok.value += 1
             else:
                 # corrotto: scarta
                 slot = int(curr_slot)
@@ -345,7 +471,6 @@ def radar_rx(
         # reset stato frame
         w = 0
         frame_ok = True
-        in_gap = False
         _free_current_slot()
 
     while not stop_evt.is_set():
@@ -396,7 +521,6 @@ def radar_rx(
                 with lost_pkts.get_lock():
                     lost_pkts.value += int(gap)
                 frame_ok = False
-                in_gap = True
 
                 bytes_missing = int(gap) * int(payload_len_ref)
                 while bytes_missing > 0 and (not stop_evt.is_set()):
@@ -406,10 +530,7 @@ def radar_rx(
                     w += take
                     bytes_missing -= take
                     if w == BYTES_PER_FRAME:
-                        _publish_frame(time.time_ns())
-
-                # dopo aver consumato il gap, ripartiamo con w==0 e frame_ok rimane False solo se siamo ancora nel frame corrente
-                in_gap = False
+                        _publish_frame()
 
         last_seq = seq
 
@@ -430,7 +551,7 @@ def radar_rx(
             payload_cursor += chunk_size
 
             if w == BYTES_PER_FRAME:
-                _publish_frame(time.time_ns())
+                _publish_frame()
 
 
 def logger_worker(
@@ -445,6 +566,7 @@ def logger_worker(
     cap_pos_id: Synchronized,
     cap_id: Synchronized,
     cap_saved: Synchronized,
+    log_bytes: Synchronized,
     stop_evt,
     out_dir_s: str,
     frames_per_position: int,
@@ -485,6 +607,9 @@ def logger_worker(
             try:
                 if buf_used and buf is not None:
                     fbin.write(buf[:buf_used])
+                    if log_bytes is not None:
+                        with log_bytes.get_lock():
+                            log_bytes.value += int(buf_used)
                 fbin.flush()
             except Exception:
                 pass
@@ -596,6 +721,9 @@ def logger_worker(
 
                 if buf_used >= BYTES_PER_FRAME * int(block_frames):
                     fbin.write(buf[:buf_used])
+                    if log_bytes is not None:
+                        with log_bytes.get_lock():
+                            log_bytes.value += int(buf_used)
                     buf_used = 0
 
             # always release logger ownership, even for corrupt slot
@@ -605,6 +733,9 @@ def logger_worker(
         if saved_local >= int(frames_per_position):
             if buf_used:
                 fbin.write(buf[:buf_used])
+                if log_bytes is not None:
+                    with log_bytes.get_lock():
+                        log_bytes.value += int(buf_used)
                 buf_used = 0
             try:
                 fbin.flush()
@@ -630,7 +761,6 @@ def dsp_worker(
     slot_ok,
     slot_usemask,
     slot_pub_seq,
-
     publish_lock,
     gui_dbuf,
     gui_h: int,
@@ -638,7 +768,9 @@ def dsp_worker(
     gui_latest_idx: Synchronized,
     gui_latest_seq: Synchronized,
     gui_lock,
-    frame_get_ok: Synchronized,
+    dsp_skip: Synchronized,
+    dsp_ms_avg: Synchronized,
+    dsp_ms_p95: Synchronized,
     stop_evt,
 ):
     # --- SETUP STATIC ---
@@ -661,6 +793,7 @@ def dsp_worker(
     shm_view = memoryview(shm_frames).cast("B")
     n_slots = len(slot_state)
     heatmap_ema = None
+    dsp_ms_samples = []
 
     if RX != 4:
         raise ValueError("DSP: conversione I/Q attuale assume RX=4 (packing IIIIQQQQ).")
@@ -707,6 +840,9 @@ def dsp_worker(
         if len(ready) > X_FRAMES:
             to_drop = ready[:-X_FRAMES]
             ready = ready[-X_FRAMES:]
+            if DEBUG_STATS and dsp_skip is not None:
+                with dsp_skip.get_lock():
+                    dsp_skip.value += len(to_drop)
             for _, s, _ in to_drop:
                 _release_slot_dsp(int(s))
 
@@ -743,12 +879,8 @@ def dsp_worker(
         complex_view = complex_data[:n_cplx]
         complex_view.real[:] = block_view[:, :4].reshape(-1)  # type: ignore
         complex_view.imag[:] = block_view[:, 4:].reshape(-1)  # type: ignore
-        if DEBUG_STATS:
-            with frame_get_ok.get_lock():
-                frame_get_ok.value += n_proc
-
-
         # --- 3. PROCESSING ---
+        t0_proc = time.perf_counter()
         heatmap_ema = process_buffer(
             complex_view, 
             n_proc,
@@ -764,6 +896,17 @@ def dsp_worker(
             gui_lock,
             max_bin
         )
+        t1_proc = time.perf_counter()
+        if n_proc > 0 and DEBUG_STATS:
+            ms_per_frame = ((t1_proc - t0_proc) * 1000.0) / float(n_proc)
+            dsp_ms_samples.extend([ms_per_frame] * int(n_proc))
+            if len(dsp_ms_samples) > 256:
+                dsp_ms_samples = dsp_ms_samples[-256:]
+            if dsp_ms_samples:
+                with dsp_ms_avg.get_lock():
+                    dsp_ms_avg.value = float(np.mean(dsp_ms_samples))
+                with dsp_ms_p95.get_lock():
+                    dsp_ms_p95.value = float(np.percentile(dsp_ms_samples, 95))
 
 def process_buffer(
     raw_buffer,
@@ -816,21 +959,22 @@ def process_buffer(
         virtual_array = va.reshape(n_frames, CHIRPS // TX, NFFT_RANGE, VIRTUAL_ANT)
 
 
-        # Finestra Angolo IN-PLACE (w_angle: (1,1,1,VIRTUAL_ANT))
+        # Limitiamo i range bin al solo intervallo visualizzato prima della angle-FFT.
+        # Evita lavoro inutile su bin che verrebbero comunque scartati.
+        virtual_array = virtual_array[:, :, :max_bin, :]
 
+        # Finestra Angolo IN-PLACE (w_angle: (1,1,1,VIRTUAL_ANT))
         virtual_array *= w_angle
 
-
         # D. ANGLE FFT
-
         angle_fft = fft.fft(virtual_array, n=NFFT_ANGLE, axis=-1, workers=FFT_WORKERS, overwrite_x=True)
-
-        angle_fft = fft.fftshift(angle_fft, axes=-1)
         
-        # Modulo quadro e media
+        # Modulo quadro e media.
+        # Poi applichiamo fftshift sulla heatmap 2D (molto piu piccola) invece che sul tensor 4D.
         re = angle_fft.real
         im = angle_fft.imag
         heatmap = (re * re + im * im).mean(axis=(0, 1))
+        heatmap = np.fft.fftshift(heatmap, axes=-1)
 
         # E. EMA e Logaritmica
         if heatmap_ema is None:
@@ -844,7 +988,7 @@ def process_buffer(
         heatmap_db = 10 * np.log10(heatmap_ema + 1e-12)
         
         # Normalizzazione e taglio
-        view_db = heatmap_db[:max_bin, :]
+        view_db = heatmap_db
         if view_db.size > 0:
             mx = np.max(view_db)
             view_db -= mx
@@ -898,8 +1042,6 @@ def main():
         slot_usemask[i] = 0
         slot_pub_seq[i] = 0
 
-    latest_ready_seq = Value("Q", 0)     # increment at each publish
-    latest_ready_slot = Value("i", -1)   # last published slot
     publish_lock = mp.Lock()  # atomic publish lock (seq+slot+state)
 
 
@@ -927,7 +1069,11 @@ def main():
     lost_pkts = Value("L", 0)
     rx_pkts = Value("L", 0)
     rx_put_drops = Value("L", 0)
-    frame_get_ok = Value("L", 0)
+    rx_frames_ok = Value("L", 0)
+    dsp_skip = Value("L", 0)
+    dsp_ms_avg = Value("d", 0.0)
+    dsp_ms_p95 = Value("d", 0.0)
+    log_bytes = Value("L", 0)
 
     run_id = time.strftime("%Y%m%d_%H%M%S")
     out_root = Path(__file__).with_name("logs")
@@ -946,8 +1092,6 @@ def main():
             slot_pos_id,
             slot_usemask,
             slot_pub_seq,
-            latest_ready_seq,
-            latest_ready_slot,
             publish_lock,
             cap_active,
             cap_pos_id,
@@ -956,6 +1100,7 @@ def main():
             lost_pkts,
             rx_pkts,
             rx_put_drops,
+            rx_frames_ok,
             stop_evt,
             SETTLING_DELAY_S,
         ),
@@ -975,6 +1120,7 @@ def main():
             cap_pos_id,
             cap_id,
             cap_saved,
+            log_bytes,
             stop_evt,
             str(out_dir),
             FRAMES_PER_POSITION,
@@ -991,8 +1137,6 @@ def main():
             slot_ok,
             slot_usemask,
             slot_pub_seq,
-            latest_ready_seq,
-            latest_ready_slot,
             publish_lock,
             gui_dbuf,
             gui_h,
@@ -1000,7 +1144,9 @@ def main():
             gui_latest_idx,
             gui_latest_seq,
             gui_lock,
-            frame_get_ok,
+            dsp_skip,
+            dsp_ms_avg,
+            dsp_ms_p95,
             stop_evt,
         ),
     )
@@ -1012,14 +1158,16 @@ def main():
     p_log.start()
     p_dsp.start()
 
+    _apply_process_priority("MAIN", os.getpid(), PRIO_MAIN, PRIO_ENABLED)
+    _apply_process_priority("RX", int(p_rx.pid or 0), PRIO_RX, PRIO_ENABLED)
+    _apply_process_priority("LOG", int(p_log.pid or 0), PRIO_LOG, PRIO_ENABLED)
+    _apply_process_priority("DSP", int(p_dsp.pid or 0), PRIO_DSP, PRIO_ENABLED)
+
     print(f"[LOGGER] dir: {out_dir}")
 
     # =========================================================================
     # GUI SETUP (RESPONSIVE - CLEAN)
     # =========================================================================
-
-    # 1) Display params da YAML
-    disp = cfg.get("display", {}) or {}
 
     dr_plot = C * FS / (2.0 * SLOPE * NFFT_RANGE)
 
@@ -1152,7 +1300,7 @@ def main():
         dpg.set_value(TXT_POS_TAG, f"Pos Counter: {pid}")
 
     def row(k, v):
-        return f"| {k:<9} | {v:<14} |\n"
+        return f"| {k:<16} | {v:<18} |\n"
 
     # 6) Build UI (ONLY TABLE LAYOUT)
     with dpg.window(tag=TAG_MAIN_WINDOW):
@@ -1239,9 +1387,12 @@ def main():
     t_img_start = time.perf_counter()
     lost_prev = 0
     pkts_prev = 0
+    frames_ok_prev = 0
+    log_bytes_prev = 0
     gui_last_seq = 0
     gui_frame = np.zeros((gui_h, gui_w), dtype=np.float32)
-    gui_skipped_total = 0
+    ring_hwm = 0
+    cpu_state = {}
 
     try:
         while dpg.is_dearpygui_running():
@@ -1289,9 +1440,6 @@ def main():
                 img_updates = 0
                 t_img_start = now
 
-                # Backlogs & Drops (no frame queue; ring slots instead)
-                with frame_get_ok.get_lock(): dsp_frames = frame_get_ok.value
-
                 # READY slots currently in ring (cheap: N_SLOTS=64)
                 ready_slots = 0
                 try:
@@ -1300,8 +1448,12 @@ def main():
                             ready_slots += 1
                 except Exception:
                     ready_slots = 0
+                ring_hwm = max(ring_hwm, int(ready_slots))
 
                 with rx_put_drops.get_lock(): drop_f = rx_put_drops.value
+                with rx_frames_ok.get_lock(): frames_ok_now = rx_frames_ok.value
+                frames_ok_delta = frames_ok_now - frames_ok_prev
+                frames_ok_prev = frames_ok_now
 
                 # Packet Stats
                 with lost_pkts.get_lock(): lost_now = lost_pkts.value
@@ -1315,32 +1467,33 @@ def main():
                 total = pkts_delta + lost_delta
                 loss_pct = (100.0 * lost_delta / total) if total > 0 else 0.0
                 pkt_rate = (pkts_delta / dt_mon) if dt_mon > 0 else 0.0
+                frames_ok_rate = (frames_ok_delta / dt_mon) if dt_mon > 0 else 0.0
+                with dsp_ms_avg.get_lock(): dsp_avg_now = float(dsp_ms_avg.value)
+                with dsp_ms_p95.get_lock(): dsp_p95_now = float(dsp_ms_p95.value)
+                with dsp_skip.get_lock(): dsp_skip_now = int(dsp_skip.value)
+                with log_bytes.get_lock(): log_bytes_now = int(log_bytes.value)
+                log_mbps = ((log_bytes_now - log_bytes_prev) / dt_mon) / (1024.0 * 1024.0) if dt_mon > 0 else 0.0
+                log_bytes_prev = log_bytes_now
+                cpu_dsp = _cpu_percent_pid(int(p_dsp.pid or 0), cpu_state)
+                cpu_log = _cpu_percent_pid(int(p_log.pid or 0), cpu_state)
                 
                 # --- AGGIORNAMENTO TESTI GUI (FORMATO TABELLA ASCII) ---
                 stats_str = (
-                    "+-----------+----------------+\n"
-                    + row("LOSS", f"{loss_pct:.3f}%")
-                    + row("RX RATE", f"{pkt_rate:.0f} pkt/s")
-                    + row("GUI RATE", f"{img_hz:.1f} Hz")
-                    + "+-----------+----------------+\n"
-                    + row("RING READY", f"{ready_slots}/{N_SLOTS}")
-                    + row("RX DROP FRAME", f"{int(drop_f)}")
-                    + row("GUI SKIP", f"{int(gui_skipped_total)}")
-                    + "+-----------+----------------+\n"
-                    + row("CAP", f"{int(cap_active.value)} pos {int(cap_pos_id.value)}")
-                    + row("CAP SAVED", f"{int(cap_saved.value)}/{FRAMES_PER_POSITION}")
-                    + row("SAR POS", f"{int(sar_pos_counter.value)}")
-                    + "+-----------+----------------+\n"
-                    + row("DSP FR", f"{int(dsp_frames)}")
-                    + row("RX", f"{p_rx.pid} {p_rx.is_alive()}")
-                    + row("LOG", f"{p_log.pid} {p_log.is_alive()}")
-                    + row("DSP", f"{p_dsp.pid} {p_dsp.is_alive()}")
-                    + "+-----------+----------------+\n"
-                    + row("RAM MAIN", f"{_rss_bytes_pid(os.getpid())/1e6:.1f}MB")
-                    + row("RAM RX", f"{_rss_bytes_pid(p_rx.pid or 0)/1e6:.1f}MB")
-                    + row("RAM LOG", f"{_rss_bytes_pid(p_log.pid or 0)/1e6:.1f}MB")
-                    + row("RAM DSP", f"{_rss_bytes_pid(p_dsp.pid or 0)/1e6:.1f}MB")
-                    + "+-----------+----------------+\n"
+                    "+------------------+--------------------+\n"
+                    + row("LOSS %", f"{loss_pct:.3f}%")
+                    + row("RX pkt/s", f"{pkt_rate:.0f}")
+                    + row("RX frames_ok", f"{frames_ok_rate:.1f}/s ({int(frames_ok_now)})")
+                    + row("RX drops_ring", f"{int(drop_f)}")
+                    + row("RING ready/slots", f"{ready_slots}/{N_SLOTS} HWM {ring_hwm}")
+                    + row("DSP ms avg/p95", f"{dsp_avg_now:.2f} / {dsp_p95_now:.2f}")
+                    + row("DSP skip", f"{dsp_skip_now}")
+                    + row("GUI Hz", f"{img_hz:.1f}")
+                    + row("CAP active pos", f"{int(cap_active.value)} {int(cap_pos_id.value)}")
+                    + row("CAP saved/target", f"{int(cap_saved.value)}/{FRAMES_PER_POSITION}")
+                    + row("LOG MB/s", f"{log_mbps:.2f}")
+                    + row("CPU dsp%", f"{cpu_dsp:.1f}%")
+                    + row("CPU log%", f"{cpu_log:.1f}%")
+                    + "+------------------+--------------------+\n"
                 )
 
                 dpg.set_value(TXT_STATS_TAG, stats_str)
@@ -1358,8 +1511,6 @@ def main():
             # 2. GUI TEXTURE UPDATE (double-buffer latest-wins)
             seq_now = int(gui_latest_seq.value)
             if seq_now != gui_last_seq:
-                if gui_last_seq > 0 and seq_now > (gui_last_seq + 1):
-                    gui_skipped_total += int(seq_now - gui_last_seq - 1)
                 with gui_lock:
                     seq_locked = int(gui_latest_seq.value)
                     idx = int(gui_latest_idx.value)

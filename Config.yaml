@@ -5,8 +5,8 @@ radar:
   fc: 77e9
 
 capture:
-  samples: 128
-  chirps: 128
+  samples: 64
+  chirps: 64
   rx: 4
   tx: 2
   x_frames: 1
@@ -25,6 +25,14 @@ display:
 dsp:
   window_range: blackman
   window_angle: hanning
+
+process:
+  priority:
+    enabled: true
+    main: above_normal
+    rx: high
+    logger: below_normal
+    dsp: high
 
 debug:
   debug_stats: true
