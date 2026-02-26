@@ -12,15 +12,17 @@ import dearpygui.dearpygui as dpg
 import scipy.fft as fft
 import os
 
+try:
+    import psutil  # type: ignore
+except Exception:
+    psutil = None
 
 def _cpu_percent_pid(pid: int, cpu_state: dict) -> float:
     """Best-effort process CPU% using psutil, non-blocking."""
     if pid is None or pid <= 0:
         return 0.0
-    try:
-        import psutil  # type: ignore
-    except Exception:
-        return 0.0
+    if psutil is None:
+        return float("nan")
     p = cpu_state.get(int(pid))
     if p is None:
         try:
@@ -189,6 +191,17 @@ XMAX_HARD_MAX = float(cfg.get("display", {}).get("crossrange_max", RMAX_HARD_MAX
 # valori iniziali di visualizzazione (partono dai limiti config, ma poi l'utente puÃ² ridurli fino a 0)
 RANGE_MAX_DISPLAY = float(cfg["display"]["range_max"])
 CROSSRANGE_MAX_DISPLAY = float(cfg.get("display", {}).get("crossrange_max", RANGE_MAX_DISPLAY))
+RANGEFFT_DB_MIN = float(cfg.get("display", {}).get("rangefft_db_min", VMIN_RAW))
+RANGEFFT_DB_MAX = float(cfg.get("display", {}).get("rangefft_db_max", VMAX_RAW))
+if RANGEFFT_DB_MAX <= RANGEFFT_DB_MIN:
+    RANGEFFT_DB_MAX = RANGEFFT_DB_MIN + 1.0
+RANGEFFT_LIN_MIN = float(cfg.get("display", {}).get("rangefft_lin_min", 10.0 ** (RANGEFFT_DB_MIN / 10.0)))
+RANGEFFT_LIN_MAX = float(cfg.get("display", {}).get("rangefft_lin_max", 10.0 ** (RANGEFFT_DB_MAX / 10.0)))
+if RANGEFFT_LIN_MAX <= RANGEFFT_LIN_MIN:
+    RANGEFFT_LIN_MAX = RANGEFFT_LIN_MIN + 1e-6
+RANGE_PROFILE_COUNT = 8
+RANGEFFT_PLOT_COUNT = int(TX)
+RANGEFFT_LINES_PER_PLOT = int(RX)
 # --- CODE QUEUE ---
 DEBUG_STATS = bool(cfg["debug"]["debug_stats"])
 
@@ -766,6 +779,7 @@ def dsp_worker(
     slot_pub_seq,
     publish_lock,
     gui_dbuf,
+    gui_prof_dbuf,
     gui_h: int,
     gui_w: int,
     gui_latest_idx: Synchronized,
@@ -902,6 +916,7 @@ def dsp_worker(
             heatmap_ema, 
             0.2, # alpha
             gui_dbuf,
+            gui_prof_dbuf,
             gui_h,
             gui_w,
             gui_latest_idx,
@@ -934,6 +949,7 @@ def process_buffer(
     heatmap_ema,
     alpha,
     gui_dbuf,
+    gui_prof_dbuf,
     gui_h,
     gui_w,
     gui_latest_idx,
@@ -980,6 +996,16 @@ def process_buffer(
         # Limitiamo i range bin al solo intervallo visualizzato prima della angle-FFT.
         # Evita lavoro inutile su bin che verrebbero comunque scartati.
         virtual_array = virtual_array[:, :, :max_bin, :]
+
+        # Profili range FFT per antenna virtuale: modulo^2 medio su frame/chirp, poi dB.
+        prof_re = virtual_array.real
+        prof_im = virtual_array.imag
+        profiles_pow = (prof_re * prof_re + prof_im * prof_im).mean(axis=(0, 1))
+        profiles_db_va = (10.0 * np.log10(profiles_pow + 1e-12)).transpose(1, 0)
+        profiles_out = np.full((RANGE_PROFILE_COUNT, max_bin), -120.0, dtype=np.float32)
+        copy_rows = min(int(RANGE_PROFILE_COUNT), int(profiles_db_va.shape[0]))
+        if copy_rows > 0:
+            profiles_out[:copy_rows, :] = profiles_db_va[:copy_rows, :].astype(np.float32, copy=False)
 
         # Finestra Angolo IN-PLACE (w_angle: (1,1,1,VIRTUAL_ANT))
         virtual_array *= w_angle
@@ -1038,6 +1064,19 @@ def process_buffer(
             n = min(dst.size, flat.size)
             if n > 0:
                 dst[:n] = flat[:n]
+
+            prof_base = next_idx * int(RANGE_PROFILE_COUNT) * int(gui_h)
+            dst_prof = np.frombuffer(
+                gui_prof_dbuf,
+                dtype=np.float32,
+                count=int(RANGE_PROFILE_COUNT) * int(gui_h),
+                offset=prof_base * 4,
+            )
+            dst_prof.fill(-120.0)
+            prof_flat = profiles_out.reshape(-1)
+            n_prof = min(dst_prof.size, prof_flat.size)
+            if n_prof > 0:
+                dst_prof[:n_prof] = prof_flat[:n_prof]
             gui_latest_idx.value = next_idx
             gui_latest_seq.value = int(gui_latest_seq.value) + 1
         return heatmap_ema
@@ -1090,6 +1129,7 @@ def main():
     gui_h = max(1, min(gui_h, NFFT_RANGE // 2))
     gui_w = int(NFFT_ANGLE)
     gui_dbuf = RawArray("f", 2 * gui_h * gui_w)
+    gui_prof_dbuf = RawArray("f", 2 * RANGE_PROFILE_COUNT * gui_h)
     gui_latest_idx = Value("i", -1)
     gui_latest_seq = Value("Q", 0)
     gui_lock = mp.Lock()
@@ -1182,6 +1222,7 @@ def main():
             slot_pub_seq,
             publish_lock,
             gui_dbuf,
+            gui_prof_dbuf,
             gui_h,
             gui_w,
             gui_latest_idx,
@@ -1212,6 +1253,8 @@ def main():
     _apply_process_priority("DSP", int(p_dsp.pid or 0), PRIO_DSP, PRIO_ENABLED)
 
     print(f"[LOGGER] dir: {out_dir}")
+    if DEBUG_STATS and psutil is None:
+        print("[STATS] CPU disabled: install 'psutil' in the active Python interpreter.")
 
     # =========================================================================
     # GUI SETUP (RESPONSIVE - CLEAN)
@@ -1219,6 +1262,7 @@ def main():
 
     # display state (cartesian X-Y only)
     norm_enabled_init = bool(norm_to_peak.value)
+    dr_plot = float(dr_shared)
     if norm_enabled_init:
         vis_vmin = float(VMIN_NORM)
         vis_vmax = float(VMAX_NORM)
@@ -1229,10 +1273,24 @@ def main():
         vis_vmax = vis_vmin + 1.0
     vis_rmax = float(RANGE_MAX_DISPLAY)
     vis_xmax = float(CROSSRANGE_MAX_DISPLAY)
+    vis_fft_mode_db = True
+    vis_fft_vmin = float(RANGEFFT_DB_MIN)
+    vis_fft_vmax = float(RANGEFFT_DB_MAX)
+    if vis_fft_vmax <= vis_fft_vmin:
+        vis_fft_vmax = vis_fft_vmin + 1.0
+    fft_mode_db = bool(vis_fft_mode_db)
 
     ui_dirty = True
     ui_dirty_t = 0.0
-    ui_pending = {"vmin": vis_vmin, "vmax": vis_vmax, "rmax": vis_rmax, "xmax": vis_xmax}
+    ui_pending = {
+        "vmin": vis_vmin,
+        "vmax": vis_vmax,
+        "rmax": vis_rmax,
+        "xmax": vis_xmax,
+        "fft_vmin": vis_fft_vmin,
+        "fft_vmax": vis_fft_vmax,
+        "fft_mode_db": bool(fft_mode_db),
+    }
 
     # 2) DearPyGui Init
     dpg.create_context()
@@ -1251,13 +1309,16 @@ def main():
     TAG_MAIN_WINDOW = "primary_window"
     TAG_SIDEBAR     = "sidebar_col"
     TAG_CBAR_COL    = "cbar_col"
+    TAG_RANGEFFT_COL = "rangefft_col"
 
     TXT_STATS_TAG = "txt_stats"
     IN_VMIN, IN_VMAX = "in_vmin", "in_vmax"
     IN_RMAX, IN_XMAX = "in_rmax", "in_xmax"
+    IN_FFT_VMIN, IN_FFT_VMAX = "in_fft_vmin", "in_fft_vmax"
     TXT_POS_TAG = "txt_pos_counter"
     TXT_LOG_TAG = "txt_log"
     BTN_NORM_TAG = "btn_norm_toggle"
+    BTN_FFT_MODE_TAG = "btn_fft_mode"
 
     TEX_TAG = "heat_tex"
     HEAT_PLOT_TAG = "heat_plot"
@@ -1265,6 +1326,27 @@ def main():
     IMG_SERIES_TAG = "img_series"
     CMAP_SCALE_TAG = "cmap_scale"
     CMAP_NUM_FMT = "%+6.1f"
+    RANGEFFT_PLOT_TAG = "rangefft_plot"
+    RANGEFFT_XAXIS_TAG = "rangefft_xaxis"
+    RANGEFFT_YAXIS_TAG = "rangefft_yaxis"
+    RANGEFFT_LINE_TAGS = [f"rangefft_line_ant{ant_i}" for ant_i in range(RANGE_PROFILE_COUNT)]
+    RANGEFFT_LINE_COLORS = [
+        (0, 255, 255, 255),    # Ciano
+        (255, 255, 0, 255),    # Giallo
+        (57, 255, 20, 255),    # Verde neon
+        (255, 140, 0, 255),    # Arancione
+        (255, 0, 255, 255),    # Magenta
+        (255, 255, 255, 255),  # Bianco
+        (255, 0, 0, 255),      # Rosso
+        (135, 206, 250, 255),  # Azzurro chiaro
+    ]
+    rangefft_line_themes = []
+    for line_color in RANGEFFT_LINE_COLORS:
+        with dpg.theme() as line_theme:
+            with dpg.theme_component(dpg.mvLineSeries):
+                dpg.add_theme_color(dpg.mvPlotCol_Line, line_color, category=dpg.mvThemeCat_Plots)
+                dpg.add_theme_style(dpg.mvPlotStyleVar_LineWeight, 2.0, category=dpg.mvThemeCat_Plots)
+        rangefft_line_themes.append(line_theme)
 
     # 4) Texture setup (1:1 con il buffer GUI, senza resampling)
     tex_w, tex_h = int(gui_w), int(gui_h)
@@ -1311,8 +1393,41 @@ def main():
         a = np.ones_like(r)
         return np.stack((r, g, b, a), axis=-1)
 
+    def _fft_mode_label(mode_db: bool) -> str:
+        return "FFT SCALE: dB" if mode_db else "FFT SCALE: LINEAR"
+
+    def _fft_axis_label(mode_db: bool) -> str:
+        return "dB" if mode_db else "Linear"
+
+    def _fft_visible_range_from_rmax(rmax_m: float):
+        max_r_bin = int(rmax_m / dr_plot) if dr_plot > 1e-12 else gui_h
+        max_r_bin = max(1, min(max_r_bin, gui_h))
+        max_r_m = float(max_r_bin) * float(dr_plot)
+        return max_r_bin, max_r_m
+
+    def _base_fft_scale_for_mode(mode_db: bool):
+        if mode_db:
+            y_min = float(RANGEFFT_DB_MIN)
+            y_max = float(RANGEFFT_DB_MAX)
+        else:
+            y_min = float(RANGEFFT_LIN_MIN)
+            y_max = float(RANGEFFT_LIN_MAX)
+            y_min = float(np.floor(y_min))
+            y_max = float(np.ceil(y_max))
+        eps = 1.0
+        if y_max <= y_min:
+            y_max = y_min + eps
+        return y_min, y_max
+
+    def _update_fft_scale_input_labels(mode_db: bool):
+        unit = "dB" if mode_db else "lin"
+        if dpg.does_item_exist(IN_FFT_VMIN):
+            dpg.configure_item(IN_FFT_VMIN, label=f"FFT Ymin ({unit})")
+        if dpg.does_item_exist(IN_FFT_VMAX):
+            dpg.configure_item(IN_FFT_VMAX, label=f"FFT Ymax ({unit})")
+
     def _apply_params(sender=None, app_data=None):
-        nonlocal ui_dirty, ui_pending
+        nonlocal ui_dirty, ui_pending, fft_mode_db
         # callback ultraleggera: salva valori e setta flag
         # Nota:
         #  - vmin/vmax sono "base values" (non hard limit). Li lasciamo liberi.
@@ -1322,6 +1437,8 @@ def main():
             vmax = float(dpg.get_value(IN_VMAX))
             rmax = float(dpg.get_value(IN_RMAX))
             xmax = float(dpg.get_value(IN_XMAX))
+            fft_vmin = float(dpg.get_value(IN_FFT_VMIN))
+            fft_vmax = float(dpg.get_value(IN_FFT_VMAX))
         except (ValueError, TypeError):
             return  # mentre scrivi '-', '.', '' ecc.
 
@@ -1333,11 +1450,19 @@ def main():
             dpg.set_value(IN_RMAX, rmax_cl)
         if xmax_cl != xmax:
             dpg.set_value(IN_XMAX, xmax_cl)
+        fft_eps = 1.0
+        if fft_vmax <= fft_vmin:
+            fft_vmax = fft_vmin + fft_eps
+            if dpg.does_item_exist(IN_FFT_VMAX):
+                dpg.set_value(IN_FFT_VMAX, fft_vmax)
 
         ui_pending["vmin"] = vmin
         ui_pending["vmax"] = vmax
         ui_pending["rmax"] = rmax_cl
         ui_pending["xmax"] = xmax_cl
+        ui_pending["fft_vmin"] = fft_vmin
+        ui_pending["fft_vmax"] = fft_vmax
+        ui_pending["fft_mode_db"] = bool(fft_mode_db)
 
         ui_dirty = True
 
@@ -1389,18 +1514,40 @@ def main():
             dpg.set_value(IN_VMAX, base_vmax)
         _apply_params()
 
-    def row(k, v):
-        return f"| {k:<16} | {v:<18} |\n"
+    def _toggle_fft_mode(sender=None, app_data=None):
+        nonlocal fft_mode_db
+        fft_mode_db = not bool(fft_mode_db)
+        if dpg.does_item_exist(BTN_FFT_MODE_TAG):
+            dpg.configure_item(BTN_FFT_MODE_TAG, label=_fft_mode_label(fft_mode_db))
+        _update_fft_scale_input_labels(fft_mode_db)
+        fft_vmin, fft_vmax = _base_fft_scale_for_mode(fft_mode_db)
+        if dpg.does_item_exist(IN_FFT_VMIN):
+            dpg.set_value(IN_FFT_VMIN, fft_vmin)
+        if dpg.does_item_exist(IN_FFT_VMAX):
+            dpg.set_value(IN_FFT_VMAX, fft_vmax)
+        _apply_params()
+
+    STATS_KEY_W = 16
+    STATS_VAL_W = 13
+
+    def _format_stats_table(rows):
+        if not rows:
+            return ""
+        rows_s = [(str(k), str(v)) for k, v in rows]
+        border = f"+{'-' * (STATS_KEY_W + 2)}+{'-' * (STATS_VAL_W + 2)}+\n"
+        body = "".join(f"| {k:<{STATS_KEY_W}} | {v:>{STATS_VAL_W}} |\n" for k, v in rows_s)
+        return border + body + border
 
     # 6) Build UI (ONLY TABLE LAYOUT)
     with dpg.window(tag=TAG_MAIN_WINDOW):
 
-        with dpg.table(header_row=False, resizable=True, policy=dpg.mvTable_SizingStretchProp):
+        with dpg.table(header_row=False, resizable=True, policy=dpg.mvTable_SizingFixedFit):
 
-            # Colonne: sidebar (fissa, min 320px), plot (stretch), colorbar (fissa)
-            dpg.add_table_column(init_width_or_weight=320, width_fixed=True)   # sidebar MIN 320px
-            dpg.add_table_column(init_width_or_weight=1.0)                     # plot stretch
-            dpg.add_table_column(init_width_or_weight=125, width_fixed=True)   # colorbar width
+            # Colonne: sidebar (fissa), plot (stretch), colorbar (fissa), range FFT (fissa)
+            dpg.add_table_column(init_width_or_weight=340, width_fixed=True, no_resize=True)                      # sidebar
+            dpg.add_table_column(init_width_or_weight=1.0, width_stretch=True, width_fixed=False)                 # plot stretch
+            dpg.add_table_column(init_width_or_weight=100, width_fixed=True, no_resize=True)                      # colorbar
+            dpg.add_table_column(init_width_or_weight=500, width_fixed=True, no_resize=True)                      # range FFT
 
 
             with dpg.table_row():
@@ -1473,6 +1620,83 @@ def main():
                         if font_mono:
                             dpg.bind_item_font(CMAP_SCALE_TAG, font_mono)
 
+                # --- RANGE FFT PROFILES ---
+                with dpg.table_cell():
+                    with dpg.child_window(tag=TAG_RANGEFFT_COL, width=-1, height=-1, border=True):
+                        dpg.add_text("RANGE FFT |TXxRX|", color=(255, 200, 0))
+                        dpg.add_separator()
+                        with dpg.plot(
+                            tag=RANGEFFT_PLOT_TAG,
+                            label=f"TX 1-{RANGEFFT_PLOT_COUNT} (RX 1-{RANGEFFT_LINES_PER_PLOT})",
+                            width=-1,
+                            height=540,
+                            no_menus=True,
+                            no_box_select=True,
+                            no_mouse_pos=True,
+                        ):
+                            dpg.add_plot_axis(
+                                dpg.mvXAxis,
+                                label="Range (m)",
+                                tag=RANGEFFT_XAXIS_TAG,
+                                auto_fit=False,
+                                lock_min=True,
+                                lock_max=True,
+                            )
+                            dpg.add_plot_axis(
+                                dpg.mvYAxis,
+                                label=_fft_axis_label(vis_fft_mode_db),
+                                tag=RANGEFFT_YAXIS_TAG,
+                                auto_fit=False,
+                                lock_min=True,
+                                lock_max=True,
+                            )
+                            dpg.add_plot_legend(location=dpg.mvPlot_Location_SouthEast, outside=True, horizontal=True)
+                            for ant_i in range(RANGE_PROFILE_COUNT):
+                                line_tag = RANGEFFT_LINE_TAGS[ant_i]
+                                dpg.add_line_series(
+                                    [0.0],
+                                    [0.0],
+                                    label=f"A{ant_i + 1}",
+                                    tag=line_tag,
+                                    parent=RANGEFFT_YAXIS_TAG,
+                                )
+                                if ant_i < len(rangefft_line_themes):
+                                    dpg.bind_item_theme(line_tag, rangefft_line_themes[ant_i])
+                        _, init_fft_rmax_m = _fft_visible_range_from_rmax(vis_rmax)
+                        dpg.set_axis_limits(RANGEFFT_XAXIS_TAG, 0.0, float(init_fft_rmax_m))
+                        dpg.set_axis_limits(RANGEFFT_YAXIS_TAG, float(vis_fft_vmin), float(vis_fft_vmax))
+                        dpg.add_separator()
+                        dpg.add_button(
+                            label=_fft_mode_label(fft_mode_db),
+                            tag=BTN_FFT_MODE_TAG,
+                            callback=_toggle_fft_mode,
+                            width=-1,
+                            height=30,
+                        )
+                        dpg.add_input_double(
+                            label="FFT Ymin (dB)",
+                            tag=IN_FFT_VMIN,
+                            default_value=float(vis_fft_vmin),
+                            format="%.0f",
+                            step=1.0,
+                            step_fast=10.0,
+                            width=220,
+                            callback=_apply_params,
+                            on_enter=False,
+                        )
+                        dpg.add_input_double(
+                            label="FFT Ymax (dB)",
+                            tag=IN_FFT_VMAX,
+                            default_value=float(vis_fft_vmax),
+                            format="%.0f",
+                            step=1.0,
+                            step_fast=10.0,
+                            width=220,
+                            callback=_apply_params,
+                            on_enter=False,
+                        )
+
+    _update_fft_scale_input_labels(fft_mode_db)
     # Applicazione parametri DOPO creazione items
     _apply_params()
 
@@ -1494,6 +1718,8 @@ def main():
         log_bytes_prev = 0
     gui_last_seq = 0
     gui_frame = np.zeros((gui_h, gui_w), dtype=np.float32)
+    rangefft_frame = np.full((RANGE_PROFILE_COUNT, gui_h), -120.0, dtype=np.float32)
+    range_axis_m = np.arange(gui_h, dtype=np.float32) * np.float32(dr_plot)
     if DEBUG_STATS:
         ring_hwm = 0
         cpu_state = {}
@@ -1513,13 +1739,22 @@ def main():
                 # HARD clamp anche qui (ridondanza: protegge da valori inseriti via codice)
                 rmax = max(0.0, min(ui_pending["rmax"], RMAX_HARD_MAX))
                 xmax = max(0.0, min(ui_pending["xmax"], XMAX_HARD_MAX))
+                fft_vmin = float(ui_pending["fft_vmin"])
+                fft_vmax = float(ui_pending["fft_vmax"])
+                fft_mode_db = bool(ui_pending["fft_mode_db"])
                 if vmax <= vmin:
                     vmax = vmin + 1.0
+                fft_eps = 1.0
+                if fft_vmax <= fft_vmin:
+                    fft_vmax = fft_vmin + fft_eps
 
                 vis_vmin = vmin
                 vis_vmax = vmax
                 vis_rmax = rmax
                 vis_xmax = xmax
+                vis_fft_mode_db = fft_mode_db
+                vis_fft_vmin = fft_vmin
+                vis_fft_vmax = fft_vmax
 
                 # update axis limits (meters). L'immagine resta su bounds fissi per mantenere texture 1:1.
                 if dpg.does_item_exist(XAXIS_TAG) and dpg.does_item_exist(YAXIS_TAG):
@@ -1529,6 +1764,16 @@ def main():
                 # colorbar
                 if dpg.does_item_exist(CMAP_SCALE_TAG):
                     dpg.configure_item(CMAP_SCALE_TAG, min_scale=vis_vmin, max_scale=vis_vmax, format=CMAP_NUM_FMT)
+                if dpg.does_item_exist(BTN_FFT_MODE_TAG):
+                    dpg.configure_item(BTN_FFT_MODE_TAG, label=_fft_mode_label(vis_fft_mode_db))
+                _update_fft_scale_input_labels(vis_fft_mode_db)
+
+                max_r_bin, max_r_m = _fft_visible_range_from_rmax(vis_rmax)
+                if dpg.does_item_exist(RANGEFFT_YAXIS_TAG):
+                    dpg.set_axis_limits(RANGEFFT_YAXIS_TAG, float(vis_fft_vmin), float(vis_fft_vmax))
+                    dpg.configure_item(RANGEFFT_YAXIS_TAG, label=_fft_axis_label(vis_fft_mode_db))
+                if dpg.does_item_exist(RANGEFFT_XAXIS_TAG):
+                    dpg.set_axis_limits(RANGEFFT_XAXIS_TAG, 0.0, float(max_r_m))
 
             
             # 1. STATS UPDATE (1Hz) - GESTIONE DATI STAMPATI
@@ -1586,34 +1831,30 @@ def main():
                 with stat_norm_max_db.get_lock(): norm_max_now = float(stat_norm_max_db.value)
                 raw_minmax_str = f"{raw_min_now:.2f}/{raw_max_now:.2f}" if (np.isfinite(raw_min_now) and np.isfinite(raw_max_now)) else "n/a"
                 norm_minmax_str = f"{norm_min_now:.2f}/{norm_max_now:.2f}" if (np.isfinite(norm_min_now) and np.isfinite(norm_max_now)) else "n/a"
+                cpu_dsp_str = f"{cpu_dsp:.1f}%" if np.isfinite(cpu_dsp) else "n/a"
+                cpu_log_str = f"{cpu_log:.1f}%" if np.isfinite(cpu_log) else "n/a"
                 
                 # --- AGGIORNAMENTO TESTI GUI (FORMATO TABELLA ASCII) ---
                 stats_rows = [
-                    row("LOSS %", f"{loss_pct:.3f}%"),
-                    row("RX pkt/s", f"{pkt_rate:.0f}"),
-                    row("RX frames_ok", f"{frames_ok_rate:.1f}/s ({int(frames_ok_now)})"),
-                    row("RX drops_ring", f"{int(drop_f)}"),
-                    row("RING ready/slots", f"{ready_slots}/{N_SLOTS} HWM {ring_hwm}"),
-                    row("DSP ms avg/p95", f"{dsp_avg_now:.2f} / {dsp_p95_now:.2f}"),
-                    row("DSP skip", f"{dsp_skip_now}"),
-                    row("GUI Hz", f"{img_hz:.1f}"),
-                    row("GUI tex bins", f"{gui_w}x{gui_h} (1:1)"),
-                    row("RAW min/max dB", raw_minmax_str),
-                    row("NORM min/max dB", norm_minmax_str),
-                    row("CAP active pos", f"{int(cap_active.value)} {int(cap_pos_id.value)}"),
-                    row("CAP saved/target", f"{int(cap_saved.value)}/{FRAMES_PER_POSITION}"),
-                    row("LOG MB/s", f"{log_mbps:.2f}"),
-                    row("CPU dsp%", f"{cpu_dsp:.1f}%"),
-                    row("CPU log%", f"{cpu_log:.1f}%"),
-                    row("stall_events", f"{stall_events_now}"),
-                    row("stream_resets", f"{stream_resets_now}"),
+                    ("LOSS %", f"{loss_pct:.3f}%"),
+                    ("RX pkt/s", f"{pkt_rate:.0f}"),
+                    ("RX frames_ok", f"{frames_ok_rate:.1f}/s ({int(frames_ok_now)})"),
+                    ("RX drops_ring", f"{int(drop_f)}"),
+                    ("RING ready/slots", f"{ready_slots}/{N_SLOTS} HWM {ring_hwm}"),
+                    ("DSP ms avg/p95", f"{dsp_avg_now:.2f}/{dsp_p95_now:.2f}"),
+                    ("DSP skip", f"{dsp_skip_now}"),
+                    ("GUI Hz", f"{img_hz:.1f}"),
+                    ("GUI tex bins", f"{gui_w}x{gui_h}"),
+                    ("RAW min/max dB", raw_minmax_str),
+                    ("NORM min/max dB", norm_minmax_str),
+                    ("LOG MB/s", f"{log_mbps:.2f}"),
+                    ("CPU dsp%", cpu_dsp_str),
+                    ("CPU log%", cpu_log_str),
+                    ("stall_events", f"{stall_events_now}"),
+                    ("stream_resets", f"{stream_resets_now}"),
                 ]
 
-                stats_str = (
-                    "+------------------+--------------------+\n"
-                    + "".join(stats_rows)
-                    + "+------------------+--------------------+\n"
-                )
+                stats_str = _format_stats_table(stats_rows)
 
                 dpg.set_value(TXT_STATS_TAG, stats_str)
                 
@@ -1637,6 +1878,14 @@ def main():
                         base = idx * gui_h * gui_w
                         src_flat = np.frombuffer(gui_dbuf, dtype=np.float32, count=gui_h * gui_w, offset=base * 4)
                         gui_frame.reshape(-1)[:] = src_flat
+                        prof_base = idx * RANGE_PROFILE_COUNT * gui_h
+                        prof_flat = np.frombuffer(
+                            gui_prof_dbuf,
+                            dtype=np.float32,
+                            count=RANGE_PROFILE_COUNT * gui_h,
+                            offset=prof_base * 4,
+                        )
+                        rangefft_frame.reshape(-1)[:] = prof_flat
                     gui_last_seq = seq_locked
 
                 denom = (vis_vmax - vis_vmin)
@@ -1652,6 +1901,24 @@ def main():
                 rgba = rgba[::-1, :, :]
                 tex_np[:] = rgba.reshape(-1)
                 dpg.set_value(TEX_TAG, tex_buf)
+
+                max_r_bin, max_r_m = _fft_visible_range_from_rmax(vis_rmax)
+                x_range_m = range_axis_m[:max_r_bin].tolist()
+                fft_slice = rangefft_frame[:, :max_r_bin]
+                if vis_fft_mode_db:
+                    fft_plot_vals = fft_slice
+                else:
+                    fft_plot_vals = np.power(10.0, fft_slice * 0.1).astype(np.float32, copy=False)
+                if dpg.does_item_exist(RANGEFFT_YAXIS_TAG):
+                    dpg.set_axis_limits(RANGEFFT_YAXIS_TAG, float(vis_fft_vmin), float(vis_fft_vmax))
+                    dpg.configure_item(RANGEFFT_YAXIS_TAG, label=_fft_axis_label(vis_fft_mode_db))
+                if dpg.does_item_exist(RANGEFFT_XAXIS_TAG):
+                    dpg.set_axis_limits(RANGEFFT_XAXIS_TAG, 0.0, float(max_r_m))
+                for ant_i in range(min(RANGE_PROFILE_COUNT, int(fft_plot_vals.shape[0]))):
+                    line_tag = RANGEFFT_LINE_TAGS[ant_i]
+                    if dpg.does_item_exist(line_tag):
+                        y_vals = fft_plot_vals[ant_i, :].tolist()
+                        dpg.set_value(line_tag, [x_range_m, y_vals])
                 if DEBUG_STATS:
                     img_updates += 1
 
