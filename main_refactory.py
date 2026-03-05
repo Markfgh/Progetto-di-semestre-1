@@ -11,7 +11,6 @@ import numpy as np
 import dearpygui.dearpygui as dpg
 import scipy.fft as fft
 import os
-import heapq
 import json
 import struct
 from datetime import datetime
@@ -370,6 +369,7 @@ def _apply_process_affinity(label: str, pid: int, cpus, enabled: bool) -> None:
 
 
 from Dsp_processing import selection_from_yaml_dict, build_windows
+from offline_processing import OfflineBPRuntime
 #import dpnp as dp
 
 
@@ -495,6 +495,7 @@ def _build_capture_file_header(pos_id: int) -> bytes:
 def radar_rx(
     cmd_queue: Queue,
     free_slots: Queue,
+    dsp_ready_queue: Queue,
     shm_frames,
     slot_state,
     slot_ok,
@@ -529,7 +530,8 @@ def radar_rx(
 
     Performance:
       - zero-copy interprocess: RX scrive raw frame in shared memory (ring di slot)
-      - nessuna Queue per i frame (nÃ© verso DSP nÃ© verso Logger)
+      - enqueue leggero verso DSP con (seq, slot) per evitare scansione completa ring
+      - logger continua a leggere dal ring condiviso durante capture
       - se non ci sono slot liberi: drop (no block), ma manteniamo l'allineamento consumando i byte
 
     Capture:
@@ -702,6 +704,7 @@ def radar_rx(
                     slot_pos_id[slot] = -1
 
                 # --- ATOMIC PUBLISH (coherent READY+slot+seq) ---
+                next_seq = 0
                 with publish_lock:
                     next_seq = int(publish_seq) + 1
                     slot_ok[slot] = 1
@@ -709,6 +712,10 @@ def radar_rx(
                     slot_pub_seq[slot] = next_seq
                     slot_state[slot] = 1  # READY (set before seq bump)
                     publish_seq = next_seq
+                try:
+                    dsp_ready_queue.put_nowait((int(next_seq), int(slot)))
+                except Exception:
+                    pass
                 if DEBUG_STATS and rx_frames_ok is not None:
                     with rx_frames_ok.get_lock():
                         rx_frames_ok.value += 1
@@ -1044,6 +1051,7 @@ def logger_worker(
 # ----------------------------
 def dsp_worker(
     free_slots: Queue,
+    dsp_ready_queue: Queue,
     shm_frames,
     slot_state,
     slot_ok,
@@ -1088,6 +1096,16 @@ def dsp_worker(
     n_slots = len(slot_state)
     heatmap_ema = None
     dsp_ms_samples = []
+    dsp_stat_last_flush = time.perf_counter()
+    dsp_ms_acc_sum = 0.0
+    dsp_ms_acc_count = 0
+    slot_i16_views = [
+        np.frombuffer(
+            shm_view[s * BYTES_PER_FRAME : (s + 1) * BYTES_PER_FRAME],
+            dtype=np.int16,
+        )
+        for s in range(n_slots)
+    ]
 
     if RX != 4:
         raise ValueError("DSP: conversione I/Q attuale assume RX=4 (packing IIIIQQQQ).")
@@ -1118,62 +1136,55 @@ def dsp_worker(
         if stop_evt.is_set():
             break
 
-        # Snapshot coherent dei frame READY destinati al DSP.
-        # Keep only newest X_FRAMES in single-pass (latest-wins) without full sort.
-        keep_heap = []
-        drop_slots = []
-        with publish_lock:
-            if X_FRAMES <= 1:
-                latest = None
-                for s in range(n_slots):
-                    if int(slot_state[s]) != 1:
-                        continue
-                    if (int(slot_usemask[s]) & 1) == 0:
-                        continue
-                    item = (int(slot_pub_seq[s]), int(s), int(slot_ok[s]))
-                    if latest is None or item[0] >= latest[0]:
-                        if latest is not None:
-                            drop_slots.append(int(latest[1]))
-                        latest = item
-                    else:
-                        drop_slots.append(int(s))
-                if latest is not None:
-                    keep_heap.append(latest)
-            else:
-                for s in range(n_slots):
-                    if int(slot_state[s]) != 1:
-                        continue
-                    if (int(slot_usemask[s]) & 1) == 0:
-                        continue
-                    seq = int(slot_pub_seq[s])
-                    item = (seq, int(s), int(slot_ok[s]))
-                    if len(keep_heap) < X_FRAMES:
-                        heapq.heappush(keep_heap, item)
-                        continue
-                    if seq > keep_heap[0][0]:
-                        old = heapq.heapreplace(keep_heap, item)
-                        drop_slots.append(int(old[1]))
-                    else:
-                        drop_slots.append(int(s))
+        drained = []
+        try:
+            first_item = dsp_ready_queue.get(timeout=0.001)
+        except pyqueue.Empty:
+            continue
+        drained.append(first_item)
+        while True:
+            try:
+                drained.append(dsp_ready_queue.get_nowait())
+            except pyqueue.Empty:
+                break
 
-        if not keep_heap and not drop_slots:
-            time.sleep(0.001)
+        ready = []
+        with publish_lock:
+            for item in drained:
+                try:
+                    seq = int(item[0])
+                    s = int(item[1])
+                except Exception:
+                    continue
+                if s < 0 or s >= n_slots:
+                    continue
+                if int(slot_state[s]) != 1:
+                    continue
+                if int(slot_pub_seq[s]) != seq:
+                    continue
+                if (int(slot_usemask[s]) & 1) == 0:
+                    continue
+                ready.append((seq, s, int(slot_ok[s])))
+
+        if not ready:
             continue
 
-        # Se backlog > X_FRAMES, scarta i più vecchi.
+        # Queue is FIFO from RX; keep only latest X_FRAMES items.
+        drop_slots = []
+        if len(ready) > X_FRAMES:
+            drop_slots = [int(s) for _, s, _ in ready[:-X_FRAMES]]
+            ready = ready[-X_FRAMES:]
+
         if drop_slots:
             if DEBUG_STATS and dsp_skip is not None:
                 with dsp_skip.get_lock():
                     dsp_skip.value += len(drop_slots)
             _release_slots_dsp(drop_slots)
 
-        # Keep heap is small (<= X_FRAMES): ordering cost is negligible.
-        keep_heap.sort(key=lambda t: t[0])
-
         # Togli eventuali corrotti dal batch da processare.
         proc_slots = []
         bad_slots = []
-        for _, s, ok in keep_heap:
+        for _, s, ok in ready:
             if ok == 1:
                 proc_slots.append(int(s))
             else:
@@ -1188,9 +1199,7 @@ def dsp_worker(
 
         # --- 1. COPIA DA SHARED MEMORY (Veloce) ---
         for k, s in enumerate(slots_to_process):
-            base = s * BYTES_PER_FRAME
-            # Copia diretta nel buffer pre-allocato
-            i16_batch[k, :] = np.frombuffer(shm_view[base : base + BYTES_PER_FRAME], dtype=np.int16)
+            i16_batch[k, :] = slot_i16_views[int(s)]
             
         # Restituisci subito gli slot al RX (Pipelining)
         _release_slots_dsp(slots_to_process)
@@ -1239,14 +1248,25 @@ def dsp_worker(
         t1_proc = time.perf_counter()
         if n_proc > 0 and DEBUG_STATS:
             ms_per_frame = ((t1_proc - t0_proc) * 1000.0) / float(n_proc)
+            dsp_ms_acc_sum += ms_per_frame * float(n_proc)
+            dsp_ms_acc_count += int(n_proc)
             dsp_ms_samples.extend([ms_per_frame] * int(n_proc))
-            if len(dsp_ms_samples) > 256:
-                dsp_ms_samples = dsp_ms_samples[-256:]
-            if dsp_ms_samples:
+            if len(dsp_ms_samples) > 4096:
+                dsp_ms_samples = dsp_ms_samples[-4096:]
+            t_stats_now = time.perf_counter()
+            if (t_stats_now - dsp_stat_last_flush) >= 1.0 and dsp_ms_acc_count > 0:
+                avg_now = float(dsp_ms_acc_sum / float(dsp_ms_acc_count))
+                p95_now = avg_now
+                if dsp_ms_samples:
+                    p95_now = float(np.percentile(dsp_ms_samples, 95))
                 with dsp_ms_avg.get_lock():
-                    dsp_ms_avg.value = float(np.mean(dsp_ms_samples))
+                    dsp_ms_avg.value = avg_now
                 with dsp_ms_p95.get_lock():
-                    dsp_ms_p95.value = float(np.percentile(dsp_ms_samples, 95))
+                    dsp_ms_p95.value = p95_now
+                dsp_stat_last_flush = t_stats_now
+                dsp_ms_acc_sum = 0.0
+                dsp_ms_acc_count = 0
+                dsp_ms_samples.clear()
 
 def process_buffer(
     raw_buffer,
@@ -1294,15 +1314,13 @@ def process_buffer(
         range_fft = fft.fft(data, n=NFFT_RANGE, axis=3, workers=FFT_WORKERS, overwrite_x=True)
 
 
-        # Preparazione Virtual Array senza transpose+ascontiguousarray:
+        # Preparazione Virtual Array:
+        # limitiamo i range bin PRIMA della copia contigua per ridurre traffico memoria.
         # range_fft: (F, C, TX, R, RX)
+        range_fft = range_fft[:, :, :, :max_bin, :]
         va = range_fft.transpose(0, 1, 3, 2, 4)   # -> (F, C, R, TX, RX) view
-        va = np.ascontiguousarray(va)            # rende il reshape prevedibile (una copia al massimo)
-        virtual_array = va.reshape(n_frames, CHIRPS // TX, NFFT_RANGE, VIRTUAL_ANT)
-
-        # Limitiamo i range bin al solo intervallo visualizzato prima della angle-FFT.
-        # Evita lavoro inutile su bin che verrebbero comunque scartati.
-        virtual_array = virtual_array[:, :, :max_bin, :]
+        va = np.ascontiguousarray(va)             # copia solo max_bin, non tutta NFFT_RANGE
+        virtual_array = va.reshape(n_frames, CHIRPS // TX, max_bin, VIRTUAL_ANT)
 
         # Profili range FFT per antenna virtuale: modulo^2 medio su frame/chirp, poi dB.
         prof_re = virtual_array.real
@@ -1398,6 +1416,7 @@ def process_buffer(
 def main():
     # --- SETUP CODE E PROCESSI ---
     free_slots = Queue()
+    dsp_ready_queue = Queue()
 
     # Ring slots (user requested 64)
     N_SLOTS = 64
@@ -1474,6 +1493,7 @@ def main():
         args=(
             cmd_q,
             free_slots,
+            dsp_ready_queue,
             shm_frames,
             slot_state,
             slot_ok,
@@ -1522,6 +1542,7 @@ def main():
         target=dsp_worker,
         args=(
             free_slots,
+            dsp_ready_queue,
             shm_frames,
             slot_state,
             slot_ok,
@@ -1567,6 +1588,35 @@ def main():
     print(f"[FFT] workers={FFT_WORKERS} logical_cpus={LOGICAL_CPUS}")
     if DEBUG_STATS and psutil is None:
         print("[STATS] psutil not available: using Windows fallback for CPU%.")
+
+    offline_runtime = None
+    offline_error = ""
+    offline_info = {}
+    try:
+        offline_runtime = OfflineBPRuntime(
+            offline_config_path=Path(__file__).with_name("offline_config.yaml"),
+            fallback_capture_cfg=Path(__file__).with_name("Config.yaml"),
+            c_m_s=float(C),
+            fs_hz=float(FS),
+            slope_hz_s=float(SLOPE),
+            fc_hz=float(FC),
+            nfft_range=int(NFFT_RANGE),
+            range_max_m=float(RANGE_MAX_DISPLAY),
+            crossrange_max_m=float(CROSSRANGE_MAX_DISPLAY),
+            image_h=int(gui_h),
+            image_w=int(gui_w),
+            default_avg_mode="both",
+        )
+        offline_info = offline_runtime.start(timeout_s=45.0)
+        print(
+            f"[OFFLINE] ready pos={offline_info.get('pos_min')}..{offline_info.get('pos_max')} "
+            f"default={offline_info.get('x_start')}..{offline_info.get('x_end')} "
+            f"avg={offline_info.get('avg_mode')}"
+        )
+    except Exception as exc:
+        offline_error = str(exc)
+        offline_runtime = None
+        print(f"[OFFLINE WARN] {offline_error}")
 
     # =========================================================================
     # GUI SETUP (RESPONSIVE - CLEAN)
@@ -1639,6 +1689,21 @@ def main():
     HEAT_PLOT_TAG = "heat_plot"
     XAXIS_TAG, YAXIS_TAG = "xaxis", "yaxis"
     IMG_SERIES_TAG = "img_series"
+    PROC_TEX_TAG = "proc_heat_tex"
+    PROC_HEAT_PLOT_TAG = "proc_heat_plot"
+    PROC_XAXIS_TAG, PROC_YAXIS_TAG = "proc_xaxis", "proc_yaxis"
+    PROC_IMG_SERIES_TAG = "proc_img_series"
+    PROC_IN_XSTART = "proc_in_xstart"
+    PROC_IN_XEND = "proc_in_xend"
+    PROC_AVG_MODE = "proc_avg_mode"
+    PROC_TXT_STATUS = "proc_txt_status"
+    PROC_IN_VMIN = "proc_in_vmin"
+    PROC_IN_VMAX = "proc_in_vmax"
+    PROC_IN_RMAX = "proc_in_rmax"
+    PROC_IN_XMAX = "proc_in_xmax"
+    PROC_BTN_NORM = "proc_btn_norm"
+    PROC_CMAP_SCALE_TAG = "proc_cmap_scale"
+    PROC_CMAP_NUM_FMT = "%+6.1f"
     CMAP_SCALE_TAG = "cmap_scale"
     CMAP_NUM_FMT = "%+6.1f"
     RANGEFFT_PLOT_TAG = "rangefft_plot"
@@ -1667,6 +1732,48 @@ def main():
     tex_w, tex_h = int(gui_w), int(gui_h)
     tex_buf = array("f", [0.0]) * (tex_w * tex_h * 4)
     tex_np = np.frombuffer(tex_buf, dtype=np.float32)
+    proc_tex_w, proc_tex_h = int(gui_w), int(gui_h)
+    proc_tex_buf = array("f", [0.0]) * (proc_tex_w * proc_tex_h * 4)
+    proc_tex_np = np.frombuffer(proc_tex_buf, dtype=np.float32)
+
+    off_pos_min = int(offline_info.get("pos_min", 0)) if offline_info else 0
+    off_pos_max = int(offline_info.get("pos_max", 0)) if offline_info else 0
+    if off_pos_max < off_pos_min:
+        off_pos_min, off_pos_max = off_pos_max, off_pos_min
+    off_x_start = int(offline_info.get("x_start", off_pos_min)) if offline_info else off_pos_min
+    off_x_end = int(offline_info.get("x_end", off_pos_max)) if offline_info else off_pos_max
+    if off_x_end < off_x_start:
+        off_x_start, off_x_end = off_x_end, off_x_start
+    off_avg_mode = str(offline_info.get("avg_mode", "both")) if offline_info else "both"
+    off_avg_modes = ["both", "loop", "frame", "none"]
+    if off_avg_mode not in off_avg_modes:
+        off_avg_mode = "both"
+    off_norm_enabled = True
+    if off_norm_enabled:
+        off_vmin = float(VMIN_NORM)
+        off_vmax = float(VMAX_NORM)
+    else:
+        off_vmin = float(VMIN_RAW)
+        off_vmax = float(VMAX_RAW)
+    if off_vmax <= off_vmin:
+        off_vmax = off_vmin + 1.0
+    off_rmax = float(RANGE_MAX_DISPLAY)
+    off_xmax = float(CROSSRANGE_MAX_DISPLAY)
+    off_ui_dirty = False
+    off_ui_dirty_t = 0.0
+    off_ui_pending = {
+        "x_start": int(off_x_start),
+        "x_end": int(off_x_end),
+        "avg_mode": str(off_avg_mode),
+        "vmin": float(off_vmin),
+        "vmax": float(off_vmax),
+        "rmax": float(off_rmax),
+        "xmax": float(off_xmax),
+        "norm_enabled": bool(off_norm_enabled),
+    }
+    off_status_text = "Offline runtime non disponibile" if offline_runtime is None else "Offline ready"
+    if offline_error:
+        off_status_text = f"ERRORE: {offline_error}"
 
     with dpg.texture_registry(show=False):
         dpg.add_dynamic_texture(
@@ -1675,10 +1782,21 @@ def main():
             default_value=[0.0, 0.0, 0.0, 1.0] * tex_w * tex_h,
             tag=TEX_TAG,
         )
+        dpg.add_dynamic_texture(
+            width=proc_tex_w,
+            height=proc_tex_h,
+            default_value=[0.0, 0.0, 0.0, 1.0] * proc_tex_w * proc_tex_h,
+            tag=PROC_TEX_TAG,
+        )
 
     # 5) Callbacks
     def _shutdown():
         stop_evt.set()
+        if offline_runtime is not None:
+            try:
+                offline_runtime.stop()
+            except Exception:
+                pass
         # allow workers to exit cleanly
         for p in (p_rx, p_log, p_dsp):
             try:
@@ -1700,13 +1818,13 @@ def main():
 
     dpg.set_exit_callback(_shutdown)
 
-    def _jet_rgba(norm01):
-        x = np.clip(norm01, 0.0, 1.0)
+    def _build_jet_lut(size: int = 2048):
+        x = np.linspace(0.0, 1.0, int(size), dtype=np.float32)
         r = np.clip(1.5 - np.abs(4.0 * x - 3.0), 0.0, 1.0)
         g = np.clip(1.5 - np.abs(4.0 * x - 2.0), 0.0, 1.0)
         b = np.clip(1.5 - np.abs(4.0 * x - 1.0), 0.0, 1.0)
-        a = np.ones_like(r)
-        return np.stack((r, g, b, a), axis=-1)
+        a = np.ones_like(x, dtype=np.float32)
+        return np.stack((r, g, b, a), axis=-1).astype(np.float32, copy=False)
 
     def _fft_mode_label(mode_db: bool) -> str:
         return "FFT SCALE: dB" if mode_db else "FFT SCALE: LINEAR"
@@ -1842,6 +1960,83 @@ def main():
             dpg.set_value(IN_FFT_VMAX, fft_vmax)
         _apply_params()
 
+    def _base_off_vscale_for_mode(enabled: bool):
+        if enabled:
+            vmin = float(VMIN_NORM)
+            vmax = float(VMAX_NORM)
+        else:
+            vmin = float(VMIN_RAW)
+            vmax = float(VMAX_RAW)
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+        return vmin, vmax
+
+    def _toggle_off_norm(sender=None, app_data=None):
+        nonlocal off_ui_pending
+        enabled = not bool(off_ui_pending.get("norm_enabled", True))
+        off_ui_pending["norm_enabled"] = bool(enabled)
+        if dpg.does_item_exist(PROC_BTN_NORM):
+            dpg.configure_item(PROC_BTN_NORM, label=_norm_toggle_label(enabled))
+        base_vmin, base_vmax = _base_off_vscale_for_mode(enabled)
+        if dpg.does_item_exist(PROC_IN_VMIN):
+            dpg.set_value(PROC_IN_VMIN, base_vmin)
+        if dpg.does_item_exist(PROC_IN_VMAX):
+            dpg.set_value(PROC_IN_VMAX, base_vmax)
+        _apply_offline_params()
+
+    def _apply_offline_params(sender=None, app_data=None):
+        nonlocal off_ui_dirty, off_ui_dirty_t, off_ui_pending, off_status_text
+
+        try:
+            vmin = float(dpg.get_value(PROC_IN_VMIN))
+            vmax = float(dpg.get_value(PROC_IN_VMAX))
+            rmax = float(dpg.get_value(PROC_IN_RMAX))
+            xmax = float(dpg.get_value(PROC_IN_XMAX))
+            x_start = int(dpg.get_value(PROC_IN_XSTART))
+            x_end = int(dpg.get_value(PROC_IN_XEND))
+        except (TypeError, ValueError):
+            return
+
+        avg_mode = str(dpg.get_value(PROC_AVG_MODE)).strip().lower()
+        if avg_mode not in off_avg_modes:
+            avg_mode = "both"
+
+        x_start_cl = max(off_pos_min, min(off_pos_max, x_start))
+        x_end_cl = max(off_pos_min, min(off_pos_max, x_end))
+        if x_end_cl < x_start_cl:
+            x_start_cl, x_end_cl = x_end_cl, x_start_cl
+
+        rmax_cl = max(0.0, min(rmax, RMAX_HARD_MAX))
+        xmax_cl = max(0.0, min(xmax, XMAX_HARD_MAX))
+
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+
+        if rmax_cl != rmax:
+            dpg.set_value(PROC_IN_RMAX, rmax_cl)
+        if xmax_cl != xmax:
+            dpg.set_value(PROC_IN_XMAX, xmax_cl)
+        if x_start_cl != x_start:
+            dpg.set_value(PROC_IN_XSTART, x_start_cl)
+        if x_end_cl != x_end:
+            dpg.set_value(PROC_IN_XEND, x_end_cl)
+
+        off_ui_pending["vmin"] = float(vmin)
+        off_ui_pending["vmax"] = float(vmax)
+        off_ui_pending["rmax"] = float(rmax_cl)
+        off_ui_pending["xmax"] = float(xmax_cl)
+        off_ui_pending["x_start"] = int(x_start_cl)
+        off_ui_pending["x_end"] = int(x_end_cl)
+        off_ui_pending["avg_mode"] = str(avg_mode)
+        off_status_text = (
+            f"Pending update | x={x_start_cl}:{x_end_cl} | avg={avg_mode} | "
+            f"v={vmin:.1f}:{vmax:.1f}"
+        )
+        if dpg.does_item_exist(PROC_TXT_STATUS):
+            dpg.set_value(PROC_TXT_STATUS, off_status_text)
+        off_ui_dirty = True
+        off_ui_dirty_t = time.perf_counter()
+
     STATS_KEY_W = 16
     STATS_VAL_W = 13
 
@@ -1862,10 +2057,10 @@ def main():
         with dpg.table(header_row=False, resizable=True, policy=dpg.mvTable_SizingFixedFit, parent=TAB_REALTIME_TAG):
 
             # Colonne: sidebar (fissa), plot (stretch), colorbar (fissa), range FFT (fissa)
-            dpg.add_table_column(init_width_or_weight=340, width_fixed=True, no_resize=True)                      # sidebar
+            dpg.add_table_column(init_width_or_weight=340, width_fixed=True)                                      # sidebar
             dpg.add_table_column(init_width_or_weight=1.0, width_stretch=True, width_fixed=False)                 # plot stretch
-            dpg.add_table_column(init_width_or_weight=100, width_fixed=True, no_resize=True)                      # colorbar
-            dpg.add_table_column(init_width_or_weight=500, width_fixed=True, no_resize=True)                      # range FFT
+            dpg.add_table_column(init_width_or_weight=100, width_fixed=True)                                      # colorbar
+            dpg.add_table_column(init_width_or_weight=500, width_fixed=True)                                      # range FFT
 
 
             with dpg.table_row():
@@ -2014,12 +2209,150 @@ def main():
                             on_enter=False,
                         )
 
-        with dpg.group(parent=TAB_PROCESSED_TAG):
-            dpg.add_text("")
+        with dpg.table(header_row=False, resizable=True, policy=dpg.mvTable_SizingFixedFit, parent=TAB_PROCESSED_TAG):
+            dpg.add_table_column(init_width_or_weight=340, width_fixed=True)
+            dpg.add_table_column(init_width_or_weight=1.0, width_stretch=True, width_fixed=False)
+            dpg.add_table_column(init_width_or_weight=100, width_fixed=True)
+
+            with dpg.table_row():
+                with dpg.table_cell():
+                    with dpg.child_window(width=-1, height=-1, border=True):
+                        dpg.add_text("DISPLAY PARAMETERS", color=(255, 200, 0))
+                        dpg.add_separator()
+                        dpg.add_spacer(width=20)
+                        dpg.add_input_float(
+                            label="Vmin (dB)",
+                            tag=PROC_IN_VMIN,
+                            default_value=float(off_vmin),
+                            step=1.0,
+                            width=220,
+                            callback=_apply_offline_params,
+                            on_enter=False,
+                        )
+                        dpg.add_input_float(
+                            label="Vmax (dB)",
+                            tag=PROC_IN_VMAX,
+                            default_value=float(off_vmax),
+                            step=1.0,
+                            width=220,
+                            callback=_apply_offline_params,
+                            on_enter=False,
+                        )
+                        dpg.add_input_float(
+                            label="Rmax (m)",
+                            tag=PROC_IN_RMAX,
+                            default_value=float(off_rmax),
+                            step=0.5,
+                            width=220,
+                            min_value=0.0,
+                            max_value=RMAX_HARD_MAX,
+                            min_clamped=True,
+                            max_clamped=True,
+                            callback=_apply_offline_params,
+                            on_enter=False,
+                        )
+                        dpg.add_input_float(
+                            label="Xmax (m)",
+                            tag=PROC_IN_XMAX,
+                            default_value=float(off_xmax),
+                            step=0.5,
+                            width=220,
+                            min_value=0.0,
+                            max_value=XMAX_HARD_MAX,
+                            min_clamped=True,
+                            max_clamped=True,
+                            callback=_apply_offline_params,
+                            on_enter=False,
+                        )
+                        dpg.add_spacer(height=8)
+                        dpg.add_button(
+                            label=_norm_toggle_label(bool(off_ui_pending.get("norm_enabled", True))),
+                            tag=PROC_BTN_NORM,
+                            callback=_toggle_off_norm,
+                            width=-1,
+                            height=32,
+                        )
+                        dpg.add_spacer(height=14)
+                        dpg.add_text("OFFLINE BP CONTROL", color=(255, 200, 0))
+                        dpg.add_separator()
+                        dpg.add_input_int(
+                            label="x_start",
+                            tag=PROC_IN_XSTART,
+                            default_value=int(off_x_start),
+                            step=1,
+                            step_fast=4,
+                            width=220,
+                            callback=_apply_offline_params,
+                            on_enter=False,
+                        )
+                        dpg.add_input_int(
+                            label="x_end",
+                            tag=PROC_IN_XEND,
+                            default_value=int(off_x_end),
+                            step=1,
+                            step_fast=4,
+                            width=220,
+                            callback=_apply_offline_params,
+                            on_enter=False,
+                        )
+                        dpg.add_combo(
+                            off_avg_modes,
+                            label="Averaging",
+                            tag=PROC_AVG_MODE,
+                            default_value=str(off_avg_mode),
+                            width=220,
+                            callback=_apply_offline_params,
+                        )
+                        dpg.add_separator()
+                        dpg.add_text(off_status_text, tag=PROC_TXT_STATUS, wrap=-1)
+
+                with dpg.table_cell():
+                    with dpg.plot(tag=PROC_HEAT_PLOT_TAG, width=-1, height=-1, equal_aspects=True):
+                        dpg.add_plot_axis(dpg.mvXAxis, label="X (m)", tag=PROC_XAXIS_TAG)
+                        dpg.add_plot_axis(dpg.mvYAxis, label="Y (m)", tag=PROC_YAXIS_TAG)
+                        dpg.add_image_series(
+                            PROC_TEX_TAG,
+                            bounds_min=(-float(CROSSRANGE_MAX_DISPLAY), 0.0),
+                            bounds_max=(+float(CROSSRANGE_MAX_DISPLAY), float(RANGE_MAX_DISPLAY)),
+                            tag=PROC_IMG_SERIES_TAG,
+                            parent=PROC_YAXIS_TAG,
+                        )
+
+                with dpg.table_cell():
+                    with dpg.child_window(width=-1, height=-1, border=True):
+                        dpg.add_colormap_scale(
+                            tag=PROC_CMAP_SCALE_TAG,
+                            min_scale=float(off_vmin),
+                            max_scale=float(off_vmax),
+                            format=PROC_CMAP_NUM_FMT,
+                            width=-1,
+                            height=-1,
+                            colormap=dpg.mvPlotColormap_Jet,
+                        )
+                        if font_mono:
+                            dpg.bind_item_font(PROC_CMAP_SCALE_TAG, font_mono)
 
     _update_fft_scale_input_labels(fft_mode_db)
     # Applicazione parametri DOPO creazione items
     _apply_params()
+    if dpg.does_item_exist(PROC_XAXIS_TAG) and dpg.does_item_exist(PROC_YAXIS_TAG):
+        dpg.set_axis_limits(PROC_XAXIS_TAG, -float(off_xmax), +float(off_xmax))
+        dpg.set_axis_limits(PROC_YAXIS_TAG, 0.0, float(off_rmax))
+    if dpg.does_item_exist(PROC_CMAP_SCALE_TAG):
+        dpg.configure_item(
+            PROC_CMAP_SCALE_TAG,
+            min_scale=float(off_vmin),
+            max_scale=float(off_vmax),
+            format=PROC_CMAP_NUM_FMT,
+        )
+
+    if offline_runtime is None:
+        for tag in (PROC_IN_XSTART, PROC_IN_XEND, PROC_AVG_MODE):
+            if dpg.does_item_exist(tag):
+                dpg.configure_item(tag, enabled=False)
+    else:
+        off_ui_dirty = True
+        off_ui_dirty_t = time.perf_counter() - 1.0
 
     dpg.create_viewport(title="MIMO Radar Real-Time", width=1400, height=900)
     dpg.setup_dearpygui()
@@ -2040,7 +2373,18 @@ def main():
     gui_last_seq = 0
     gui_frame = np.zeros((gui_h, gui_w), dtype=np.float32)
     rangefft_frame = np.full((RANGE_PROFILE_COUNT, gui_h), -120.0, dtype=np.float32)
+    proc_frame = np.full((proc_tex_h, proc_tex_w), off_vmin, dtype=np.float32)
     range_axis_m = np.arange(gui_h, dtype=np.float32) * np.float32(dr_plot)
+    x_range_cache = {}
+    jet_lut = _build_jet_lut(2048)
+    norm_frame = np.empty((gui_h, gui_w), dtype=np.float32)
+    lut_idx = np.empty((gui_h, gui_w), dtype=np.int32)
+    rgba_frame = np.empty((gui_h, gui_w, 4), dtype=np.float32)
+    proc_norm_frame = np.empty((proc_tex_h, proc_tex_w), dtype=np.float32)
+    proc_lut_idx = np.empty((proc_tex_h, proc_tex_w), dtype=np.int32)
+    proc_rgba_frame = np.empty((proc_tex_h, proc_tex_w, 4), dtype=np.float32)
+    proc_view_frame = np.empty((proc_tex_h, proc_tex_w), dtype=np.float32)
+    lut_last = float(jet_lut.shape[0] - 1)
     if DEBUG_STATS:
         ring_hwm = 0
         cpu_state = {}
@@ -2095,6 +2439,90 @@ def main():
                     dpg.configure_item(RANGEFFT_YAXIS_TAG, label=_fft_axis_label(vis_fft_mode_db))
                 if dpg.does_item_exist(RANGEFFT_XAXIS_TAG):
                     dpg.set_axis_limits(RANGEFFT_XAXIS_TAG, 0.0, float(max_r_m))
+
+            # --- OFFLINE UI apply (throttled) ---
+            if off_ui_dirty and (now - off_ui_dirty_t) >= 0.08:
+                off_ui_dirty = False
+                off_ui_dirty_t = now
+                off_vmin = float(off_ui_pending["vmin"])
+                off_vmax = float(off_ui_pending["vmax"])
+                off_rmax = max(0.0, min(float(off_ui_pending["rmax"]), RMAX_HARD_MAX))
+                off_xmax = max(0.0, min(float(off_ui_pending["xmax"]), XMAX_HARD_MAX))
+                off_norm_enabled = bool(off_ui_pending.get("norm_enabled", True))
+                if off_vmax <= off_vmin:
+                    off_vmax = off_vmin + 1.0
+                    if dpg.does_item_exist(PROC_IN_VMAX):
+                        dpg.set_value(PROC_IN_VMAX, off_vmax)
+
+                off_ui_pending["vmin"] = float(off_vmin)
+                off_ui_pending["vmax"] = float(off_vmax)
+                off_ui_pending["rmax"] = float(off_rmax)
+                off_ui_pending["xmax"] = float(off_xmax)
+                off_ui_pending["norm_enabled"] = bool(off_norm_enabled)
+
+                if dpg.does_item_exist(PROC_IN_RMAX):
+                    dpg.set_value(PROC_IN_RMAX, off_rmax)
+                if dpg.does_item_exist(PROC_IN_XMAX):
+                    dpg.set_value(PROC_IN_XMAX, off_xmax)
+                if dpg.does_item_exist(PROC_BTN_NORM):
+                    dpg.configure_item(PROC_BTN_NORM, label=_norm_toggle_label(off_norm_enabled))
+                if dpg.does_item_exist(PROC_XAXIS_TAG) and dpg.does_item_exist(PROC_YAXIS_TAG):
+                    dpg.set_axis_limits(PROC_XAXIS_TAG, -float(off_xmax), +float(off_xmax))
+                    dpg.set_axis_limits(PROC_YAXIS_TAG, 0.0, float(off_rmax))
+                if dpg.does_item_exist(PROC_CMAP_SCALE_TAG):
+                    dpg.configure_item(
+                        PROC_CMAP_SCALE_TAG,
+                        min_scale=float(off_vmin),
+                        max_scale=float(off_vmax),
+                        format=PROC_CMAP_NUM_FMT,
+                    )
+
+                if offline_runtime is not None:
+                    try:
+                        offline_runtime.update_params(
+                            x_start=int(off_ui_pending["x_start"]),
+                            x_end=int(off_ui_pending["x_end"]),
+                            avg_mode=str(off_ui_pending["avg_mode"]),
+                        )
+                    except Exception as e:
+                        off_status_text = f"ERR update: {e}"
+                        if dpg.does_item_exist(PROC_TXT_STATUS):
+                            dpg.set_value(PROC_TXT_STATUS, off_status_text)
+
+            # --- OFFLINE FRAME update (double-buffer latest-wins) ---
+            if offline_runtime is not None:
+                off_frame = offline_runtime.poll_frame()
+                if off_frame is not None:
+                    frame_db, info = off_frame
+                    proc_frame[:, :] = frame_db
+                    off_status_text = (
+                        f"x={info.get('x_start')}:{info.get('x_end')} | "
+                        f"avg={info.get('avg_mode')} | "
+                        f"pos={info.get('n_pos_used', 'n/a')} | "
+                        f"BP={float(info.get('elapsed_ms', 0.0)):.1f} ms"
+                    )
+                    if dpg.does_item_exist(PROC_TXT_STATUS):
+                        dpg.set_value(PROC_TXT_STATUS, off_status_text)
+
+                    if off_norm_enabled and proc_frame.size > 0:
+                        np.subtract(proc_frame, float(np.max(proc_frame)), out=proc_view_frame)
+                    else:
+                        proc_view_frame[:, :] = proc_frame
+
+                    off_denom = float(off_vmax - off_vmin)
+                    if off_denom < 1e-6:
+                        off_denom = 1e-6
+                    np.subtract(proc_view_frame, float(off_vmin), out=proc_norm_frame)
+                    proc_norm_frame *= float(1.0 / off_denom)
+                    np.clip(proc_norm_frame, 0.0, 1.0, out=proc_norm_frame)
+                    np.multiply(proc_norm_frame, lut_last, out=proc_norm_frame)
+                    np.rint(proc_norm_frame, out=proc_norm_frame)
+                    proc_lut_idx[:, :] = proc_norm_frame
+                    np.take(jet_lut, proc_lut_idx, axis=0, out=proc_rgba_frame)
+                    proc_tex_np[:] = proc_rgba_frame[::-1, :, :].reshape(-1)
+                    dpg.set_value(PROC_TEX_TAG, proc_tex_buf)
+                elif offline_runtime.last_error and dpg.does_item_exist(PROC_TXT_STATUS):
+                    dpg.set_value(PROC_TXT_STATUS, f"ERRORE: {offline_runtime.last_error}")
 
             
             # 1. STATS UPDATE (1Hz) - GESTIONE DATI STAMPATI
@@ -2213,28 +2641,26 @@ def main():
                 if denom < 1e-6:
                     denom = 1e-6
 
-                src = gui_frame
-                img = src
-
-                norm = (img - vis_vmin) / denom
-                norm = np.clip(norm, 0.0, 1.0)
-                rgba = _jet_rgba(norm)
-                rgba = rgba[::-1, :, :]
-                tex_np[:] = rgba.reshape(-1)
+                np.subtract(gui_frame, float(vis_vmin), out=norm_frame)
+                norm_frame *= float(1.0 / denom)
+                np.clip(norm_frame, 0.0, 1.0, out=norm_frame)
+                np.multiply(norm_frame, lut_last, out=norm_frame)
+                np.rint(norm_frame, out=norm_frame)
+                lut_idx[:, :] = norm_frame
+                np.take(jet_lut, lut_idx, axis=0, out=rgba_frame)
+                tex_np[:] = rgba_frame[::-1, :, :].reshape(-1)
                 dpg.set_value(TEX_TAG, tex_buf)
 
-                max_r_bin, max_r_m = _fft_visible_range_from_rmax(vis_rmax)
-                x_range_m = range_axis_m[:max_r_bin].tolist()
+                max_r_bin, _ = _fft_visible_range_from_rmax(vis_rmax)
+                x_range_m = x_range_cache.get(max_r_bin)
+                if x_range_m is None:
+                    x_range_m = range_axis_m[:max_r_bin].tolist()
+                    x_range_cache[max_r_bin] = x_range_m
                 fft_slice = rangefft_frame[:, :max_r_bin]
                 if vis_fft_mode_db:
                     fft_plot_vals = fft_slice
                 else:
                     fft_plot_vals = np.power(10.0, fft_slice * 0.1).astype(np.float32, copy=False)
-                if dpg.does_item_exist(RANGEFFT_YAXIS_TAG):
-                    dpg.set_axis_limits(RANGEFFT_YAXIS_TAG, float(vis_fft_vmin), float(vis_fft_vmax))
-                    dpg.configure_item(RANGEFFT_YAXIS_TAG, label=_fft_axis_label(vis_fft_mode_db))
-                if dpg.does_item_exist(RANGEFFT_XAXIS_TAG):
-                    dpg.set_axis_limits(RANGEFFT_XAXIS_TAG, 0.0, float(max_r_m))
                 for ant_i in range(min(RANGE_PROFILE_COUNT, int(fft_plot_vals.shape[0]))):
                     line_tag = RANGEFFT_LINE_TAGS[ant_i]
                     if dpg.does_item_exist(line_tag):
