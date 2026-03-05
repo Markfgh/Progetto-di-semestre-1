@@ -11,32 +11,105 @@ import numpy as np
 import dearpygui.dearpygui as dpg
 import scipy.fft as fft
 import os
+import heapq
+import json
+import struct
+from datetime import datetime
 
 try:
     import psutil  # type: ignore
 except Exception:
     psutil = None
 
+def _cpu_percent_pid_win(pid: int, cpu_state: dict) -> float:
+    """Windows fallback CPU% for a pid using GetProcessTimes."""
+    if os.name != "nt" or pid is None or pid <= 0:
+        return float("nan")
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        class FILETIME(ctypes.Structure):
+            _fields_ = [("dwLowDateTime", wt.DWORD), ("dwHighDateTime", wt.DWORD)]
+
+        def _ft_to_int(ft: FILETIME) -> int:
+            return (int(ft.dwHighDateTime) << 32) | int(ft.dwLowDateTime)
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        PROCESS_QUERY_INFORMATION = 0x0400
+
+        kernel32 = ctypes.windll.kernel32
+        OpenProcess = kernel32.OpenProcess
+        OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+        OpenProcess.restype = wt.HANDLE
+
+        GetProcessTimes = kernel32.GetProcessTimes
+        GetProcessTimes.argtypes = [
+            wt.HANDLE,
+            ctypes.POINTER(FILETIME),
+            ctypes.POINTER(FILETIME),
+            ctypes.POINTER(FILETIME),
+            ctypes.POINTER(FILETIME),
+        ]
+        GetProcessTimes.restype = wt.BOOL
+
+        CloseHandle = kernel32.CloseHandle
+        CloseHandle.argtypes = [wt.HANDLE]
+        CloseHandle.restype = wt.BOOL
+
+        h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_QUERY_INFORMATION, False, int(pid))
+        if not h:
+            return 0.0
+        try:
+            ft_create = FILETIME()
+            ft_exit = FILETIME()
+            ft_kernel = FILETIME()
+            ft_user = FILETIME()
+            ok = GetProcessTimes(h, ft_create, ft_exit, ft_kernel, ft_user)
+            if not ok:
+                return 0.0
+            cpu_now_100ns = _ft_to_int(ft_kernel) + _ft_to_int(ft_user)
+            t_now = time.perf_counter()
+            key = ("win_cpu", int(pid))
+            prev = cpu_state.get(key)
+            cpu_state[key] = (t_now, cpu_now_100ns)
+            if prev is None:
+                return 0.0
+            dt = float(t_now - prev[0])
+            dc = int(cpu_now_100ns - prev[1])
+            if dt <= 0.0 or dc < 0:
+                return 0.0
+            # 100ns ticks -> seconds; 100% means one full CPU core.
+            return float((dc * 1e-7 / dt) * 100.0)
+        finally:
+            try:
+                CloseHandle(h)
+            except Exception:
+                pass
+    except Exception:
+        return float("nan")
+
 def _cpu_percent_pid(pid: int, cpu_state: dict) -> float:
     """Best-effort process CPU% using psutil, non-blocking."""
     if pid is None or pid <= 0:
         return 0.0
-    if psutil is None:
-        return float("nan")
-    p = cpu_state.get(int(pid))
-    if p is None:
-        try:
-            p = psutil.Process(int(pid))
-            p.cpu_percent(None)
-            cpu_state[int(pid)] = p
-            return 0.0
-        except Exception:
-            return 0.0
-    try:
-        return float(p.cpu_percent(None))
-    except Exception:
-        cpu_state.pop(int(pid), None)
-        return 0.0
+    if psutil is not None:
+        p = cpu_state.get(int(pid))
+        if p is None:
+            try:
+                p = psutil.Process(int(pid))
+                p.cpu_percent(None)
+                cpu_state[int(pid)] = p
+                return 0.0
+            except Exception:
+                pass
+        else:
+            try:
+                return float(p.cpu_percent(None))
+            except Exception:
+                cpu_state.pop(int(pid), None)
+    # Fallback if psutil is missing or fails for this pid.
+    return _cpu_percent_pid_win(int(pid), cpu_state)
 
 
 def _normalize_priority_level(level: str) -> str:
@@ -147,6 +220,155 @@ def _apply_process_priority(label: str, pid: int, level: str, enabled: bool) -> 
     else:
         print(f"[PRIO WARN] {label} pid={int(pid)} requested={level} ({msg})")
 
+
+def _parse_cpu_set(raw_value, logical_count: int):
+    """Parse CPU set from list[int] or string like '0-7,10,12-15'."""
+    if logical_count <= 0:
+        return []
+    out = set()
+    if isinstance(raw_value, (list, tuple)):
+        for x in raw_value:
+            try:
+                c = int(x)
+            except Exception:
+                continue
+            if 0 <= c < logical_count:
+                out.add(c)
+        return sorted(out)
+    if isinstance(raw_value, str):
+        txt = raw_value.strip()
+        if not txt:
+            return []
+        for part in txt.split(","):
+            p = part.strip()
+            if not p:
+                continue
+            if "-" in p:
+                lr = p.split("-", 1)
+                if len(lr) != 2:
+                    continue
+                try:
+                    lo = int(lr[0].strip())
+                    hi = int(lr[1].strip())
+                except Exception:
+                    continue
+                if hi < lo:
+                    lo, hi = hi, lo
+                lo = max(0, lo)
+                hi = min(logical_count - 1, hi)
+                for c in range(lo, hi + 1):
+                    out.add(c)
+            else:
+                try:
+                    c = int(p)
+                except Exception:
+                    continue
+                if 0 <= c < logical_count:
+                    out.add(c)
+        return sorted(out)
+    return []
+
+
+def _default_affinity_sets(logical_count: int):
+    """
+    Auto partition logical CPUs:
+      - DSP gets most cores
+      - MAIN/RX/LOG stay on a reserved tail set
+    """
+    if logical_count <= 1:
+        return {"main": [0], "rx": [0], "log": [0], "dsp": [0]}
+
+    if logical_count >= 24:
+        reserve = 8
+    elif logical_count >= 16:
+        reserve = 4
+    else:
+        reserve = 2
+    reserve = min(max(1, reserve), logical_count - 1)
+
+    dsp = list(range(0, logical_count - reserve))
+    tail = list(range(logical_count - reserve, logical_count))
+    if not dsp:
+        dsp = [0]
+    if not tail:
+        tail = [logical_count - 1]
+
+    rx = [tail[0]]
+    log = [tail[1]] if len(tail) >= 2 else [tail[0]]
+    main = tail
+    return {"main": main, "rx": rx, "log": log, "dsp": dsp}
+
+
+def _apply_process_affinity(label: str, pid: int, cpus, enabled: bool) -> None:
+    if not enabled:
+        return
+    if pid is None or int(pid) <= 0:
+        print(f"[AFF WARN] {label} skipped: invalid pid")
+        return
+    if not cpus:
+        print(f"[AFF WARN] {label} skipped: empty cpu set")
+        return
+    if psutil is not None:
+        try:
+            p = psutil.Process(int(pid))
+            p.cpu_affinity(list(cpus))
+            print(f"[AFF] {label} pid={int(pid)} cpus={list(cpus)} (psutil)")
+            return
+        except Exception as e:
+            print(f"[AFF WARN] {label} psutil failed ({e}), trying WinAPI fallback")
+
+    if os.name != "nt":
+        print(f"[AFF WARN] {label} skipped: affinity fallback only implemented on Windows")
+        return
+
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        PROCESS_SET_INFORMATION = 0x0200
+        PROCESS_QUERY_INFORMATION = 0x0400
+
+        mask = 0
+        for c in cpus:
+            cc = int(c)
+            if 0 <= cc < 64:
+                mask |= (1 << cc)
+        if mask == 0:
+            print(f"[AFF WARN] {label} skipped: cpu mask is zero")
+            return
+
+        kernel32 = ctypes.windll.kernel32
+        OpenProcess = kernel32.OpenProcess
+        OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+        OpenProcess.restype = wt.HANDLE
+
+        SetProcessAffinityMask = kernel32.SetProcessAffinityMask
+        SetProcessAffinityMask.argtypes = [wt.HANDLE, ctypes.c_size_t]
+        SetProcessAffinityMask.restype = wt.BOOL
+
+        CloseHandle = kernel32.CloseHandle
+        CloseHandle.argtypes = [wt.HANDLE]
+        CloseHandle.restype = wt.BOOL
+
+        h = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION, False, int(pid))
+        if not h:
+            print(f"[AFF WARN] {label} OpenProcess failed")
+            return
+        try:
+            ok = SetProcessAffinityMask(h, ctypes.c_size_t(mask))
+            if not ok:
+                print(f"[AFF WARN] {label} SetProcessAffinityMask failed")
+                return
+            print(f"[AFF] {label} pid={int(pid)} cpus={list(cpus)} (winapi)")
+        finally:
+            try:
+                CloseHandle(h)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[AFF WARN] {label} fallback failed ({e})")
+
+
 from Dsp_processing import selection_from_yaml_dict, build_windows
 #import dpnp as dp
 
@@ -161,6 +383,7 @@ with CFG_PATH.open("r", encoding="utf-8") as f:
 C = float(cfg["radar"]["c"])
 FS = float(cfg["radar"]["fs"])
 SLOPE = float(cfg["radar"]["slope"])
+FC = float(cfg["radar"]["fc"])
 
 # --- CONFIGURAZIONE ACQUISIZIONE ---
 SAMPLES = int(cfg["capture"]["samples"])
@@ -206,21 +429,64 @@ RANGEFFT_LINES_PER_PLOT = int(RX)
 DEBUG_STATS = bool(cfg["debug"]["debug_stats"])
 
 # --- WORKERS FFT ---
-FFT_WORKERS = int(cfg.get("dsp", {}).get("fft_workers", cfg.get("fft", {}).get("workers", 6)))
+LOGICAL_CPUS = int(os.cpu_count() or 1)
+_fft_workers_raw = cfg.get("dsp", {}).get("fft_workers", cfg.get("fft", {}).get("workers", None))
+if _fft_workers_raw is None:
+    FFT_WORKERS = max(1, min(16, LOGICAL_CPUS - 4))
+else:
+    FFT_WORKERS = int(_fft_workers_raw)
+FFT_WORKERS = max(1, min(FFT_WORKERS, LOGICAL_CPUS))
 
 # --- PROCESS PRIORITY ---
-prio_cfg = cfg.get("process", {}).get("priority", {}) or {}
+proc_cfg = cfg.get("process", {}) or {}
+prio_cfg = proc_cfg.get("priority", {}) or {}
 PRIO_ENABLED = bool(prio_cfg.get("enabled", False))
 PRIO_MAIN = str(prio_cfg.get("main", "normal"))
 PRIO_RX = str(prio_cfg.get("rx", "normal"))
 PRIO_LOG = str(prio_cfg.get("logger", prio_cfg.get("log", "normal")))
 PRIO_DSP = str(prio_cfg.get("dsp", "normal"))
 
+# --- PROCESS AFFINITY ---
+aff_cfg = proc_cfg.get("affinity", {}) or {}
+AFF_ENABLED = bool(aff_cfg.get("enabled", True))
+auto_sets = _default_affinity_sets(LOGICAL_CPUS)
+AFF_MAIN = _parse_cpu_set(aff_cfg.get("main", auto_sets["main"]), LOGICAL_CPUS)
+AFF_RX = _parse_cpu_set(aff_cfg.get("rx", auto_sets["rx"]), LOGICAL_CPUS)
+AFF_LOG = _parse_cpu_set(aff_cfg.get("logger", aff_cfg.get("log", auto_sets["log"])), LOGICAL_CPUS)
+AFF_DSP = _parse_cpu_set(aff_cfg.get("dsp", auto_sets["dsp"]), LOGICAL_CPUS)
+
 # --- SAR capture-only parameters ---
 sar_cfg = cfg.get("sar", {}) or {}
 # Backward-compat: if not present, reuse old 'logger.settling_delay_s'
 SETTLING_DELAY_S = float(sar_cfg.get("settling_delay_s", 0.4))
 FRAMES_PER_POSITION = int(sar_cfg.get("frames_per_position", 8))
+
+# Binary header prepended to each capture_pos*.bin:
+# [8-byte magic][4-byte little-endian header_len][header_json_utf8]
+CAPTURE_HEADER_MAGIC = b"RTPBIN1\x00"
+
+
+def _build_capture_file_header(pos_id: int) -> bytes:
+    header = {
+        "format": "rt_capture_v1",
+        "position": int(pos_id),
+        "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "radar": {
+            "c": float(C),
+            "fs": float(FS),
+            "slope": float(SLOPE),
+            "fc": float(FC),
+        },
+        "capture": {
+            "samples": int(SAMPLES),
+            "chirps": int(CHIRPS),
+            "rx": int(RX),
+            "tx": int(TX),
+            "x_frames": int(X_FRAMES),
+        },
+    }
+    payload = json.dumps(header, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    return CAPTURE_HEADER_MAGIC + struct.pack("<I", len(payload)) + payload
 
 
 # ----------------------------
@@ -591,6 +857,7 @@ def logger_worker(
     """
     Logger capture-only (reworked for performance):
       - produce 1 file .bin per click: capture_pos{pos_id}.bin
+      - prepend header (magic+json) con metadata posizione/data/radar/capture
       - scrive a blocchi (block_frames) per ridurre overhead I/O
       - salva SOLO frame validi (slot_ok==1) e SOLO quando cap_active==1
       - deve arrivare a frames_per_position frame completi per la posizione corrente.
@@ -648,6 +915,11 @@ def logger_worker(
         buf = bytearray(BYTES_PER_FRAME * int(block_frames))
         p = out_dir / f"capture_pos{pos_local}.bin"
         fbin = open(p, "wb", buffering=1024 * 1024)
+        header_blob = _build_capture_file_header(pos_local)
+        fbin.write(header_blob)
+        if log_bytes is not None:
+            with log_bytes.get_lock():
+                log_bytes.value += int(len(header_blob))
         with cap_saved.get_lock():
             cap_saved.value = 0
 
@@ -820,73 +1092,108 @@ def dsp_worker(
     if RX != 4:
         raise ValueError("DSP: conversione I/Q attuale assume RX=4 (packing IIIIQQQQ).")
 
-    def _release_slot_dsp(s: int) -> None:
-        """Clear DSP bit and free slot only when no other consumer needs it."""
-        to_free = False
+    def _release_slots_dsp(slots) -> None:
+        """Clear DSP bit for multiple slots; free only when no consumer still needs them."""
+        if not slots:
+            return
+        to_free = []
         try:
             with publish_lock:
-                m = int(slot_usemask[s]) & (~1)
-                slot_usemask[s] = m
-                if m == 0:
-                    slot_state[s] = 0
-                    to_free = True
+                for s in slots:
+                    si = int(s)
+                    m = int(slot_usemask[si]) & (~1)
+                    slot_usemask[si] = m
+                    if m == 0:
+                        slot_state[si] = 0
+                        to_free.append(si)
         except Exception:
-            to_free = False
-        if to_free:
+            return
+        for si in to_free:
             try:
-                free_slots.put_nowait(int(s))
+                free_slots.put_nowait(int(si))
             except Exception:
                 pass
+
     while True:
         if stop_evt.is_set():
             break
 
-        # Snapshot coherent dei frame READY destinati al DSP
-        ready = []
+        # Snapshot coherent dei frame READY destinati al DSP.
+        # Keep only newest X_FRAMES in single-pass (latest-wins) without full sort.
+        keep_heap = []
+        drop_slots = []
         with publish_lock:
-            for s in range(n_slots):
-                if int(slot_state[s]) != 1:
-                    continue
-                if (int(slot_usemask[s]) & 1) == 0:
-                    continue
-                ready.append((int(slot_pub_seq[s]), s, int(slot_ok[s])))
+            if X_FRAMES <= 1:
+                latest = None
+                for s in range(n_slots):
+                    if int(slot_state[s]) != 1:
+                        continue
+                    if (int(slot_usemask[s]) & 1) == 0:
+                        continue
+                    item = (int(slot_pub_seq[s]), int(s), int(slot_ok[s]))
+                    if latest is None or item[0] >= latest[0]:
+                        if latest is not None:
+                            drop_slots.append(int(latest[1]))
+                        latest = item
+                    else:
+                        drop_slots.append(int(s))
+                if latest is not None:
+                    keep_heap.append(latest)
+            else:
+                for s in range(n_slots):
+                    if int(slot_state[s]) != 1:
+                        continue
+                    if (int(slot_usemask[s]) & 1) == 0:
+                        continue
+                    seq = int(slot_pub_seq[s])
+                    item = (seq, int(s), int(slot_ok[s]))
+                    if len(keep_heap) < X_FRAMES:
+                        heapq.heappush(keep_heap, item)
+                        continue
+                    if seq > keep_heap[0][0]:
+                        old = heapq.heapreplace(keep_heap, item)
+                        drop_slots.append(int(old[1]))
+                    else:
+                        drop_slots.append(int(s))
 
-        if not ready:
+        if not keep_heap and not drop_slots:
             time.sleep(0.001)
             continue
 
-        # Ordina per seq crescente: i più vecchi prima
-        ready.sort(key=lambda t: t[0])
-
-        # Se backlog > X_FRAMES, scarta i più vecchi (latest-wins)
-        if len(ready) > X_FRAMES:
-            to_drop = ready[:-X_FRAMES]
-            ready = ready[-X_FRAMES:]
+        # Se backlog > X_FRAMES, scarta i più vecchi.
+        if drop_slots:
             if DEBUG_STATS and dsp_skip is not None:
                 with dsp_skip.get_lock():
-                    dsp_skip.value += len(to_drop)
-            for _, s, _ in to_drop:
-                _release_slot_dsp(int(s))
+                    dsp_skip.value += len(drop_slots)
+            _release_slots_dsp(drop_slots)
 
-        # Togli eventuali corrotti dal batch da processare
-        proc_slots = [s for _, s, ok in ready if ok == 1]
-        for _, s, ok in ready:
-            if ok != 1:
-                _release_slot_dsp(int(s))
+        # Keep heap is small (<= X_FRAMES): ordering cost is negligible.
+        keep_heap.sort(key=lambda t: t[0])
+
+        # Togli eventuali corrotti dal batch da processare.
+        proc_slots = []
+        bad_slots = []
+        for _, s, ok in keep_heap:
+            if ok == 1:
+                proc_slots.append(int(s))
+            else:
+                bad_slots.append(int(s))
+        if bad_slots:
+            _release_slots_dsp(bad_slots)
         if not proc_slots:
             continue
 
         n_proc = min(len(proc_slots), X_FRAMES)
+        slots_to_process = proc_slots[:n_proc]
 
         # --- 1. COPIA DA SHARED MEMORY (Veloce) ---
-        for k, s in enumerate(proc_slots[:n_proc]):
+        for k, s in enumerate(slots_to_process):
             base = s * BYTES_PER_FRAME
             # Copia diretta nel buffer pre-allocato
             i16_batch[k, :] = np.frombuffer(shm_view[base : base + BYTES_PER_FRAME], dtype=np.int16)
             
         # Restituisci subito gli slot al RX (Pipelining)
-        for s in proc_slots[:n_proc]:
-            _release_slot_dsp(int(s))
+        _release_slots_dsp(slots_to_process)
 
         # --- 2. CONVERSIONE INT16 -> COMPLEX64 (Zero Alloc) ---
         flat_i16 = i16_batch[:n_proc, :].reshape(-1)
@@ -1251,10 +1558,15 @@ def main():
     _apply_process_priority("RX", int(p_rx.pid or 0), PRIO_RX, PRIO_ENABLED)
     _apply_process_priority("LOG", int(p_log.pid or 0), PRIO_LOG, PRIO_ENABLED)
     _apply_process_priority("DSP", int(p_dsp.pid or 0), PRIO_DSP, PRIO_ENABLED)
+    _apply_process_affinity("MAIN", os.getpid(), AFF_MAIN, AFF_ENABLED)
+    _apply_process_affinity("RX", int(p_rx.pid or 0), AFF_RX, AFF_ENABLED)
+    _apply_process_affinity("LOG", int(p_log.pid or 0), AFF_LOG, AFF_ENABLED)
+    _apply_process_affinity("DSP", int(p_dsp.pid or 0), AFF_DSP, AFF_ENABLED)
 
     print(f"[LOGGER] dir: {out_dir}")
+    print(f"[FFT] workers={FFT_WORKERS} logical_cpus={LOGICAL_CPUS}")
     if DEBUG_STATS and psutil is None:
-        print("[STATS] CPU disabled: install 'psutil' in the active Python interpreter.")
+        print("[STATS] psutil not available: using Windows fallback for CPU%.")
 
     # =========================================================================
     # GUI SETUP (RESPONSIVE - CLEAN)

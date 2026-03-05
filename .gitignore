@@ -10,4 +10,4 @@ venv/
 
 # Logs & data
 logs/
-*.bin
+*.bintor

@@ -3,12 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import re
+import json
+import struct
 from typing import Callable
 
 import numpy as np
 import yaml
 
 _CAPTURE_FILE_RE = re.compile(r"^capture_pos(-?\d+)\.bin$")
+_CAPTURE_HEADER_MAGIC = b"RTPBIN1\x00"
+_CAPTURE_HEADER_PREFIX_LEN = len(_CAPTURE_HEADER_MAGIC) + 4
+_CAPTURE_HEADER_MAX_LEN = 256 * 1024
 
 
 @dataclass(frozen=True)
@@ -193,17 +198,20 @@ class SARReader:
             raise FileNotFoundError(f"File non trovato: {path}")
 
         file_size = path.stat().st_size
+        data_offset = self._detect_capture_data_offset(path, file_size)
+        payload_size = int(file_size - data_offset)
         bytes_per_frame = self.config.bytes_per_frame
-        if file_size % bytes_per_frame != 0:
+        if payload_size % bytes_per_frame != 0:
             raise ValueError(
-                f"{path.name}: file_size={file_size} non multiplo di bytes_per_frame={bytes_per_frame}"
+                f"{path.name}: payload_size={payload_size} (offset={data_offset}) "
+                f"non multiplo di bytes_per_frame={bytes_per_frame}"
             )
 
-        n_frames = file_size // bytes_per_frame
+        n_frames = payload_size // bytes_per_frame
         if n_frames <= 0:
-            raise ValueError(f"{path.name}: file vuoto")
+            raise ValueError(f"{path.name}: nessun frame nel payload (offset={data_offset})")
 
-        raw = np.fromfile(path, dtype=np.int16)
+        raw = np.fromfile(path, dtype=np.int16, offset=int(data_offset))
         expected_i16 = n_frames * self.config.i16_per_frame
         if raw.size != expected_i16:
             raise ValueError(
@@ -212,6 +220,97 @@ class SARReader:
 
         raw_frames = raw.reshape(n_frames, self.config.i16_per_frame)
         return raw_frames, int(n_frames)
+
+    def _detect_capture_data_offset(self, path: Path, file_size: int) -> int:
+        if file_size < _CAPTURE_HEADER_PREFIX_LEN:
+            raise ValueError(
+                f"{path.name}: file troppo piccolo per header {_CAPTURE_HEADER_MAGIC!r}"
+            )
+
+        with path.open("rb") as f:
+            prefix = f.read(_CAPTURE_HEADER_PREFIX_LEN)
+
+        if len(prefix) != _CAPTURE_HEADER_PREFIX_LEN:
+            raise ValueError(
+                f"{path.name}: prefisso header incompleto (attesi {_CAPTURE_HEADER_PREFIX_LEN} byte)"
+            )
+        if prefix[: len(_CAPTURE_HEADER_MAGIC)] != _CAPTURE_HEADER_MAGIC:
+            raise ValueError(
+                f"{path.name}: magic header mancante o non valida (attesa {_CAPTURE_HEADER_MAGIC!r})"
+            )
+
+        header_len = int(struct.unpack("<I", prefix[len(_CAPTURE_HEADER_MAGIC) :])[0])
+        if header_len <= 0 or header_len > _CAPTURE_HEADER_MAX_LEN:
+            raise ValueError(
+                f"{path.name}: header_len non valido ({header_len}), magic riconosciuta"
+            )
+
+        data_offset = _CAPTURE_HEADER_PREFIX_LEN + header_len
+        if data_offset >= file_size:
+            raise ValueError(
+                f"{path.name}: header invalido (offset={data_offset}, file_size={file_size})"
+            )
+        return int(data_offset)
+
+    def _extract_position_from_header(self, path: Path) -> int:
+        meta = self._read_capture_header_metadata(path)
+        if "position" not in meta:
+            raise ValueError(f"{path.name}: header senza campo obbligatorio 'position'")
+        try:
+            return int(meta["position"])
+        except Exception as e:
+            raise ValueError(f"{path.name}: campo header 'position' non valido ({meta['position']!r})") from e
+
+    def _read_capture_header_metadata(self, path: Path) -> dict:
+        file_size = path.stat().st_size
+        if file_size < _CAPTURE_HEADER_PREFIX_LEN:
+            raise ValueError(
+                f"{path.name}: file troppo piccolo per header {_CAPTURE_HEADER_MAGIC!r}"
+            )
+
+        with path.open("rb") as f:
+            prefix = f.read(_CAPTURE_HEADER_PREFIX_LEN)
+            if len(prefix) != _CAPTURE_HEADER_PREFIX_LEN:
+                raise ValueError(
+                    f"{path.name}: prefisso header incompleto (attesi {_CAPTURE_HEADER_PREFIX_LEN} byte)"
+                )
+            if prefix[: len(_CAPTURE_HEADER_MAGIC)] != _CAPTURE_HEADER_MAGIC:
+                raise ValueError(
+                    f"{path.name}: magic header mancante o non valida (attesa {_CAPTURE_HEADER_MAGIC!r})"
+                )
+
+            header_len = int(struct.unpack("<I", prefix[len(_CAPTURE_HEADER_MAGIC) :])[0])
+            if header_len <= 0 or header_len > _CAPTURE_HEADER_MAX_LEN:
+                raise ValueError(
+                    f"{path.name}: header_len non valido ({header_len}), magic riconosciuta"
+                )
+
+            data_offset = _CAPTURE_HEADER_PREFIX_LEN + header_len
+            if data_offset >= file_size:
+                raise ValueError(
+                    f"{path.name}: header invalido (offset={data_offset}, file_size={file_size})"
+                )
+
+            payload = f.read(header_len)
+            if len(payload) != header_len:
+                raise ValueError(
+                    f"{path.name}: header tronco (attesi {header_len} byte, letti {len(payload)})"
+                )
+
+        try:
+            meta = json.loads(payload.decode("utf-8"))
+        except Exception as e:
+            raise ValueError(f"{path.name}: header JSON non valido") from e
+        if not isinstance(meta, dict):
+            raise ValueError(f"{path.name}: header JSON deve essere un oggetto")
+        fmt = str(meta.get("format", ""))
+        if fmt != "rt_capture_v1":
+            raise ValueError(
+                f"{path.name}: header format non supportato ({fmt!r}), atteso 'rt_capture_v1'"
+            )
+        if "position" not in meta:
+            raise ValueError(f"{path.name}: header senza campo obbligatorio 'position'")
+        return meta
 
     def _raw_to_iq(self, raw_frames: np.ndarray, n_frames: int) -> np.ndarray:
         cfg = self.config
@@ -247,12 +346,26 @@ class SARReader:
         pos_files: list[tuple[int, Path]] = []
         for p in source_dir.glob("*.bin"):
             match = _CAPTURE_FILE_RE.match(p.name)
-            if match is None:
+            pos_from_name = int(match.group(1)) if match is not None else None
+            try:
+                pos_from_header = self._extract_position_from_header(p)
+            except ValueError:
+                # Skip files not in current capture format.
                 continue
-            pos_files.append((int(match.group(1)), p))
+
+            if pos_from_name is not None and pos_from_header is not None and pos_from_name != pos_from_header:
+                raise ValueError(
+                    f"{p.name}: posizione incoerente (nome={pos_from_name}, header={pos_from_header})"
+                )
+
+            pos = pos_from_header
+            pos_files.append((int(pos), p))
 
         if not pos_files:
-            raise FileNotFoundError(f"Nessun file capture_pos*.bin trovato in {source_dir}")
+            raise FileNotFoundError(
+                f"Nessun file di capture valido trovato in {source_dir} "
+                f"(richiesto header {_CAPTURE_HEADER_MAGIC!r} con format='rt_capture_v1')"
+            )
 
         pos_files.sort(key=lambda t: t[0])
         pos_ids = [pos for pos, _ in pos_files]
@@ -284,17 +397,17 @@ class SARReader:
         if not input_dir.exists():
             raise FileNotFoundError(f"Cartella input non trovata: {input_dir}")
 
-        direct = list(input_dir.glob("capture_pos*.bin"))
+        direct = list(input_dir.glob("*.bin"))
         if direct:
             return input_dir
 
         run_dirs = sorted([p for p in input_dir.glob("run_*") if p.is_dir()], key=lambda p: p.name)
         for run_dir in reversed(run_dirs):
-            if any(run_dir.glob("capture_pos*.bin")):
+            if any(run_dir.glob("*.bin")):
                 return run_dir
 
         raise FileNotFoundError(
-            f"Nessun capture_pos*.bin trovato in {input_dir} (neanche dentro run_*)"
+            f"Nessun file .bin trovato in {input_dir} (neanche dentro run_*)"
         )
 
 

@@ -12,9 +12,9 @@ capture:
   x_frames: 1
 
 fft:
-  nfft_range: 128
+  nfft_range: 512
   nfft_angle: 256
-  workers: 4    
+  workers: 8
 
 display:
   vmax: 90
@@ -39,11 +39,17 @@ rx:
 
 process:
   priority:
-    enabled: true
+    enabled: false
     main: above_normal
     rx: high
     logger: below_normal
     dsp: high
+  affinity:
+    enabled: false
+    main: "24-31"
+    rx: "24"
+    logger: "25"
+    dsp: "0-23"
 
 debug:
   debug_stats: true
