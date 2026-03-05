@@ -8,3 +8,6 @@ scan:
   x_end: 8
   x_step: 1
   x_pitch_m: 0.01 # 10mm pitch 
+
+bp:
+  phase_sign: -1 # usa +1 se vuoi invertire il verso di fase
