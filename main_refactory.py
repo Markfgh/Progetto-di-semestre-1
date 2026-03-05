@@ -1307,6 +1307,9 @@ def main():
 
     # 3) Tags (NO container/resize tags)
     TAG_MAIN_WINDOW = "primary_window"
+    TAG_MAIN_TABBAR = "main_tabbar"
+    TAB_REALTIME_TAG = "tab_tempo_reale"
+    TAB_PROCESSED_TAG = "tab_dati_processati"
     TAG_SIDEBAR     = "sidebar_col"
     TAG_CBAR_COL    = "cbar_col"
     TAG_RANGEFFT_COL = "rangefft_col"
@@ -1540,8 +1543,11 @@ def main():
 
     # 6) Build UI (ONLY TABLE LAYOUT)
     with dpg.window(tag=TAG_MAIN_WINDOW):
+        with dpg.tab_bar(tag=TAG_MAIN_TABBAR):
+            dpg.add_tab(label="Tempo Reale", tag=TAB_REALTIME_TAG)
+            dpg.add_tab(label="Dati Processati", tag=TAB_PROCESSED_TAG)
 
-        with dpg.table(header_row=False, resizable=True, policy=dpg.mvTable_SizingFixedFit):
+        with dpg.table(header_row=False, resizable=True, policy=dpg.mvTable_SizingFixedFit, parent=TAB_REALTIME_TAG):
 
             # Colonne: sidebar (fissa), plot (stretch), colorbar (fissa), range FFT (fissa)
             dpg.add_table_column(init_width_or_weight=340, width_fixed=True, no_resize=True)                      # sidebar
@@ -1695,6 +1701,9 @@ def main():
                             callback=_apply_params,
                             on_enter=False,
                         )
+
+        with dpg.group(parent=TAB_PROCESSED_TAG):
+            dpg.add_text("")
 
     _update_fft_scale_input_labels(fft_mode_db)
     # Applicazione parametri DOPO creazione items
