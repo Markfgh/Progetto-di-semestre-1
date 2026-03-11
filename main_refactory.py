@@ -9,7 +9,6 @@ from multiprocessing.sharedctypes import RawArray, Synchronized
 import yaml
 import numpy as np
 import dearpygui.dearpygui as dpg
-import scipy.fft as fft
 import os
 import json
 import struct
@@ -368,8 +367,8 @@ def _apply_process_affinity(label: str, pid: int, cpus, enabled: bool) -> None:
         print(f"[AFF WARN] {label} fallback failed ({e})")
 
 
-from Dsp_processing import selection_from_yaml_dict, build_windows
 from offline_processing import OfflineBPRuntime
+from realtime_dsp import RealtimeDSPConfig, dsp_worker
 #import dpnp as dp
 
 
@@ -436,6 +435,24 @@ if _fft_workers_raw is None:
 else:
     FFT_WORKERS = int(_fft_workers_raw)
 FFT_WORKERS = max(1, min(FFT_WORKERS, LOGICAL_CPUS))
+REALTIME_DSP_CFG = RealtimeDSPConfig(
+    c=float(C),
+    fs=float(FS),
+    slope=float(SLOPE),
+    samples=int(SAMPLES),
+    chirps=int(CHIRPS),
+    rx=int(RX),
+    tx=int(TX),
+    x_frames=int(X_FRAMES),
+    bytes_per_frame=int(BYTES_PER_FRAME),
+    nfft_range=int(NFFT_RANGE),
+    nfft_angle=int(NFFT_ANGLE),
+    range_max_display=float(RANGE_MAX_DISPLAY),
+    range_profile_count=int(RANGE_PROFILE_COUNT),
+    virtual_ant=int(VIRTUAL_ANT),
+    fft_workers=int(FFT_WORKERS),
+    debug_stats=bool(DEBUG_STATS),
+)
 
 # --- PROCESS PRIORITY ---
 proc_cfg = cfg.get("process", {}) or {}
@@ -1046,373 +1063,6 @@ def logger_worker(
             time.sleep(0.002)
 
 
-# ----------------------------
-# WORKER DSP (latest-wins)
-# ----------------------------
-def dsp_worker(
-    free_slots: Queue,
-    dsp_ready_queue: Queue,
-    shm_frames,
-    slot_state,
-    slot_ok,
-    slot_usemask,
-    slot_pub_seq,
-    publish_lock,
-    gui_dbuf,
-    gui_prof_dbuf,
-    gui_h: int,
-    gui_w: int,
-    gui_latest_idx: Synchronized,
-    gui_latest_seq: Synchronized,
-    gui_lock,
-    dsp_skip: Synchronized,
-    dsp_ms_avg: Synchronized,
-    dsp_ms_p95: Synchronized,
-    norm_to_peak: Synchronized,
-    stat_raw_min_db: Synchronized,
-    stat_raw_max_db: Synchronized,
-    stat_norm_min_db: Synchronized,
-    stat_norm_max_db: Synchronized,
-    stop_evt,
-):
-    # --- SETUP STATIC ---
-    selection = selection_from_yaml_dict(cfg)
-    window_range, window_angle = build_windows(selection, samples=SAMPLES, virtual_ant=VIRTUAL_ANT)
-
-    # Costanti
-    dr = C * FS / (2.0 * SLOPE * NFFT_RANGE)
-    max_bin = int(np.floor(RANGE_MAX_DISPLAY / dr))
-    max_bin = max(1, min(max_bin, NFFT_RANGE // 2))
-
-    # Parametri memoria
-    i16_per_frame = BYTES_PER_FRAME // 2
-    total_samples_needed = X_FRAMES * CHIRPS * SAMPLES * RX
-
-    # --- PRE-ALLOCAZIONE MEMORIA (Fuori dal loop!) ---
-    i16_batch = np.zeros((X_FRAMES, i16_per_frame), dtype=np.int16)
-    complex_data = np.zeros(total_samples_needed, dtype=np.complex64)
-
-    shm_view = memoryview(shm_frames).cast("B")
-    n_slots = len(slot_state)
-    heatmap_ema = None
-    dsp_ms_samples = []
-    dsp_stat_last_flush = time.perf_counter()
-    dsp_ms_acc_sum = 0.0
-    dsp_ms_acc_count = 0
-    slot_i16_views = [
-        np.frombuffer(
-            shm_view[s * BYTES_PER_FRAME : (s + 1) * BYTES_PER_FRAME],
-            dtype=np.int16,
-        )
-        for s in range(n_slots)
-    ]
-
-    if RX != 4:
-        raise ValueError("DSP: conversione I/Q attuale assume RX=4 (packing IIIIQQQQ).")
-
-    def _release_slots_dsp(slots) -> None:
-        """Clear DSP bit for multiple slots; free only when no consumer still needs them."""
-        if not slots:
-            return
-        to_free = []
-        try:
-            with publish_lock:
-                for s in slots:
-                    si = int(s)
-                    m = int(slot_usemask[si]) & (~1)
-                    slot_usemask[si] = m
-                    if m == 0:
-                        slot_state[si] = 0
-                        to_free.append(si)
-        except Exception:
-            return
-        for si in to_free:
-            try:
-                free_slots.put_nowait(int(si))
-            except Exception:
-                pass
-
-    while True:
-        if stop_evt.is_set():
-            break
-
-        drained = []
-        try:
-            first_item = dsp_ready_queue.get(timeout=0.001)
-        except pyqueue.Empty:
-            continue
-        drained.append(first_item)
-        while True:
-            try:
-                drained.append(dsp_ready_queue.get_nowait())
-            except pyqueue.Empty:
-                break
-
-        ready = []
-        with publish_lock:
-            for item in drained:
-                try:
-                    seq = int(item[0])
-                    s = int(item[1])
-                except Exception:
-                    continue
-                if s < 0 or s >= n_slots:
-                    continue
-                if int(slot_state[s]) != 1:
-                    continue
-                if int(slot_pub_seq[s]) != seq:
-                    continue
-                if (int(slot_usemask[s]) & 1) == 0:
-                    continue
-                ready.append((seq, s, int(slot_ok[s])))
-
-        if not ready:
-            continue
-
-        # Queue is FIFO from RX; keep only latest X_FRAMES items.
-        drop_slots = []
-        if len(ready) > X_FRAMES:
-            drop_slots = [int(s) for _, s, _ in ready[:-X_FRAMES]]
-            ready = ready[-X_FRAMES:]
-
-        if drop_slots:
-            if DEBUG_STATS and dsp_skip is not None:
-                with dsp_skip.get_lock():
-                    dsp_skip.value += len(drop_slots)
-            _release_slots_dsp(drop_slots)
-
-        # Togli eventuali corrotti dal batch da processare.
-        proc_slots = []
-        bad_slots = []
-        for _, s, ok in ready:
-            if ok == 1:
-                proc_slots.append(int(s))
-            else:
-                bad_slots.append(int(s))
-        if bad_slots:
-            _release_slots_dsp(bad_slots)
-        if not proc_slots:
-            continue
-
-        n_proc = min(len(proc_slots), X_FRAMES)
-        slots_to_process = proc_slots[:n_proc]
-
-        # --- 1. COPIA DA SHARED MEMORY (Veloce) ---
-        for k, s in enumerate(slots_to_process):
-            i16_batch[k, :] = slot_i16_views[int(s)]
-            
-        # Restituisci subito gli slot al RX (Pipelining)
-        _release_slots_dsp(slots_to_process)
-
-        # --- 2. CONVERSIONE INT16 -> COMPLEX64 (Zero Alloc) ---
-        flat_i16 = i16_batch[:n_proc, :].reshape(-1)
-        n_blocks = flat_i16.size // 8
-        
-        # View strutturata (n, 8)
-        block_view = flat_i16[:n_blocks*8].reshape(n_blocks, 8)
-        
-        # Copia nei canali Real e Imag del buffer complesso PRE-ALLOCATO
-        # Nota: usiamo [:] per forzare la copia in-place senza riallocare
-        n_cplx = n_proc * CHIRPS * SAMPLES * RX
-        complex_view = complex_data[:n_cplx]
-        complex_view.real[:] = block_view[:, :4].reshape(-1)  # type: ignore
-        complex_view.imag[:] = block_view[:, 4:].reshape(-1)  # type: ignore
-        # --- 3. PROCESSING ---
-        t0_proc = time.perf_counter()
-        try:
-            with norm_to_peak.get_lock():
-                normalize_to_peak = bool(norm_to_peak.value)
-        except Exception:
-            normalize_to_peak = True
-        heatmap_ema = process_buffer(
-            complex_view, 
-            n_proc,
-            window_range, 
-            window_angle, 
-            heatmap_ema, 
-            0.2, # alpha
-            gui_dbuf,
-            gui_prof_dbuf,
-            gui_h,
-            gui_w,
-            gui_latest_idx,
-            gui_latest_seq,
-            gui_lock,
-            max_bin,
-            normalize_to_peak,
-            stat_raw_min_db,
-            stat_raw_max_db,
-            stat_norm_min_db,
-            stat_norm_max_db,
-        )
-        t1_proc = time.perf_counter()
-        if n_proc > 0 and DEBUG_STATS:
-            ms_per_frame = ((t1_proc - t0_proc) * 1000.0) / float(n_proc)
-            dsp_ms_acc_sum += ms_per_frame * float(n_proc)
-            dsp_ms_acc_count += int(n_proc)
-            dsp_ms_samples.extend([ms_per_frame] * int(n_proc))
-            if len(dsp_ms_samples) > 4096:
-                dsp_ms_samples = dsp_ms_samples[-4096:]
-            t_stats_now = time.perf_counter()
-            if (t_stats_now - dsp_stat_last_flush) >= 1.0 and dsp_ms_acc_count > 0:
-                avg_now = float(dsp_ms_acc_sum / float(dsp_ms_acc_count))
-                p95_now = avg_now
-                if dsp_ms_samples:
-                    p95_now = float(np.percentile(dsp_ms_samples, 95))
-                with dsp_ms_avg.get_lock():
-                    dsp_ms_avg.value = avg_now
-                with dsp_ms_p95.get_lock():
-                    dsp_ms_p95.value = p95_now
-                dsp_stat_last_flush = t_stats_now
-                dsp_ms_acc_sum = 0.0
-                dsp_ms_acc_count = 0
-                dsp_ms_samples.clear()
-
-def process_buffer(
-    raw_buffer,
-    n_frames: int,
-    w_range,
-    w_angle,
-    heatmap_ema,
-    alpha,
-    gui_dbuf,
-    gui_prof_dbuf,
-    gui_h,
-    gui_w,
-    gui_latest_idx,
-    gui_latest_seq,
-    gui_lock,
-    max_bin,
-    normalize_to_peak: bool,
-    stat_raw_min_db: Synchronized,
-    stat_raw_max_db: Synchronized,
-    stat_norm_min_db: Synchronized,
-    stat_norm_max_db: Synchronized,
-):
-
-    try:
-        # A. Reshape SENZA transpose (evita copia grossa)
-
-        # Shape: (F, chirpsPerTx, TX, SAMPLES, RX)  -> samples Ã¨ axis=3
-
-        data = raw_buffer.reshape(n_frames, CHIRPS // TX, TX, SAMPLES, RX)
-
-
-        # B. DSP IN-PLACE
-
-        # Clutter removal: sottrai la media lungo SAMPLES (axis=3)
-
-        data -= data.mean(axis=2, keepdims=True, dtype=np.complex64)
-
-        # Finestra Range: w_range deve essere broadcastabile su axis=3 (shape: 1,1,1,SAMPLES,1)
-
-        data *= w_range
-
-
-        # C. RANGE FFT (samples axis=3)
-
-        range_fft = fft.fft(data, n=NFFT_RANGE, axis=3, workers=FFT_WORKERS, overwrite_x=True)
-
-
-        # Preparazione Virtual Array:
-        # limitiamo i range bin PRIMA della copia contigua per ridurre traffico memoria.
-        # range_fft: (F, C, TX, R, RX)
-        range_fft = range_fft[:, :, :, :max_bin, :]
-        va = range_fft.transpose(0, 1, 3, 2, 4)   # -> (F, C, R, TX, RX) view
-        va = np.ascontiguousarray(va)             # copia solo max_bin, non tutta NFFT_RANGE
-        virtual_array = va.reshape(n_frames, CHIRPS // TX, max_bin, VIRTUAL_ANT)
-
-        # Profili range FFT per antenna virtuale: modulo^2 medio su frame/chirp, poi dB.
-        prof_re = virtual_array.real
-        prof_im = virtual_array.imag
-        profiles_pow = (prof_re * prof_re + prof_im * prof_im).mean(axis=(0, 1))
-        profiles_db_va = (10.0 * np.log10(profiles_pow + 1e-12)).transpose(1, 0)
-        profiles_out = np.full((RANGE_PROFILE_COUNT, max_bin), -120.0, dtype=np.float32)
-        copy_rows = min(int(RANGE_PROFILE_COUNT), int(profiles_db_va.shape[0]))
-        if copy_rows > 0:
-            profiles_out[:copy_rows, :] = profiles_db_va[:copy_rows, :].astype(np.float32, copy=False)
-
-        # Finestra Angolo IN-PLACE (w_angle: (1,1,1,VIRTUAL_ANT))
-        virtual_array *= w_angle
-
-        # D. ANGLE FFT
-        angle_fft = fft.fft(virtual_array, n=NFFT_ANGLE, axis=-1, workers=FFT_WORKERS, overwrite_x=True)
-        
-        # Modulo quadro e media.
-        # Poi applichiamo fftshift sulla heatmap 2D (molto piu piccola) invece che sul tensor 4D.
-        re = angle_fft.real
-        im = angle_fft.imag
-        heatmap = (re * re + im * im).mean(axis=(0, 1))
-        heatmap = np.fft.fftshift(heatmap, axes=-1)
-
-        # E. EMA e Logaritmica
-        if heatmap_ema is None:
-            heatmap_ema = heatmap
-        else:
-            # EMA ottimizzata
-            heatmap_ema *= (1.0 - alpha)
-            heatmap_ema += (alpha * heatmap)
-        
-        # Conversione dB (crea copia, inevitabile ma veloce su array piccolo)
-        heatmap_db = 10 * np.log10(heatmap_ema + 1e-12)
-        
-        # Normalizzazione e taglio
-        view_db = heatmap_db
-        if view_db.size > 0:
-            raw_max = float(np.max(view_db))
-            if DEBUG_STATS:
-                raw_min = float(np.min(view_db))
-                norm_max = 0.0
-                norm_min = float(raw_min - raw_max)
-                try:
-                    with stat_raw_min_db.get_lock():
-                        stat_raw_min_db.value = raw_min
-                    with stat_raw_max_db.get_lock():
-                        stat_raw_max_db.value = raw_max
-                    with stat_norm_min_db.get_lock():
-                        stat_norm_min_db.value = norm_min
-                    with stat_norm_max_db.get_lock():
-                        stat_norm_max_db.value = norm_max
-                except Exception:
-                    pass
-            if normalize_to_peak:
-                view_db -= raw_max
-
-        # publish verso GUI su double-buffer shared (latest-wins, lock breve)
-        with gui_lock:
-            prev_idx = int(gui_latest_idx.value)
-            next_idx = 1 if prev_idx == 0 else 0
-            base = next_idx * int(gui_h) * int(gui_w)
-            dst = np.frombuffer(gui_dbuf, dtype=np.float32, count=int(gui_h) * int(gui_w), offset=base * 4)
-            dst.fill(-120.0)
-            flat = view_db.astype(np.float32, copy=False).reshape(-1)
-            n = min(dst.size, flat.size)
-            if n > 0:
-                dst[:n] = flat[:n]
-
-            prof_base = next_idx * int(RANGE_PROFILE_COUNT) * int(gui_h)
-            dst_prof = np.frombuffer(
-                gui_prof_dbuf,
-                dtype=np.float32,
-                count=int(RANGE_PROFILE_COUNT) * int(gui_h),
-                offset=prof_base * 4,
-            )
-            dst_prof.fill(-120.0)
-            prof_flat = profiles_out.reshape(-1)
-            n_prof = min(dst_prof.size, prof_flat.size)
-            if n_prof > 0:
-                dst_prof[:n_prof] = prof_flat[:n_prof]
-            gui_latest_idx.value = next_idx
-            gui_latest_seq.value = int(gui_latest_seq.value) + 1
-        return heatmap_ema
-
-    except Exception as e:
-        print(f"[DSP ERR] {e}")
-        return heatmap_ema
-
-
-
-
 def main():
     # --- SETUP CODE E PROCESSI ---
     free_slots = Queue()
@@ -1565,6 +1215,8 @@ def main():
             stat_norm_min_db,
             stat_norm_max_db,
             stop_evt,
+            cfg,
+            REALTIME_DSP_CFG,
         ),
     )
 

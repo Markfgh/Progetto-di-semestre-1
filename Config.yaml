@@ -31,7 +31,21 @@ display:
 dsp:
   window_range: blackman
   window_angle: hanning
-
+  mean_before_range_fft:
+    enabled: true
+    axes: [loop] # Options: frame, loop, tx, sample, rx
+  mean_after_range_fft:
+    enabled: false
+    axes: [loop] # Options: frame, loop, tx, range_bin, rx (clutter removal = range_bin)
+  background_subtraction:
+    enabled: true
+    mode: ema # Options: ema, running_mean, window_mean, frozen
+    alpha: 0.02
+    init_frames: 20
+    window_frames: 20
+    clamp_positive_only: false
+  loop_average_after_background:
+    enabled: false
 rx:
   stall_timeout_s: 2.0
   seq_reorder_max_back: 32
