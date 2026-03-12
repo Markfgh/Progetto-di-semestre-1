@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import queue as pyqueue
 import time
 from multiprocessing.sharedctypes import Synchronized
@@ -10,13 +10,19 @@ import numpy as np
 import scipy.fft as fft
 
 # Realtime DSP only: window setup, batch processing, and worker loop.
-WindowType = Literal["rectangular", "hanning", "hamming", "blackman"]
-_VALID_WINDOWS = {"rectangular", "hanning", "hamming", "blackman"}
+WindowType = Literal["none", "rectangular", "hanning", "hamming", "blackman"]
+_VALID_WINDOWS = {"none", "rectangular", "hanning", "hamming", "blackman"}
 
 MeanAxis = Literal["frame", "loop", "tx", "sample", "range_bin", "rx"]
 BackgroundMode = Literal["ema", "running_mean", "window_mean", "frozen"]
+AngleProcessingMode = Literal["fft", "bartlett", "mvdr"]
+HeatmapSpatialFilterMode = Literal["none", "gaussian_3x3"]
+SlowTimeMode = Literal["none", "mean_subtraction", "highpass", "doppler_fft"]
 _VALID_MEAN_AXES = {"frame", "loop", "tx", "sample", "range_bin", "rx"}
 _VALID_BACKGROUND_MODES = {"ema", "running_mean", "window_mean", "frozen"}
+_VALID_ANGLE_PROCESSING_MODES = {"fft", "bartlett", "mvdr"}
+_VALID_HEATMAP_SPATIAL_FILTER_MODES = {"none", "gaussian_3x3"}
+_VALID_SLOW_TIME_MODES = {"none", "mean_subtraction", "highpass", "doppler_fft"}
 
 _MEAN_AXIS_INDEX = {
     "frame": 0,
@@ -57,12 +63,42 @@ class BackgroundSubtractionState:
     init_count: int = 0
     running_sum: np.ndarray | None = None
     running_count: int = 0
-    window_queue: list[np.ndarray] = field(default_factory=list)
+    window_ring: np.ndarray | None = None
+    window_sum: np.ndarray | None = None
+    window_count: int = 0
+    window_head: int = 0
 
 
 @dataclass(frozen=True)
 class LoopAverageConfig:
     enabled: bool = False
+
+
+@dataclass(frozen=True)
+class AngleProcessingConfig:
+    mode: AngleProcessingMode = "fft"
+    mvdr_diagonal_loading: float = 0.01
+
+
+@dataclass(frozen=True)
+class HeatmapEMAConfig:
+    enabled: bool = True
+    alpha: float = 0.2
+
+
+@dataclass(frozen=True)
+class HeatmapSpatialFilterConfig:
+    enabled: bool = False
+    mode: HeatmapSpatialFilterMode = "gaussian_3x3"
+
+
+@dataclass(frozen=True)
+class SlowTimeConfig:
+    enabled: bool = False
+    mode: SlowTimeMode = "none"
+    highpass_beta: float = 0.9
+    doppler_fft_shift: bool = True
+    doppler_zero_notch: bool = False
 
 
 @dataclass(frozen=True)
@@ -88,6 +124,8 @@ class RealtimeDSPConfig:
 # Return a 1D FFT window of the requested type as float32.
 def _get_window_1d(win_type: str, size: int) -> np.ndarray:
     wt = win_type.lower()
+    if wt == "none":
+        return np.ones(size, dtype=np.float32)
     if wt == "rectangular":
         return np.ones(size, dtype=np.float32)
     if wt == "hanning":
@@ -96,7 +134,7 @@ def _get_window_1d(win_type: str, size: int) -> np.ndarray:
         return np.hamming(size).astype(np.float32, copy=False)
     if wt == "blackman":
         return np.blackman(size).astype(np.float32, copy=False)
-    raise ValueError(f"Unknown window type: {win_type!r}. Use: rectangular|hanning|hamming|blackman")
+    raise ValueError(f"Unknown window type: {win_type!r}. Use: none|rectangular|hanning|hamming|blackman")
 
 
 # Build range and angle windows with shapes ready for NumPy broadcasting
@@ -198,11 +236,216 @@ def loop_average_after_background_from_yaml_dict(cfg: dict[str, Any]) -> LoopAve
     return LoopAverageConfig(enabled=bool(block.get("enabled", False)))
 
 
+def angle_processing_from_yaml_dict(cfg: dict[str, Any]) -> AngleProcessingConfig:
+    dsp = cfg.get("dsp", {}) or {}
+    block = dsp.get("angle_processing", {}) or {}
+    mode_raw = str(block.get("mode", "fft")).strip().lower()
+    mode: AngleProcessingMode = "fft"
+    if mode_raw in _VALID_ANGLE_PROCESSING_MODES:
+        if mode_raw == "bartlett":
+            mode = "bartlett"
+        elif mode_raw == "mvdr":
+            mode = "mvdr"
+    try:
+        mvdr_diagonal_loading = float(block.get("mvdr_diagonal_loading", 0.01))
+    except (TypeError, ValueError):
+        mvdr_diagonal_loading = 0.01
+    return AngleProcessingConfig(
+        mode=mode,
+        mvdr_diagonal_loading=max(0.0, mvdr_diagonal_loading),
+    )
+
+
+def heatmap_ema_from_yaml_dict(cfg: dict[str, Any]) -> HeatmapEMAConfig:
+    dsp = cfg.get("dsp", {}) or {}
+    block = dsp.get("heatmap_ema", {}) or {}
+    try:
+        alpha = float(block.get("alpha", 0.2))
+    except (TypeError, ValueError):
+        alpha = 0.2
+    return HeatmapEMAConfig(
+        enabled=bool(block.get("enabled", True)),
+        alpha=min(max(alpha, 0.0), 1.0),
+    )
+
+
+def heatmap_spatial_filter_from_yaml_dict(cfg: dict[str, Any]) -> HeatmapSpatialFilterConfig:
+    dsp = cfg.get("dsp", {}) or {}
+    block = dsp.get("heatmap_spatial_filter", {}) or {}
+    mode_raw = str(block.get("mode", "gaussian_3x3")).strip().lower()
+    mode: HeatmapSpatialFilterMode = "gaussian_3x3"
+    if mode_raw in _VALID_HEATMAP_SPATIAL_FILTER_MODES and mode_raw == "none":
+        mode = "none"
+    return HeatmapSpatialFilterConfig(
+        enabled=bool(block.get("enabled", False)),
+        mode=mode,
+    )
+
+
+def slow_time_from_yaml_dict(cfg: dict[str, Any]) -> SlowTimeConfig:
+    dsp = cfg.get("dsp", {}) or {}
+    block = dsp.get("slow_time", {}) or {}
+    mode_raw = str(block.get("mode", "none")).strip().lower()
+    mode: SlowTimeMode = "none"
+    if mode_raw in _VALID_SLOW_TIME_MODES:
+        if mode_raw == "mean_subtraction":
+            mode = "mean_subtraction"
+        elif mode_raw == "highpass":
+            mode = "highpass"
+        elif mode_raw == "doppler_fft":
+            mode = "doppler_fft"
+    try:
+        highpass_beta = float(block.get("highpass_beta", 0.9))
+    except (TypeError, ValueError):
+        highpass_beta = 0.9
+    return SlowTimeConfig(
+        enabled=bool(block.get("enabled", False)),
+        mode=mode,
+        highpass_beta=min(max(highpass_beta, 0.0), 1.0),
+        doppler_fft_shift=bool(block.get("doppler_fft_shift", True)),
+        doppler_zero_notch=bool(block.get("doppler_zero_notch", False)),
+    )
+
+
 def subtract_selected_mean(data: np.ndarray, selection: MeanSelection) -> np.ndarray:
     if not selection.enabled or not selection.axes:
         return data
     axes = tuple(_MEAN_AXIS_INDEX[axis] for axis in selection.axes)
-    return data - data.mean(axis=axes, keepdims=True, dtype=np.complex64)
+    mean = data.mean(axis=axes, keepdims=True, dtype=np.complex64)
+    np.subtract(data, mean, out=data)
+    return data
+
+
+def apply_heatmap_spatial_filter(
+    heatmap: np.ndarray,
+    filter_cfg: HeatmapSpatialFilterConfig,
+) -> np.ndarray:
+    if not filter_cfg.enabled or filter_cfg.mode == "none":
+        return heatmap
+    if heatmap.ndim != 2 or heatmap.shape[0] < 1 or heatmap.shape[1] < 1:
+        return heatmap
+    # 3x3 Gaussian blur for display smoothing only.
+    kernel = np.array(
+        [[1.0, 2.0, 1.0], [2.0, 4.0, 2.0], [1.0, 2.0, 1.0]],
+        dtype=np.float32,
+    ) / np.float32(16.0)
+    padded = np.pad(heatmap.astype(np.float32, copy=False), ((1, 1), (1, 1)), mode="edge")
+    out = (
+        padded[:-2, :-2] * kernel[0, 0]
+        + padded[:-2, 1:-1] * kernel[0, 1]
+        + padded[:-2, 2:] * kernel[0, 2]
+        + padded[1:-1, :-2] * kernel[1, 0]
+        + padded[1:-1, 1:-1] * kernel[1, 1]
+        + padded[1:-1, 2:] * kernel[1, 2]
+        + padded[2:, :-2] * kernel[2, 0]
+        + padded[2:, 1:-1] * kernel[2, 1]
+        + padded[2:, 2:] * kernel[2, 2]
+    )
+    return out.astype(np.float32, copy=False)
+
+
+def apply_slow_time_filter(
+    data: np.ndarray,
+    slow_time_cfg: SlowTimeConfig,
+    *,
+    fft_workers: int = 1,
+) -> np.ndarray:
+    if not slow_time_cfg.enabled or slow_time_cfg.mode == "none":
+        return data
+    if data.ndim != 5 or int(data.shape[1]) <= 0:
+        return data
+
+    if slow_time_cfg.mode == "mean_subtraction":
+        return data - data.mean(axis=1, keepdims=True, dtype=np.complex64)
+
+    if slow_time_cfg.mode == "highpass":
+        out = np.empty_like(data)
+        out[:, :1, :, :, :] = data[:, :1, :, :, :]
+        beta = np.float32(slow_time_cfg.highpass_beta)
+        # Slow-time high-pass IIR to emphasize chirp-to-chirp changes and suppress static clutter.
+        for k in range(1, int(data.shape[1])):
+            out[:, k : k + 1, :, :, :] = (
+                beta * out[:, k - 1 : k, :, :, :]
+                + data[:, k : k + 1, :, :, :]
+                - data[:, k - 1 : k, :, :, :]
+            )
+        return out
+
+    out = fft.fft(
+        data,
+        n=int(data.shape[1]),
+        axis=1,
+        workers=int(fft_workers),
+        overwrite_x=False,
+    )
+    if slow_time_cfg.doppler_fft_shift:
+        out = np.fft.fftshift(out, axes=1)
+    if slow_time_cfg.doppler_zero_notch and out.shape[1] > 0:
+        zero_idx = int(out.shape[1] // 2) if slow_time_cfg.doppler_fft_shift else 0
+        out[:, zero_idx : zero_idx + 1, :, :, :] = 0
+    return out.astype(np.complex64, copy=False)
+
+
+def build_angle_steering_matrix(virtual_ant: int, nfft_angle: int) -> np.ndarray:
+    ant_idx = np.arange(int(virtual_ant), dtype=np.float32)
+    # Spatial frequency grid in fftshift order: u in [-1, 1).
+    u = np.linspace(-1.0, 1.0, int(nfft_angle), endpoint=False, dtype=np.float32)
+    phase = (-1j * np.pi) * ant_idx[:, None] * u[None, :]
+    steering = np.exp(phase).astype(np.complex64, copy=False)
+    col_energy = (steering.real * steering.real + steering.imag * steering.imag).sum(axis=0, dtype=np.float32)
+    col_norm = np.sqrt(np.maximum(col_energy, np.float32(1e-8))).astype(np.float32, copy=False)
+    steering /= col_norm[np.newaxis, :].astype(np.complex64, copy=False)
+    return steering
+
+
+def compute_angle_heatmap(
+    virtual_array: np.ndarray,
+    *,
+    angle_cfg: AngleProcessingConfig,
+    dsp_cfg: RealtimeDSPConfig,
+    angle_steering: np.ndarray,
+) -> np.ndarray:
+    if angle_cfg.mode == "fft":
+        angle_fft = fft.fft(
+            virtual_array,
+            n=dsp_cfg.nfft_angle,
+            axis=-1,
+            workers=dsp_cfg.fft_workers,
+            overwrite_x=True,
+        )
+        re = angle_fft.real
+        im = angle_fft.imag
+        heatmap = (re * re + im * im).mean(axis=(0, 1), dtype=np.float32)
+        return np.fft.fftshift(heatmap, axes=-1).astype(np.float32, copy=False)
+
+    x = virtual_array.transpose(2, 0, 1, 3)
+    n_range = int(x.shape[0])
+    n_snap = int(x.shape[1] * x.shape[2])
+    n_ant = int(x.shape[3])
+    x = x.reshape(n_range, n_snap, n_ant).astype(np.complex64, copy=False)
+    steering = angle_steering[:n_ant, :]
+
+    if angle_cfg.mode == "bartlett":
+        y = np.einsum("rsm,mk->rsk", x, np.conj(steering), optimize=True)
+        yr = y.real
+        yi = y.imag
+        return (yr * yr + yi * yi).mean(axis=1, dtype=np.float32).astype(np.float32, copy=False)
+
+    cov = np.einsum("rsm,rsn->rmn", np.conj(x), x, optimize=True).astype(np.complex64, copy=False)
+    if n_snap > 0:
+        cov /= np.float32(n_snap)
+    if angle_cfg.mvdr_diagonal_loading > 0.0:
+        ant = int(cov.shape[-1])
+        tr = np.trace(cov, axis1=-2, axis2=-1).real.astype(np.float32, copy=False)
+        tr /= np.float32(max(1, ant))
+        eye = np.eye(ant, dtype=np.complex64)[None, :, :]
+        load = (np.float32(angle_cfg.mvdr_diagonal_loading) * tr)[:, None, None].astype(np.complex64, copy=False)
+        cov = cov + (load * eye)
+    cov_inv = np.linalg.pinv(cov).astype(np.complex64, copy=False)
+    den_left = np.einsum("rmn,nk->rmk", cov_inv, steering, optimize=True)
+    den = np.einsum("mk,rmk->rk", np.conj(steering), den_left, optimize=True).real.astype(np.float32, copy=False)
+    np.maximum(den, np.float32(1e-8), out=den)
+    return (np.float32(1.0) / den).astype(np.float32, copy=False)
 
 
 def apply_background_subtraction(
@@ -217,21 +460,56 @@ def apply_background_subtraction(
     batch_frames = int(range_fft.shape[0])
     model_initialized_now = False
 
+    def _window_mean_push_batch() -> None:
+        if batch_frames <= 0:
+            return
+        frame_shape = tuple(int(x) for x in range_fft.shape[1:])
+        window_frames = int(max(1, bg_cfg.window_frames))
+        ring = bg_state.window_ring
+        sum_buf = bg_state.window_sum
+        if (
+            ring is None
+            or sum_buf is None
+            or int(ring.shape[0]) != window_frames
+            or tuple(int(x) for x in ring.shape[1:]) != frame_shape
+        ):
+            ring = np.empty((window_frames,) + frame_shape, dtype=np.complex64)
+            sum_buf = np.zeros(frame_shape, dtype=np.complex64)
+            bg_state.window_count = 0
+            bg_state.window_head = 0
+            bg_state.window_ring = ring
+            bg_state.window_sum = sum_buf
+
+        assert ring is not None
+        assert sum_buf is not None
+        count = int(bg_state.window_count)
+        head = int(bg_state.window_head)
+        cap = int(ring.shape[0])
+        for frame in range_fft:
+            if count < cap:
+                ring[head, ...] = frame
+                sum_buf += ring[head, ...]
+                count += 1
+            else:
+                sum_buf -= ring[head, ...]
+                ring[head, ...] = frame
+                sum_buf += ring[head, ...]
+            head += 1
+            if head >= cap:
+                head = 0
+        bg_state.window_count = int(count)
+        bg_state.window_head = int(head)
+
     if bg_state.model is None:
         if bg_cfg.mode == "window_mean":
-            for frame in range_fft:
-                bg_state.window_queue.append(np.array(frame, dtype=np.complex64, copy=True))
+            _window_mean_push_batch()
             bg_state.init_count += batch_frames
             if bg_state.init_count < bg_cfg.init_frames:
                 return range_fft
-            if len(bg_state.window_queue) > bg_cfg.window_frames:
-                bg_state.window_queue = bg_state.window_queue[-bg_cfg.window_frames :]
+            if bg_state.window_sum is None or bg_state.window_count <= 0:
+                return range_fft
             bg_state.model = np.asarray(
-                np.mean(
-                    np.stack(bg_state.window_queue, axis=0),
-                    axis=0,
-                    dtype=np.complex64,
-                ),
+                bg_state.window_sum / np.float32(max(1, bg_state.window_count)),
                 dtype=np.complex64,
             )
             model_initialized_now = True
@@ -284,19 +562,19 @@ def apply_background_subtraction(
             dtype=np.complex64,
         )
     elif bg_cfg.mode == "window_mean":
-        for frame in range_fft:
-            bg_state.window_queue.append(np.array(frame, dtype=np.complex64, copy=True))
-        if len(bg_state.window_queue) > bg_cfg.window_frames:
-            bg_state.window_queue = bg_state.window_queue[-bg_cfg.window_frames :]
-        bg_state.model = np.asarray(
-            np.mean(
-                np.stack(bg_state.window_queue, axis=0),
-                axis=0,
+        _window_mean_push_batch()
+        if bg_state.window_sum is not None and bg_state.window_count > 0:
+            bg_state.model = np.asarray(
+                bg_state.window_sum / np.float32(max(1, bg_state.window_count)),
                 dtype=np.complex64,
-            ),
-            dtype=np.complex64,
-        )
+            )
     return range_fft_out
+
+
+def _convert_rx4_iiiiqqqq_to_complex64(dst_frame: np.ndarray, src_i16_frame: np.ndarray) -> None:
+    block_view = src_i16_frame.reshape(-1, 8)
+    dst_frame.real[:] = block_view[:, :4].reshape(-1)  # type: ignore[index]
+    dst_frame.imag[:] = block_view[:, 4:].reshape(-1)  # type: ignore[index]
 
 
 # Process one DSP batch and publish the updated heatmap/profile views to the GUI buffers.
@@ -307,11 +585,15 @@ def process_buffer(
     w_angle: np.ndarray,
     mean_before_range_fft: MeanSelection,
     mean_after_range_fft: MeanSelection,
+    slow_time_cfg: SlowTimeConfig,
     bg_subtraction: BackgroundSubtractionConfig,
-    loop_average_after_background: LoopAverageConfig,
+    apply_loop_average_after_background: bool,
+    angle_processing: AngleProcessingConfig,
+    heatmap_ema_cfg: HeatmapEMAConfig,
+    heatmap_spatial_filter_cfg: HeatmapSpatialFilterConfig,
+    angle_steering: np.ndarray,
     bg_state: BackgroundSubtractionState,
     heatmap_ema: np.ndarray | None,
-    alpha: float,
     gui_dbuf,
     gui_prof_dbuf,
     gui_h: int,
@@ -321,6 +603,7 @@ def process_buffer(
     gui_lock,
     max_bin: int,
     normalize_to_peak: bool,
+    profiles_out_buf: np.ndarray,
     stat_raw_min_db: Synchronized,
     stat_raw_max_db: Synchronized,
     stat_norm_min_db: Synchronized,
@@ -344,14 +627,20 @@ def process_buffer(
 
         # Compute the range FFT along the sample axis.
         range_fft = fft.fft(data,n=dsp_cfg.nfft_range,axis=3,workers=dsp_cfg.fft_workers,overwrite_x=True,)
+        # Apply the selected slow-time filter on the loop axis after the range FFT.
+        range_fft = apply_slow_time_filter(
+            range_fft,
+            slow_time_cfg,
+            fft_workers=dsp_cfg.fft_workers,
+        )
         range_fft = subtract_selected_mean(range_fft, mean_after_range_fft)
         range_fft = apply_background_subtraction(
             range_fft,
             bg_subtraction,
             bg_state,
         )
-        
-        if loop_average_after_background.enabled:
+
+        if apply_loop_average_after_background:
             # Collapse the loop dimension while preserving the axis for the downstream pipeline.
             range_fft = range_fft.mean(axis=1, keepdims=True, dtype=np.complex64)
 
@@ -369,35 +658,41 @@ def process_buffer(
         prof_re = virtual_array.real
         prof_im = virtual_array.imag
         profiles_pow = (prof_re * prof_re + prof_im * prof_im).mean(axis=(0, 1))
-        profiles_db_va = (10.0 * np.log10(profiles_pow + 1e-12)).transpose(1, 0)
-        profiles_out = np.full((dsp_cfg.range_profile_count, max_bin), -120.0, dtype=np.float32)
+        profiles_db = np.array(profiles_pow, dtype=np.float32, copy=True)
+        np.add(profiles_db, np.float32(1e-12), out=profiles_db)
+        np.log10(profiles_db, out=profiles_db)
+        profiles_db *= np.float32(10.0)
+        profiles_db_va = profiles_db.transpose(1, 0)
+        profiles_out = profiles_out_buf
+        profiles_out.fill(np.float32(-120.0))
         copy_rows = min(int(dsp_cfg.range_profile_count), int(profiles_db_va.shape[0]))
         if copy_rows > 0:
             profiles_out[:copy_rows, :] = profiles_db_va[:copy_rows, :].astype(np.float32, copy=False)
 
+
         virtual_array *= w_angle
 
-        angle_fft = fft.fft(
+        heatmap = compute_angle_heatmap(
             virtual_array,
-            n=dsp_cfg.nfft_angle,
-            axis=-1,
-            workers=dsp_cfg.fft_workers,
-            overwrite_x=True,
+            angle_cfg=angle_processing,
+            dsp_cfg=dsp_cfg,
+            angle_steering=angle_steering,
         )
 
-        re = angle_fft.real
-        im = angle_fft.imag
-        heatmap = (re * re + im * im).mean(axis=(0, 1))
-        heatmap = np.fft.fftshift(heatmap, axes=-1)
-
-        # EMA stabilizes the display without reprocessing past frames.
-        if heatmap_ema is None:
+        if not heatmap_ema_cfg.enabled: #bypass
             heatmap_ema = heatmap
-        else:
-            heatmap_ema *= (1.0 - alpha)
-            heatmap_ema += (alpha * heatmap)
+        elif heatmap_ema is None: #initialize
+            heatmap_ema = heatmap
+        else: # update
+            heatmap_ema *= (1.0 - heatmap_ema_cfg.alpha)
+            heatmap_ema += (heatmap_ema_cfg.alpha * heatmap)
+        heatmap_ema = apply_heatmap_spatial_filter(heatmap_ema, heatmap_spatial_filter_cfg)
 
-        heatmap_db = 10 * np.log10(heatmap_ema + 1e-12)
+        # Convert to dB and optionally normalize to the peak for display.
+        heatmap_db = np.array(heatmap_ema, dtype=np.float32, copy=True)
+        np.add(heatmap_db, np.float32(1e-12), out=heatmap_db)
+        np.log10(heatmap_db, out=heatmap_db)
+        heatmap_db *= np.float32(10.0)
 
         view_db = heatmap_db
         if view_db.size > 0:
@@ -483,12 +778,20 @@ def dsp_worker(
 ) -> None:
     selection = selection_from_yaml_dict(cfg_dict)
     mean_before_range_fft, mean_after_range_fft = mean_selections_from_yaml_dict(cfg_dict)
+    slow_time_cfg = slow_time_from_yaml_dict(cfg_dict)
     bg_subtraction = background_subtraction_from_yaml_dict(cfg_dict)
     loop_average_after_background = loop_average_after_background_from_yaml_dict(cfg_dict)
+    angle_processing = angle_processing_from_yaml_dict(cfg_dict)
+    heatmap_ema_cfg = heatmap_ema_from_yaml_dict(cfg_dict)
+    heatmap_spatial_filter_cfg = heatmap_spatial_filter_from_yaml_dict(cfg_dict)
     window_range, window_angle = build_windows(
         selection,
         samples=dsp_cfg.samples,
         virtual_ant=dsp_cfg.virtual_ant,
+    )
+    angle_steering = build_angle_steering_matrix(
+        virtual_ant=dsp_cfg.virtual_ant,
+        nfft_angle=dsp_cfg.nfft_angle,
     )
 
     dr = dsp_cfg.c * dsp_cfg.fs / (2.0 * dsp_cfg.slope * dsp_cfg.nfft_range)
@@ -497,14 +800,16 @@ def dsp_worker(
 
     i16_per_frame = dsp_cfg.bytes_per_frame // 2
     total_samples_needed = dsp_cfg.x_frames * dsp_cfg.chirps * dsp_cfg.samples * dsp_cfg.rx
+    complex_per_frame = dsp_cfg.chirps * dsp_cfg.samples * dsp_cfg.rx
 
-    i16_batch = np.zeros((dsp_cfg.x_frames, i16_per_frame), dtype=np.int16)
     complex_data = np.zeros(total_samples_needed, dtype=np.complex64)
+    profiles_out_buf = np.empty((dsp_cfg.range_profile_count, max_bin), dtype=np.float32)
 
     shm_view = memoryview(shm_frames).cast("B")
     n_slots = len(slot_state)
     heatmap_ema = None
     bg_state = BackgroundSubtractionState()
+    warned_loop_average_after_doppler = False
     dsp_ms_samples: list[float] = []
     dsp_stat_last_flush = time.perf_counter()
     dsp_ms_acc_sum = 0.0
@@ -606,22 +911,19 @@ def dsp_worker(
         n_proc = min(len(proc_slots), dsp_cfg.x_frames)
         slots_to_process = proc_slots[:n_proc]
 
-        for k, s in enumerate(slots_to_process):
-            i16_batch[k, :] = slot_i16_views[int(s)]
-
         # Release slots early so RX/logger can keep moving while DSP computes.
         _release_slots_dsp(slots_to_process)
 
         # Current packing is IIIIQQQQ for RX=4, converted in-place to complex64.
-        flat_i16 = i16_batch[:n_proc, :].reshape(-1)
-        n_blocks = flat_i16.size // 8
-
-        block_view = flat_i16[: n_blocks * 8].reshape(n_blocks, 8)
-
-        n_cplx = n_proc * dsp_cfg.chirps * dsp_cfg.samples * dsp_cfg.rx
+        n_cplx = n_proc * complex_per_frame
         complex_view = complex_data[:n_cplx]
-        complex_view.real[:] = block_view[:, :4].reshape(-1)  # type: ignore
-        complex_view.imag[:] = block_view[:, 4:].reshape(-1)  # type: ignore
+        for k, s in enumerate(slots_to_process):
+            start = int(k * complex_per_frame)
+            end = int(start + complex_per_frame)
+            _convert_rx4_iiiiqqqq_to_complex64(
+                complex_view[start:end],
+                slot_i16_views[int(s)],
+            )
 
         t0_proc = time.perf_counter()
         try:
@@ -629,6 +931,12 @@ def dsp_worker(
                 normalize_to_peak = bool(norm_to_peak.value)
         except Exception:
             normalize_to_peak = True
+        apply_loop_average_after_background = bool(loop_average_after_background.enabled)
+        if slow_time_cfg.enabled and slow_time_cfg.mode == "doppler_fft" and apply_loop_average_after_background:
+            if not warned_loop_average_after_doppler:
+                print("[DSP WARN] loop_average_after_background skipped because slow_time.mode=doppler_fft.")
+                warned_loop_average_after_doppler = True
+            apply_loop_average_after_background = False
         heatmap_ema = process_buffer(
             complex_view,
             n_proc,
@@ -636,11 +944,15 @@ def dsp_worker(
             window_angle,
             mean_before_range_fft,
             mean_after_range_fft,
+            slow_time_cfg,
             bg_subtraction,
-            loop_average_after_background,
+            apply_loop_average_after_background,
+            angle_processing,
+            heatmap_ema_cfg,
+            heatmap_spatial_filter_cfg,
+            angle_steering,
             bg_state,
             heatmap_ema,
-            0.2,
             gui_dbuf,
             gui_prof_dbuf,
             gui_h,
@@ -650,6 +962,7 @@ def dsp_worker(
             gui_lock,
             max_bin,
             normalize_to_peak,
+            profiles_out_buf,
             stat_raw_min_db,
             stat_raw_max_db,
             stat_norm_min_db,

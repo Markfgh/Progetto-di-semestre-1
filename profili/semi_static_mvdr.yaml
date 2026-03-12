@@ -9,47 +9,47 @@ capture:
   chirps: 256
   rx: 4
   tx: 2
-  x_frames: 1
+  x_frames: 2
 
 fft:
-  nfft_range: 256
+  nfft_range: 512
   nfft_angle: 128
   workers: 8
 
 display:
   vmax: 90
-  vmin: 70
-  vmin_norm: -20
+  vmin: 65
+  vmin_norm: -25
   vmax_norm: 0
-  range_max: 12.5
-  crossrange_max: 5.0
+  range_max: 8.0
+  crossrange_max: 3.0
   rangefft_db_min: 0
   rangefft_db_max: 90
   rangefft_lin_min: 0
   rangefft_lin_max: 15e7
 
 dsp:
-  window_range: hamming     # Options: none, rectangular, hanning, hamming, blackman
-  window_angle: rectangular  # Options: none, rectangular, hanning, hamming, blackman
+  window_range: blackman     # Options: none, rectangular, hanning, hamming, blackman
+  window_angle: none         # Options: none, rectangular, hanning, hamming, blackman
 
   mean_before_range_fft:
     enabled: true
-    axes: [sample] # Options: frame, loop, tx, sample, rx
+    axes: [sample]           # Options: frame, loop, tx, sample, rx
 
   mean_after_range_fft:
     enabled: false
-    axes: [range_bin] # Options: frame, loop, tx, range_bin, rx (clutter removal = range_bin)
-    
+    axes: [range_bin]        # Options: frame, loop, tx, range_bin, rx
+
   slow_time:
     enabled: false
-    mode: none # Options: none, mean_subtraction, highpass, doppler_fft
+    mode: none               # Options: none, mean_subtraction, highpass, doppler_fft
     highpass_beta: 0.9
     doppler_fft_shift: true
     doppler_zero_notch: false
 
   background_subtraction:
-    enabled: false  
-    mode: ema # Options: ema, running_mean, window_mean, frozen
+    enabled: false
+    mode: ema                # Options: ema, running_mean, window_mean, frozen
     alpha: 0.02
     init_frames: 20
     window_frames: 20
@@ -59,17 +59,16 @@ dsp:
     enabled: false
 
   angle_processing:
-    mode: mvdr # Options: fft, bartlett, mvdr
+    mode: mvdr               # Options: fft, bartlett, mvdr
     mvdr_diagonal_loading: 0.02
 
   heatmap_ema:
     enabled: true
-    alpha: 0.15
+    alpha: 0.08
 
   heatmap_spatial_filter:
     enabled: false
-    mode: gaussian_3x3 # Options: gaussian_3x3, none
-
+    mode: gaussian_3x3       # Options: gaussian_3x3, none
 
 rx:
   stall_timeout_s: 2.0

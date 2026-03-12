@@ -82,8 +82,11 @@ def back_projection_image(
     n_bins_avail = int(range_fft_sel.shape[2])
     max_bin_eff = max(0, min(int(max_bin), n_bins_avail))
     if max_bin_eff < 2:
-        img_mag = np.abs(img_flat).reshape(x_grid.shape)
-        return (20.0 * np.log10(img_mag + 1e-6)).astype(np.float32, copy=False)
+        img_mag = np.abs(img_flat).reshape(x_grid.shape).astype(np.float32, copy=False)
+        np.add(img_mag, np.float32(1e-6), out=img_mag)
+        np.log10(img_mag, out=img_mag)
+        img_mag *= np.float32(20.0)
+        return img_mag.astype(np.float32, copy=False)
     chunk_n = max(1, int(chunk_size))
 
     for pos_i in range(n_pos):
@@ -123,6 +126,8 @@ def back_projection_image(
             phase = np.exp(1j * (phase_scale * rr[idx])).astype(np.complex64, copy=False)
             img_flat[idx] += s_interp * phase
 
-    img_mag = np.abs(img_flat).reshape(x_grid.shape)
-    img_db = (20.0 * np.log10(img_mag + 1e-6)).astype(np.float32, copy=False)
-    return img_db
+    img_mag = np.abs(img_flat).reshape(x_grid.shape).astype(np.float32, copy=False)
+    np.add(img_mag, np.float32(1e-6), out=img_mag)
+    np.log10(img_mag, out=img_mag)
+    img_mag *= np.float32(20.0)
+    return img_mag.astype(np.float32, copy=False)

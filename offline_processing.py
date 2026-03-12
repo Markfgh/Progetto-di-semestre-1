@@ -10,6 +10,7 @@ from typing import Any
 import multiprocessing as mp
 import queue as pyqueue
 from multiprocessing import Process, Queue
+from multiprocessing import shared_memory
 from multiprocessing.sharedctypes import Synchronized
 
 import numpy as np
@@ -577,6 +578,7 @@ def _offline_reader_worker(
     status_q: Queue,
     stop_evt,
 ) -> None:
+    shm_range_fft = None
     try:
         reader = SARReader(offline_config_path=offline_config_path, fallback_capture_cfg=fallback_capture_cfg)
         data = reader.load(keep_raw=False)
@@ -584,10 +586,16 @@ def _offline_reader_worker(
         # Riduzione preliminare: media sulle antenne virtuali per ridurre payload e costo DSP.
         sig = data.iq_cube.mean(axis=3, dtype=np.complex64)  # [pos, frame, loop, sample]
         range_fft = np.fft.fft(sig, n=int(nfft_range), axis=-1).astype(np.complex64, copy=False)
+        range_fft = np.ascontiguousarray(range_fft, dtype=np.complex64)
+        shm_range_fft = shared_memory.SharedMemory(create=True, size=int(range_fft.nbytes))
+        shm_arr = np.ndarray(range_fft.shape, dtype=np.complex64, buffer=shm_range_fft.buf)
+        shm_arr[:] = range_fft
 
         msg = {
             "type": "data",
-            "range_fft": range_fft,
+            "range_fft_shm_name": str(shm_range_fft.name),
+            "range_fft_shape": tuple(int(x) for x in range_fft.shape),
+            "range_fft_dtype": "complex64",
             "positions": data.positions.astype(np.int32, copy=False),
             "x_start_cfg": int(reader.config.x_start),
             "x_end_cfg": int(reader.config.x_end),
@@ -612,7 +620,33 @@ def _offline_reader_worker(
         except Exception:
             pass
     finally:
+        if shm_range_fft is not None:
+            try:
+                shm_range_fft.close()
+            except Exception:
+                pass
         stop_evt.wait(0.01)
+
+
+def _range_fft_from_init_msg(init_msg: dict[str, Any]) -> tuple[np.ndarray, shared_memory.SharedMemory | None]:
+    shm_name = init_msg.get("range_fft_shm_name")
+    if shm_name is not None:
+        shape_raw = init_msg.get("range_fft_shape")
+        if not isinstance(shape_raw, (tuple, list)):
+            raise ValueError("range_fft_shape mancante o non valido nel messaggio init")
+        shape = tuple(int(x) for x in shape_raw)
+        if len(shape) != 4:
+            raise ValueError(f"range_fft_shape non valido: {shape!r}")
+        dtype_s = str(init_msg.get("range_fft_dtype", "complex64")).strip().lower()
+        if dtype_s != "complex64":
+            raise ValueError(f"range_fft_dtype non supportato: {dtype_s!r}")
+        shm_obj = shared_memory.SharedMemory(name=str(shm_name))
+        arr = np.ndarray(shape, dtype=np.complex64, buffer=shm_obj.buf)
+        return arr, shm_obj
+
+    # Backward-compatible fallback for legacy queue payloads.
+    arr = np.asarray(init_msg["range_fft"], dtype=np.complex64)
+    return arr, None
 
 
 def _offline_dsp_worker(
@@ -638,6 +672,7 @@ def _offline_dsp_worker(
     default_avg_mode: str,
     phase_sign: int,
 ) -> None:
+    shm_range_fft = None
     try:
         phase_sign_i = _phase_sign_normalize(phase_sign, field_name="phase_sign")
         init_msg = None
@@ -656,7 +691,7 @@ def _offline_dsp_worker(
             _queue_put_latest(status_q, {"type": "error", "error": str(init_msg.get("error", "errore reader"))})
             return
 
-        range_fft_4d = np.asarray(init_msg["range_fft"], dtype=np.complex64)
+        range_fft_4d, shm_range_fft = _range_fft_from_init_msg(init_msg)
         positions = np.asarray(init_msg["positions"], dtype=np.int32)
         if range_fft_4d.ndim != 4:
             raise ValueError(f"range_fft_4d shape non valido: {range_fft_4d.shape!r}")
@@ -811,6 +846,16 @@ def _offline_dsp_worker(
             _queue_put_latest(status_q, {"type": "error", "error": f"[offline_dsp] {type(exc).__name__}: {exc}"})
         except Exception:
             pass
+    finally:
+        if shm_range_fft is not None:
+            try:
+                shm_range_fft.close()
+            except Exception:
+                pass
+            try:
+                shm_range_fft.unlink()
+            except Exception:
+                pass
 
 
 class OfflineBPRuntime:
@@ -1030,7 +1075,7 @@ class OfflineBPRuntime:
         }
         self._put_latest_cmd(cmd)
 
-    def poll_frame(self) -> tuple[np.ndarray, dict[str, Any]] | None:
+    def poll_frame(self, copy_frame: bool = True) -> tuple[np.ndarray, dict[str, Any]] | None:
         self._drain_status()
         if self._last_error is not None:
             return None
@@ -1054,7 +1099,9 @@ class OfflineBPRuntime:
             self._frame_cache.reshape(-1)[:] = src
             self._last_seq = int(seq_locked)
 
-        return self._frame_cache.copy(), self.last_info
+        if copy_frame:
+            return self._frame_cache.copy(), self.last_info
+        return self._frame_cache, self.last_info
 
     def _put_latest_cmd(self, cmd: dict[str, Any]) -> None:
         if self._cmd_q is None:

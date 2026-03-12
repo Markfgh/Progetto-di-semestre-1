@@ -2032,11 +2032,14 @@ def main():
     norm_frame = np.empty((gui_h, gui_w), dtype=np.float32)
     lut_idx = np.empty((gui_h, gui_w), dtype=np.int32)
     rgba_frame = np.empty((gui_h, gui_w, 4), dtype=np.float32)
+    fft_lin_frame = np.empty((RANGE_PROFILE_COUNT, gui_h), dtype=np.float32)
     proc_norm_frame = np.empty((proc_tex_h, proc_tex_w), dtype=np.float32)
     proc_lut_idx = np.empty((proc_tex_h, proc_tex_w), dtype=np.int32)
     proc_rgba_frame = np.empty((proc_tex_h, proc_tex_w, 4), dtype=np.float32)
     proc_view_frame = np.empty((proc_tex_h, proc_tex_w), dtype=np.float32)
     lut_last = float(jet_lut.shape[0] - 1)
+    fft_plot_period_s = 0.05
+    fft_plot_last_t = 0.0
     if DEBUG_STATS:
         ring_hwm = 0
         cpu_state = {}
@@ -2143,7 +2146,7 @@ def main():
 
             # --- OFFLINE FRAME update (double-buffer latest-wins) ---
             if offline_runtime is not None:
-                off_frame = offline_runtime.poll_frame()
+                off_frame = offline_runtime.poll_frame(copy_frame=False)
                 if off_frame is not None:
                     frame_db, info = off_frame
                     proc_frame[:, :] = frame_db
@@ -2303,21 +2306,25 @@ def main():
                 tex_np[:] = rgba_frame[::-1, :, :].reshape(-1)
                 dpg.set_value(TEX_TAG, tex_buf)
 
-                max_r_bin, _ = _fft_visible_range_from_rmax(vis_rmax)
-                x_range_m = x_range_cache.get(max_r_bin)
-                if x_range_m is None:
-                    x_range_m = range_axis_m[:max_r_bin].tolist()
-                    x_range_cache[max_r_bin] = x_range_m
-                fft_slice = rangefft_frame[:, :max_r_bin]
-                if vis_fft_mode_db:
-                    fft_plot_vals = fft_slice
-                else:
-                    fft_plot_vals = np.power(10.0, fft_slice * 0.1).astype(np.float32, copy=False)
-                for ant_i in range(min(RANGE_PROFILE_COUNT, int(fft_plot_vals.shape[0]))):
-                    line_tag = RANGEFFT_LINE_TAGS[ant_i]
-                    if dpg.does_item_exist(line_tag):
-                        y_vals = fft_plot_vals[ant_i, :].tolist()
-                        dpg.set_value(line_tag, [x_range_m, y_vals])
+                if (now - fft_plot_last_t) >= fft_plot_period_s:
+                    fft_plot_last_t = now
+                    max_r_bin, _ = _fft_visible_range_from_rmax(vis_rmax)
+                    x_range_m = x_range_cache.get(max_r_bin)
+                    if x_range_m is None:
+                        x_range_m = range_axis_m[:max_r_bin].tolist()
+                        x_range_cache[max_r_bin] = x_range_m
+                    fft_slice = rangefft_frame[:, :max_r_bin]
+                    if vis_fft_mode_db:
+                        fft_plot_vals = fft_slice
+                    else:
+                        fft_plot_vals = fft_lin_frame[:, :max_r_bin]
+                        np.multiply(fft_slice, np.float32(0.1), out=fft_plot_vals)
+                        np.power(np.float32(10.0), fft_plot_vals, out=fft_plot_vals)
+                    for ant_i in range(min(RANGE_PROFILE_COUNT, int(fft_plot_vals.shape[0]))):
+                        line_tag = RANGEFFT_LINE_TAGS[ant_i]
+                        if dpg.does_item_exist(line_tag):
+                            y_vals = fft_plot_vals[ant_i, :].tolist()
+                            dpg.set_value(line_tag, [x_range_m, y_vals])
                 if DEBUG_STATS:
                     img_updates += 1
 
