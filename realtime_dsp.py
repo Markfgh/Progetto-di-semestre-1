@@ -9,6 +9,8 @@ from typing import Any, Literal
 import numpy as np
 import scipy.fft as fft
 
+from tracker import MultiObjectTracker, Track, TrackerConfig, TrackingConfig
+
 # Realtime DSP only: window setup, batch processing, and worker loop.
 WindowType = Literal["none", "rectangular", "hanning", "hamming", "blackman"]
 _VALID_WINDOWS = {"none", "rectangular", "hanning", "hamming", "blackman"}
@@ -18,11 +20,14 @@ BackgroundMode = Literal["ema", "running_mean", "window_mean", "frozen"]
 AngleProcessingMode = Literal["fft", "bartlett", "mvdr"]
 HeatmapSpatialFilterMode = Literal["none", "gaussian_3x3"]
 SlowTimeMode = Literal["none", "mean_subtraction", "highpass", "doppler_fft"]
+DetectionThresholdMode = Literal["relative", "absolute"]
+DetectionSource = Literal["static", "moving", "fused"]
 _VALID_MEAN_AXES = {"frame", "loop", "tx", "sample", "range_bin", "rx"}
 _VALID_BACKGROUND_MODES = {"ema", "running_mean", "window_mean", "frozen"}
 _VALID_ANGLE_PROCESSING_MODES = {"fft", "bartlett", "mvdr"}
 _VALID_HEATMAP_SPATIAL_FILTER_MODES = {"none", "gaussian_3x3"}
 _VALID_SLOW_TIME_MODES = {"none", "mean_subtraction", "highpass", "doppler_fft"}
+_VALID_THRESHOLD_MODES = {"relative", "absolute"}
 
 _MEAN_AXIS_INDEX = {
     "frame": 0,
@@ -37,6 +42,7 @@ _MEAN_AXIS_INDEX = {
 @dataclass(frozen=True)
 class DspSelection:
     window_range: WindowType = "blackman"
+    window_doppler: WindowType = "hanning"
     window_angle: WindowType = "hanning"
 
 
@@ -102,6 +108,54 @@ class SlowTimeConfig:
 
 
 @dataclass(frozen=True)
+class DetectionConfigStatic:
+    enabled: bool = True
+    threshold_mode: DetectionThresholdMode = "relative"
+    threshold_db: float = -10.0
+    localmax_range_bins: int = 2
+    localmax_angle_bins: int = 2
+    min_power_db: float = 5.0
+    max_detections: int = 64
+
+
+@dataclass(frozen=True)
+class DetectionConfigMoving:
+    enabled: bool = True
+    threshold_mode: DetectionThresholdMode = "relative"
+    threshold_db: float = -12.0
+    localmax_range_bins: int = 2
+    localmax_doppler_bins: int = 1
+    zero_doppler_exclusion_bins: int = 1
+    min_power_db: float = 5.0
+    doppler_fft_shift: bool = True
+    max_detections: int = 64
+
+
+@dataclass(frozen=True)
+class FusionConfig:
+    enabled: bool = True
+    merge_xy_m: float = 0.40
+    merge_range_m: float = 0.30
+    merge_angle_deg: float = 5.0
+    prefer_moving_when_doppler_valid: bool = True
+
+
+@dataclass
+class Detection:
+    range_bin: int
+    angle_bin: int | None
+    doppler_bin: int | None
+    range_m: float
+    angle_deg: float
+    doppler_mps: float | None
+    x_m: float
+    y_m: float
+    power_lin: float
+    power_db: float
+    source: DetectionSource
+
+
+@dataclass(frozen=True)
 class RealtimeDSPConfig:
     # Packed config passed to the DSP process to avoid relying on globals.
     c: float
@@ -138,11 +192,17 @@ def _get_window_1d(win_type: str, size: int) -> np.ndarray:
 
 
 # Build range and angle windows with shapes ready for NumPy broadcasting
-def build_windows(selection: DspSelection, samples: int, virtual_ant: int) -> tuple[np.ndarray, np.ndarray]:
+def build_windows(
+    selection: DspSelection,
+    samples: int,
+    n_loops: int,
+    virtual_ant: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     # Pre-shaped for NumPy broadcasting on range and virtual-array axes.
     w_range = _get_window_1d(selection.window_range, samples).reshape(1, 1, 1, samples, 1)
+    w_doppler = _get_window_1d(selection.window_doppler, n_loops).reshape(1, n_loops, 1, 1, 1)
     w_angle = _get_window_1d(selection.window_angle, virtual_ant).reshape(1, 1, 1, virtual_ant)
-    return w_range, w_angle
+    return w_range, w_doppler, w_angle
 
 
 # Normalize a config value to a valid window type, falling back to the default.
@@ -181,6 +241,7 @@ def selection_from_yaml_dict(cfg: dict[str, Any]) -> DspSelection:
     dsp = cfg.get("dsp", {}) or {}
     return DspSelection(
         window_range=window_type_normalize(dsp.get("window_range"), "blackman"),
+        window_doppler=window_type_normalize(dsp.get("window_doppler"), "hanning"),
         window_angle=window_type_normalize(dsp.get("window_angle"), "hanning"),
     )
 
@@ -304,6 +365,318 @@ def slow_time_from_yaml_dict(cfg: dict[str, Any]) -> SlowTimeConfig:
         highpass_beta=min(max(highpass_beta, 0.0), 1.0),
         doppler_fft_shift=bool(block.get("doppler_fft_shift", True)),
         doppler_zero_notch=bool(block.get("doppler_zero_notch", False)),
+    )
+
+
+def _to_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _to_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _to_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(parsed):
+        return None
+    return float(parsed)
+
+
+def _threshold_mode_from_value(value: Any, default: DetectionThresholdMode = "relative") -> DetectionThresholdMode:
+    mode_raw = str(value or default).strip().lower()
+    if mode_raw not in _VALID_THRESHOLD_MODES:
+        return default
+    return mode_raw  # type: ignore[return-value]
+
+
+def _tracking_cfg_value(
+    tracking_block: dict[str, Any],
+    tracker_block: dict[str, Any],
+    *keys: str,
+    default: Any,
+) -> Any:
+    for key in keys:
+        if key in tracking_block:
+            return tracking_block.get(key)
+    for key in keys:
+        if key in tracker_block:
+            return tracker_block.get(key)
+    return default
+
+
+def detection_static_from_yaml_dict(cfg: dict[str, Any]) -> DetectionConfigStatic:
+    block = cfg.get("detection_static", {}) or {}
+    return DetectionConfigStatic(
+        enabled=bool(block.get("enabled", True)),
+        threshold_mode=_threshold_mode_from_value(block.get("threshold_mode"), "relative"),
+        threshold_db=_to_float(block.get("threshold_db", -10.0), -10.0),
+        localmax_range_bins=max(0, _to_int(block.get("localmax_range_bins", 2), 2)),
+        localmax_angle_bins=max(0, _to_int(block.get("localmax_angle_bins", 2), 2)),
+        min_power_db=_to_float(block.get("min_power_db", 5.0), 5.0),
+        max_detections=max(1, _to_int(block.get("max_detections", 64), 64)),
+    )
+
+
+def detection_moving_from_yaml_dict(cfg: dict[str, Any]) -> DetectionConfigMoving:
+    block = cfg.get("detection_moving", {}) or {}
+    return DetectionConfigMoving(
+        enabled=bool(block.get("enabled", True)),
+        threshold_mode=_threshold_mode_from_value(block.get("threshold_mode"), "relative"),
+        threshold_db=_to_float(block.get("threshold_db", -12.0), -12.0),
+        localmax_range_bins=max(0, _to_int(block.get("localmax_range_bins", 2), 2)),
+        localmax_doppler_bins=max(0, _to_int(block.get("localmax_doppler_bins", 1), 1)),
+        zero_doppler_exclusion_bins=max(0, _to_int(block.get("zero_doppler_exclusion_bins", 1), 1)),
+        min_power_db=_to_float(block.get("min_power_db", 5.0), 5.0),
+        doppler_fft_shift=bool(block.get("doppler_fft_shift", True)),
+        max_detections=max(1, _to_int(block.get("max_detections", 64), 64)),
+    )
+
+
+def fusion_from_yaml_dict(cfg: dict[str, Any]) -> FusionConfig:
+    block = cfg.get("fusion", {}) or {}
+    return FusionConfig(
+        enabled=bool(block.get("enabled", True)),
+        merge_xy_m=max(0.0, _to_float(block.get("merge_xy_m", 0.40), 0.40)),
+        merge_range_m=max(0.0, _to_float(block.get("merge_range_m", 0.30), 0.30)),
+        merge_angle_deg=max(0.0, _to_float(block.get("merge_angle_deg", 5.0), 5.0)),
+        prefer_moving_when_doppler_valid=bool(block.get("prefer_moving_when_doppler_valid", True)),
+    )
+
+
+def tracking_from_yaml_dict(cfg: dict[str, Any]) -> TrackingConfig:
+    tracking_block = cfg.get("tracking", {}) or {}
+    tracker_block = cfg.get("tracker", {}) or {}
+    dt_s = _to_optional_float(
+        _tracking_cfg_value(
+            tracking_block,
+            tracker_block,
+            "dt_s",
+            "frame_dt_s",
+            default=None,
+        )
+    )
+    return TrackingConfig(
+        enabled=bool(_tracking_cfg_value(tracking_block, tracker_block, "enabled", default=True)),
+        dt_s=None if dt_s is None else max(1e-3, float(dt_s)),
+        max_tracks=max(1, _to_int(_tracking_cfg_value(tracking_block, tracker_block, "max_tracks", default=30), 30)),
+        min_hits_to_confirm=max(
+            1,
+            _to_int(
+                _tracking_cfg_value(
+                    tracking_block,
+                    tracker_block,
+                    "min_hits_to_confirm",
+                    "min_confirmed_hits",
+                    default=3,
+                ),
+                3,
+            ),
+        ),
+        max_missed_tentative=max(
+            0,
+            _to_int(
+                _tracking_cfg_value(
+                    tracking_block,
+                    tracker_block,
+                    "max_missed_tentative",
+                    default=2,
+                ),
+                2,
+            ),
+        ),
+        max_missed_confirmed=max(
+            0,
+            _to_int(
+                _tracking_cfg_value(
+                    tracking_block,
+                    tracker_block,
+                    "max_missed_confirmed",
+                    "max_missed_frames",
+                    default=8,
+                ),
+                8,
+            ),
+        ),
+        max_track_age=max(
+            0,
+            _to_int(
+                _tracking_cfg_value(
+                    tracking_block,
+                    tracker_block,
+                    "max_track_age",
+                    default=0,
+                ),
+                0,
+            ),
+        ),
+    )
+
+
+def tracker_from_yaml_dict(cfg: dict[str, Any]) -> TrackerConfig:
+    tracking_block = cfg.get("tracking", {}) or {}
+    tracker_block = cfg.get("tracker", {}) or {}
+    return TrackerConfig(
+        model=str(
+            _tracking_cfg_value(
+                tracking_block,
+                tracker_block,
+                "model",
+                default="kalman_cv_2d",
+            )
+            or "kalman_cv_2d"
+        )
+        .strip()
+        .lower(),
+        gating_xy_m=max(
+            0.0,
+            _to_float(
+                _tracking_cfg_value(tracking_block, tracker_block, "gating_xy_m", default=0.75),
+                0.75,
+            ),
+        ),
+        gating_doppler_mps=max(
+            0.0,
+            _to_float(
+                _tracking_cfg_value(tracking_block, tracker_block, "gating_doppler_mps", default=0.50),
+                0.50,
+            ),
+        ),
+        process_noise_pos=max(
+            1e-4,
+            _to_float(
+                _tracking_cfg_value(
+                    tracking_block,
+                    tracker_block,
+                    "process_noise_pos",
+                    "process_noise_xy",
+                    default=0.20,
+                ),
+                0.20,
+            ),
+        ),
+        process_noise_vel=max(
+            1e-4,
+            _to_float(
+                _tracking_cfg_value(
+                    tracking_block,
+                    tracker_block,
+                    "process_noise_vel",
+                    "process_noise_v",
+                    default=1.00,
+                ),
+                1.00,
+            ),
+        ),
+        measurement_noise_xy=max(
+            1e-4,
+            _to_float(
+                _tracking_cfg_value(
+                    tracking_block,
+                    tracker_block,
+                    "measurement_noise_xy",
+                    default=0.25,
+                ),
+                0.25,
+            ),
+        ),
+        static_speed_threshold_mps=max(
+            0.0,
+            _to_float(
+                _tracking_cfg_value(
+                    tracking_block,
+                    tracker_block,
+                    "static_speed_threshold_mps",
+                    default=0.08,
+                ),
+                0.08,
+            ),
+        ),
+        dynamic_speed_threshold_mps=max(
+            0.0,
+            _to_float(
+                _tracking_cfg_value(
+                    tracking_block,
+                    tracker_block,
+                    "dynamic_speed_threshold_mps",
+                    default=0.20,
+                ),
+                0.20,
+            ),
+        ),
+        doppler_static_threshold_mps=max(
+            0.0,
+            _to_float(
+                _tracking_cfg_value(
+                    tracking_block,
+                    tracker_block,
+                    "doppler_static_threshold_mps",
+                    default=0.10,
+                ),
+                0.10,
+            ),
+        ),
+        classification_confirm_frames=max(
+            1,
+            _to_int(
+                _tracking_cfg_value(
+                    tracking_block,
+                    tracker_block,
+                    "classification_confirm_frames",
+                    default=2,
+                ),
+                2,
+            ),
+        ),
+        use_doppler_in_cost=bool(
+            _tracking_cfg_value(
+                tracking_block,
+                tracker_block,
+                "use_doppler_in_cost",
+                default=True,
+            )
+        ),
+        use_detection_class_in_cost=bool(
+            _tracking_cfg_value(
+                tracking_block,
+                tracker_block,
+                "use_detection_class_in_cost",
+                default=True,
+            )
+        ),
+        history_len=max(
+            1,
+            _to_int(
+                _tracking_cfg_value(
+                    tracking_block,
+                    tracker_block,
+                    "history_len",
+                    default=10,
+                ),
+                10,
+            ),
+        ),
+        debug_log=bool(
+            _tracking_cfg_value(
+                tracking_block,
+                tracker_block,
+                "debug_log",
+                default=False,
+            )
+        ),
     )
 
 
@@ -448,6 +821,440 @@ def compute_angle_heatmap(
     return (np.float32(1.0) / den).astype(np.float32, copy=False)
 
 
+def build_angle_axis_deg(nfft_angle: int) -> np.ndarray:
+    u = np.linspace(-1.0, 1.0, int(nfft_angle), endpoint=False, dtype=np.float32)
+    np.clip(u, -1.0, 1.0, out=u)
+    return np.rad2deg(np.arcsin(u)).astype(np.float32, copy=False)
+
+
+def _resolve_chirp_period_s(cfg: dict[str, Any]) -> float | None:
+    radar = cfg.get("radar", {}) or {}
+    capture = cfg.get("capture", {}) or {}
+    for key in (
+        "chirp_period_s",
+        "chirp_repetition_s",
+        "pri_s",
+        "t_chirp_s",
+        "tc_s",
+        "chirp_time_s",
+    ):
+        val = _to_float(radar.get(key, None), float("nan"))
+        if np.isfinite(val) and val > 0.0:
+            return float(val)
+    for key in ("chirp_period_s", "chirp_repetition_s", "pri_s"):
+        val = _to_float(capture.get(key, None), float("nan"))
+        if np.isfinite(val) and val > 0.0:
+            return float(val)
+    return None
+
+
+def build_doppler_axis_mps(
+    cfg: dict[str, Any],
+    dsp_cfg: RealtimeDSPConfig,
+    n_doppler: int,
+    *,
+    doppler_fft_shift: bool,
+) -> np.ndarray | None:
+    radar = cfg.get("radar", {}) or {}
+    fc_hz = _to_float(radar.get("fc", None), float("nan"))
+    if not np.isfinite(fc_hz) or fc_hz <= 0.0:
+        print("[DSP WARN] Doppler axis disabled: invalid radar.fc in config (doppler_mps=None).")
+        return None
+    chirp_period_s = _resolve_chirp_period_s(cfg)
+    if chirp_period_s is None or chirp_period_s <= 0.0:
+        print("[DSP WARN] Doppler axis disabled: missing/invalid chirp_period_s or pri_s (doppler_mps=None).")
+        return None
+    if int(dsp_cfg.tx) != 2:
+        print(
+            f"[DSP WARN] Doppler axis assumes fixed TDM-MIMO 2TX; cfg tx={int(dsp_cfg.tx)}. "
+            "Using effective_pri_s = chirp_period_s * 2."
+        )
+    effective_pri_s = float(chirp_period_s) * 2.0
+    wavelength_m = float(dsp_cfg.c) / float(fc_hz)
+    fd_hz = np.fft.fftfreq(int(n_doppler), d=effective_pri_s).astype(np.float32, copy=False)
+    if doppler_fft_shift:
+        fd_hz = np.fft.fftshift(fd_hz)
+    return (fd_hz * np.float32(wavelength_m * 0.5)).astype(np.float32, copy=False)
+
+
+def _build_virtual_array_from_range_fft(
+    range_fft: np.ndarray,
+    *,
+    max_bin: int,
+    dsp_cfg: RealtimeDSPConfig,
+) -> np.ndarray:
+    trimmed = range_fft[:, :, :, :max_bin, :]
+    va = trimmed.transpose(0, 1, 3, 2, 4)
+    va = np.ascontiguousarray(va)
+    return va.reshape(
+        int(range_fft.shape[0]),
+        int(range_fft.shape[1]),
+        int(max_bin),
+        int(dsp_cfg.virtual_ant),
+    )
+
+
+def _power_to_db(power_lin: np.ndarray) -> np.ndarray:
+    out = np.array(power_lin, dtype=np.float32, copy=True)
+    np.add(out, np.float32(1e-12), out=out)
+    np.log10(out, out=out)
+    out *= np.float32(10.0)
+    return out
+
+
+def _resolve_detection_threshold_db(
+    power_db: np.ndarray,
+    *,
+    threshold_mode: DetectionThresholdMode,
+    threshold_db: float,
+    min_power_db: float,
+) -> float:
+    if power_db.size <= 0:
+        return float(min_power_db)
+    if threshold_mode == "relative":
+        ref_db = float(np.max(power_db))
+        return max(float(min_power_db), ref_db + float(threshold_db))
+    return max(float(min_power_db), float(threshold_db))
+
+
+def _select_localmax_2d(
+    power_db: np.ndarray,
+    *,
+    threshold_db: float,
+    win_row: int,
+    win_col: int,
+    max_peaks: int,
+) -> np.ndarray:
+    if power_db.size <= 0 or max_peaks <= 0:
+        return np.empty((0, 2), dtype=np.int32)
+    candidates_mask = power_db >= np.float32(threshold_db)
+    if not np.any(candidates_mask):
+        return np.empty((0, 2), dtype=np.int32)
+    candidates = np.argwhere(candidates_mask)
+    strengths = power_db[candidates_mask]
+    order = np.argsort(strengths)[::-1]
+    suppressed = np.zeros(power_db.shape, dtype=bool)
+    selected: list[tuple[int, int]] = []
+    n_rows, n_cols = int(power_db.shape[0]), int(power_db.shape[1])
+    row_pad = int(max(0, win_row))
+    col_pad = int(max(0, win_col))
+    for idx in order:
+        r = int(candidates[idx, 0])
+        c = int(candidates[idx, 1])
+        if suppressed[r, c]:
+            continue
+        selected.append((r, c))
+        r0 = max(0, r - row_pad)
+        r1 = min(n_rows, r + row_pad + 1)
+        c0 = max(0, c - col_pad)
+        c1 = min(n_cols, c + col_pad + 1)
+        suppressed[r0:r1, c0:c1] = True
+        if len(selected) >= max_peaks:
+            break
+    if not selected:
+        return np.empty((0, 2), dtype=np.int32)
+    return np.asarray(selected, dtype=np.int32)
+
+
+
+# Main detection function for static targets using angle heatmap peak picking.
+def detect_static_targets(
+    range_fft: np.ndarray,
+    *,
+    static_cfg: DetectionConfigStatic,
+    angle_cfg: AngleProcessingConfig,
+    dsp_cfg: RealtimeDSPConfig,
+    w_angle: np.ndarray,
+    angle_steering: np.ndarray,
+    angle_axis_deg: np.ndarray,
+    range_bin_m: float,
+    max_bin: int,
+) -> tuple[list[Detection], np.ndarray]:
+    if not static_cfg.enabled:
+        return [], np.empty((0, 0), dtype=np.float32)
+    if range_fft.ndim != 5 or max_bin <= 0:
+        return [], np.empty((0, 0), dtype=np.float32)
+    if int(range_fft.shape[0]) <= 0 or int(range_fft.shape[1]) <= 0:
+        return [], np.empty((0, 0), dtype=np.float32)
+
+    virtual_array = _build_virtual_array_from_range_fft(
+        range_fft,
+        max_bin=max_bin,
+        dsp_cfg=dsp_cfg,
+    )
+    virtual_array *= w_angle
+    static_heatmap = compute_angle_heatmap(
+        virtual_array,
+        angle_cfg=angle_cfg,
+        dsp_cfg=dsp_cfg,
+        angle_steering=angle_steering,
+    )
+    static_db = _power_to_db(static_heatmap)
+    threshold_db = _resolve_detection_threshold_db(
+        static_db,
+        threshold_mode=static_cfg.threshold_mode,
+        threshold_db=static_cfg.threshold_db,
+        min_power_db=static_cfg.min_power_db,
+    )
+    peak_idx = _select_localmax_2d(
+        static_db,
+        threshold_db=threshold_db,
+        win_row=static_cfg.localmax_range_bins,
+        win_col=static_cfg.localmax_angle_bins,
+        max_peaks=static_cfg.max_detections,
+    )
+    detections: list[Detection] = []
+    for r_bin, a_bin in peak_idx:
+        rb = int(r_bin)
+        ab = int(a_bin)
+        range_m = float(rb) * float(range_bin_m)
+        angle_deg = float(angle_axis_deg[ab]) if 0 <= ab < int(angle_axis_deg.size) else 0.0
+        angle_rad = np.deg2rad(np.float32(angle_deg))
+        x_m = float(range_m * float(np.sin(angle_rad)))
+        y_m = float(range_m * float(np.cos(angle_rad)))
+        p_lin = float(static_heatmap[rb, ab])
+        p_db = float(static_db[rb, ab])
+        detections.append(
+            Detection(
+                range_bin=rb,
+                angle_bin=ab,
+                doppler_bin=None,
+                range_m=range_m,
+                angle_deg=angle_deg,
+                doppler_mps=None,
+                x_m=x_m,
+                y_m=y_m,
+                power_lin=p_lin,
+                power_db=p_db,
+                source="static",
+            )
+        )
+    return detections, static_heatmap
+
+
+def compute_range_doppler(
+    range_fft: np.ndarray,
+    *,
+    max_bin: int,
+    dsp_cfg: RealtimeDSPConfig,
+    moving_cfg: DetectionConfigMoving,
+    w_doppler: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    if range_fft.ndim != 5 or max_bin <= 0:
+        return np.empty((0, 0, 0, 0, 0), dtype=np.complex64), np.empty((0, 0), dtype=np.float32)
+    n_loops = int(range_fft.shape[1])
+    if n_loops <= 0:
+        return np.empty((0, 0, 0, 0, 0), dtype=np.complex64), np.empty((0, 0), dtype=np.float32)
+
+    trimmed = range_fft[:, :, :, :max_bin, :]
+    trimmed = np.ascontiguousarray(trimmed * w_doppler)
+    doppler_cube = fft.fft(
+        trimmed,
+        n=n_loops,
+        axis=1,
+        workers=dsp_cfg.fft_workers,
+        overwrite_x=False,
+    )
+    if moving_cfg.doppler_fft_shift:
+        doppler_cube = np.fft.fftshift(doppler_cube, axes=1)
+    doppler_cube = doppler_cube.astype(np.complex64, copy=False)
+
+    re = doppler_cube.real
+    im = doppler_cube.imag
+    rd_pow = (re * re + im * im).mean(axis=(0, 2, 4), dtype=np.float32)
+    range_doppler_map = rd_pow.transpose(1, 0).astype(np.float32, copy=False)
+
+    excl = int(max(0, moving_cfg.zero_doppler_exclusion_bins))
+    if excl > 0 and range_doppler_map.shape[1] > 0:
+        zero_idx = int(range_doppler_map.shape[1] // 2) if moving_cfg.doppler_fft_shift else 0
+        d0 = max(0, zero_idx - excl)
+        d1 = min(int(range_doppler_map.shape[1]), zero_idx + excl + 1)
+        range_doppler_map[:, d0:d1] = 0.0
+    return doppler_cube, range_doppler_map
+
+
+def detect_moving_targets(
+    range_doppler_map: np.ndarray,
+    *,
+    moving_cfg: DetectionConfigMoving,
+    range_bin_m: float,
+    doppler_axis_mps: np.ndarray | None,
+) -> list[Detection]:
+    if not moving_cfg.enabled or range_doppler_map.size <= 0:
+        return []
+    moving_db = _power_to_db(range_doppler_map)
+    threshold_db = _resolve_detection_threshold_db(
+        moving_db,
+        threshold_mode=moving_cfg.threshold_mode,
+        threshold_db=moving_cfg.threshold_db,
+        min_power_db=moving_cfg.min_power_db,
+    )
+    peak_idx = _select_localmax_2d(
+        moving_db,
+        threshold_db=threshold_db,
+        win_row=moving_cfg.localmax_range_bins,
+        win_col=moving_cfg.localmax_doppler_bins,
+        max_peaks=moving_cfg.max_detections,
+    )
+    detections: list[Detection] = []
+    for r_bin, d_bin in peak_idx:
+        rb = int(r_bin)
+        dbin = int(d_bin)
+        range_m = float(rb) * float(range_bin_m)
+        doppler_mps = None
+        if doppler_axis_mps is not None and 0 <= dbin < int(doppler_axis_mps.size):
+            doppler_mps = float(doppler_axis_mps[dbin])
+        p_lin = float(range_doppler_map[rb, dbin])
+        p_db = float(moving_db[rb, dbin])
+        detections.append(
+            Detection(
+                range_bin=rb,
+                angle_bin=None,
+                doppler_bin=dbin,
+                range_m=range_m,
+                angle_deg=0.0,
+                doppler_mps=doppler_mps,
+                x_m=0.0,
+                y_m=range_m,
+                power_lin=p_lin,
+                power_db=p_db,
+                source="moving",
+            )
+        )
+    return detections
+
+
+def estimate_angle_for_moving_detections(
+    detections: list[Detection],
+    doppler_cube: np.ndarray,
+    *,
+    w_angle: np.ndarray,
+    angle_cfg: AngleProcessingConfig,
+    dsp_cfg: RealtimeDSPConfig,
+    angle_steering: np.ndarray,
+    angle_axis_deg: np.ndarray,
+) -> list[Detection]:
+    if not detections or doppler_cube.ndim != 5:
+        return detections
+    n_frames = int(doppler_cube.shape[0])
+    n_doppler = int(doppler_cube.shape[1])
+    n_range = int(doppler_cube.shape[3])
+    for det in detections:
+        if det.doppler_bin is None:
+            continue
+        dbin = int(det.doppler_bin)
+        rbin = int(det.range_bin)
+        if dbin < 0 or dbin >= n_doppler or rbin < 0 or rbin >= n_range:
+            continue
+        snapshot = doppler_cube[:, dbin : dbin + 1, :, rbin : rbin + 1, :]
+        va = snapshot.transpose(0, 1, 3, 2, 4).reshape(n_frames, 1, 1, int(dsp_cfg.virtual_ant))
+        va = np.ascontiguousarray(va)
+        va *= w_angle
+        angle_pow = compute_angle_heatmap(
+            va,
+            angle_cfg=angle_cfg,
+            dsp_cfg=dsp_cfg,
+            angle_steering=angle_steering,
+        )
+        if angle_pow.size <= 0:
+            continue
+        angle_spec = angle_pow[0]
+        angle_bin = int(np.argmax(angle_spec))
+        angle_deg = float(angle_axis_deg[angle_bin]) if 0 <= angle_bin < int(angle_axis_deg.size) else 0.0
+        angle_rad = np.deg2rad(np.float32(angle_deg))
+        det.angle_bin = angle_bin
+        det.angle_deg = angle_deg
+        det.x_m = float(det.range_m * float(np.sin(angle_rad)))
+        det.y_m = float(det.range_m * float(np.cos(angle_rad)))
+    return detections
+
+
+def _merge_two_detections(
+    det_static: Detection,
+    det_moving: Detection,
+    fusion_cfg: FusionConfig,
+) -> Detection:
+    use_moving_primary = bool(
+        fusion_cfg.prefer_moving_when_doppler_valid and det_moving.doppler_mps is not None
+    )
+    if use_moving_primary:
+        range_bin = int(det_moving.range_bin)
+        angle_bin = det_moving.angle_bin if det_moving.angle_bin is not None else det_static.angle_bin
+        range_m = float(det_moving.range_m)
+        angle_deg = float(det_moving.angle_deg if det_moving.angle_bin is not None else det_static.angle_deg)
+        x_m = float(det_moving.x_m if det_moving.angle_bin is not None else det_static.x_m)
+        y_m = float(det_moving.y_m if det_moving.angle_bin is not None else det_static.y_m)
+    else:
+        w_static = max(float(det_static.power_lin), 1e-6)
+        w_moving = max(float(det_moving.power_lin), 1e-6)
+        w_sum = w_static + w_moving
+        x_m = (det_static.x_m * w_static + det_moving.x_m * w_moving) / w_sum
+        y_m = (det_static.y_m * w_static + det_moving.y_m * w_moving) / w_sum
+        range_m = float(np.hypot(x_m, y_m))
+        angle_deg = float(np.rad2deg(np.arctan2(np.float32(x_m), np.float32(max(y_m, 1e-6)))))
+        range_bin = int(round((det_static.range_bin * w_static + det_moving.range_bin * w_moving) / w_sum))
+        angle_bin = det_moving.angle_bin if det_moving.angle_bin is not None else det_static.angle_bin
+    return Detection(
+        range_bin=range_bin,
+        angle_bin=angle_bin,
+        doppler_bin=det_moving.doppler_bin,
+        range_m=range_m,
+        angle_deg=angle_deg,
+        doppler_mps=det_moving.doppler_mps,
+        x_m=x_m,
+        y_m=y_m,
+        power_lin=max(float(det_static.power_lin), float(det_moving.power_lin)),
+        power_db=max(float(det_static.power_db), float(det_moving.power_db)),
+        source="fused",
+    )
+
+
+def fuse_detections(
+    detections_static: list[Detection],
+    detections_moving: list[Detection],
+    fusion_cfg: FusionConfig,
+) -> list[Detection]:
+    if not detections_static and not detections_moving:
+        return []
+    if not fusion_cfg.enabled:
+        out = list(detections_moving) + list(detections_static)
+        out.sort(key=lambda d: d.power_lin, reverse=True)
+        return out
+
+    fused: list[Detection] = []
+    used_static: set[int] = set()
+    moving_sorted = sorted(detections_moving, key=lambda d: d.power_lin, reverse=True)
+    for moving_det in moving_sorted:
+        best_idx = -1
+        best_xy = float("inf")
+        for si, static_det in enumerate(detections_static):
+            if si in used_static:
+                continue
+            dx = float(moving_det.x_m - static_det.x_m)
+            dy = float(moving_det.y_m - static_det.y_m)
+            d_xy = float(np.hypot(dx, dy))
+            if d_xy > fusion_cfg.merge_xy_m:
+                continue
+            if abs(float(moving_det.range_m - static_det.range_m)) > fusion_cfg.merge_range_m:
+                continue
+            if abs(float(moving_det.angle_deg - static_det.angle_deg)) > fusion_cfg.merge_angle_deg:
+                continue
+            if d_xy < best_xy:
+                best_xy = d_xy
+                best_idx = si
+        if best_idx >= 0:
+            used_static.add(best_idx)
+            fused.append(_merge_two_detections(detections_static[best_idx], moving_det, fusion_cfg))
+        else:
+            fused.append(moving_det)
+
+    for si, static_det in enumerate(detections_static):
+        if si not in used_static:
+            fused.append(static_det)
+    fused.sort(key=lambda d: d.power_lin, reverse=True)
+    return fused
+
+
 def apply_background_subtraction(
     range_fft: np.ndarray,
     bg_cfg: BackgroundSubtractionConfig,
@@ -582,6 +1389,7 @@ def process_buffer(
     raw_buffer: np.ndarray,
     n_frames: int,
     w_range: np.ndarray,
+    w_doppler: np.ndarray,
     w_angle: np.ndarray,
     mean_before_range_fft: MeanSelection,
     mean_after_range_fft: MeanSelection,
@@ -592,6 +1400,12 @@ def process_buffer(
     heatmap_ema_cfg: HeatmapEMAConfig,
     heatmap_spatial_filter_cfg: HeatmapSpatialFilterConfig,
     angle_steering: np.ndarray,
+    angle_axis_deg: np.ndarray,
+    doppler_axis_mps: np.ndarray | None,
+    detection_static_cfg: DetectionConfigStatic,
+    detection_moving_cfg: DetectionConfigMoving,
+    fusion_cfg: FusionConfig,
+    tracker: MultiObjectTracker,
     bg_state: BackgroundSubtractionState,
     heatmap_ema: np.ndarray | None,
     gui_dbuf,
@@ -609,50 +1423,71 @@ def process_buffer(
     stat_norm_min_db: Synchronized,
     stat_norm_max_db: Synchronized,
     dsp_cfg: RealtimeDSPConfig,
-) -> np.ndarray | None:
+) -> tuple[np.ndarray | None, list[Detection], list[Track]]:
     try:
-
         # Raw complex stream -> Reshape -> radar tensor [frame, loop, tx, sample, rx].
-        data = raw_buffer.reshape(
-            n_frames,
-            dsp_cfg.chirps // dsp_cfg.tx,
-            dsp_cfg.tx,
-            dsp_cfg.samples,
-            dsp_cfg.rx,
-        )
+        data = raw_buffer.reshape(n_frames,dsp_cfg.chirps // dsp_cfg.tx,dsp_cfg.tx,dsp_cfg.samples,dsp_cfg.rx,)
 
+        # Range-FFT pre-processing: static mean subtraction and range windowing.
         data = subtract_selected_mean(data, mean_before_range_fft)
+
+        # Apply range window (broadcasting over all non-range dimensions) to reduce sidelobes before the range FFT.
         data *= w_range
 
+        # Range FFT with optional zero-padding and in-place computation to save memory.
+        range_fft_common = fft.fft(data,n=dsp_cfg.nfft_range,axis=3,workers=dsp_cfg.fft_workers,overwrite_x=True,)
 
-        # Compute the range FFT along the sample axis.
-        range_fft = fft.fft(data,n=dsp_cfg.nfft_range,axis=3,workers=dsp_cfg.fft_workers,overwrite_x=True,)
-        # Apply the selected slow-time filter on the loop axis after the range FFT.
-        range_fft = apply_slow_time_filter(
-            range_fft,
-            slow_time_cfg,
-            fft_workers=dsp_cfg.fft_workers,
-        )
-        range_fft = subtract_selected_mean(range_fft, mean_after_range_fft)
-        range_fft = apply_background_subtraction(
-            range_fft,
-            bg_subtraction,
-            bg_state,
-        )
+        # Range bin to physical range conversion factor (meters per bin).
+        range_bin_m = dsp_cfg.c * dsp_cfg.fs / (2.0 * dsp_cfg.slope * dsp_cfg.nfft_range)
+
+        # Tracking path (physical data): no display EMA/blur/normalization.
+        detections_static: list[Detection] = []
+        detections_moving: list[Detection] = []
+        # If enabled, detect static targets from the range-FFT cube and estimate their angle/range.
+        if detection_static_cfg.enabled:
+            detections_static, _ = detect_static_targets(range_fft_common,static_cfg=detection_static_cfg,angle_cfg=angle_processing,dsp_cfg=dsp_cfg,
+                w_angle=w_angle,angle_steering=angle_steering,angle_axis_deg=angle_axis_deg,range_bin_m=range_bin_m,max_bin=max_bin,)
+        
+        if detection_moving_cfg.enabled:
+            doppler_cube, range_doppler_map = compute_range_doppler(
+                range_fft_common,
+                max_bin=max_bin,
+                dsp_cfg=dsp_cfg,
+                moving_cfg=detection_moving_cfg,
+                w_doppler=w_doppler,
+            )
+            detections_moving = detect_moving_targets(
+                range_doppler_map,
+                moving_cfg=detection_moving_cfg,
+                range_bin_m=range_bin_m,
+                doppler_axis_mps=doppler_axis_mps,
+            )
+            detections_moving = estimate_angle_for_moving_detections(
+                detections_moving,
+                doppler_cube,
+                w_angle=w_angle,
+                angle_cfg=angle_processing,
+                dsp_cfg=dsp_cfg,
+                angle_steering=angle_steering,
+                angle_axis_deg=angle_axis_deg,
+            )
+        fused_detections = fuse_detections(detections_static, detections_moving, fusion_cfg)
+        active_tracks = tracker.step(fused_detections, timestamp_s=time.perf_counter())
+
+        # Display path remains unchanged and independent from tracking.
+        range_fft_display = apply_slow_time_filter(range_fft_common,slow_time_cfg,fft_workers=dsp_cfg.fft_workers,)
+        range_fft_display = subtract_selected_mean(range_fft_display, mean_after_range_fft)
+        range_fft_display = apply_background_subtraction(range_fft_display,bg_subtraction,bg_state,)
 
         if apply_loop_average_after_background:
             # Collapse the loop dimension while preserving the axis for the downstream pipeline.
-            range_fft = range_fft.mean(axis=1, keepdims=True, dtype=np.complex64)
+            range_fft_display = range_fft_display.mean(axis=1, keepdims=True, dtype=np.complex64)
 
         # Build the virtual array after trimming range bins to limit memory traffic.
-        range_fft = range_fft[:, :, :, :max_bin, :]
-        va = range_fft.transpose(0, 1, 3, 2, 4)
-        va = np.ascontiguousarray(va)
-        virtual_array = va.reshape(
-            n_frames,
-            dsp_cfg.chirps // dsp_cfg.tx,
-            max_bin,
-            dsp_cfg.virtual_ant,
+        virtual_array = _build_virtual_array_from_range_fft(
+            range_fft_display,
+            max_bin=max_bin,
+            dsp_cfg=dsp_cfg,
         )
 
         prof_re = virtual_array.real
@@ -668,7 +1503,6 @@ def process_buffer(
         copy_rows = min(int(dsp_cfg.range_profile_count), int(profiles_db_va.shape[0]))
         if copy_rows > 0:
             profiles_out[:copy_rows, :] = profiles_db_va[:copy_rows, :].astype(np.float32, copy=False)
-
 
         virtual_array *= w_angle
 
@@ -741,11 +1575,11 @@ def process_buffer(
                 dst_prof[:n_prof] = prof_flat[:n_prof]
             gui_latest_idx.value = next_idx
             gui_latest_seq.value = int(gui_latest_seq.value) + 1
-        return heatmap_ema
+        return heatmap_ema, fused_detections, active_tracks
 
     except Exception as e:
         print(f"[DSP ERR] {e}")
-        return heatmap_ema
+        return heatmap_ema, [], list(tracker.tracks)
 
 
 def dsp_worker(
@@ -764,6 +1598,11 @@ def dsp_worker(
     gui_latest_idx: Synchronized,
     gui_latest_seq: Synchronized,
     gui_lock,
+    tracks_xy_dbuf,
+    tracks_meta_dbuf,
+    tracks_count: Synchronized,
+    tracks_seq: Synchronized,
+    tracks_lock,
     dsp_skip: Synchronized,
     dsp_ms_avg: Synchronized,
     dsp_ms_p95: Synchronized,
@@ -784,14 +1623,28 @@ def dsp_worker(
     angle_processing = angle_processing_from_yaml_dict(cfg_dict)
     heatmap_ema_cfg = heatmap_ema_from_yaml_dict(cfg_dict)
     heatmap_spatial_filter_cfg = heatmap_spatial_filter_from_yaml_dict(cfg_dict)
-    window_range, window_angle = build_windows(
+    detection_static_cfg = detection_static_from_yaml_dict(cfg_dict)
+    detection_moving_cfg = detection_moving_from_yaml_dict(cfg_dict)
+    fusion_cfg = fusion_from_yaml_dict(cfg_dict)
+    tracking_cfg = tracking_from_yaml_dict(cfg_dict)
+    tracker_cfg = tracker_from_yaml_dict(cfg_dict)
+    window_range, window_doppler, window_angle = build_windows(
         selection,
         samples=dsp_cfg.samples,
+        n_loops=dsp_cfg.chirps // dsp_cfg.tx,
         virtual_ant=dsp_cfg.virtual_ant,
     )
     angle_steering = build_angle_steering_matrix(
         virtual_ant=dsp_cfg.virtual_ant,
         nfft_angle=dsp_cfg.nfft_angle,
+    )
+    angle_axis_deg = build_angle_axis_deg(dsp_cfg.nfft_angle)
+    n_doppler = int(dsp_cfg.chirps // dsp_cfg.tx)
+    doppler_axis_mps = build_doppler_axis_mps(
+        cfg_dict,
+        dsp_cfg,
+        n_doppler,
+        doppler_fft_shift=detection_moving_cfg.doppler_fft_shift,
     )
 
     dr = dsp_cfg.c * dsp_cfg.fs / (2.0 * dsp_cfg.slope * dsp_cfg.nfft_range)
@@ -809,6 +1662,10 @@ def dsp_worker(
     n_slots = len(slot_state)
     heatmap_ema = None
     bg_state = BackgroundSubtractionState()
+    tracker = MultiObjectTracker(tracking_cfg=tracking_cfg, tracker_cfg=tracker_cfg)
+    tracks_xy_view = np.frombuffer(tracks_xy_dbuf, dtype=np.float32)
+    tracks_meta_view = np.frombuffer(tracks_meta_dbuf, dtype=np.int32)
+    tracks_capacity = int(min(tracks_xy_view.size // 4, tracks_meta_view.size // 4))
     warned_loop_average_after_doppler = False
     dsp_ms_samples: list[float] = []
     dsp_stat_last_flush = time.perf_counter()
@@ -824,6 +1681,25 @@ def dsp_worker(
 
     if dsp_cfg.rx != 4:
         raise ValueError("DSP: conversione I/Q attuale assume RX=4 (packing IIIIQQQQ).")
+
+    def _publish_tracks_latest_wins(active_tracks: list[Track]) -> None:
+        if tracks_capacity <= 0:
+            return
+        n_pub = min(int(len(active_tracks)), tracks_capacity)
+        with tracks_lock:
+            for idx_tr in range(n_pub):
+                tr = active_tracks[idx_tr]
+                base = idx_tr * 4
+                tracks_xy_view[base + 0] = np.float32(tr.x_m)
+                tracks_xy_view[base + 1] = np.float32(tr.y_m)
+                tracks_xy_view[base + 2] = np.float32(tr.vx_mps)
+                tracks_xy_view[base + 3] = np.float32(tr.vy_mps)
+                tracks_meta_view[base + 0] = int(tr.track_id)
+                tracks_meta_view[base + 1] = 1 if tr.confirmed else 0
+                tracks_meta_view[base + 2] = int(tr.age)
+                tracks_meta_view[base + 3] = int(tr.missed_frames)
+            tracks_count.value = n_pub
+            tracks_seq.value = int(tracks_seq.value) + 1
 
     def _release_slots_dsp(slots) -> None:
         # Release the DSP ownership bit; the slot is recycled only when no consumer needs it.
@@ -937,10 +1813,11 @@ def dsp_worker(
                 print("[DSP WARN] loop_average_after_background skipped because slow_time.mode=doppler_fft.")
                 warned_loop_average_after_doppler = True
             apply_loop_average_after_background = False
-        heatmap_ema = process_buffer(
+        heatmap_ema, _, active_tracks = process_buffer(
             complex_view,
             n_proc,
             window_range,
+            window_doppler,
             window_angle,
             mean_before_range_fft,
             mean_after_range_fft,
@@ -951,6 +1828,12 @@ def dsp_worker(
             heatmap_ema_cfg,
             heatmap_spatial_filter_cfg,
             angle_steering,
+            angle_axis_deg,
+            doppler_axis_mps,
+            detection_static_cfg,
+            detection_moving_cfg,
+            fusion_cfg,
+            tracker,
             bg_state,
             heatmap_ema,
             gui_dbuf,
@@ -969,6 +1852,7 @@ def dsp_worker(
             stat_norm_max_db,
             dsp_cfg,
         )
+        _publish_tracks_latest_wins(active_tracks)
         t1_proc = time.perf_counter()
         if n_proc > 0 and dsp_cfg.debug_stats:
             ms_per_frame = ((t1_proc - t0_proc) * 1000.0) / float(n_proc)

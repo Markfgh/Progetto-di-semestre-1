@@ -1109,6 +1109,13 @@ def main():
     gui_latest_idx = Value("i", -1)
     gui_latest_seq = Value("Q", 0)
     gui_lock = mp.Lock()
+    track_cfg = cfg.get("tracking", {}) or {}
+    track_max_shared = max(1, int(track_cfg.get("max_tracks", 30)))
+    gui_tracks_xy_dbuf = RawArray("f", track_max_shared * 4)   # x, y, vx, vy
+    gui_tracks_meta_dbuf = RawArray("i", track_max_shared * 4)  # id, confirmed, age, missed
+    gui_tracks_count = Value("i", 0)
+    gui_tracks_seq = Value("Q", 0)
+    gui_tracks_lock = mp.Lock()
 
     cmd_q = Queue(maxsize=16)
 
@@ -1206,6 +1213,11 @@ def main():
             gui_latest_idx,
             gui_latest_seq,
             gui_lock,
+            gui_tracks_xy_dbuf,
+            gui_tracks_meta_dbuf,
+            gui_tracks_count,
+            gui_tracks_seq,
+            gui_tracks_lock,
             dsp_skip,
             dsp_ms_avg,
             dsp_ms_p95,
@@ -1341,6 +1353,11 @@ def main():
     HEAT_PLOT_TAG = "heat_plot"
     XAXIS_TAG, YAXIS_TAG = "xaxis", "yaxis"
     IMG_SERIES_TAG = "img_series"
+    TRACK_SCATTER_CONF_TAG = "track_scatter_confirmed"
+    TRACK_SCATTER_UNCONF_TAG = "track_scatter_unconfirmed"
+    TRACK_VEL_SERIES_TAG = "track_velocity_series"
+    TRACK_ANN_PREFIX = "track_ann_"
+    TRACK_VEL_SCALE = 0.25
     PROC_TEX_TAG = "proc_heat_tex"
     PROC_HEAT_PLOT_TAG = "proc_heat_plot"
     PROC_XAXIS_TAG, PROC_YAXIS_TAG = "proc_xaxis", "proc_yaxis"
@@ -1379,6 +1396,22 @@ def main():
                 dpg.add_theme_color(dpg.mvPlotCol_Line, line_color, category=dpg.mvThemeCat_Plots)
                 dpg.add_theme_style(dpg.mvPlotStyleVar_LineWeight, 2.0, category=dpg.mvThemeCat_Plots)
         rangefft_line_themes.append(line_theme)
+    with dpg.theme() as track_conf_theme:
+        with dpg.theme_component(dpg.mvScatterSeries):
+            dpg.add_theme_color(dpg.mvPlotCol_MarkerFill, (255, 0, 0, 255), category=dpg.mvThemeCat_Plots)
+            dpg.add_theme_color(dpg.mvPlotCol_MarkerOutline, (255, 0, 0, 255), category=dpg.mvThemeCat_Plots)
+            dpg.add_theme_style(dpg.mvPlotStyleVar_Marker, dpg.mvPlotMarker_Circle, category=dpg.mvThemeCat_Plots)
+            dpg.add_theme_style(dpg.mvPlotStyleVar_MarkerSize, 8.0, category=dpg.mvThemeCat_Plots)
+    with dpg.theme() as track_unconf_theme:
+        with dpg.theme_component(dpg.mvScatterSeries):
+            dpg.add_theme_color(dpg.mvPlotCol_MarkerFill, (255, 220, 0, 255), category=dpg.mvThemeCat_Plots)
+            dpg.add_theme_color(dpg.mvPlotCol_MarkerOutline, (255, 220, 0, 255), category=dpg.mvThemeCat_Plots)
+            dpg.add_theme_style(dpg.mvPlotStyleVar_Marker, dpg.mvPlotMarker_Diamond, category=dpg.mvThemeCat_Plots)
+            dpg.add_theme_style(dpg.mvPlotStyleVar_MarkerSize, 8.0, category=dpg.mvThemeCat_Plots)
+    with dpg.theme() as track_vel_theme:
+        with dpg.theme_component(dpg.mvLineSeries):
+            dpg.add_theme_color(dpg.mvPlotCol_Line, (255, 255, 255, 170), category=dpg.mvThemeCat_Plots)
+            dpg.add_theme_style(dpg.mvPlotStyleVar_LineWeight, 1.0, category=dpg.mvThemeCat_Plots)
 
     # 4) Texture setup (1:1 con il buffer GUI, senza resampling)
     tex_w, tex_h = int(gui_w), int(gui_h)
@@ -1700,6 +1733,9 @@ def main():
         body = "".join(f"| {k:<{STATS_KEY_W}} | {v:>{STATS_VAL_W}} |\n" for k, v in rows_s)
         return border + body + border
 
+    track_annotation_tags: list[str] = []
+    supports_plot_annotation = bool(hasattr(dpg, "add_plot_annotation"))
+
     # 6) Build UI (ONLY TABLE LAYOUT)
     with dpg.window(tag=TAG_MAIN_WINDOW):
         with dpg.tab_bar(tag=TAG_MAIN_TABBAR):
@@ -1768,6 +1804,33 @@ def main():
                             tag=IMG_SERIES_TAG,
                             parent=YAXIS_TAG,
                         )
+                        dpg.add_scatter_series([], [], label="Tracks confirmed", tag=TRACK_SCATTER_CONF_TAG, parent=YAXIS_TAG)
+                        dpg.add_scatter_series([], [], label="Tracks tentative", tag=TRACK_SCATTER_UNCONF_TAG, parent=YAXIS_TAG)
+                        dpg.add_line_series([], [], label="Track velocity", tag=TRACK_VEL_SERIES_TAG, parent=YAXIS_TAG)
+                        dpg.bind_item_theme(TRACK_SCATTER_CONF_TAG, track_conf_theme)
+                        dpg.bind_item_theme(TRACK_SCATTER_UNCONF_TAG, track_unconf_theme)
+                        dpg.bind_item_theme(TRACK_VEL_SERIES_TAG, track_vel_theme)
+                        if supports_plot_annotation:
+                            add_plot_annotation_fn = getattr(dpg, "add_plot_annotation", None)
+                            if callable(add_plot_annotation_fn):
+                                for ann_i in range(track_max_shared):
+                                    ann_tag = f"{TRACK_ANN_PREFIX}{ann_i}"
+                                    try:
+                                        add_plot_annotation_fn(
+                                            label="",
+                                            default_value=(0.0, 0.0),
+                                            offset=(6, 6),
+                                            color=(255, 255, 255, 220),
+                                            clamped=False,
+                                            parent=YAXIS_TAG,
+                                            tag=ann_tag,
+                                        )
+                                        dpg.configure_item(ann_tag, show=False)
+                                        track_annotation_tags.append(ann_tag)
+                                    except Exception:
+                                        track_annotation_tags.clear()
+                                        supports_plot_annotation = False
+                                        break
 
                 # --- COLORBAR ---
                 with dpg.table_cell():
@@ -2023,8 +2086,12 @@ def main():
         frames_ok_prev = 0
         log_bytes_prev = 0
     gui_last_seq = 0
+    tracks_last_seq = 0
     gui_frame = np.zeros((gui_h, gui_w), dtype=np.float32)
     rangefft_frame = np.full((RANGE_PROFILE_COUNT, gui_h), -120.0, dtype=np.float32)
+    gui_tracks_xy_view = np.frombuffer(gui_tracks_xy_dbuf, dtype=np.float32, count=track_max_shared * 4)
+    gui_tracks_meta_view = np.frombuffer(gui_tracks_meta_dbuf, dtype=np.int32, count=track_max_shared * 4)
+    tracks_out: list[dict[str, float | int | bool]] = []
     proc_frame = np.full((proc_tex_h, proc_tex_w), off_vmin, dtype=np.float32)
     range_axis_m = np.arange(gui_h, dtype=np.float32) * np.float32(dr_plot)
     x_range_cache = {}
@@ -2327,6 +2394,85 @@ def main():
                             dpg.set_value(line_tag, [x_range_m, y_vals])
                 if DEBUG_STATS:
                     img_updates += 1
+
+            # 3. TRACK OVERLAY UPDATE (latest-wins shared state)
+            tracks_seq_now = int(gui_tracks_seq.value)
+            if tracks_seq_now != tracks_last_seq:
+                with gui_tracks_lock:
+                    tracks_seq_locked = int(gui_tracks_seq.value)
+                    n_tracks = max(0, min(int(gui_tracks_count.value), track_max_shared))
+                    tracks_out = []
+                    for tr_i in range(n_tracks):
+                        base = tr_i * 4
+                        tr_id = int(gui_tracks_meta_view[base + 0])
+                        tr_confirmed = bool(int(gui_tracks_meta_view[base + 1]))
+                        tr_age = int(gui_tracks_meta_view[base + 2])
+                        tr_missed = int(gui_tracks_meta_view[base + 3])
+                        tr_x = float(gui_tracks_xy_view[base + 0])
+                        tr_y = float(gui_tracks_xy_view[base + 1])
+                        tr_vx = float(gui_tracks_xy_view[base + 2])
+                        tr_vy = float(gui_tracks_xy_view[base + 3])
+                        tracks_out.append(
+                            {
+                                "id": tr_id,
+                                "x": tr_x,
+                                "y": tr_y,
+                                "vx": tr_vx,
+                                "vy": tr_vy,
+                                "confirmed": tr_confirmed,
+                                "age": tr_age,
+                                "missed": tr_missed,
+                            }
+                        )
+                    tracks_last_seq = tracks_seq_locked
+
+                conf_x: list[float] = []
+                conf_y: list[float] = []
+                unconf_x: list[float] = []
+                unconf_y: list[float] = []
+                vel_x: list[float] = []
+                vel_y: list[float] = []
+                for tr in tracks_out:
+                    tx = float(tr["x"])
+                    ty = float(tr["y"])
+                    if bool(tr["confirmed"]):
+                        conf_x.append(tx)
+                        conf_y.append(ty)
+                    else:
+                        unconf_x.append(tx)
+                        unconf_y.append(ty)
+                    vel_x.extend([tx, tx + float(tr["vx"]) * TRACK_VEL_SCALE, float("nan")])
+                    vel_y.extend([ty, ty + float(tr["vy"]) * TRACK_VEL_SCALE, float("nan")])
+
+                if dpg.does_item_exist(TRACK_SCATTER_CONF_TAG):
+                    dpg.set_value(TRACK_SCATTER_CONF_TAG, [conf_x, conf_y])
+                if dpg.does_item_exist(TRACK_SCATTER_UNCONF_TAG):
+                    dpg.set_value(TRACK_SCATTER_UNCONF_TAG, [unconf_x, unconf_y])
+                if dpg.does_item_exist(TRACK_VEL_SERIES_TAG):
+                    dpg.set_value(TRACK_VEL_SERIES_TAG, [vel_x, vel_y])
+
+                if supports_plot_annotation and track_annotation_tags:
+                    n_labels = min(len(track_annotation_tags), len(tracks_out))
+                    for ann_i, ann_tag in enumerate(track_annotation_tags):
+                        if not dpg.does_item_exist(ann_tag):
+                            continue
+                        try:
+                            if ann_i < n_labels:
+                                tr = tracks_out[ann_i]
+                                dpg.configure_item(
+                                    ann_tag,
+                                    label=f"ID {int(tr['id'])}",
+                                    default_value=(float(tr["x"]), float(tr["y"])),
+                                    show=True,
+                                )
+                            else:
+                                dpg.configure_item(ann_tag, show=False)
+                        except Exception:
+                            supports_plot_annotation = False
+                            for hide_tag in track_annotation_tags:
+                                if dpg.does_item_exist(hide_tag):
+                                    dpg.configure_item(hide_tag, show=False)
+                            break
 
             dpg.render_dearpygui_frame()
 
