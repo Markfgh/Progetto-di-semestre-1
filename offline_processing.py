@@ -18,8 +18,12 @@ import yaml
 
 from offline_dsp import (
     AvgMode,
+    BpMode,
     avg_mode_normalize as _avg_mode_normalize,
     back_projection_image as _back_projection_image,
+    back_projection_image_mimo as _back_projection_image_mimo,
+    bp_mode_normalize as _bp_mode_normalize,
+    build_virtual_array_x_offsets as _build_virtual_array_x_offsets,
     phase_sign_normalize as _phase_sign_normalize,
     reduce_avg_mode as _reduce_avg_mode,
 )
@@ -565,6 +569,51 @@ def _read_phase_sign(offline_config_path: str | Path) -> int:
     return _phase_sign_normalize(raw, field_name="offline_config: bp.phase_sign")
 
 
+def _to_bool(field_name: str, value: Any) -> bool:
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, (int, np.integer)):
+        return bool(int(value))
+    if isinstance(value, str):
+        value_s = value.strip().lower()
+        if value_s in {"1", "true", "yes", "y", "on"}:
+            return True
+        if value_s in {"0", "false", "no", "n", "off"}:
+            return False
+    raise ValueError(f"{field_name} non valido: {value!r}")
+
+
+def _read_bp_runtime_cfg(offline_config_path: str | Path) -> dict[str, Any]:
+    cfg = _load_yaml_file(Path(offline_config_path))
+    bp_cfg = cfg.get("bp", {}) or {}
+
+    mode: BpMode = _bp_mode_normalize(_pick(bp_cfg.get("mode"), "sar_only"))
+    use_virtual_antennas = _to_bool(
+        "offline_config: bp.use_virtual_antennas",
+        _pick(bp_cfg.get("use_virtual_antennas"), True),
+    )
+    coherent_sum = _to_bool(
+        "offline_config: bp.coherent_sum",
+        _pick(bp_cfg.get("coherent_sum"), True),
+    )
+
+    raw_pitch = _pick(bp_cfg.get("virtual_ant_pitch_m"), 0.00195)
+    try:
+        virtual_ant_pitch_m = float(raw_pitch)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"offline_config: bp.virtual_ant_pitch_m non valido: {raw_pitch!r}") from exc
+
+    if mode == "mimo_sar" and use_virtual_antennas and virtual_ant_pitch_m <= 0.0:
+        raise ValueError("offline_config: bp.virtual_ant_pitch_m deve essere > 0 in mimo_sar")
+
+    return {
+        "mode": mode,
+        "use_virtual_antennas": bool(use_virtual_antennas),
+        "coherent_sum": bool(coherent_sum),
+        "virtual_ant_pitch_m": float(virtual_ant_pitch_m),
+    }
+
+
 # ---------------------------------------------------------------------
 # Offline Multiprocess Pipeline
 # - reader process: load + range-FFT prep
@@ -581,11 +630,18 @@ def _offline_reader_worker(
     shm_range_fft = None
     try:
         reader = SARReader(offline_config_path=offline_config_path, fallback_capture_cfg=fallback_capture_cfg)
+        bp_runtime_cfg = _read_bp_runtime_cfg(offline_config_path)
+        bp_mode: BpMode = bp_runtime_cfg["mode"]
         data = reader.load(keep_raw=False)
 
-        # Riduzione preliminare: media sulle antenne virtuali per ridurre payload e costo DSP.
-        sig = data.iq_cube.mean(axis=3, dtype=np.complex64)  # [pos, frame, loop, sample]
-        range_fft = np.fft.fft(sig, n=int(nfft_range), axis=-1).astype(np.complex64, copy=False)
+        if bp_mode == "mimo_sar":
+            # MIMO-SAR: preserva asse antenna [pos, frame, loop, ant, sample].
+            sig = data.iq_cube
+            range_fft = np.fft.fft(sig, n=int(nfft_range), axis=-1).astype(np.complex64, copy=False)
+        else:
+            # Legacy SAR-only: media preliminare sulle antenne virtuali.
+            sig = data.iq_cube.mean(axis=3, dtype=np.complex64)  # [pos, frame, loop, sample]
+            range_fft = np.fft.fft(sig, n=int(nfft_range), axis=-1).astype(np.complex64, copy=False)
         range_fft = np.ascontiguousarray(range_fft, dtype=np.complex64)
         shm_range_fft = shared_memory.SharedMemory(create=True, size=int(range_fft.nbytes))
         shm_arr = np.ndarray(range_fft.shape, dtype=np.complex64, buffer=shm_range_fft.buf)
@@ -599,6 +655,12 @@ def _offline_reader_worker(
             "positions": data.positions.astype(np.int32, copy=False),
             "x_start_cfg": int(reader.config.x_start),
             "x_end_cfg": int(reader.config.x_end),
+            "bp_mode": str(bp_mode),
+            "bp_virtual_ant_pitch_m": float(bp_runtime_cfg["virtual_ant_pitch_m"]),
+            "bp_use_virtual_antennas": bool(bp_runtime_cfg["use_virtual_antennas"]),
+            "bp_coherent_sum": bool(bp_runtime_cfg["coherent_sum"]),
+            "tx": int(data.tx),
+            "rx": int(data.rx),
         }
         _queue_put_latest(reader_to_dsp_q, msg)
         _queue_put_latest(
@@ -607,6 +669,7 @@ def _offline_reader_worker(
                 "type": "reader_ready",
                 "positions": int(data.positions.size),
                 "frames_per_pos": int(data.n_frames_per_position),
+                "bp_mode": str(bp_mode),
             },
         )
     except Exception as exc:
@@ -635,7 +698,7 @@ def _range_fft_from_init_msg(init_msg: dict[str, Any]) -> tuple[np.ndarray, shar
         if not isinstance(shape_raw, (tuple, list)):
             raise ValueError("range_fft_shape mancante o non valido nel messaggio init")
         shape = tuple(int(x) for x in shape_raw)
-        if len(shape) != 4:
+        if len(shape) not in (4, 5):
             raise ValueError(f"range_fft_shape non valido: {shape!r}")
         dtype_s = str(init_msg.get("range_fft_dtype", "complex64")).strip().lower()
         if dtype_s != "complex64":
@@ -646,6 +709,8 @@ def _range_fft_from_init_msg(init_msg: dict[str, Any]) -> tuple[np.ndarray, shar
 
     # Backward-compatible fallback for legacy queue payloads.
     arr = np.asarray(init_msg["range_fft"], dtype=np.complex64)
+    if arr.ndim not in (4, 5):
+        raise ValueError(f"range_fft shape non valido: {arr.shape!r}")
     return arr, None
 
 
@@ -691,14 +756,53 @@ def _offline_dsp_worker(
             _queue_put_latest(status_q, {"type": "error", "error": str(init_msg.get("error", "errore reader"))})
             return
 
-        range_fft_4d, shm_range_fft = _range_fft_from_init_msg(init_msg)
+        range_fft_data, shm_range_fft = _range_fft_from_init_msg(init_msg)
         positions = np.asarray(init_msg["positions"], dtype=np.int32)
-        if range_fft_4d.ndim != 4:
-            raise ValueError(f"range_fft_4d shape non valido: {range_fft_4d.shape!r}")
-        if positions.ndim != 1 or positions.size != range_fft_4d.shape[0]:
-            raise ValueError("positions non coerente con range_fft_4d")
+        bp_mode: BpMode = _bp_mode_normalize(_pick(init_msg.get("bp_mode"), "sar_only"))
+        if ("bp_mode" not in init_msg) and range_fft_data.ndim == 5:
+            bp_mode = "mimo_sar"
+        if range_fft_data.ndim not in (4, 5):
+            raise ValueError(f"range_fft shape non valido: {range_fft_data.shape!r}")
+        if bp_mode == "sar_only" and range_fft_data.ndim != 4:
+            raise ValueError(f"range_fft shape non coerente con bp.mode=sar_only: {range_fft_data.shape!r}")
+        if bp_mode == "mimo_sar" and range_fft_data.ndim != 5:
+            raise ValueError(f"range_fft shape non coerente con bp.mode=mimo_sar: {range_fft_data.shape!r}")
+        if positions.ndim != 1 or positions.size != range_fft_data.shape[0]:
+            raise ValueError("positions non coerente con range_fft")
 
-        n_pos, _, _, n_bins_total = range_fft_4d.shape
+        use_virtual_antennas = _to_bool(
+            "init_msg: bp_use_virtual_antennas",
+            _pick(init_msg.get("bp_use_virtual_antennas"), True),
+        )
+        coherent_sum = _to_bool(
+            "init_msg: bp_coherent_sum",
+            _pick(init_msg.get("bp_coherent_sum"), True),
+        )
+        raw_virtual_pitch = _pick(init_msg.get("bp_virtual_ant_pitch_m"), 0.00195)
+        try:
+            virtual_ant_pitch_m = float(raw_virtual_pitch)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"init_msg: bp_virtual_ant_pitch_m non valido: {raw_virtual_pitch!r}") from exc
+        if bp_mode == "mimo_sar" and use_virtual_antennas and virtual_ant_pitch_m <= 0.0:
+            raise ValueError("bp_virtual_ant_pitch_m deve essere > 0 in mimo_sar")
+
+        x_ant_m = np.zeros(1, dtype=np.float32)
+        n_ant_used = 1
+        if bp_mode == "mimo_sar":
+            n_ant_data = int(range_fft_data.shape[3])
+            tx_i = max(1, int(_pick(init_msg.get("tx"), 2)))
+            rx_i = max(1, int(_pick(init_msg.get("rx"), 4)))
+            n_ant_cfg = tx_i * rx_i
+            if n_ant_cfg != n_ant_data:
+                n_ant_cfg = n_ant_data
+            x_ant_m = _build_virtual_array_x_offsets(
+                n_ant_cfg,
+                pitch_m=float(virtual_ant_pitch_m),
+                use_virtual_antennas=bool(use_virtual_antennas),
+            )
+            n_ant_used = int(x_ant_m.size)
+
+        n_bins_total = int(range_fft_data.shape[-1])
         dr_m = float(c_m_s) * float(fs_hz) / (2.0 * float(slope_hz_s) * float(nfft_range))
         max_bin = int(np.floor(float(range_max_m) / dr_m))
         max_bin = max(1, min(max_bin, int(n_bins_total)))
@@ -744,6 +848,8 @@ def _offline_dsp_worker(
                 "img_h": int(gui_h),
                 "img_w": int(gui_w),
                 "dr_m": float(dr_m),
+                "bp_mode": str(bp_mode),
+                "virtual_antennas": int(n_ant_used),
             },
         )
 
@@ -793,22 +899,43 @@ def _offline_dsp_worker(
                 if not np.any(sel_mask):
                     sel_mask[:] = True
                 sel_idx = np.where(sel_mask)[0]
-                range_fft_sel = range_fft_4d[sel_idx, :, :, :max_bin]
                 x_pos_m_sel = x_pos_m_full[sel_idx]
-
-                reduced = _reduce_avg_mode(range_fft_sel, avg_mode)
-                img_db = _back_projection_image(
-                    reduced,
-                    x_pos_m_sel,
-                    x_grid,
-                    y_grid,
-                    dr_m=dr_m,
-                    fc_hz=fc_hz,
-                    c_m_s=c_m_s,
-                    max_bin=max_bin,
-                    phase_sign=phase_sign_i,
-                    chunk_size=16384,
-                )
+                if bp_mode == "mimo_sar":
+                    range_fft_sel = range_fft_data[sel_idx, :, :, :, :max_bin]
+                    reduced = _reduce_avg_mode(range_fft_sel, avg_mode)
+                    if reduced.ndim != 4:
+                        raise ValueError(f"reduce_avg_mode mimo_sar shape non valido: {reduced.shape!r}")
+                    img_db = _back_projection_image_mimo(
+                        reduced,
+                        x_pos_m_sel,
+                        x_ant_m,
+                        x_grid,
+                        y_grid,
+                        dr_m=dr_m,
+                        fc_hz=fc_hz,
+                        c_m_s=c_m_s,
+                        max_bin=max_bin,
+                        phase_sign=phase_sign_i,
+                        chunk_size=16384,
+                        coherent_sum=bool(coherent_sum),
+                    )
+                else:
+                    range_fft_sel = range_fft_data[sel_idx, :, :, :max_bin]
+                    reduced = _reduce_avg_mode(range_fft_sel, avg_mode)
+                    if reduced.ndim != 3:
+                        raise ValueError(f"reduce_avg_mode sar_only shape non valido: {reduced.shape!r}")
+                    img_db = _back_projection_image(
+                        reduced,
+                        x_pos_m_sel,
+                        x_grid,
+                        y_grid,
+                        dr_m=dr_m,
+                        fc_hz=fc_hz,
+                        c_m_s=c_m_s,
+                        max_bin=max_bin,
+                        phase_sign=phase_sign_i,
+                        chunk_size=16384,
+                    )
 
                 with gui_lock:
                     prev_idx = int(gui_latest_idx.value)
@@ -833,6 +960,7 @@ def _offline_dsp_worker(
                         "x_end": int(x_end),
                         "avg_mode": str(avg_mode),
                         "n_pos_used": int(sel_idx.size),
+                        "bp_mode": str(bp_mode),
                         "elapsed_ms": float((t1 - t0) * 1000.0),
                     },
                 )
@@ -861,7 +989,8 @@ def _offline_dsp_worker(
 class OfflineBPRuntime:
     """
     Runtime/controller offline a due processi:
-    - reader process: carica bin e prepara range-FFT 4D [pos, frame, loop, range]
+    - reader process: carica bin e prepara range-FFT 4D/5D
+      [pos, frame, loop, range] oppure [pos, frame, loop, ant, range]
     - dsp process: applica media runtime + back projection e pubblica frame su double-buffer
     """
 

@@ -368,7 +368,13 @@ def _apply_process_affinity(label: str, pid: int, cpus, enabled: bool) -> None:
 
 
 from offline_processing import OfflineBPRuntime
-from realtime_dsp import RealtimeDSPConfig, dsp_worker
+from realtime_dsp import (
+    RealtimeDSPConfig,
+    build_angle_axis_deg,
+    display_projection_from_yaml_dict,
+    dsp_worker,
+    resolve_display_crossrange_max_m,
+)
 #import dpnp as dp
 
 
@@ -408,11 +414,27 @@ VMAX_NORM = float(cfg.get("display", {}).get("vmax_norm", VMAX_RAW))
 
 # range_max / crossrange_max: HARD LIMIT (0 .. max config)
 RMAX_HARD_MAX = float(cfg["display"]["range_max"])
-XMAX_HARD_MAX = float(cfg.get("display", {}).get("crossrange_max", RMAX_HARD_MAX))
+RANGE_MAX_DISPLAY = float(cfg["display"]["range_max"])
+display_projection_cfg = display_projection_from_yaml_dict(cfg)
+HEATMAP_CROSSRANGE_MAX_DISPLAY = float(
+    resolve_display_crossrange_max_m(
+        RANGE_MAX_DISPLAY,
+        build_angle_axis_deg(NFFT_ANGLE),
+        display_projection_cfg,
+    )
+)
+HEATMAP_XMAX_HARD_MAX = float(HEATMAP_CROSSRANGE_MAX_DISPLAY)
+
+crossrange_cfg_raw = cfg.get("display", {}).get("crossrange_max_m", cfg.get("display", {}).get("crossrange_max", None))
+try:
+    CROSSRANGE_MAX_DISPLAY = float(crossrange_cfg_raw)
+except (TypeError, ValueError):
+    CROSSRANGE_MAX_DISPLAY = float(RANGE_MAX_DISPLAY)
+if not np.isfinite(CROSSRANGE_MAX_DISPLAY) or CROSSRANGE_MAX_DISPLAY <= 0.0:
+    CROSSRANGE_MAX_DISPLAY = float(RANGE_MAX_DISPLAY)
+XMAX_HARD_MAX = float(CROSSRANGE_MAX_DISPLAY)
 
 # valori iniziali di visualizzazione (partono dai limiti config, ma poi l'utente puÃ² ridurli fino a 0)
-RANGE_MAX_DISPLAY = float(cfg["display"]["range_max"])
-CROSSRANGE_MAX_DISPLAY = float(cfg.get("display", {}).get("crossrange_max", RANGE_MAX_DISPLAY))
 RANGEFFT_DB_MIN = float(cfg.get("display", {}).get("rangefft_db_min", VMIN_RAW))
 RANGEFFT_DB_MAX = float(cfg.get("display", {}).get("rangefft_db_max", VMAX_RAW))
 if RANGEFFT_DB_MAX <= RANGEFFT_DB_MIN:
@@ -1113,6 +1135,8 @@ def main():
     track_max_shared = max(1, int(track_cfg.get("max_tracks", 30)))
     gui_tracks_xy_dbuf = RawArray("f", track_max_shared * 4)   # x, y, vx, vy
     gui_tracks_meta_dbuf = RawArray("i", track_max_shared * 4)  # id, confirmed, age, missed
+    gui_tracks_state_dbuf = RawArray("i", track_max_shared * 2)  # motion_state_code, has_stop
+    gui_tracks_stop_xy_dbuf = RawArray("f", track_max_shared * 2)  # stop_x, stop_y
     gui_tracks_count = Value("i", 0)
     gui_tracks_seq = Value("Q", 0)
     gui_tracks_lock = mp.Lock()
@@ -1215,6 +1239,8 @@ def main():
             gui_lock,
             gui_tracks_xy_dbuf,
             gui_tracks_meta_dbuf,
+            gui_tracks_state_dbuf,
+            gui_tracks_stop_xy_dbuf,
             gui_tracks_count,
             gui_tracks_seq,
             gui_tracks_lock,
@@ -1298,7 +1324,7 @@ def main():
     if vis_vmax <= vis_vmin:
         vis_vmax = vis_vmin + 1.0
     vis_rmax = float(RANGE_MAX_DISPLAY)
-    vis_xmax = float(CROSSRANGE_MAX_DISPLAY)
+    vis_xmax = float(HEATMAP_CROSSRANGE_MAX_DISPLAY)
     vis_fft_mode_db = True
     vis_fft_vmin = float(RANGEFFT_DB_MIN)
     vis_fft_vmax = float(RANGEFFT_DB_MAX)
@@ -1355,6 +1381,10 @@ def main():
     IMG_SERIES_TAG = "img_series"
     TRACK_SCATTER_CONF_TAG = "track_scatter_confirmed"
     TRACK_SCATTER_UNCONF_TAG = "track_scatter_unconfirmed"
+    TRACK_SCATTER_MOVING_TAG = "track_scatter_moving"
+    TRACK_SCATTER_STOPPED_TAG = "track_scatter_stopped"
+    TRACK_SCATTER_UNKNOWN_TAG = "track_scatter_unknown"
+    TRACK_STOP_MARKER_TAG = "track_stop_marker"
     TRACK_VEL_SERIES_TAG = "track_velocity_series"
     TRACK_ANN_PREFIX = "track_ann_"
     TRACK_VEL_SCALE = 0.25
@@ -1398,20 +1428,44 @@ def main():
         rangefft_line_themes.append(line_theme)
     with dpg.theme() as track_conf_theme:
         with dpg.theme_component(dpg.mvScatterSeries):
-            dpg.add_theme_color(dpg.mvPlotCol_MarkerFill, (255, 0, 0, 255), category=dpg.mvThemeCat_Plots)
-            dpg.add_theme_color(dpg.mvPlotCol_MarkerOutline, (255, 0, 0, 255), category=dpg.mvThemeCat_Plots)
+            dpg.add_theme_color(dpg.mvPlotCol_MarkerFill, (255, 255, 255, 0), category=dpg.mvThemeCat_Plots)
+            dpg.add_theme_color(dpg.mvPlotCol_MarkerOutline, (255, 255, 255, 220), category=dpg.mvThemeCat_Plots)
             dpg.add_theme_style(dpg.mvPlotStyleVar_Marker, dpg.mvPlotMarker_Circle, category=dpg.mvThemeCat_Plots)
             dpg.add_theme_style(dpg.mvPlotStyleVar_MarkerSize, 8.0, category=dpg.mvThemeCat_Plots)
     with dpg.theme() as track_unconf_theme:
         with dpg.theme_component(dpg.mvScatterSeries):
-            dpg.add_theme_color(dpg.mvPlotCol_MarkerFill, (255, 220, 0, 255), category=dpg.mvThemeCat_Plots)
-            dpg.add_theme_color(dpg.mvPlotCol_MarkerOutline, (255, 220, 0, 255), category=dpg.mvThemeCat_Plots)
+            dpg.add_theme_color(dpg.mvPlotCol_MarkerFill, (255, 255, 255, 0), category=dpg.mvThemeCat_Plots)
+            dpg.add_theme_color(dpg.mvPlotCol_MarkerOutline, (255, 255, 255, 130), category=dpg.mvThemeCat_Plots)
             dpg.add_theme_style(dpg.mvPlotStyleVar_Marker, dpg.mvPlotMarker_Diamond, category=dpg.mvThemeCat_Plots)
-            dpg.add_theme_style(dpg.mvPlotStyleVar_MarkerSize, 8.0, category=dpg.mvThemeCat_Plots)
+            dpg.add_theme_style(dpg.mvPlotStyleVar_MarkerSize, 7.0, category=dpg.mvThemeCat_Plots)
     with dpg.theme() as track_vel_theme:
         with dpg.theme_component(dpg.mvLineSeries):
             dpg.add_theme_color(dpg.mvPlotCol_Line, (255, 255, 255, 170), category=dpg.mvThemeCat_Plots)
             dpg.add_theme_style(dpg.mvPlotStyleVar_LineWeight, 1.0, category=dpg.mvThemeCat_Plots)
+    with dpg.theme() as track_moving_theme:
+        with dpg.theme_component(dpg.mvScatterSeries):
+            dpg.add_theme_color(dpg.mvPlotCol_MarkerFill, (0, 235, 180, 255), category=dpg.mvThemeCat_Plots)
+            dpg.add_theme_color(dpg.mvPlotCol_MarkerOutline, (0, 235, 180, 255), category=dpg.mvThemeCat_Plots)
+            dpg.add_theme_style(dpg.mvPlotStyleVar_Marker, dpg.mvPlotMarker_Circle, category=dpg.mvThemeCat_Plots)
+            dpg.add_theme_style(dpg.mvPlotStyleVar_MarkerSize, 7.0, category=dpg.mvThemeCat_Plots)
+    with dpg.theme() as track_stopped_theme:
+        with dpg.theme_component(dpg.mvScatterSeries):
+            dpg.add_theme_color(dpg.mvPlotCol_MarkerFill, (255, 175, 0, 255), category=dpg.mvThemeCat_Plots)
+            dpg.add_theme_color(dpg.mvPlotCol_MarkerOutline, (255, 175, 0, 255), category=dpg.mvThemeCat_Plots)
+            dpg.add_theme_style(dpg.mvPlotStyleVar_Marker, dpg.mvPlotMarker_Square, category=dpg.mvThemeCat_Plots)
+            dpg.add_theme_style(dpg.mvPlotStyleVar_MarkerSize, 7.0, category=dpg.mvThemeCat_Plots)
+    with dpg.theme() as track_unknown_theme:
+        with dpg.theme_component(dpg.mvScatterSeries):
+            dpg.add_theme_color(dpg.mvPlotCol_MarkerFill, (155, 155, 155, 255), category=dpg.mvThemeCat_Plots)
+            dpg.add_theme_color(dpg.mvPlotCol_MarkerOutline, (155, 155, 155, 255), category=dpg.mvThemeCat_Plots)
+            dpg.add_theme_style(dpg.mvPlotStyleVar_Marker, dpg.mvPlotMarker_Circle, category=dpg.mvThemeCat_Plots)
+            dpg.add_theme_style(dpg.mvPlotStyleVar_MarkerSize, 6.0, category=dpg.mvThemeCat_Plots)
+    with dpg.theme() as track_stop_marker_theme:
+        with dpg.theme_component(dpg.mvScatterSeries):
+            dpg.add_theme_color(dpg.mvPlotCol_MarkerFill, (255, 230, 80, 255), category=dpg.mvThemeCat_Plots)
+            dpg.add_theme_color(dpg.mvPlotCol_MarkerOutline, (255, 230, 80, 255), category=dpg.mvThemeCat_Plots)
+            dpg.add_theme_style(dpg.mvPlotStyleVar_Marker, dpg.mvPlotMarker_Cross, category=dpg.mvThemeCat_Plots)
+            dpg.add_theme_style(dpg.mvPlotStyleVar_MarkerSize, 8.0, category=dpg.mvThemeCat_Plots)
 
     # 4) Texture setup (1:1 con il buffer GUI, senza resampling)
     tex_w, tex_h = int(gui_w), int(gui_h)
@@ -1692,7 +1746,7 @@ def main():
             x_start_cl, x_end_cl = x_end_cl, x_start_cl
 
         rmax_cl = max(0.0, min(rmax, RMAX_HARD_MAX))
-        xmax_cl = max(0.0, min(xmax, XMAX_HARD_MAX))
+        xmax_cl = max(0.0, min(xmax, HEATMAP_XMAX_HARD_MAX))
 
         if vmax <= vmin:
             vmax = vmin + 1.0
@@ -1765,7 +1819,7 @@ def main():
                                           min_value=0.0, max_value=RMAX_HARD_MAX, min_clamped=True, max_clamped=True,
                                           callback=_apply_params, on_enter=False)
                         dpg.add_input_float(label="Xmax (m)", tag=IN_XMAX, default_value=vis_xmax, step=0.5, width=CTRL_W,
-                                          min_value=0.0, max_value=XMAX_HARD_MAX, min_clamped=True, max_clamped=True,
+                                          min_value=0.0, max_value=HEATMAP_XMAX_HARD_MAX, min_clamped=True, max_clamped=True,
                                           callback=_apply_params, on_enter=False)
                         dpg.add_spacer(height=8)
                         dpg.add_button(
@@ -1799,16 +1853,24 @@ def main():
                         # bounds in metri fissi (full FOV): zoom/crop gestiti dagli assi
                         dpg.add_image_series(
                             TEX_TAG,
-                            bounds_min=(-float(CROSSRANGE_MAX_DISPLAY), 0.0),
-                            bounds_max=(+float(CROSSRANGE_MAX_DISPLAY), float(RANGE_MAX_DISPLAY)),
+                            bounds_min=(-float(HEATMAP_CROSSRANGE_MAX_DISPLAY), 0.0),
+                            bounds_max=(+float(HEATMAP_CROSSRANGE_MAX_DISPLAY), float(RANGE_MAX_DISPLAY)),
                             tag=IMG_SERIES_TAG,
                             parent=YAXIS_TAG,
                         )
                         dpg.add_scatter_series([], [], label="Tracks confirmed", tag=TRACK_SCATTER_CONF_TAG, parent=YAXIS_TAG)
                         dpg.add_scatter_series([], [], label="Tracks tentative", tag=TRACK_SCATTER_UNCONF_TAG, parent=YAXIS_TAG)
+                        dpg.add_scatter_series([], [], label="Tracks moving", tag=TRACK_SCATTER_MOVING_TAG, parent=YAXIS_TAG)
+                        dpg.add_scatter_series([], [], label="Tracks stopped", tag=TRACK_SCATTER_STOPPED_TAG, parent=YAXIS_TAG)
+                        dpg.add_scatter_series([], [], label="Tracks unknown", tag=TRACK_SCATTER_UNKNOWN_TAG, parent=YAXIS_TAG)
+                        dpg.add_scatter_series([], [], label="Stop point", tag=TRACK_STOP_MARKER_TAG, parent=YAXIS_TAG)
                         dpg.add_line_series([], [], label="Track velocity", tag=TRACK_VEL_SERIES_TAG, parent=YAXIS_TAG)
                         dpg.bind_item_theme(TRACK_SCATTER_CONF_TAG, track_conf_theme)
                         dpg.bind_item_theme(TRACK_SCATTER_UNCONF_TAG, track_unconf_theme)
+                        dpg.bind_item_theme(TRACK_SCATTER_MOVING_TAG, track_moving_theme)
+                        dpg.bind_item_theme(TRACK_SCATTER_STOPPED_TAG, track_stopped_theme)
+                        dpg.bind_item_theme(TRACK_SCATTER_UNKNOWN_TAG, track_unknown_theme)
+                        dpg.bind_item_theme(TRACK_STOP_MARKER_TAG, track_stop_marker_theme)
                         dpg.bind_item_theme(TRACK_VEL_SERIES_TAG, track_vel_theme)
                         if supports_plot_annotation:
                             add_plot_annotation_fn = getattr(dpg, "add_plot_annotation", None)
@@ -2091,6 +2153,8 @@ def main():
     rangefft_frame = np.full((RANGE_PROFILE_COUNT, gui_h), -120.0, dtype=np.float32)
     gui_tracks_xy_view = np.frombuffer(gui_tracks_xy_dbuf, dtype=np.float32, count=track_max_shared * 4)
     gui_tracks_meta_view = np.frombuffer(gui_tracks_meta_dbuf, dtype=np.int32, count=track_max_shared * 4)
+    gui_tracks_state_view = np.frombuffer(gui_tracks_state_dbuf, dtype=np.int32, count=track_max_shared * 2)
+    gui_tracks_stop_xy_view = np.frombuffer(gui_tracks_stop_xy_dbuf, dtype=np.float32, count=track_max_shared * 2)
     tracks_out: list[dict[str, float | int | bool]] = []
     proc_frame = np.full((proc_tex_h, proc_tex_w), off_vmin, dtype=np.float32)
     range_axis_m = np.arange(gui_h, dtype=np.float32) * np.float32(dr_plot)
@@ -2125,7 +2189,7 @@ def main():
                 vmax = ui_pending["vmax"]
                 # HARD clamp anche qui (ridondanza: protegge da valori inseriti via codice)
                 rmax = max(0.0, min(ui_pending["rmax"], RMAX_HARD_MAX))
-                xmax = max(0.0, min(ui_pending["xmax"], XMAX_HARD_MAX))
+                xmax = max(0.0, min(ui_pending["xmax"], HEATMAP_XMAX_HARD_MAX))
                 fft_vmin = float(ui_pending["fft_vmin"])
                 fft_vmax = float(ui_pending["fft_vmax"])
                 fft_mode_db = bool(ui_pending["fft_mode_db"])
@@ -2404,6 +2468,7 @@ def main():
                     tracks_out = []
                     for tr_i in range(n_tracks):
                         base = tr_i * 4
+                        base2 = tr_i * 2
                         tr_id = int(gui_tracks_meta_view[base + 0])
                         tr_confirmed = bool(int(gui_tracks_meta_view[base + 1]))
                         tr_age = int(gui_tracks_meta_view[base + 2])
@@ -2412,6 +2477,14 @@ def main():
                         tr_y = float(gui_tracks_xy_view[base + 1])
                         tr_vx = float(gui_tracks_xy_view[base + 2])
                         tr_vy = float(gui_tracks_xy_view[base + 3])
+                        tr_motion_state_code = int(gui_tracks_state_view[base2 + 0])
+                        tr_has_stop = bool(int(gui_tracks_state_view[base2 + 1]))
+                        tr_stop_x = float(gui_tracks_stop_xy_view[base2 + 0])
+                        tr_stop_y = float(gui_tracks_stop_xy_view[base2 + 1])
+                        if not tr_has_stop or not np.isfinite(tr_stop_x) or not np.isfinite(tr_stop_y):
+                            tr_has_stop = False
+                            tr_stop_x = float("nan")
+                            tr_stop_y = float("nan")
                         tracks_out.append(
                             {
                                 "id": tr_id,
@@ -2422,6 +2495,10 @@ def main():
                                 "confirmed": tr_confirmed,
                                 "age": tr_age,
                                 "missed": tr_missed,
+                                "motion_state_code": tr_motion_state_code,
+                                "has_stop": tr_has_stop,
+                                "stop_x": tr_stop_x,
+                                "stop_y": tr_stop_y,
                             }
                         )
                     tracks_last_seq = tracks_seq_locked
@@ -2430,24 +2507,59 @@ def main():
                 conf_y: list[float] = []
                 unconf_x: list[float] = []
                 unconf_y: list[float] = []
+                moving_x: list[float] = []
+                moving_y: list[float] = []
+                stopped_x: list[float] = []
+                stopped_y: list[float] = []
+                unknown_x: list[float] = []
+                unknown_y: list[float] = []
+                stop_mark_x: list[float] = []
+                stop_mark_y: list[float] = []
                 vel_x: list[float] = []
                 vel_y: list[float] = []
                 for tr in tracks_out:
                     tx = float(tr["x"])
                     ty = float(tr["y"])
+                    motion_state_code = int(tr.get("motion_state_code", 0))
+                    has_stop = bool(tr.get("has_stop", False))
                     if bool(tr["confirmed"]):
                         conf_x.append(tx)
                         conf_y.append(ty)
                     else:
                         unconf_x.append(tx)
                         unconf_y.append(ty)
-                    vel_x.extend([tx, tx + float(tr["vx"]) * TRACK_VEL_SCALE, float("nan")])
-                    vel_y.extend([ty, ty + float(tr["vy"]) * TRACK_VEL_SCALE, float("nan")])
+
+                    if motion_state_code == 1:
+                        moving_x.append(tx)
+                        moving_y.append(ty)
+                        vel_x.extend([tx, tx + float(tr["vx"]) * TRACK_VEL_SCALE, float("nan")])
+                        vel_y.extend([ty, ty + float(tr["vy"]) * TRACK_VEL_SCALE, float("nan")])
+                    elif motion_state_code == 2:
+                        stopped_x.append(tx)
+                        stopped_y.append(ty)
+                    else:
+                        unknown_x.append(tx)
+                        unknown_y.append(ty)
+
+                    if has_stop:
+                        sx = float(tr.get("stop_x", float("nan")))
+                        sy = float(tr.get("stop_y", float("nan")))
+                        if np.isfinite(sx) and np.isfinite(sy):
+                            stop_mark_x.append(sx)
+                            stop_mark_y.append(sy)
 
                 if dpg.does_item_exist(TRACK_SCATTER_CONF_TAG):
                     dpg.set_value(TRACK_SCATTER_CONF_TAG, [conf_x, conf_y])
                 if dpg.does_item_exist(TRACK_SCATTER_UNCONF_TAG):
                     dpg.set_value(TRACK_SCATTER_UNCONF_TAG, [unconf_x, unconf_y])
+                if dpg.does_item_exist(TRACK_SCATTER_MOVING_TAG):
+                    dpg.set_value(TRACK_SCATTER_MOVING_TAG, [moving_x, moving_y])
+                if dpg.does_item_exist(TRACK_SCATTER_STOPPED_TAG):
+                    dpg.set_value(TRACK_SCATTER_STOPPED_TAG, [stopped_x, stopped_y])
+                if dpg.does_item_exist(TRACK_SCATTER_UNKNOWN_TAG):
+                    dpg.set_value(TRACK_SCATTER_UNKNOWN_TAG, [unknown_x, unknown_y])
+                if dpg.does_item_exist(TRACK_STOP_MARKER_TAG):
+                    dpg.set_value(TRACK_STOP_MARKER_TAG, [stop_mark_x, stop_mark_y])
                 if dpg.does_item_exist(TRACK_VEL_SERIES_TAG):
                     dpg.set_value(TRACK_VEL_SERIES_TAG, [vel_x, vel_y])
 
@@ -2459,9 +2571,20 @@ def main():
                         try:
                             if ann_i < n_labels:
                                 tr = tracks_out[ann_i]
+                                motion_code = int(tr.get("motion_state_code", 0))
+                                if motion_code == 1:
+                                    suffix = " M"
+                                elif motion_code == 2:
+                                    suffix = " S"
+                                else:
+                                    suffix = " U"
+                                speed = float(np.hypot(float(tr["vx"]), float(tr["vy"])))
+                                label = f"ID {int(tr['id'])}{suffix}"
+                                if motion_code == 1:
+                                    label = f"{label} {speed:.2f}"
                                 dpg.configure_item(
                                     ann_tag,
-                                    label=f"ID {int(tr['id'])}",
+                                    label=label,
                                     default_value=(float(tr["x"]), float(tr["y"])),
                                     show=True,
                                 )

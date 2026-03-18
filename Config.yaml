@@ -1,12 +1,12 @@
 radar:
   c: 3e8                 # Speed of light [m/s].
-  fs: 10e6               # ADC sampling rate [Hz].
-  slope: 60.012e12       # FMCW slope [Hz/s].
+  fs: 15e6               # ADC sampling rate [Hz].
+  slope: 19.988e12       # FMCW slope [Hz/s].
   fc: 77e9               # Carrier [Hz] (used for doppler axis in m/s).
-  chirp_period_s: 160e-6 # Chirp repetition period [s].
+  chirp_period_s:     -6 # Chirp repetition period [s].
 
 capture:
-  samples: 128   # ADC samples/chirp.
+  samples: 256   # ADC samples/chirp.
   chirps: 256    # Chirps/frame.
   rx: 4          # Current IQ conversion assumes RX=4.
   tx: 2          # Doppler axis calibration currently tuned for TX=2 TDM-MIMO.
@@ -14,7 +14,7 @@ capture:
 
 fft:
   nfft_range: 512 # Typical: 256 or 512. Higher = finer range bins, more CPU.
-  nfft_angle: 256 # Typical: 128/256/512. Higher = finer angular grid, more CPU.
+  nfft_angle: 512 # Typical: 128/256/512. Higher = finer angular grid, more CPU.
   workers: 8      # FFT worker threads.
 
 display:
@@ -22,17 +22,19 @@ display:
   vmin: 55           # Color scale min in RAW mode.
   vmin_norm: -20     # Normalized mode: typical clean range -25..-15 dB.
   vmax_norm: 0       # Normalized mode peak.
-  range_max: 12.5     # Hard limit shown on Y axis [m].
-  crossrange_max: 3.0 # Hard limit shown on X axis [m].
+  projection_mode: cartesian # Options: polar_stretched, cartesian.
+  projection_interp: bilinear # Used only in cartesian mode: nearest, bilinear.
+  range_max: 100     # Hard limit shown on Y axis [m].
+  crossrange_max: 50.0 # X extent [m]; use "auto" to derive it from angle FOV for the realtime heatmap.
   rangefft_db_min: 0
   rangefft_db_max: 95
   rangefft_lin_min: 0
   rangefft_lin_max: 15e7
 
 dsp:
-  window_range: rectangular # Options: none, rectangular, hanning, hamming, blackman.
-  window_doppler: rectangular # Applied on slow-time chirps before Doppler FFT.
-  window_angle: rectangular  # Options: none, rectangular, hanning, hamming, blackman.
+  window_range: hanning # Options: none, rectangular, hanning, hamming, blackman.
+  window_doppler: none # Applied on slow-time chirps before Doppler FFT.
+  window_angle: hanning  # Options: none, rectangular, hanning, hamming, blackman.
 
   mean_before_range_fft:
     enabled: false
@@ -63,7 +65,7 @@ dsp:
 
   angle_processing:
     mode: fft # Options: fft, bartlett, mvdr. "beamforming" is not a valid value.
-    mvdr_diagonal_loading: 0.02 # Used only if mode=mvdr. Typical: 0.005..0.05.
+    mvdr_diagonal_loading: 0.005 # Used only if mode=mvdr. Typical: 0.005..0.05.
 
   heatmap_ema:
     enabled: false
@@ -71,51 +73,56 @@ dsp:
 
   heatmap_spatial_filter:
     enabled: false
-    mode: gaussian_3x3 # Options: gaussian_3x3, none.
+    mode: none # Display-only smoothing in polar space. Options: none, gaussian_3x3.
 
 tracking:
-  enabled: false
-  dt_s: 0.04096 # Fixed frame period: 256 chirps * 160 us = 40.96 ms.
-  model: kalman_cv_2d
-  max_tracks: 24
-  min_hits_to_confirm: 4
-  max_missed_tentative: 1
-  max_missed_confirmed: 3
-  max_track_age: 0 # 0 disables age-based deletion.
-  gating_xy_m: 0.60
-  gating_doppler_mps: 0.70
-  process_noise_pos: 0.12
-  process_noise_vel: 0.60
-  measurement_noise_xy: 0.18
-  static_speed_threshold_mps: 0.08
-  dynamic_speed_threshold_mps: 0.20
-  doppler_static_threshold_mps: 0.10
-  classification_confirm_frames: 3
-  use_doppler_in_cost: true
-  use_detection_class_in_cost: true
-  history_len: 10
-  debug_log: false
+  enabled: false # Enables/disables the multi-object tracker.
+  dt_s: 0.04096 # Fixed tracker time step [s]; here 256 chirps * 160 us = 40.96 ms.
+  model: kalman_cv_2d # Dynamic model in use: constant-velocity 2D Kalman filter (x, y, vx, vy).
+  max_tracks: 8 # Maximum number of live tracks kept at the same time.
+  min_hits_to_confirm: 12 # Required matches before a track changes from tentative to confirmed.
+  max_missed_tentative: 1 # How many unmatched frames are allowed for a tentative track.
+  max_missed_confirmed: 6 # How many unmatched frames are allowed for a confirmed track.
+  max_track_age: 0 # Maximum age in frames; 0 disables age-based deletion.
+  gating_xy_m: 0.60 # Maximum XY distance [m] allowed to associate a detection with a track.
+  gating_doppler_mps: 0.40 # Maximum doppler difference [m/s] allowed during association.
+  process_noise_pos: 0.08 # Process noise on position: higher = more flexible but less stable tracks.
+  process_noise_vel: 0.50 # Process noise on velocity: higher = Kalman accepts faster velocity changes.
+  measurement_noise_xy: 0.20 # Measurement noise on x/y [m]: higher = less trust in each instant detection.
+  moving_speed_threshold_mps: 0.20 # Estimated speed threshold above which a target tends to be classified as moving.
+  stopped_speed_threshold_mps: 0.08 # Estimated speed threshold below which a target tends to be classified as stopped.
+  doppler_moving_threshold_mps: 0.12 # Alternative absolute doppler threshold used to classify a target as moving.
+  motion_confirm_frames_moving: 5 # Number of consistent frames needed to confirm the moving state.
+  motion_confirm_frames_stopped: 5 # Number of consistent frames needed to confirm the stopped state.
+  stopped_memory_s: 5.0 # Keeps a stopped confirmed track alive longer when the moving branch drops it.
+  stopped_resume_gate_m: 0.90 # If the target restarts near the stop point, reacquire the same track.
+  stop_position_alpha: 0.25 # 0..1 smoothing applied to the stored stop position; higher = faster updates.
+  birth_min_separation_m: 0.5 # Minimum distance from existing tracks to avoid duplicate new-track allocation.
+  use_doppler_in_cost: true # Use doppler in the association cost, not only XY distance.
+  history_len: 12 # Number of past positions stored for each track.
+  debug_log: false # If true, prints tracker stats and details to the console.
   # Legacy aliases still accepted by the parser:
-  # min_confirmed_hits, max_missed_frames, process_noise_xy, process_noise_v
+  # min_confirmed_hits, max_missed_frames, process_noise_xy, process_noise_v,
+  # dynamic_speed_threshold_mps, static_speed_threshold_mps, classification_confirm_frames
 
 detection_static:
   enabled: false
   threshold_mode: absolute # Options: relative, absolute.
-  threshold_db: -1 # Relative mode: threshold = max_db + threshold_db.
-  localmax_range_bins: 3 # NMS neighborhood in range bins.
-  localmax_angle_bins: 15 # NMS neighborhood in angle bins.
+  threshold_db: 8 # Relative mode: threshold = max_db + threshold_db.
+  localmax_range_bins: 5 # NMS neighborhood in range bins.
+  localmax_angle_bins: 20 # NMS neighborhood in angle bins.
   min_power_db: 8 # Absolute safety floor (also in relative mode).
-  max_detections: 20 # Cap per frame.
+  max_detections: 8 # Cap per frame.
 
 detection_moving:
   enabled: false
   threshold_mode: relative # Options: relative, absolute.
-  threshold_db: -6
+  threshold_db: -4
   localmax_range_bins: 8
   localmax_doppler_bins: 4
-  zero_doppler_exclusion_bins: 12 # Keep slow movers while still suppressing zero-speed clutter.
-  min_power_db: 5
-  max_detections: 1
+  zero_doppler_exclusion_bins: 2 # Keep slow movers while still suppressing zero-speed clutter.
+  min_power_db: 7
+  max_detections: 8
 
 fusion:
   enabled: false
