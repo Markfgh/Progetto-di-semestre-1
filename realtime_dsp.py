@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 import queue as pyqueue
 import time
@@ -118,6 +118,14 @@ class SlowTimeConfig:
     highpass_beta: float = 0.9
     doppler_fft_shift: bool = True
     doppler_zero_notch: bool = False
+
+
+@dataclass(frozen=True)
+class PostRangeFftFilterConfig:
+    mean_after_range_fft: MeanSelection = MeanSelection(enabled=False)
+    slow_time: SlowTimeConfig = SlowTimeConfig(enabled=False)
+    background_subtraction: BackgroundSubtractionConfig = BackgroundSubtractionConfig(enabled=False)
+    loop_average_after_background: LoopAverageConfig = LoopAverageConfig(enabled=False)
 
 
 @dataclass(frozen=True)
@@ -279,41 +287,6 @@ def mean_selections_from_yaml_dict(cfg: dict[str, Any]) -> tuple[MeanSelection, 
     )
 
 
-def background_subtraction_from_yaml_dict(cfg: dict[str, Any]) -> BackgroundSubtractionConfig:
-    dsp = cfg.get("dsp", {}) or {}
-    bg = dsp.get("background_subtraction", {}) or {}
-    mode = str(bg.get("mode", "ema")).strip().lower()
-    if mode not in _VALID_BACKGROUND_MODES:
-        mode = "ema"
-    try:
-        alpha = float(bg.get("alpha", 0.02))
-    except (TypeError, ValueError):
-        alpha = 0.02
-    alpha = min(max(alpha, 0.0), 1.0)
-    try:
-        init_frames = int(bg.get("init_frames", 20))
-    except (TypeError, ValueError):
-        init_frames = 20
-    try:
-        window_frames = int(bg.get("window_frames", 20))
-    except (TypeError, ValueError):
-        window_frames = 20
-    return BackgroundSubtractionConfig(
-        enabled=bool(bg.get("enabled", False)),
-        mode=mode,  # type: ignore[arg-type]
-        alpha=alpha,
-        init_frames=max(1, init_frames),
-        window_frames=max(1, window_frames),
-        clamp_positive_only=bool(bg.get("clamp_positive_only", False)),
-    )
-
-
-def loop_average_after_background_from_yaml_dict(cfg: dict[str, Any]) -> LoopAverageConfig:
-    dsp = cfg.get("dsp", {}) or {}
-    block = dsp.get("loop_average_after_background", {}) or {}
-    return LoopAverageConfig(enabled=bool(block.get("enabled", False)))
-
-
 def angle_processing_from_yaml_dict(cfg: dict[str, Any]) -> AngleProcessingConfig:
     dsp = cfg.get("dsp", {}) or {}
     block = dsp.get("angle_processing", {}) or {}
@@ -388,9 +361,7 @@ def display_projection_from_yaml_dict(cfg: dict[str, Any]) -> DisplayProjectionC
     )
 
 
-def slow_time_from_yaml_dict(cfg: dict[str, Any]) -> SlowTimeConfig:
-    dsp = cfg.get("dsp", {}) or {}
-    block = dsp.get("slow_time", {}) or {}
+def _slow_time_from_block(block: dict[str, Any]) -> SlowTimeConfig:
     mode_raw = str(block.get("mode", "none")).strip().lower()
     mode: SlowTimeMode = "none"
     if mode_raw in _VALID_SLOW_TIME_MODES:
@@ -410,6 +381,238 @@ def slow_time_from_yaml_dict(cfg: dict[str, Any]) -> SlowTimeConfig:
         highpass_beta=min(max(highpass_beta, 0.0), 1.0),
         doppler_fft_shift=bool(block.get("doppler_fft_shift", True)),
         doppler_zero_notch=bool(block.get("doppler_zero_notch", False)),
+    )
+
+
+def _background_subtraction_from_block(block: dict[str, Any]) -> BackgroundSubtractionConfig:
+    mode = str(block.get("mode", "ema")).strip().lower()
+    if mode not in _VALID_BACKGROUND_MODES:
+        mode = "ema"
+    try:
+        alpha = float(block.get("alpha", 0.02))
+    except (TypeError, ValueError):
+        alpha = 0.02
+    alpha = min(max(alpha, 0.0), 1.0)
+    try:
+        init_frames = int(block.get("init_frames", 20))
+    except (TypeError, ValueError):
+        init_frames = 20
+    try:
+        window_frames = int(block.get("window_frames", 20))
+    except (TypeError, ValueError):
+        window_frames = 20
+    return BackgroundSubtractionConfig(
+        enabled=bool(block.get("enabled", False)),
+        mode=mode,  # type: ignore[arg-type]
+        alpha=alpha,
+        init_frames=max(1, init_frames),
+        window_frames=max(1, window_frames),
+        clamp_positive_only=bool(block.get("clamp_positive_only", False)),
+    )
+
+
+def _loop_average_after_background_from_block(block: dict[str, Any]) -> LoopAverageConfig:
+    return LoopAverageConfig(enabled=bool(block.get("enabled", False)))
+
+
+def slow_time_from_yaml_dict(cfg: dict[str, Any]) -> SlowTimeConfig:
+    # Legacy compatibility wrapper: maps to the display branch filters.
+    return display_post_range_fft_filters_from_yaml_dict(cfg).slow_time
+
+
+def background_subtraction_from_yaml_dict(cfg: dict[str, Any]) -> BackgroundSubtractionConfig:
+    # Legacy compatibility wrapper: maps to the display branch filters.
+    return display_post_range_fft_filters_from_yaml_dict(cfg).background_subtraction
+
+
+def loop_average_after_background_from_yaml_dict(cfg: dict[str, Any]) -> LoopAverageConfig:
+    # Legacy compatibility wrapper: maps to the display branch filters.
+    return display_post_range_fft_filters_from_yaml_dict(cfg).loop_average_after_background
+
+
+def display_post_range_fft_filters_from_yaml_dict(cfg: dict[str, Any]) -> PostRangeFftFilterConfig:
+    dsp = cfg.get("dsp", {}) or {}
+    branch = dsp.get("display_filters", {}) or {}
+    return PostRangeFftFilterConfig(
+        mean_after_range_fft=_mean_selection_from_yaml_dict(
+            {"mean_after_range_fft": branch.get("mean_after_range_fft", dsp.get("mean_after_range_fft", {}))},
+            "mean_after_range_fft",
+            ("tx",),
+        ),
+        slow_time=_slow_time_from_block(branch.get("slow_time", dsp.get("slow_time", {})) or {}),
+        background_subtraction=_background_subtraction_from_block(
+            branch.get("background_subtraction", dsp.get("background_subtraction", {})) or {}
+        ),
+        loop_average_after_background=_loop_average_after_background_from_block(
+            branch.get("loop_average_after_background", dsp.get("loop_average_after_background", {})) or {}
+        ),
+    )
+
+
+def detection_static_post_range_fft_filters_from_yaml_dict(cfg: dict[str, Any]) -> PostRangeFftFilterConfig:
+    dsp = cfg.get("dsp", {}) or {}
+    # `detection_filters` is kept as a legacy alias for backward compatibility.
+    branch = dsp.get("detection_static_filters", dsp.get("detection_filters", {})) or {}
+    return PostRangeFftFilterConfig(
+        mean_after_range_fft=_mean_selection_from_yaml_dict(
+            {"mean_after_range_fft": branch.get("mean_after_range_fft", {})},
+            "mean_after_range_fft",
+            ("tx",),
+        ),
+        slow_time=_slow_time_from_block(branch.get("slow_time", {}) or {}),
+        background_subtraction=_background_subtraction_from_block(branch.get("background_subtraction", {}) or {}),
+        loop_average_after_background=_loop_average_after_background_from_block(
+            branch.get("loop_average_after_background", {}) or {}
+        ),
+    )
+
+
+def detection_moving_pre_doppler_filters_from_yaml_dict(cfg: dict[str, Any]) -> PostRangeFftFilterConfig:
+    dsp = cfg.get("dsp", {}) or {}
+    branch = dsp.get("detection_moving_pre_doppler_filters", {}) or {}
+    return PostRangeFftFilterConfig(
+        mean_after_range_fft=_mean_selection_from_yaml_dict(
+            {"mean_after_range_fft": branch.get("mean_after_range_fft", {})},
+            "mean_after_range_fft",
+            ("tx",),
+        ),
+        slow_time=_slow_time_from_block(branch.get("slow_time", {}) or {}),
+        background_subtraction=_background_subtraction_from_block(branch.get("background_subtraction", {}) or {}),
+        loop_average_after_background=_loop_average_after_background_from_block(
+            branch.get("loop_average_after_background", {}) or {}
+        ),
+    )
+
+
+def _sanitize_post_range_fft_mean_selection(
+    selection: MeanSelection,
+    *,
+    branch_label: str,
+    slow_time_cfg: SlowTimeConfig,
+) -> tuple[MeanSelection, list[str]]:
+    if not selection.enabled or not selection.axes:
+        return selection, []
+
+    warnings: list[str] = []
+    axes_out: list[MeanAxis] = []
+    seen: set[str] = set()
+    normalized_sample = False
+    removed_loop = False
+
+    for axis in selection.axes:
+        axis_eff = axis
+        if axis_eff == "sample":
+            axis_eff = "range_bin"
+            normalized_sample = True
+        if slow_time_cfg.enabled and slow_time_cfg.mode == "doppler_fft" and axis_eff == "loop":
+            removed_loop = True
+            continue
+        if axis_eff in seen:
+            continue
+        axes_out.append(axis_eff)
+        seen.add(axis_eff)
+
+    if normalized_sample:
+        warnings.append(
+            f"{branch_label}.mean_after_range_fft.axes uses 'sample' after range FFT; normalizing it to 'range_bin'."
+        )
+    if removed_loop:
+        warnings.append(
+            f"{branch_label}.mean_after_range_fft.axes contains 'loop' but slow_time.mode=doppler_fft turns that axis into Doppler bins; removing 'loop'."
+        )
+
+    if not axes_out:
+        warnings.append(
+            f"{branch_label}.mean_after_range_fft has no coherent axes left after sanitization; disabling mean_after_range_fft."
+        )
+        return replace(selection, enabled=False), warnings
+
+    axes_tuple = tuple(axes_out)
+    if axes_tuple == selection.axes:
+        return selection, warnings
+    return replace(selection, axes=axes_tuple), warnings
+
+
+def _sanitize_post_range_fft_filters(
+    filters_cfg: PostRangeFftFilterConfig,
+    *,
+    branch_label: str,
+    allow_doppler_fft: bool,
+    detection_safe_background: bool,
+    allow_loop_average_after_background: bool,
+) -> tuple[PostRangeFftFilterConfig, list[str]]:
+    sanitized = filters_cfg
+    warnings: list[str] = []
+
+    if sanitized.slow_time.enabled and sanitized.slow_time.mode == "doppler_fft" and not allow_doppler_fft:
+        warnings.append(
+            f"{branch_label}.slow_time.mode=doppler_fft is unsupported in this branch; forcing slow_time off."
+        )
+        sanitized = replace(
+            sanitized,
+            slow_time=replace(sanitized.slow_time, enabled=False, mode="none", doppler_zero_notch=False),
+        )
+
+    if sanitized.loop_average_after_background.enabled and not allow_loop_average_after_background:
+        warnings.append(
+            f"{branch_label}.loop_average_after_background is unsupported in this branch; ignoring it."
+        )
+        sanitized = replace(sanitized, loop_average_after_background=LoopAverageConfig(enabled=False))
+
+    mean_selection, mean_warnings = _sanitize_post_range_fft_mean_selection(
+        sanitized.mean_after_range_fft,
+        branch_label=branch_label,
+        slow_time_cfg=sanitized.slow_time,
+    )
+    warnings.extend(mean_warnings)
+    if mean_selection != sanitized.mean_after_range_fft:
+        sanitized = replace(sanitized, mean_after_range_fft=mean_selection)
+
+    if detection_safe_background and sanitized.background_subtraction.clamp_positive_only:
+        warnings.append(
+            f"{branch_label}.background_subtraction.clamp_positive_only is display-only and unsafe for detection; forcing it off."
+        )
+        sanitized = replace(
+            sanitized,
+            background_subtraction=replace(sanitized.background_subtraction, clamp_positive_only=False),
+        )
+
+    return sanitized, warnings
+
+
+def sanitize_detection_moving_pre_doppler_filters(
+    filters_cfg: PostRangeFftFilterConfig,
+) -> tuple[PostRangeFftFilterConfig, list[str]]:
+    return _sanitize_post_range_fft_filters(
+        filters_cfg,
+        branch_label="detection_moving_pre_doppler_filters",
+        allow_doppler_fft=False,
+        detection_safe_background=True,
+        allow_loop_average_after_background=False,
+    )
+
+
+def sanitize_detection_static_post_range_fft_filters(
+    filters_cfg: PostRangeFftFilterConfig,
+) -> tuple[PostRangeFftFilterConfig, list[str]]:
+    return _sanitize_post_range_fft_filters(
+        filters_cfg,
+        branch_label="detection_static_filters",
+        allow_doppler_fft=True,
+        detection_safe_background=True,
+        allow_loop_average_after_background=True,
+    )
+
+
+def sanitize_display_post_range_fft_filters(
+    filters_cfg: PostRangeFftFilterConfig,
+) -> tuple[PostRangeFftFilterConfig, list[str]]:
+    return _sanitize_post_range_fft_filters(
+        filters_cfg,
+        branch_label="display_filters",
+        allow_doppler_fft=True,
+        detection_safe_background=False,
+        allow_loop_average_after_background=True,
     )
 
 
@@ -597,18 +800,20 @@ def tracking_from_yaml_dict(cfg: dict[str, Any]) -> TrackingConfig:
 def tracker_from_yaml_dict(cfg: dict[str, Any]) -> TrackerConfig:
     tracking_block = cfg.get("tracking", {}) or {}
     tracker_block = cfg.get("tracker", {}) or {}
-    return TrackerConfig(
-        model=str(
-            _tracking_cfg_value(
-                tracking_block,
-                tracker_block,
-                "model",
-                default="kalman_cv_2d",
-            )
-            or "kalman_cv_2d"
+    model = str(
+        _tracking_cfg_value(
+            tracking_block,
+            tracker_block,
+            "model",
+            default="kalman_cv_2d",
         )
-        .strip()
-        .lower(),
+        or "kalman_cv_2d"
+    ).strip().lower()
+    if model != "kalman_cv_2d":
+        print(f"[TRACK WARN] tracking.model={model!r} unsupported; forcing 'kalman_cv_2d'.")
+        model = "kalman_cv_2d"
+    return TrackerConfig(
+        model=model,
         gating_xy_m=max(
             0.0,
             _to_float(
@@ -889,6 +1094,33 @@ def apply_slow_time_filter(
         zero_idx = int(out.shape[1] // 2) if slow_time_cfg.doppler_fft_shift else 0
         out[:, zero_idx : zero_idx + 1, :, :, :] = 0
     return out.astype(np.complex64, copy=False)
+
+
+def apply_post_range_fft_filters(
+    data: np.ndarray,
+    filters_cfg: PostRangeFftFilterConfig,
+    *,
+    bg_state: BackgroundSubtractionState,
+    fft_workers: int,
+    apply_loop_average_after_background: bool,
+) -> np.ndarray:
+    out = apply_slow_time_filter(
+        data,
+        filters_cfg.slow_time,
+        fft_workers=fft_workers,
+    )
+    out = subtract_selected_mean(out, filters_cfg.mean_after_range_fft)
+    out = apply_background_subtraction(out, filters_cfg.background_subtraction, bg_state)
+    if apply_loop_average_after_background:
+        # Collapse the loop dimension while preserving the axis for the downstream pipeline.
+        out = out.mean(axis=1, keepdims=True, dtype=np.complex64)
+    return out
+
+
+def _branch_needs_copy(filters_cfg: PostRangeFftFilterConfig) -> bool:
+    if not filters_cfg.mean_after_range_fft.enabled or not filters_cfg.mean_after_range_fft.axes:
+        return False
+    return not filters_cfg.slow_time.enabled or filters_cfg.slow_time.mode == "none"
 
 
 def _build_angle_u_axis(nfft_angle: int) -> np.ndarray:
@@ -1743,7 +1975,7 @@ def clean_detections_for_tracking(
             )
         )
 
-    if len(cleaned) <= 1:
+    if len(cleaned) <= 1 or not fusion_cfg.enabled:
         return cleaned
 
     dedup_xy_m = max(0.05, 0.5 * float(fusion_cfg.merge_xy_m))
@@ -1903,10 +2135,11 @@ def process_buffer(
     apply_doppler_window: bool,
     apply_angle_window: bool,
     mean_before_range_fft: MeanSelection,
-    mean_after_range_fft: MeanSelection,
-    slow_time_cfg: SlowTimeConfig,
-    bg_subtraction: BackgroundSubtractionConfig,
-    apply_loop_average_after_background: bool,
+    detection_static_post_range_fft_filters: PostRangeFftFilterConfig,
+    detection_moving_pre_doppler_filters: PostRangeFftFilterConfig,
+    display_post_range_fft_filters: PostRangeFftFilterConfig,
+    apply_detection_loop_average_after_background: bool,
+    apply_display_loop_average_after_background: bool,
     angle_processing: AngleProcessingConfig,
     heatmap_ema_cfg: HeatmapEMAConfig,
     heatmap_spatial_filter_cfg: HeatmapSpatialFilterConfig,
@@ -1920,7 +2153,9 @@ def process_buffer(
     detection_static_cfg: DetectionConfigStatic,
     detection_moving_cfg: DetectionConfigMoving,
     fusion_cfg: FusionConfig,
-    bg_state: BackgroundSubtractionState,
+    detection_static_bg_state: BackgroundSubtractionState,
+    detection_moving_bg_state: BackgroundSubtractionState,
+    display_bg_state: BackgroundSubtractionState,
     heatmap_ema: np.ndarray | None,
     virtual_array_work_buf: np.ndarray | None,
     doppler_work_buf: np.ndarray | None,
@@ -1959,13 +2194,54 @@ def process_buffer(
         # Range bin to physical range conversion factor (meters per bin).
         range_bin_m = dsp_cfg.c * dsp_cfg.fs / (2.0 * dsp_cfg.slope * dsp_cfg.nfft_range)
 
+        range_fft_detection_static = range_fft_common
+        if detection_static_cfg.enabled:
+            range_fft_detection_static_in = (
+                range_fft_common.copy()
+                if _branch_needs_copy(detection_static_post_range_fft_filters)
+                else range_fft_common
+            )
+            range_fft_detection_static = apply_post_range_fft_filters(
+                range_fft_detection_static_in,
+                detection_static_post_range_fft_filters,
+                bg_state=detection_static_bg_state,
+                fft_workers=dsp_cfg.fft_workers,
+                apply_loop_average_after_background=apply_detection_loop_average_after_background,
+            )
+        range_fft_detection_moving = range_fft_common
+        if detection_moving_cfg.enabled:
+            range_fft_detection_moving_in = (
+                range_fft_common.copy()
+                if _branch_needs_copy(detection_moving_pre_doppler_filters)
+                else range_fft_common
+            )
+            range_fft_detection_moving = apply_post_range_fft_filters(
+                range_fft_detection_moving_in,
+                detection_moving_pre_doppler_filters,
+                bg_state=detection_moving_bg_state,
+                fft_workers=dsp_cfg.fft_workers,
+                apply_loop_average_after_background=False,
+            )
+        range_fft_display_in = (
+            range_fft_common.copy()
+            if _branch_needs_copy(display_post_range_fft_filters)
+            else range_fft_common
+        )
+        range_fft_display = apply_post_range_fft_filters(
+            range_fft_display_in,
+            display_post_range_fft_filters,
+            bg_state=display_bg_state,
+            fft_workers=dsp_cfg.fft_workers,
+            apply_loop_average_after_background=apply_display_loop_average_after_background,
+        )
+
         # Tracking path (physical data): no display EMA/blur/normalization.
         detections_static: list[Detection] = []
         detections_moving: list[Detection] = []
         # If enabled, detect static targets from the range-FFT cube and estimate their angle/range.
         if detection_static_cfg.enabled:
             detections_static, _ = detect_static_targets(
-                range_fft_common,
+                range_fft_detection_static,
                 static_cfg=detection_static_cfg,
                 angle_cfg=angle_processing,
                 dsp_cfg=dsp_cfg,
@@ -1978,13 +2254,13 @@ def process_buffer(
                 virtual_array_work_buf=(
                     None
                     if virtual_array_work_buf is None
-                    else virtual_array_work_buf[:n_frames, : int(range_fft_common.shape[1]), :, :, :]
+                    else virtual_array_work_buf[:n_frames, : int(range_fft_detection_static.shape[1]), :, :, :]
                 ),
             )
         
         if detection_moving_cfg.enabled:
             doppler_cube, range_doppler_map = compute_range_doppler(
-                range_fft_common,
+                range_fft_detection_moving,
                 max_bin=max_bin,
                 dsp_cfg=dsp_cfg,
                 moving_cfg=detection_moving_cfg,
@@ -1993,7 +2269,7 @@ def process_buffer(
                 doppler_work_buf=(
                     None
                     if doppler_work_buf is None
-                    else doppler_work_buf[:n_frames, : int(range_fft_common.shape[1]), :, :, :]
+                    else doppler_work_buf[:n_frames, : int(range_fft_detection_moving.shape[1]), :, :, :]
                 ),
             )
             detections_moving = detect_moving_targets(
@@ -2015,14 +2291,31 @@ def process_buffer(
         fused_detections = fuse_detections(detections_static, detections_moving, fusion_cfg)
         tracking_detections = clean_detections_for_tracking(fused_detections, fusion_cfg)
 
-        # Display path stays independent from tracking and can reproject only for visualization.
-        range_fft_display = apply_slow_time_filter(range_fft_common,slow_time_cfg,fft_workers=dsp_cfg.fft_workers,)
-        range_fft_display = subtract_selected_mean(range_fft_display, mean_after_range_fft)
-        range_fft_display = apply_background_subtraction(range_fft_display,bg_subtraction,bg_state,)
-
-        if apply_loop_average_after_background:
-            # Collapse the loop dimension while preserving the axis for the downstream pipeline.
-            range_fft_display = range_fft_display.mean(axis=1, keepdims=True, dtype=np.complex64)
+        fft_profile_bins = min(int(range_fft_display.shape[3]), int(profiles_out_buf.shape[1]))
+        profiles_out = profiles_out_buf
+        profiles_out.fill(np.float32(-120.0))
+        if fft_profile_bins > 0:
+            # Keep the Range FFT plot decoupled from the physical max_bin used by the radar logic.
+            profiles_src = range_fft_display[:, :, :, :fft_profile_bins, :]
+            prof_re = profiles_src.real
+            prof_im = profiles_src.imag
+            profiles_pow = (prof_re * prof_re + prof_im * prof_im).mean(axis=(0, 1), dtype=np.float32)
+            if (
+                profiles_db_work_buf is not None
+                and profiles_db_work_buf.shape == profiles_pow.shape
+                and profiles_db_work_buf.dtype == np.float32
+            ):
+                profiles_db = profiles_db_work_buf
+                np.copyto(profiles_db, profiles_pow, casting="unsafe")
+            else:
+                profiles_db = np.array(profiles_pow, dtype=np.float32, copy=True)
+            np.add(profiles_db, np.float32(1e-12), out=profiles_db)
+            np.log10(profiles_db, out=profiles_db)
+            profiles_db *= np.float32(10.0)
+            profiles_db_va = profiles_db.transpose(0, 2, 1).reshape(int(dsp_cfg.virtual_ant), int(fft_profile_bins))
+            copy_rows = min(int(dsp_cfg.range_profile_count), int(profiles_db_va.shape[0]))
+            if copy_rows > 0:
+                profiles_out[:copy_rows, :fft_profile_bins] = profiles_db_va[:copy_rows, :].astype(np.float32, copy=False)
 
         # Build the virtual array after trimming range bins to limit memory traffic.
         virtual_array = _build_virtual_array_from_range_fft(
@@ -2035,28 +2328,6 @@ def process_buffer(
                 else virtual_array_work_buf[:n_frames, : int(range_fft_display.shape[1]), :, :, :]
             ),
         )
-
-        prof_re = virtual_array.real
-        prof_im = virtual_array.imag
-        profiles_pow = (prof_re * prof_re + prof_im * prof_im).mean(axis=(0, 1))
-        if (
-            profiles_db_work_buf is not None
-            and profiles_db_work_buf.shape == profiles_pow.shape
-            and profiles_db_work_buf.dtype == np.float32
-        ):
-            profiles_db = profiles_db_work_buf
-            np.copyto(profiles_db, profiles_pow, casting="unsafe")
-        else:
-            profiles_db = np.array(profiles_pow, dtype=np.float32, copy=True)
-        np.add(profiles_db, np.float32(1e-12), out=profiles_db)
-        np.log10(profiles_db, out=profiles_db)
-        profiles_db *= np.float32(10.0)
-        profiles_db_va = profiles_db.transpose(1, 0)
-        profiles_out = profiles_out_buf
-        profiles_out.fill(np.float32(-120.0))
-        copy_rows = min(int(dsp_cfg.range_profile_count), int(profiles_db_va.shape[0]))
-        if copy_rows > 0:
-            profiles_out[:copy_rows, :] = profiles_db_va[:copy_rows, :].astype(np.float32, copy=False)
 
         if apply_angle_window:
             virtual_array *= w_angle
@@ -2154,6 +2425,7 @@ def dsp_worker(
     gui_dbuf,
     gui_prof_dbuf,
     gui_h: int,
+    fft_plot_h: int,
     gui_w: int,
     gui_latest_idx: Synchronized,
     gui_latest_seq: Synchronized,
@@ -2178,10 +2450,19 @@ def dsp_worker(
     dsp_cfg: RealtimeDSPConfig,
 ) -> None:
     selection = selection_from_yaml_dict(cfg_dict)
-    mean_before_range_fft, mean_after_range_fft = mean_selections_from_yaml_dict(cfg_dict)
-    slow_time_cfg = slow_time_from_yaml_dict(cfg_dict)
-    bg_subtraction = background_subtraction_from_yaml_dict(cfg_dict)
-    loop_average_after_background = loop_average_after_background_from_yaml_dict(cfg_dict)
+    mean_before_range_fft, _ = mean_selections_from_yaml_dict(cfg_dict)
+    detection_static_post_range_fft_filters = detection_static_post_range_fft_filters_from_yaml_dict(cfg_dict)
+    detection_static_post_range_fft_filters, detection_static_filter_warnings = sanitize_detection_static_post_range_fft_filters(
+        detection_static_post_range_fft_filters
+    )
+    detection_moving_pre_doppler_filters = detection_moving_pre_doppler_filters_from_yaml_dict(cfg_dict)
+    detection_moving_pre_doppler_filters, detection_moving_filter_warnings = sanitize_detection_moving_pre_doppler_filters(
+        detection_moving_pre_doppler_filters
+    )
+    display_post_range_fft_filters = display_post_range_fft_filters_from_yaml_dict(cfg_dict)
+    display_post_range_fft_filters, display_filter_warnings = sanitize_display_post_range_fft_filters(
+        display_post_range_fft_filters
+    )
     angle_processing = angle_processing_from_yaml_dict(cfg_dict)
     heatmap_ema_cfg = heatmap_ema_from_yaml_dict(cfg_dict)
     heatmap_spatial_filter_cfg = heatmap_spatial_filter_from_yaml_dict(cfg_dict)
@@ -2191,6 +2472,15 @@ def dsp_worker(
     fusion_cfg = fusion_from_yaml_dict(cfg_dict)
     tracking_cfg = tracking_from_yaml_dict(cfg_dict)
     tracker_cfg = tracker_from_yaml_dict(cfg_dict)
+    tracking_runtime_enabled = bool(getattr(tracking_cfg, "enabled", False))
+    if tracking_runtime_enabled and int(dsp_cfg.x_frames) > 1:
+        print(
+            f"[TRACK WARN] tracking disabled because capture.x_frames={int(dsp_cfg.x_frames)}. "
+            "Current tracker expects x_frames=1."
+        )
+        tracking_runtime_enabled = False
+    for warn_msg in detection_static_filter_warnings + detection_moving_filter_warnings + display_filter_warnings:
+        print(f"[DSP WARN] {warn_msg}")
     window_range, window_doppler, window_angle = build_windows(
         selection,
         samples=dsp_cfg.samples,
@@ -2229,12 +2519,11 @@ def dsp_worker(
     max_bin = int(np.floor(dsp_cfg.range_max_display / dr))
     max_bin = max(1, min(max_bin, dsp_cfg.nfft_range // 2))
 
-    i16_per_frame = dsp_cfg.bytes_per_frame // 2
     total_samples_needed = dsp_cfg.x_frames * dsp_cfg.chirps * dsp_cfg.samples * dsp_cfg.rx
     complex_per_frame = dsp_cfg.chirps * dsp_cfg.samples * dsp_cfg.rx
 
     complex_data = np.zeros(total_samples_needed, dtype=np.complex64)
-    profiles_out_buf = np.empty((dsp_cfg.range_profile_count, max_bin), dtype=np.float32)
+    profiles_out_buf = np.empty((dsp_cfg.range_profile_count, int(fft_plot_h)), dtype=np.float32)
     virtual_array_work_buf = np.empty(
         (dsp_cfg.x_frames, n_doppler, max_bin, dsp_cfg.tx, dsp_cfg.rx),
         dtype=np.complex64,
@@ -2243,14 +2532,14 @@ def dsp_worker(
         (dsp_cfg.x_frames, n_doppler, dsp_cfg.tx, max_bin, dsp_cfg.rx),
         dtype=np.complex64,
     )
-    profiles_db_work_buf = np.empty((max_bin, dsp_cfg.virtual_ant), dtype=np.float32)
+    profiles_db_work_buf = np.empty((dsp_cfg.tx, int(fft_plot_h), dsp_cfg.rx), dtype=np.float32)
     heatmap_db_work_buf = np.empty((int(gui_h), int(gui_w)), dtype=np.float32)
     gui_heat_size = int(gui_h) * int(gui_w)
     gui_heat_views = (
         np.frombuffer(gui_dbuf, dtype=np.float32, count=gui_heat_size, offset=0),
         np.frombuffer(gui_dbuf, dtype=np.float32, count=gui_heat_size, offset=gui_heat_size * 4),
     )
-    gui_prof_size = int(dsp_cfg.range_profile_count) * int(gui_h)
+    gui_prof_size = int(dsp_cfg.range_profile_count) * int(fft_plot_h)
     gui_profile_views = (
         np.frombuffer(gui_prof_dbuf, dtype=np.float32, count=gui_prof_size, offset=0),
         np.frombuffer(gui_prof_dbuf, dtype=np.float32, count=gui_prof_size, offset=gui_prof_size * 4),
@@ -2259,9 +2548,11 @@ def dsp_worker(
     shm_view = memoryview(shm_frames).cast("B")
     n_slots = len(slot_state)
     heatmap_ema = None
-    bg_state = BackgroundSubtractionState()
+    detection_static_bg_state = BackgroundSubtractionState()
+    detection_moving_bg_state = BackgroundSubtractionState()
+    display_bg_state = BackgroundSubtractionState()
     tracker: MultiObjectTracker | None
-    if tracking_cfg.enabled:
+    if tracking_runtime_enabled:
         tracker = MultiObjectTracker(tracking_cfg=tracking_cfg, tracker_cfg=tracker_cfg)
     else:
         tracker = None
@@ -2277,7 +2568,8 @@ def dsp_worker(
             tracks_stop_xy_view.size // 2,
         )
     )
-    warned_loop_average_after_doppler = False
+    warned_display_loop_average_after_doppler = False
+    warned_detection_loop_average_after_doppler = False
     dsp_ms_samples: list[float] = []
     dsp_stat_last_flush = time.perf_counter()
     dsp_ms_acc_sum = 0.0
@@ -2418,9 +2710,6 @@ def dsp_worker(
         n_proc = min(len(proc_slots), dsp_cfg.x_frames)
         slots_to_process = proc_slots[:n_proc]
 
-        # Release slots early so RX/logger can keep moving while DSP computes.
-        _release_slots_dsp(slots_to_process)
-
         # Current packing is IIIIQQQQ for RX=4, converted in-place to complex64.
         n_cplx = n_proc * complex_per_frame
         complex_view = complex_data[:n_cplx]
@@ -2431,6 +2720,7 @@ def dsp_worker(
                 complex_view[start:end],
                 slot_i16_views[int(s)],
             )
+        _release_slots_dsp(slots_to_process)
 
         t0_proc = time.perf_counter()
         try:
@@ -2438,12 +2728,30 @@ def dsp_worker(
                 normalize_to_peak = bool(norm_to_peak.value)
         except Exception:
             normalize_to_peak = True
-        apply_loop_average_after_background = bool(loop_average_after_background.enabled)
-        if slow_time_cfg.enabled and slow_time_cfg.mode == "doppler_fft" and apply_loop_average_after_background:
-            if not warned_loop_average_after_doppler:
-                print("[DSP WARN] loop_average_after_background skipped because slow_time.mode=doppler_fft.")
-                warned_loop_average_after_doppler = True
-            apply_loop_average_after_background = False
+        apply_display_loop_average_after_background = bool(
+            display_post_range_fft_filters.loop_average_after_background.enabled
+        )
+        if (
+            display_post_range_fft_filters.slow_time.enabled
+            and display_post_range_fft_filters.slow_time.mode == "doppler_fft"
+            and apply_display_loop_average_after_background
+        ):
+            if not warned_display_loop_average_after_doppler:
+                print("[DSP WARN] display_filters.loop_average_after_background skipped because display_filters.slow_time.mode=doppler_fft.")
+                warned_display_loop_average_after_doppler = True
+            apply_display_loop_average_after_background = False
+        apply_detection_loop_average_after_background = bool(
+            detection_static_post_range_fft_filters.loop_average_after_background.enabled
+        )
+        if (
+            detection_static_post_range_fft_filters.slow_time.enabled
+            and detection_static_post_range_fft_filters.slow_time.mode == "doppler_fft"
+            and apply_detection_loop_average_after_background
+        ):
+            if not warned_detection_loop_average_after_doppler:
+                print("[DSP WARN] detection_static_filters.loop_average_after_background skipped because detection_static_filters.slow_time.mode=doppler_fft.")
+                warned_detection_loop_average_after_doppler = True
+            apply_detection_loop_average_after_background = False
         heatmap_ema, tracking_detections = process_buffer(
             complex_view,
             n_proc,
@@ -2454,10 +2762,11 @@ def dsp_worker(
             apply_doppler_window,
             apply_angle_window,
             mean_before_range_fft,
-            mean_after_range_fft,
-            slow_time_cfg,
-            bg_subtraction,
-            apply_loop_average_after_background,
+            detection_static_post_range_fft_filters,
+            detection_moving_pre_doppler_filters,
+            display_post_range_fft_filters,
+            apply_detection_loop_average_after_background,
+            apply_display_loop_average_after_background,
             angle_processing,
             heatmap_ema_cfg,
             heatmap_spatial_filter_cfg,
@@ -2471,7 +2780,9 @@ def dsp_worker(
             detection_static_cfg,
             detection_moving_cfg,
             fusion_cfg,
-            bg_state,
+            detection_static_bg_state,
+            detection_moving_bg_state,
+            display_bg_state,
             heatmap_ema,
             virtual_array_work_buf[:n_proc, :, :, :, :],
             doppler_work_buf[:n_proc, :, :, :, :],
@@ -2493,7 +2804,7 @@ def dsp_worker(
             stat_norm_max_db,
             dsp_cfg,
         )
-        if tracker is not None and tracking_cfg.enabled:
+        if tracker is not None and tracking_runtime_enabled:
             active_tracks = tracker.step(tracking_detections, timestamp_s=time.perf_counter())
         else:
             active_tracks = []

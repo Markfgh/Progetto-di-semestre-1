@@ -661,6 +661,8 @@ class MultiObjectTracker:
                 return True
             return False
 
+        self._decay_unmatched_track_motion(track, now_s)
+
         max_missed = int(self.tracking_cfg.max_missed_confirmed)
         if track.motion_state == "stopped":
             max_missed = max(max_missed, self._stopped_hold_frames())
@@ -672,6 +674,33 @@ class MultiObjectTracker:
             track.state = "deleted"
             return True
         return False
+
+    def _decay_unmatched_track_motion(self, track: Track, now_s: float) -> None:
+        if track.motion_state == "stopped":
+            return
+
+        # In moving-only mode a target can disappear as soon as it reaches near-zero Doppler.
+        # Decay the latent velocity on unmatched confirmed tracks so they can still settle to
+        # the stopped state and use the stopped-memory hold instead of being deleted early.
+        track.vx_mps *= 0.35
+        track.vy_mps *= 0.35
+
+        stop_confirm = max(1, int(self.tracker_cfg.motion_confirm_frames_stopped))
+        speed_mps = float(track.speed_mps)
+        if speed_mps <= float(self.tracker_cfg.stopped_speed_threshold_mps):
+            track.stopped_evidence = min(stop_confirm, track.stopped_evidence + 1)
+            track.moving_evidence = max(0, track.moving_evidence - 1)
+        else:
+            track.moving_evidence = max(0, track.moving_evidence - 1)
+
+        if track.stopped_evidence >= stop_confirm:
+            prev_state = track.motion_state
+            track.motion_state = "stopped"
+            if prev_state != "stopped":
+                track.last_motion_change_s = float(now_s)
+                self._enter_stopped_state(track, now_s)
+            else:
+                self._update_stop_anchor(track, now_s)
 
     def _stopped_hold_frames(self) -> int:
         hold_s = max(0.0, float(self.tracker_cfg.stopped_memory_s))

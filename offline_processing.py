@@ -14,6 +14,7 @@ from multiprocessing import shared_memory
 from multiprocessing.sharedctypes import Synchronized
 
 import numpy as np
+import scipy.fft as fft
 import yaml
 
 from offline_dsp import (
@@ -486,18 +487,6 @@ class SARReader:
         )
 
 
-class SARProcessor:
-    def __init__(self, reader: SARReader) -> None:
-        self.reader = reader
-
-    def read(self, keep_raw: bool = False) -> SARData:
-        return self.reader.load(keep_raw=keep_raw)
-
-    def process(self, data: SARData | None = None) -> SARData:
-        if data is None:
-            data = self.read(keep_raw=False)
-        return data
-
 def _load_yaml_file(path: Path) -> dict:
     if not path.exists():
         return {}
@@ -569,6 +558,24 @@ def _read_phase_sign(offline_config_path: str | Path) -> int:
     return _phase_sign_normalize(raw, field_name="offline_config: bp.phase_sign")
 
 
+def _read_default_avg_mode(offline_config_path: str | Path) -> AvgMode:
+    cfg = _load_yaml_file(Path(offline_config_path))
+    bp_cfg = cfg.get("bp", {}) or {}
+    raw = _pick(bp_cfg.get("avg_mode"), "both")
+    return _avg_mode_normalize(None if raw is None else str(raw))
+
+
+def _read_fft_workers(fallback_capture_cfg: str | Path) -> int:
+    cfg = _load_yaml_file(Path(fallback_capture_cfg))
+    fft_cfg = cfg.get("fft", {}) or {}
+    raw = _pick(fft_cfg.get("workers"), 1)
+    try:
+        workers = int(raw)
+    except (TypeError, ValueError):
+        workers = 1
+    return max(1, workers)
+
+
 def _to_bool(field_name: str, value: Any) -> bool:
     if isinstance(value, bool):
         return bool(value)
@@ -588,6 +595,7 @@ def _read_bp_runtime_cfg(offline_config_path: str | Path) -> dict[str, Any]:
     bp_cfg = cfg.get("bp", {}) or {}
 
     mode: BpMode = _bp_mode_normalize(_pick(bp_cfg.get("mode"), "sar_only"))
+    avg_mode: AvgMode = _avg_mode_normalize(_pick(bp_cfg.get("avg_mode"), "both"))
     use_virtual_antennas = _to_bool(
         "offline_config: bp.use_virtual_antennas",
         _pick(bp_cfg.get("use_virtual_antennas"), True),
@@ -608,10 +616,34 @@ def _read_bp_runtime_cfg(offline_config_path: str | Path) -> dict[str, Any]:
 
     return {
         "mode": mode,
+        "avg_mode": avg_mode,
         "use_virtual_antennas": bool(use_virtual_antennas),
         "coherent_sum": bool(coherent_sum),
         "virtual_ant_pitch_m": float(virtual_ant_pitch_m),
     }
+
+
+def _resolve_effective_avg_mode(
+    requested_avg_mode: AvgMode,
+    *,
+    bp_mode: BpMode,
+    coherent_sum: bool,
+) -> tuple[AvgMode, str | None]:
+    if bp_mode == "sar_only":
+        if requested_avg_mode != "both":
+            return (
+                "both",
+                f"[OFFLINE WARN] avg_mode={requested_avg_mode} ignored because bp.mode=sar_only collapses snapshots inside BP; forcing avg_mode=both to match current output.",
+            )
+        return "both", None
+    if coherent_sum:
+        if requested_avg_mode != "both":
+            return (
+                "both",
+                f"[OFFLINE WARN] avg_mode={requested_avg_mode} ignored because bp.coherent_sum=true collapses snapshots coherently inside BP; forcing avg_mode=both to match current output.",
+            )
+        return "both", None
+    return requested_avg_mode, None
 
 
 # ---------------------------------------------------------------------
@@ -628,20 +660,22 @@ def _offline_reader_worker(
     stop_evt,
 ) -> None:
     shm_range_fft = None
+    shm_cleanup_transferred = False
     try:
         reader = SARReader(offline_config_path=offline_config_path, fallback_capture_cfg=fallback_capture_cfg)
         bp_runtime_cfg = _read_bp_runtime_cfg(offline_config_path)
+        fft_workers = _read_fft_workers(fallback_capture_cfg)
         bp_mode: BpMode = bp_runtime_cfg["mode"]
         data = reader.load(keep_raw=False)
 
         if bp_mode == "mimo_sar":
             # MIMO-SAR: preserva asse antenna [pos, frame, loop, ant, sample].
             sig = data.iq_cube
-            range_fft = np.fft.fft(sig, n=int(nfft_range), axis=-1).astype(np.complex64, copy=False)
+            range_fft = fft.fft(sig, n=int(nfft_range), axis=-1, workers=fft_workers).astype(np.complex64, copy=False)
         else:
             # Legacy SAR-only: media preliminare sulle antenne virtuali.
             sig = data.iq_cube.mean(axis=3, dtype=np.complex64)  # [pos, frame, loop, sample]
-            range_fft = np.fft.fft(sig, n=int(nfft_range), axis=-1).astype(np.complex64, copy=False)
+            range_fft = fft.fft(sig, n=int(nfft_range), axis=-1, workers=fft_workers).astype(np.complex64, copy=False)
         range_fft = np.ascontiguousarray(range_fft, dtype=np.complex64)
         shm_range_fft = shared_memory.SharedMemory(create=True, size=int(range_fft.nbytes))
         shm_arr = np.ndarray(range_fft.shape, dtype=np.complex64, buffer=shm_range_fft.buf)
@@ -663,6 +697,7 @@ def _offline_reader_worker(
             "rx": int(data.rx),
         }
         _queue_put_latest(reader_to_dsp_q, msg)
+        shm_cleanup_transferred = True
         _queue_put_latest(
             status_q,
             {
@@ -684,6 +719,11 @@ def _offline_reader_worker(
             pass
     finally:
         if shm_range_fft is not None:
+            if not shm_cleanup_transferred:
+                try:
+                    shm_range_fft.unlink()
+                except Exception:
+                    pass
             try:
                 shm_range_fft.close()
             except Exception:
@@ -833,7 +873,14 @@ def _offline_dsp_worker(
         x_end = max(pos_min, min(pos_max, x_end))
         if x_end < x_start:
             x_start, x_end = x_end, x_start
-        avg_mode: AvgMode = _avg_mode_normalize(default_avg_mode)
+        avg_mode_requested: AvgMode = _avg_mode_normalize(default_avg_mode)
+        avg_mode, avg_mode_warning = _resolve_effective_avg_mode(
+            avg_mode_requested,
+            bp_mode=bp_mode,
+            coherent_sum=bool(coherent_sum),
+        )
+        if avg_mode_warning:
+            print(avg_mode_warning)
 
         _queue_put_latest(
             status_q,
@@ -844,6 +891,7 @@ def _offline_dsp_worker(
                 "x_start": x_start,
                 "x_end": x_end,
                 "avg_mode": avg_mode,
+                "avg_mode_requested": str(avg_mode_requested),
                 "phase_sign": int(phase_sign_i),
                 "img_h": int(gui_h),
                 "img_w": int(gui_w),
@@ -885,7 +933,14 @@ def _offline_dsp_worker(
                     x_start, x_end = x_end, x_start
                 avg_mode_new = cmd.get("avg_mode", None)
                 if avg_mode_new is not None:
-                    avg_mode = _avg_mode_normalize(str(avg_mode_new))
+                    avg_mode_requested = _avg_mode_normalize(str(avg_mode_new))
+                    avg_mode, avg_mode_warning = _resolve_effective_avg_mode(
+                        avg_mode_requested,
+                        bp_mode=bp_mode,
+                        coherent_sum=bool(coherent_sum),
+                    )
+                    if avg_mode_warning:
+                        print(avg_mode_warning)
                 dirty = True
 
             if stop_evt.is_set():
@@ -959,6 +1014,7 @@ def _offline_dsp_worker(
                         "x_start": int(x_start),
                         "x_end": int(x_end),
                         "avg_mode": str(avg_mode),
+                        "avg_mode_requested": str(avg_mode_requested),
                         "n_pos_used": int(sel_idx.size),
                         "bp_mode": str(bp_mode),
                         "elapsed_ms": float((t1 - t0) * 1000.0),
@@ -1009,7 +1065,7 @@ class OfflineBPRuntime:
         image_h: int,
         image_w: int,
         x_pitch_m: float | None = None,
-        default_avg_mode: str = "both",
+        default_avg_mode: str | None = None,
         phase_sign: int | None = None,
     ) -> None:
         self.offline_config_path = str(offline_config_path)
@@ -1024,7 +1080,9 @@ class OfflineBPRuntime:
         self.image_h = int(image_h)
         self.image_w = int(image_w)
         self.x_pitch_m = float(x_pitch_m) if x_pitch_m is not None else _read_x_pitch_m(self.offline_config_path)
-        self.default_avg_mode = _avg_mode_normalize(default_avg_mode)
+        self.default_avg_mode = _avg_mode_normalize(
+            _pick(default_avg_mode, _read_default_avg_mode(self.offline_config_path))
+        )
         self.phase_sign = _phase_sign_normalize(
             _pick(phase_sign, _read_phase_sign(self.offline_config_path)),
             field_name="phase_sign",

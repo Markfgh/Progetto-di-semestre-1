@@ -143,8 +143,7 @@ def back_projection_image(
         dx = x_flat - np.float32(x_pos_m[pos_i])
         rr = np.sqrt(dx * dx + y_sq).astype(np.float32, copy=False)
         b = rr * inv_dr
-        b0 = np.floor(b).astype(np.int32, copy=False)
-        valid = np.isfinite(b) & (b0 >= 0) & (b0 < (max_bin_eff - 1))
+        valid = np.isfinite(b) & (b >= 0.0) & (b < np.float32(max_bin_eff - 1))
         valid_idx = np.flatnonzero(valid)
         if valid_idx.size == 0:
             continue
@@ -238,8 +237,7 @@ def back_projection_image_mimo(
             dx = x_flat - x_eff
             rr = np.sqrt(dx * dx + y_sq).astype(np.float32, copy=False)
             b = rr * inv_dr
-            b0 = np.floor(b).astype(np.int32, copy=False)
-            valid = np.isfinite(b) & (b0 >= 0) & (b0 < (max_bin_eff - 1))
+            valid = np.isfinite(b) & (b >= 0.0) & (b < np.float32(max_bin_eff - 1))
             valid_idx = np.flatnonzero(valid)
             if valid_idx.size == 0:
                 continue
