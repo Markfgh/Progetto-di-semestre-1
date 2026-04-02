@@ -371,8 +371,10 @@ from offline_processing import OfflineBPRuntime
 from realtime_dsp import (
     RealtimeDSPConfig,
     build_angle_axis_deg,
+    calibration_from_yaml_dict,
     display_projection_from_yaml_dict,
     dsp_worker,
+    resolve_processing_range_max_m,
     resolve_display_crossrange_max_m,
 )
 #import dpnp as dp
@@ -415,6 +417,7 @@ VMAX_NORM = float(cfg.get("display", {}).get("vmax_norm", VMAX_RAW))
 # range_max / crossrange_max: HARD LIMIT (0 .. max config)
 RMAX_HARD_MAX = float(cfg["display"]["range_max"])
 RANGE_MAX_DISPLAY = float(cfg["display"]["range_max"])
+RANGE_MAX_PROCESSING = float(resolve_processing_range_max_m(cfg))
 display_projection_cfg = display_projection_from_yaml_dict(cfg)
 HEATMAP_CROSSRANGE_MAX_DISPLAY = float(
     resolve_display_crossrange_max_m(
@@ -462,6 +465,7 @@ if _fft_workers_raw is None:
 else:
     FFT_WORKERS = int(_fft_workers_raw)
 FFT_WORKERS = max(1, min(FFT_WORKERS, LOGICAL_CPUS))
+CALIBRATION_CFG = calibration_from_yaml_dict(cfg, virtual_ant=int(VIRTUAL_ANT))
 REALTIME_DSP_CFG = RealtimeDSPConfig(
     c=float(C),
     fs=float(FS),
@@ -479,6 +483,8 @@ REALTIME_DSP_CFG = RealtimeDSPConfig(
     virtual_ant=int(VIRTUAL_ANT),
     fft_workers=int(FFT_WORKERS),
     debug_stats=bool(DEBUG_STATS),
+    range_max_processing_m=float(RANGE_MAX_PROCESSING),
+    calibration=CALIBRATION_CFG,
 )
 
 # --- PROCESS PRIORITY ---
@@ -538,6 +544,7 @@ def _build_capture_file_header(pos_id: int) -> bytes:
 # ----------------------------
 def radar_rx(
     cmd_queue: Queue,
+    dsp_cmd_queue: Queue,
     free_slots: Queue,
     dsp_ready_queue: Queue,
     shm_frames,
@@ -649,6 +656,14 @@ def radar_rx(
             except pyqueue.Empty:
                 break
             if not cmd:
+                continue
+            if isinstance(cmd, dict):
+                cmd_type = str(cmd.get("type", "")).strip().lower()
+                if cmd_type == "calibrate_boresight":
+                    try:
+                        dsp_cmd_queue.put_nowait({"type": "calibrate_boresight"})
+                    except Exception:
+                        pass
                 continue
             if cmd[0] == "CAPTURE":
                 pending_pos_id = int(cmd[1])
@@ -1148,6 +1163,7 @@ def main():
     gui_tracks_lock = mp.Lock()
 
     cmd_q = Queue(maxsize=16)
+    dsp_cmd_q = Queue(maxsize=16)
 
     stop_evt = mp.Event()
     sar_pos_counter = Value("L", 0)  # GUI-only counter (pos id generator)
@@ -1179,6 +1195,7 @@ def main():
         target=radar_rx,
         args=(
             cmd_q,
+            dsp_cmd_q,
             free_slots,
             dsp_ready_queue,
             shm_frames,
@@ -1230,6 +1247,7 @@ def main():
         args=(
             free_slots,
             dsp_ready_queue,
+            dsp_cmd_q,
             shm_frames,
             slot_state,
             slot_ok,
@@ -1298,7 +1316,7 @@ def main():
             slope_hz_s=float(SLOPE),
             fc_hz=float(FC),
             nfft_range=int(NFFT_RANGE),
-            range_max_m=float(RANGE_MAX_DISPLAY),
+            range_max_m=float(RANGE_MAX_PROCESSING),
             crossrange_max_m=float(CROSSRANGE_MAX_DISPLAY),
             image_h=int(gui_h),
             image_w=int(gui_w),
@@ -1394,6 +1412,8 @@ def main():
     HEAT_PLOT_TAG = "heat_plot"
     XAXIS_TAG, YAXIS_TAG = "xaxis", "yaxis"
     IMG_SERIES_TAG = "img_series"
+    GUIDE_POS20_TAG = "guide_pos20"
+    GUIDE_NEG20_TAG = "guide_neg20"
     TRACK_SCATTER_CONF_TAG = "track_scatter_confirmed"
     TRACK_SCATTER_UNCONF_TAG = "track_scatter_unconfirmed"
     TRACK_SCATTER_MOVING_TAG = "track_scatter_moving"
@@ -1457,6 +1477,10 @@ def main():
         with dpg.theme_component(dpg.mvLineSeries):
             dpg.add_theme_color(dpg.mvPlotCol_Line, (255, 255, 255, 170), category=dpg.mvThemeCat_Plots)
             dpg.add_theme_style(dpg.mvPlotStyleVar_LineWeight, 1.0, category=dpg.mvThemeCat_Plots)
+    with dpg.theme() as guide_line_theme:
+        with dpg.theme_component(dpg.mvLineSeries):
+            dpg.add_theme_color(dpg.mvPlotCol_Line, (255, 230, 80, 190), category=dpg.mvThemeCat_Plots)
+            dpg.add_theme_style(dpg.mvPlotStyleVar_LineWeight, 1.5, category=dpg.mvThemeCat_Plots)
     with dpg.theme() as track_moving_theme:
         with dpg.theme_component(dpg.mvScatterSeries):
             dpg.add_theme_color(dpg.mvPlotCol_MarkerFill, (0, 235, 180, 255), category=dpg.mvThemeCat_Plots)
@@ -1513,6 +1537,14 @@ def main():
         off_vmax = off_vmin + 1.0
     off_rmax = float(RANGE_MAX_DISPLAY)
     off_xmax = float(CROSSRANGE_MAX_DISPLAY)
+
+    guide_angle_deg = 20.0
+    guide_slope = float(np.tan(np.deg2rad(np.float32(guide_angle_deg))))
+
+    def _guide_line_points(angle_sign: float, y_max_m: float) -> list[list[float]]:
+        y_top = max(0.0, float(y_max_m))
+        x_top = float(angle_sign) * guide_slope * y_top
+        return [[0.0, x_top], [0.0, y_top]]
     off_ui_dirty = False
     off_ui_dirty_t = 0.0
     off_ui_pending = {
@@ -1711,6 +1743,12 @@ def main():
         except Exception:
             pass
         dpg.set_value(TXT_POS_TAG, f"Pos Counter: {pid}")
+
+    def _on_calibrate_boresight():
+        try:
+            cmd_q.put_nowait({"type": "calibrate_boresight"})
+        except Exception:
+            pass
 
     def _norm_toggle_label(enabled: bool) -> str:
         return "NORM: ON" if enabled else "NORM: OFF"
@@ -1936,6 +1974,13 @@ def main():
                             dpg.add_spacer(height=14)
                             dpg.add_text("SYSTEM STATS", color=(255, 200, 0))
                             dpg.add_separator()
+                            dpg.add_button(
+                                label="Esegui Calibrazione Boresight",
+                                callback=_on_calibrate_boresight,
+                                width=-1,
+                                height=32,
+                            )
+                            dpg.add_spacer(height=8)
                             dpg.add_text("Waiting for data...", tag=TXT_STATS_TAG, wrap=-1)
                             if font_mono:
                                 dpg.bind_item_font(TXT_STATS_TAG, font_mono)
@@ -1961,6 +2006,10 @@ def main():
                         dpg.add_scatter_series([], [], label="Tracks unknown", tag=TRACK_SCATTER_UNKNOWN_TAG, parent=YAXIS_TAG)
                         dpg.add_scatter_series([], [], label="Stop point", tag=TRACK_STOP_MARKER_TAG, parent=YAXIS_TAG)
                         dpg.add_line_series([], [], label="Track velocity", tag=TRACK_VEL_SERIES_TAG, parent=YAXIS_TAG)
+                        guide_neg_x, guide_y = _guide_line_points(-1.0, RANGE_MAX_DISPLAY)
+                        guide_pos_x, _ = _guide_line_points(+1.0, RANGE_MAX_DISPLAY)
+                        dpg.add_line_series(guide_neg_x, guide_y, label="-20 deg", tag=GUIDE_NEG20_TAG, parent=YAXIS_TAG)
+                        dpg.add_line_series(guide_pos_x, guide_y, label="+20 deg", tag=GUIDE_POS20_TAG, parent=YAXIS_TAG)
                         dpg.bind_item_theme(TRACK_SCATTER_CONF_TAG, track_conf_theme)
                         dpg.bind_item_theme(TRACK_SCATTER_UNCONF_TAG, track_unconf_theme)
                         dpg.bind_item_theme(TRACK_SCATTER_MOVING_TAG, track_moving_theme)
@@ -1968,6 +2017,8 @@ def main():
                         dpg.bind_item_theme(TRACK_SCATTER_UNKNOWN_TAG, track_unknown_theme)
                         dpg.bind_item_theme(TRACK_STOP_MARKER_TAG, track_stop_marker_theme)
                         dpg.bind_item_theme(TRACK_VEL_SERIES_TAG, track_vel_theme)
+                        dpg.bind_item_theme(GUIDE_NEG20_TAG, guide_line_theme)
+                        dpg.bind_item_theme(GUIDE_POS20_TAG, guide_line_theme)
                         if supports_plot_annotation:
                             add_plot_annotation_fn = getattr(dpg, "add_plot_annotation", None)
                             if callable(add_plot_annotation_fn):
@@ -2345,6 +2396,12 @@ def main():
                 if dpg.does_item_exist(XAXIS_TAG) and dpg.does_item_exist(YAXIS_TAG):
                     dpg.set_axis_limits(XAXIS_TAG, -vis_xmax, +vis_xmax)
                     dpg.set_axis_limits(YAXIS_TAG, 0.0, float(vis_rmax))
+                if dpg.does_item_exist(GUIDE_NEG20_TAG):
+                    guide_neg_x, guide_y = _guide_line_points(-1.0, vis_rmax)
+                    dpg.set_value(GUIDE_NEG20_TAG, [guide_neg_x, guide_y])
+                if dpg.does_item_exist(GUIDE_POS20_TAG):
+                    guide_pos_x, guide_y = _guide_line_points(+1.0, vis_rmax)
+                    dpg.set_value(GUIDE_POS20_TAG, [guide_pos_x, guide_y])
 
                 # colorbar
                 if dpg.does_item_exist(CMAP_SCALE_TAG):

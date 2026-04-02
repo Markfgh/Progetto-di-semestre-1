@@ -55,6 +55,7 @@ def test_dsp_releases_slot_only_after_copy(monkeypatch) -> None:
     shm_frames = bytearray(original_i16.tobytes())
     free_slots = OverwritingFreeSlots(shm_frames, overwrite_i16)
     dsp_ready_queue: queue.Queue[tuple[int, int]] = queue.Queue()
+    dsp_cmd_queue: queue.Queue[dict[str, str]] = queue.Queue()
     dsp_ready_queue.put((1, 0))
 
     slot_state = mp.Array("i", [1])
@@ -109,8 +110,12 @@ def test_dsp_releases_slot_only_after_copy(monkeypatch) -> None:
             np.ones((1, 1, 1, virtual_ant), dtype=np.float32),
         ),
     )
-    monkeypatch.setattr(realtime_dsp, "build_angle_steering_matrix", lambda virtual_ant, nfft_angle: np.zeros((nfft_angle, virtual_ant), dtype=np.complex64))
-    monkeypatch.setattr(realtime_dsp, "build_angle_axis_deg", lambda nfft_angle: np.zeros(nfft_angle, dtype=np.float32))
+    monkeypatch.setattr(
+        realtime_dsp,
+        "build_angle_steering_matrix",
+        lambda virtual_ant, nfft_angle, geometry=None: np.zeros((nfft_angle, virtual_ant), dtype=np.complex64),
+    )
+    monkeypatch.setattr(realtime_dsp, "build_angle_axis_deg", lambda nfft_angle, geometry=None: np.zeros(nfft_angle, dtype=np.float32))
     monkeypatch.setattr(realtime_dsp, "resolve_display_crossrange_max_m", lambda display_y_max_m, angle_axis_deg, display_projection_cfg: display_y_max_m)
     monkeypatch.setattr(realtime_dsp, "build_display_projection_lut", lambda **kwargs: None)
     monkeypatch.setattr(realtime_dsp, "build_doppler_axis_mps", lambda cfg_dict, dsp_cfg, n_doppler, doppler_fft_shift: np.zeros(n_doppler, dtype=np.float32))
@@ -118,7 +123,8 @@ def test_dsp_releases_slot_only_after_copy(monkeypatch) -> None:
     def fake_process_buffer(raw_buffer, n_frames, *args, **kwargs):
         captured["raw_buffer"] = np.array(raw_buffer[: expected_complex.size], copy=True)
         stop_evt.set()
-        return None, []
+        cal_vector = np.asarray(kwargs.get("cal_vector", np.ones(dsp_cfg.virtual_ant, dtype=np.complex64)), dtype=np.complex64)
+        return None, [], cal_vector
 
     monkeypatch.setattr(realtime_dsp, "process_buffer", fake_process_buffer)
 
@@ -132,6 +138,7 @@ def test_dsp_releases_slot_only_after_copy(monkeypatch) -> None:
     realtime_dsp.dsp_worker(
         free_slots=free_slots,
         dsp_ready_queue=dsp_ready_queue,
+        dsp_cmd_queue=dsp_cmd_queue,
         shm_frames=shm_frames,
         slot_state=slot_state,
         slot_ok=slot_ok,
@@ -141,6 +148,7 @@ def test_dsp_releases_slot_only_after_copy(monkeypatch) -> None:
         gui_dbuf=gui_dbuf,
         gui_prof_dbuf=gui_prof_dbuf,
         gui_h=1,
+        fft_plot_h=1,
         gui_w=1,
         gui_latest_idx=mp.Value("i", 0),
         gui_latest_seq=mp.Value("i", 0),
@@ -167,3 +175,4 @@ def test_dsp_releases_slot_only_after_copy(monkeypatch) -> None:
 
     assert free_slots.released == [0]
     np.testing.assert_array_equal(captured["raw_buffer"], expected_complex)
+

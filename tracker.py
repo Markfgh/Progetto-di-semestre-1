@@ -239,9 +239,9 @@ class MultiObjectTracker:
         self._i4 = np.eye(4, dtype=np.float64)
         cfg_dt_s = self.tracking_cfg.dt_s
         if cfg_dt_s is not None and math.isfinite(cfg_dt_s) and cfg_dt_s > 0.0:
-            self._fixed_dt_s: float | None = float(cfg_dt_s)
+            self._nominal_dt_s: float | None = float(cfg_dt_s)
         else:
-            self._fixed_dt_s = None
+            self._nominal_dt_s = None
         self._cached_predict_dt_s: float | None = None
         self._cached_f_mat: np.ndarray | None = None
         self._cached_q_mat: np.ndarray | None = None
@@ -329,11 +329,10 @@ class MultiObjectTracker:
         return 0.05
 
     def _resolve_dt(self, timestamp_s: float) -> float:
-        cfg_dt_s = self.tracking_cfg.dt_s
-        if cfg_dt_s is not None and math.isfinite(cfg_dt_s) and cfg_dt_s > 0.0:
-            dt_s = float(cfg_dt_s)
-        elif self._last_timestamp_s is not None:
+        if self._last_timestamp_s is not None:
             dt_s = float(timestamp_s - self._last_timestamp_s)
+        elif self._nominal_dt_s is not None:
+            dt_s = float(self._nominal_dt_s)
         else:
             dt_s = self._last_dt_s
         if not math.isfinite(dt_s) or dt_s <= 0.0:
@@ -435,7 +434,7 @@ class MultiObjectTracker:
         )
 
     def _get_predict_mats(self, dt_s: float) -> tuple[np.ndarray, np.ndarray]:
-        dt_use = float(self._fixed_dt_s) if self._fixed_dt_s is not None else float(dt_s)
+        dt_use = float(dt_s)
         if (
             self._cached_f_mat is None
             or self._cached_q_mat is None
@@ -797,10 +796,8 @@ class MultiObjectTracker:
         return track
 
     def _initial_velocity(self, meas: Measurement) -> tuple[float, float]:
-        if meas.doppler_mps is None or meas.range_m <= _EPS:
-            return 0.0, 0.0
-        scale = float(meas.doppler_mps) / max(float(meas.range_m), _EPS)
-        return float(meas.x_m * scale), float(meas.y_m * scale)
+        # Single-frame radial Doppler is insufficient to infer the full 2D velocity vector.
+        return 0.0, 0.0
 
     def _refresh_track_measurement(self, track: Track, meas: Measurement) -> None:
         track.doppler_mps = meas.doppler_mps
@@ -821,7 +818,18 @@ class MultiObjectTracker:
     def _expected_track_doppler(self, track: Track) -> float | None:
         if track.motion_state == "stopped":
             return 0.0
-        return track.radial_velocity_mps
+        radial_velocity = track.radial_velocity_mps
+        if (
+            radial_velocity is not None
+            and (
+                track.hits > 1
+                or track.speed_mps > max(self.tracker_cfg.stopped_speed_threshold_mps, _EPS)
+            )
+        ):
+            return float(radial_velocity)
+        if track.doppler_mps is not None:
+            return float(track.doppler_mps)
+        return radial_velocity
 
     def _update_motion_state(self, track: Track, meas: Measurement, now_s: float) -> None:
         move_confirm = max(1, int(self.tracker_cfg.motion_confirm_frames_moving))
@@ -885,7 +893,8 @@ class MultiObjectTracker:
             if track.motion_state == "stopped":
                 self._enter_stopped_state(track, now_s)
             elif track.motion_state == "moving":
-                track.doppler_mps = track.radial_velocity_mps
+                if track.doppler_mps is None:
+                    track.doppler_mps = track.radial_velocity_mps
         elif track.motion_state == "stopped":
             self._update_stop_anchor(track, now_s)
 

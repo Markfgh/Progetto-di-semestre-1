@@ -7,10 +7,16 @@ import time
 from multiprocessing.sharedctypes import Synchronized
 from typing import Any, Literal
 
+
 import numpy as np
+import pyfftw
 import scipy.fft as fft
 
 from tracker import MultiObjectTracker, Track, TrackerConfig, TrackingConfig
+
+# Diciamo a SciPy di usare il motore di FFTW sotto il cofano
+pyfftw.interfaces.cache.enable()
+fft.set_global_backend(pyfftw.interfaces.scipy_fft)
 
 # Realtime DSP only: window setup, batch processing, and worker loop.
 WindowType = Literal["none", "rectangular", "hanning", "hamming", "blackman"]
@@ -52,6 +58,13 @@ class DspSelection:
 
 
 @dataclass(frozen=True)
+class CalibrationConfig:
+    enabled: bool = True
+    vector_real: tuple[float, ...] = (1.0,) * 8
+    vector_imag: tuple[float, ...] = (0.0,) * 8
+
+
+@dataclass(frozen=True)
 class MeanSelection:
     axes: tuple[MeanAxis, ...] = ("tx",)
     enabled: bool = False
@@ -89,6 +102,9 @@ class LoopAverageConfig:
 class AngleProcessingConfig:
     mode: AngleProcessingMode = "fft"
     mvdr_diagonal_loading: float = 0.01
+    aggregation: str = "frame_loop"
+    frame_index: int = 0
+    loop_index: int = 0
 
 
 @dataclass(frozen=True)
@@ -195,6 +211,17 @@ class RealtimeDSPConfig:
     virtual_ant: int
     fft_workers: int
     debug_stats: bool
+    range_max_processing_m: float = 0.0
+    calibration: CalibrationConfig = CalibrationConfig()
+
+
+@dataclass(frozen=True)
+class VirtualArrayGeometry:
+    order_flat: np.ndarray
+    phase_centers_lambda: np.ndarray
+    identity_order: bool
+    uniform_half_lambda: bool
+    uniform_spacing_lambda: float | None
 
 # Return a 1D FFT window of the requested type as float32.
 def _get_window_1d(win_type: str, size: int) -> np.ndarray:
@@ -271,6 +298,35 @@ def selection_from_yaml_dict(cfg: dict[str, Any]) -> DspSelection:
     )
 
 
+def _calibration_vector_from_yaml(raw_value: Any, *, size: int, default: float) -> tuple[float, ...]:
+    size = max(1, int(size))
+    if isinstance(raw_value, (list, tuple)):
+        raw_items = list(raw_value)
+    else:
+        raw_items = []
+    out: list[float] = []
+    for raw_item in raw_items[:size]:
+        try:
+            val = float(raw_item)
+        except (TypeError, ValueError):
+            val = float(default)
+        out.append(val)
+    if len(out) < size:
+        out.extend([float(default)] * (size - len(out)))
+    return tuple(out)
+
+
+def calibration_from_yaml_dict(cfg: dict[str, Any], *, virtual_ant: int = 8) -> CalibrationConfig:
+    dsp = cfg.get("dsp", {}) or {}
+    block = dsp.get("calibration", {}) or {}
+    size = max(1, int(virtual_ant))
+    return CalibrationConfig(
+        enabled=bool(block.get("enabled", True)),
+        vector_real=_calibration_vector_from_yaml(block.get("vector_real"), size=size, default=1.0),
+        vector_imag=_calibration_vector_from_yaml(block.get("vector_imag"), size=size, default=0.0),
+    )
+
+
 def _mean_selection_from_yaml_dict(dsp: dict[str, Any], key: str, default_axes: tuple[MeanAxis, ...]) -> MeanSelection:
     block = dsp.get(key, {}) or {}
     return MeanSelection(
@@ -301,9 +357,23 @@ def angle_processing_from_yaml_dict(cfg: dict[str, Any]) -> AngleProcessingConfi
         mvdr_diagonal_loading = float(block.get("mvdr_diagonal_loading", 0.01))
     except (TypeError, ValueError):
         mvdr_diagonal_loading = 0.01
+    aggregation_raw = str(block.get("aggregation", "frame_loop")).strip().lower()
+    if aggregation_raw not in {"frame_loop", "frame", "loop", "none"}:
+        aggregation_raw = "frame_loop"
+    try:
+        frame_index = int(block.get("frame_index", 0))
+    except (TypeError, ValueError):
+        frame_index = 0
+    try:
+        loop_index = int(block.get("loop_index", 0))
+    except (TypeError, ValueError):
+        loop_index = 0
     return AngleProcessingConfig(
         mode=mode,
         mvdr_diagonal_loading=max(0.0, mvdr_diagonal_loading),
+        aggregation=aggregation_raw,
+        frame_index=max(0, frame_index),
+        loop_index=max(0, loop_index),
     )
 
 
@@ -642,6 +712,168 @@ def _to_optional_float(value: Any) -> float | None:
     if not np.isfinite(parsed):
         return None
     return float(parsed)
+
+
+def resolve_processing_range_max_m(cfg: dict[str, Any]) -> float:
+    processing = cfg.get("processing", {}) or {}
+    detection = cfg.get("detection", {}) or {}
+    display = cfg.get("display", {}) or {}
+    raw_value = None
+    for block, key in (
+        (processing, "range_max_m"),
+        (detection, "range_max_m"),
+        (processing, "range_max"),
+        (detection, "range_max"),
+    ):
+        if key in block:
+            raw_value = block.get(key)
+            break
+    if raw_value is None:
+        raw_value = display.get("range_max_m", display.get("range_max", None))
+    parsed = _to_optional_float(raw_value)
+    if parsed is not None and parsed > 0.0:
+        return float(parsed)
+    display_fallback = _to_optional_float(display.get("range_max_m", display.get("range_max", None)))
+    if display_fallback is not None and display_fallback > 0.0:
+        return float(display_fallback)
+    return 0.0
+
+
+def _default_virtual_array_order_flat(virtual_ant: int) -> np.ndarray:
+    return np.arange(max(0, int(virtual_ant)), dtype=np.int32)
+
+
+def _default_virtual_array_phase_centers_lambda(virtual_ant: int) -> np.ndarray:
+    return (np.float32(0.5) * np.arange(max(0, int(virtual_ant)), dtype=np.float32)).astype(np.float32, copy=False)
+
+
+def _parse_virtual_array_order_entry(
+    entry: Any,
+    *,
+    tx: int,
+    rx: int,
+    virtual_ant: int,
+) -> int:
+    if isinstance(entry, dict):
+        if "flat" in entry:
+            idx = int(entry["flat"])
+        else:
+            idx = int(entry["tx"]) * int(rx) + int(entry["rx"])
+    elif isinstance(entry, (list, tuple)):
+        if len(entry) == 2:
+            idx = int(entry[0]) * int(rx) + int(entry[1])
+        elif len(entry) == 1:
+            idx = int(entry[0])
+        else:
+            raise ValueError(f"virtual_array_order entry non valido: {entry!r}")
+    else:
+        idx = int(entry)
+    if idx < 0 or idx >= int(virtual_ant):
+        raise ValueError(f"virtual_array_order index fuori range: {idx}")
+    return int(idx)
+
+
+def build_virtual_array_geometry_from_yaml_dict(
+    cfg: dict[str, Any],
+    dsp_cfg: RealtimeDSPConfig,
+) -> tuple[VirtualArrayGeometry, list[str]]:
+    block = cfg.get("antenna", {}) or cfg.get("virtual_array", {}) or {}
+    virtual_ant = int(dsp_cfg.virtual_ant)
+    default_order = _default_virtual_array_order_flat(virtual_ant)
+    default_phase_centers = _default_virtual_array_phase_centers_lambda(virtual_ant)
+    warnings: list[str] = []
+
+    order_flat = default_order
+    order_raw = block.get("virtual_array_order", block.get("order", None))
+    if order_raw is not None:
+        try:
+            order_list = list(order_raw)
+            if len(order_list) != virtual_ant:
+                raise ValueError(
+                    f"virtual_array_order size={len(order_list)} != virtual_ant={virtual_ant}"
+                )
+            parsed = np.asarray(
+                [
+                    _parse_virtual_array_order_entry(
+                        item,
+                        tx=int(dsp_cfg.tx),
+                        rx=int(dsp_cfg.rx),
+                        virtual_ant=virtual_ant,
+                    )
+                    for item in order_list
+                ],
+                dtype=np.int32,
+            )
+            if np.unique(parsed).size != virtual_ant:
+                raise ValueError("virtual_array_order contiene duplicati")
+            order_flat = parsed
+        except Exception as exc:
+            warnings.append(
+                f"antenna.virtual_array_order non valido ({exc}); using legacy tx-major/rx order."
+            )
+            order_flat = default_order
+
+    phase_centers_lambda = default_phase_centers
+    phase_centers_lambda_raw = block.get(
+        "virtual_array_phase_centers_lambda",
+        block.get("phase_centers_lambda", None),
+    )
+    phase_centers_m_raw = block.get(
+        "virtual_array_phase_centers_m",
+        block.get("phase_centers_m", None),
+    )
+    if phase_centers_lambda_raw is not None or phase_centers_m_raw is not None:
+        try:
+            raw_values = phase_centers_lambda_raw if phase_centers_lambda_raw is not None else phase_centers_m_raw
+            parsed = np.asarray(list(raw_values), dtype=np.float32)
+            if parsed.size != virtual_ant or not np.all(np.isfinite(parsed)):
+                raise ValueError(
+                    f"phase center size/values incoerenti: size={parsed.size}, virtual_ant={virtual_ant}"
+                )
+            if phase_centers_lambda_raw is not None:
+                phase_centers_lambda = parsed.astype(np.float32, copy=False)
+            else:
+                radar = cfg.get("radar", {}) or {}
+                c_mps = _to_float(radar.get("c", 3e8), 3e8)
+                fc_hz = _to_float(radar.get("fc", None), float("nan"))
+                if not np.isfinite(fc_hz) or fc_hz <= 0.0:
+                    raise ValueError("radar.fc mancante/invalid per convertire phase_centers_m in lambda")
+                wavelength_m = float(c_mps) / float(fc_hz)
+                if not np.isfinite(wavelength_m) or wavelength_m <= 0.0:
+                    raise ValueError("wavelength_m non valida")
+                phase_centers_lambda = (parsed / np.float32(wavelength_m)).astype(np.float32, copy=False)
+        except Exception as exc:
+            warnings.append(
+                f"antenna.virtual_array_phase_centers_* non valido ({exc}); using legacy half-lambda ULA."
+            )
+            phase_centers_lambda = default_phase_centers
+
+    identity_order = bool(np.array_equal(order_flat, default_order))
+    uniform_spacing_lambda: float | None = None
+    if phase_centers_lambda.size <= 1:
+        uniform_half_lambda = True
+        uniform_spacing_lambda = 0.5
+    else:
+        spacing = np.diff(phase_centers_lambda.astype(np.float64, copy=False))
+        is_uniform_spacing = bool(
+            np.all(np.isfinite(spacing))
+            and np.allclose(spacing, spacing[0], atol=1e-4, rtol=0.0)
+        )
+        if is_uniform_spacing:
+            uniform_spacing_lambda = float(spacing[0])
+        uniform_half_lambda = bool(
+            is_uniform_spacing
+            and np.isclose(float(spacing[0]), 0.5, atol=1e-3, rtol=0.0)
+        )
+
+    geometry = VirtualArrayGeometry(
+        order_flat=order_flat,
+        phase_centers_lambda=phase_centers_lambda.astype(np.float32, copy=False),
+        identity_order=identity_order,
+        uniform_half_lambda=uniform_half_lambda,
+        uniform_spacing_lambda=uniform_spacing_lambda,
+    )
+    return geometry, warnings
 
 
 def resolve_display_crossrange_max_m(
@@ -1104,11 +1336,7 @@ def apply_post_range_fft_filters(
     fft_workers: int,
     apply_loop_average_after_background: bool,
 ) -> np.ndarray:
-    out = apply_slow_time_filter(
-        data,
-        filters_cfg.slow_time,
-        fft_workers=fft_workers,
-    )
+    out = apply_slow_time_filter(data,filters_cfg.slow_time,fft_workers=fft_workers,)
     out = subtract_selected_mean(out, filters_cfg.mean_after_range_fft)
     out = apply_background_subtraction(out, filters_cfg.background_subtraction, bg_state)
     if apply_loop_average_after_background:
@@ -1123,20 +1351,38 @@ def _branch_needs_copy(filters_cfg: PostRangeFftFilterConfig) -> bool:
     return not filters_cfg.slow_time.enabled or filters_cfg.slow_time.mode == "none"
 
 
-def _build_angle_u_axis(nfft_angle: int) -> np.ndarray:
+def _build_angle_u_axis(nfft_angle: int, spacing_lambda: float = 0.5) -> np.ndarray:
     nfft_angle = max(1, int(nfft_angle))
     if nfft_angle == 1:
         return np.asarray([0.0], dtype=np.float32)
-    # Use a symmetric endfire-inclusive grid so the angular axis spans -90..+90 evenly.
-    u = np.linspace(-1.0, 1.0, nfft_angle, endpoint=True, dtype=np.float32)
-    np.clip(u, -1.0, 1.0, out=u)
+    spacing = float(spacing_lambda)
+    if not np.isfinite(spacing) or abs(spacing) <= 1e-8:
+        spacing = 0.5
+    u = (np.fft.fftshift(np.fft.fftfreq(nfft_angle, d=1.0)) / np.float32(spacing)).astype(
+        np.float32,
+        copy=False,
+    )
     return u
 
 
-def build_angle_steering_matrix(virtual_ant: int, nfft_angle: int) -> np.ndarray:
-    ant_idx = np.arange(int(virtual_ant), dtype=np.float32)
-    u = _build_angle_u_axis(nfft_angle)
-    phase = (-1j * np.pi) * ant_idx[:, None] * u[None, :]
+def build_angle_steering_matrix(
+    virtual_ant: int,
+    nfft_angle: int,
+    geometry: VirtualArrayGeometry | None = None,
+) -> np.ndarray:
+    if geometry is None:
+        phase_centers_lambda = _default_virtual_array_phase_centers_lambda(int(virtual_ant))
+    else:
+        phase_centers_lambda = np.asarray(geometry.phase_centers_lambda, dtype=np.float32).reshape(-1)
+    if phase_centers_lambda.size != int(virtual_ant):
+        raise ValueError(
+            f"phase_centers_lambda size={phase_centers_lambda.size} != virtual_ant={int(virtual_ant)}"
+        )
+    spacing_lambda = 0.5
+    if geometry is not None and geometry.uniform_spacing_lambda is not None:
+        spacing_lambda = float(geometry.uniform_spacing_lambda)
+    u = _build_angle_u_axis(nfft_angle, spacing_lambda=spacing_lambda)
+    phase = (-1j * np.float32(2.0 * np.pi)) * phase_centers_lambda[:, None] * u[None, :]
     steering = np.exp(phase).astype(np.complex64, copy=False)
     col_energy = (steering.real * steering.real + steering.imag * steering.imag).sum(axis=0, dtype=np.float32)
     col_norm = np.sqrt(np.maximum(col_energy, np.float32(1e-8))).astype(np.float32, copy=False)
@@ -1144,25 +1390,56 @@ def build_angle_steering_matrix(virtual_ant: int, nfft_angle: int) -> np.ndarray
     return steering
 
 
+#[frame, loop, range_bin, virtual_ant] -> [range_bin, angle_bin] with angle_bin either FFT or Bartlett/MVDR output
 def compute_angle_heatmap(
-    virtual_array: np.ndarray,
+    virtual_array: np.ndarray, # dati effettivi di forma [frame, loop, range_bin, virtual_ant]
     *,
-    angle_cfg: AngleProcessingConfig,
+    angle_cfg: AngleProcessingConfig, 
     dsp_cfg: RealtimeDSPConfig,
-    angle_steering: np.ndarray,
+    angle_steering: np.ndarray, # matrice di steering per Bartlett/MVDR, già normalizzata
+    geometry: VirtualArrayGeometry | None = None,
 ) -> np.ndarray:
+    # in [frame, loop, range_bin, angle_bin] -> [range_bin, angle_bin] con eventuale aggregazione su frame/loop a seconda di angle_cfg
+    def _aggregate_angle_power(power: np.ndarray) -> np.ndarray:
+        if power.ndim != 4:
+            return np.asarray(power, dtype=np.float32)
+        mode = str(getattr(angle_cfg, "aggregation", "frame_loop")).strip().lower()
+        if mode == "frame":
+            return power.mean(axis=0, dtype=np.float32)
+        if mode == "loop":
+            return power.mean(axis=1, dtype=np.float32)
+        if mode == "none":
+            frame_idx = min(max(0, int(getattr(angle_cfg, "frame_index", 0))), int(power.shape[0]) - 1)
+            loop_idx = min(max(0, int(getattr(angle_cfg, "loop_index", 0))), int(power.shape[1]) - 1)
+            return power[frame_idx, loop_idx, :, :].astype(np.float32, copy=False)
+        return power.mean(axis=(0, 1), dtype=np.float32)
+
+    # calculate angle heatmap with FFT; output is [range_bin, angle_bin]
     if angle_cfg.mode == "fft":
         angle_fft = fft.fft(
             virtual_array,
             n=dsp_cfg.nfft_angle,
-            axis=-1,
+            axis=3,
             workers=dsp_cfg.fft_workers,
             overwrite_x=True,
         )
-        re = angle_fft.real
+        # power calculation
+        re = angle_fft.real 
         im = angle_fft.imag
-        heatmap = (re * re + im * im).mean(axis=(0, 1), dtype=np.float32)
-        return np.fft.fftshift(heatmap, axes=-1).astype(np.float32, copy=False)
+        power = (re * re + im * im).astype(np.float32, copy=False) 
+        # shift zero angle to center bin
+        power  = np.fft.fftshift(power , axes=-1)
+        spacing_lambda = 0.5
+        if geometry is not None and geometry.uniform_spacing_lambda is not None:
+            spacing_lambda = float(geometry.uniform_spacing_lambda)
+        valid_u = np.abs(
+            _build_angle_u_axis(dsp_cfg.nfft_angle, spacing_lambda=spacing_lambda).astype(np.float64, copy=False)
+        ) <= 1.0
+        if np.any(~valid_u):
+            power[..., ~valid_u] = np.float32(0.0)
+        # aggregate according to angle_cfg and return
+        heatmap = _aggregate_angle_power(power)
+        return heatmap.astype(np.float32, copy=False)
 
     x = virtual_array.transpose(2, 0, 1, 3)
     n_range = int(x.shape[0])
@@ -1171,11 +1448,13 @@ def compute_angle_heatmap(
     x = x.reshape(n_range, n_snap, n_ant).astype(np.complex64, copy=False)
     steering = angle_steering[:n_ant, :]
 
+
     if angle_cfg.mode == "bartlett":
         y = np.einsum("rsm,mk->rsk", x, np.conj(steering), optimize=True)
         yr = y.real
         yi = y.imag
-        return (yr * yr + yi * yi).mean(axis=1, dtype=np.float32).astype(np.float32, copy=False)
+        power = (yr * yr + yi * yi).astype(np.float32, copy=False)
+        return power.mean(axis=1, dtype=np.float32).astype(np.float32, copy=False)
 
     cov = np.einsum("rsm,rsn->rmn", np.conj(x), x, optimize=True).astype(np.complex64, copy=False)
     if n_snap > 0:
@@ -1194,9 +1473,21 @@ def compute_angle_heatmap(
     return (np.float32(1.0) / den).astype(np.float32, copy=False)
 
 
-def build_angle_axis_deg(nfft_angle: int) -> np.ndarray:
-    u = _build_angle_u_axis(nfft_angle)
-    return np.rad2deg(np.arcsin(u)).astype(np.float32, copy=False)
+def build_angle_axis_deg(
+    nfft_angle: int,
+    geometry: VirtualArrayGeometry | None = None,
+) -> np.ndarray:
+    spacing_lambda = 0.5
+    if geometry is not None and geometry.uniform_spacing_lambda is not None:
+        spacing_lambda = float(geometry.uniform_spacing_lambda)
+    u = _build_angle_u_axis(nfft_angle, spacing_lambda=spacing_lambda)
+    angle_axis = np.full(u.shape, np.float32(np.nan), dtype=np.float32)
+    valid = np.abs(u.astype(np.float64, copy=False)) <= 1.0
+    if np.any(valid):
+        angle_axis[valid] = np.rad2deg(
+            np.arcsin(u[valid].astype(np.float64, copy=False))
+        ).astype(np.float32, copy=False)
+    return angle_axis
 
 
 def _normalize_display_projection_mode(value: Any) -> DisplayProjectionMode:
@@ -1319,50 +1610,60 @@ def build_display_projection_lut(
 
 
 def project_heatmap_for_display(
-    heatmap_lin: np.ndarray,
-    angle_axis_deg: np.ndarray,
-    dr_m: float,
-    gui_h: int,
-    gui_w: int,
-    y_max_m: float,
-    x_max_m: float,
-    projection_mode: str = "polar_stretched",
-    projection_interp: str = "nearest",
-    out: np.ndarray | None = None,
-    fill_value: float = 0.0,
-    precomputed_lut: dict[str, Any] | None = None,
+    heatmap_lin: np.ndarray, # matrice di potenza lineare [range_bin, angle_bin]
+    angle_axis_deg: np.ndarray, # asse degli angoli in gradi corrispondente alla dimensione angle_bin di heatmap_lin
+    dr_m: float, # risoluzione in metri per bin di range
+    gui_h: int, # altezza in pixel dell'area di visualizzazione
+    gui_w: int, # larghezza in pixel dell'area di visualizzazione
+    y_max_m: float, # distanza massima in metri da visualizzare sull'asse y (range)
+    x_max_m: float, # distanza massima in metri da visualizzare sull'asse x (angle); per la modalità "polar_stretched" questo è anche il raggio massimo visualizzato
+    projection_mode: str = "polar_stretched", # modalità di proiezione per visualizzare il heatmap; "polar_stretched" per una proiezione polare con stretching lineare dell'asse x, "cartesian" per una proiezione cartesiana senza stretching (ma comunque con interpolazione se projection_interp != "nearest")
+    projection_interp: str = "nearest", # metodo di interpolazione da usare se la modalità di proiezione richiede una mappatura non 1:1 tra pixel e bin di heatmap; "nearest" per nearest neighbor, "bilinear" per interpolazione bilineare
+    out: np.ndarray | None = None, # array opzionale di output preallocato con shape (gui_h, gui_w) e dtype float32; se fornito e compatibile, verrà usato per evitare l'allocazione interna di un nuovo array
+    fill_value: float = 0.0, # valore di potenza lineare da usare per i pixel dell'output che non corrispondono a nessun bin valido del heatmap; di default 0.0 per visualizzare come nero, ma può essere impostato a un valore più alto per evidenziare le aree fuori range/angolo
+    precomputed_lut: dict[str, Any] | None = None, # lookup table opzionale precomputata per la proiezione, ottenibile con build_display_projection_lut; se fornita e compatibile, verrà usata per evitare il calcolo interno della LUT e velocizzare la proiezione soprattutto in caso di proiezioni complesse o output di grandi dimensioni
 ) -> np.ndarray:
-    gui_h = max(0, int(gui_h))
+    # round to int and sanitize inputs
+    gui_h = max(0, int(gui_h)) 
     gui_w = max(0, int(gui_w))
+    # la modalità di proiezione e il metodo di interpolazione vengono normalizzati e validati; 
+    # se non validi, si usano i valori di default "polar_stretched" e "nearest"
     mode = _normalize_display_projection_mode(projection_mode)
     interp = _normalize_display_projection_interp(projection_interp)
-    if out is not None and out.shape == (gui_h, gui_w) and out.dtype == np.float32:
-        dst = out
-    else:
-        dst = np.empty((gui_h, gui_w), dtype=np.float32)
-    dst.fill(np.float32(fill_value))
 
-    src = np.asarray(heatmap_lin, dtype=np.float32)
+    if out is not None and out.shape == (gui_h, gui_w) and out.dtype == np.float32:
+        dst = out #heatmap out [gui_h, gui_w] già preallocato e compatibile
+    else:
+        dst = np.empty((gui_h, gui_w), dtype=np.float32) #heatmap out [gui_h, gui_w] da allocare
+    dst.fill(np.float32(fill_value)) #fill con fill_value per i pixel non validi
+
+    #check input heatmap e angle_axis e sanity check per dimensioni e valori; se non validi, restituisco dst già fill
+    src = np.asarray(heatmap_lin, dtype=np.float32) 
     if src.ndim != 2 or gui_h <= 0 or gui_w <= 0:
         return dst
 
-    src_rows = int(src.shape[0])
+    # Source heatmap size: rows=range bins, cols=angle bins.
+    src_rows = int(src.shape[0]) 
     src_cols = int(src.shape[1])
     if src_rows <= 0 or src_cols <= 0:
         return dst
 
+    # Non-cartesian mode copies the polar heatmap directly; cartesian mode needs a valid angle axis.
     if mode != "cartesian":
+        # Copy only the overlapping source area when display mode keeps the polar grid unchanged.
         copy_rows = min(gui_h, src_rows)
         copy_cols = min(gui_w, src_cols)
         if copy_rows > 0 and copy_cols > 0:
             dst[:copy_rows, :copy_cols] = src[:copy_rows, :copy_cols]
         return dst
 
+    # Use only the angle columns that have a matching valid angle-axis entry.
     angle_axis = np.asarray(angle_axis_deg, dtype=np.float32).reshape(-1)
     eff_cols = min(src_cols, int(angle_axis.size))
     if eff_cols <= 0:
         return dst
 
+    # Rebuild the projection LUT whenever the cached one does not match the current display geometry.
     lut = precomputed_lut
     if (
         lut is None
@@ -1385,6 +1686,7 @@ def project_heatmap_for_display(
             projection_interp=interp,
         )
 
+    #Abort if the LUT provides no valid angle coverage for the current output grid.
     valid_theta = np.asarray(lut.get("valid_theta", np.zeros(gui_h * gui_w, dtype=bool)), dtype=bool)
     if valid_theta.size != gui_h * gui_w or not np.any(valid_theta):
         return dst
@@ -1477,6 +1779,37 @@ def _resolve_chirp_period_s(cfg: dict[str, Any]) -> float | None:
     return None
 
 
+def resolve_nominal_frame_period_s(
+    cfg: dict[str, Any],
+    dsp_cfg: RealtimeDSPConfig,
+    tracking_cfg: TrackingConfig | None = None,
+) -> float | None:
+    tracking_dt_s = None if tracking_cfg is None else getattr(tracking_cfg, "dt_s", None)
+    if tracking_dt_s is not None:
+        dt_s = float(tracking_dt_s)
+        if np.isfinite(dt_s) and dt_s > 0.0:
+            return float(dt_s)
+    chirp_period_s = _resolve_chirp_period_s(cfg)
+    if chirp_period_s is None or chirp_period_s <= 0.0:
+        return None
+    frame_period_s = float(chirp_period_s) * float(max(1, int(dsp_cfg.chirps)))
+    if not np.isfinite(frame_period_s) or frame_period_s <= 0.0:
+        return None
+    return float(frame_period_s)
+
+
+def _build_doppler_bin_cycles_axis(
+    n_doppler: int,
+    *,
+    doppler_fft_shift: bool,
+) -> np.ndarray:
+    n_doppler = max(1, int(n_doppler))
+    doppler_cycles = np.fft.fftfreq(n_doppler, d=1.0).astype(np.float32, copy=False)
+    if doppler_fft_shift:
+        doppler_cycles = np.fft.fftshift(doppler_cycles)
+    return doppler_cycles.astype(np.float32, copy=False)
+
+
 def build_doppler_axis_mps(
     cfg: dict[str, Any],
     dsp_cfg: RealtimeDSPConfig,
@@ -1493,17 +1826,79 @@ def build_doppler_axis_mps(
     if chirp_period_s is None or chirp_period_s <= 0.0:
         print("[DSP WARN] Doppler axis disabled: missing/invalid chirp_period_s or pri_s (doppler_mps=None).")
         return None
-    if int(dsp_cfg.tx) != 2:
+    tx_count = max(1, int(dsp_cfg.tx))
+    if tx_count != 2:
         print(
-            f"[DSP WARN] Doppler axis assumes fixed TDM-MIMO 2TX; cfg tx={int(dsp_cfg.tx)}. "
-            "Using effective_pri_s = chirp_period_s * 2."
+            f"[DSP WARN] Doppler axis generalized to uniform TDM with tx={tx_count}; "
+            "verify against the real chirp schedule if TX delays are non-uniform."
         )
-    effective_pri_s = float(chirp_period_s) * 2.0
+    effective_pri_s = float(chirp_period_s) * float(tx_count)
     wavelength_m = float(dsp_cfg.c) / float(fc_hz)
-    fd_hz = np.fft.fftfreq(int(n_doppler), d=effective_pri_s).astype(np.float32, copy=False)
-    if doppler_fft_shift:
-        fd_hz = np.fft.fftshift(fd_hz)
+    doppler_cycles = _build_doppler_bin_cycles_axis(n_doppler, doppler_fft_shift=doppler_fft_shift)
+    fd_hz = (doppler_cycles / np.float32(effective_pri_s)).astype(np.float32, copy=False)
     return (fd_hz * np.float32(wavelength_m * 0.5)).astype(np.float32, copy=False)
+
+
+def build_tdm_mimo_doppler_compensation_table(
+    n_doppler: int,
+    tx_count: int,
+    *,
+    doppler_fft_shift: bool,
+) -> np.ndarray:
+    n_doppler = max(0, int(n_doppler))
+    tx_count = max(0, int(tx_count))
+    if n_doppler <= 0 or tx_count <= 0:
+        return np.empty((0, 0), dtype=np.complex64)
+    if tx_count == 1:
+        return np.ones((n_doppler, 1), dtype=np.complex64)
+
+    doppler_cycles = _build_doppler_bin_cycles_axis(n_doppler, doppler_fft_shift=doppler_fft_shift)
+    tx_delay_in_loops = (np.arange(tx_count, dtype=np.float32) / np.float32(tx_count)).astype(np.float32, copy=False)
+    # numpy/scipy FFT sign convention: a target at Doppler bin k carries an extra phase
+    # exp(+j 2*pi*f_d*t_tx) on TX acquired t_tx later. Undo it before virtual-array flattening.
+    # TODO(hardware): validate sign against real board chirp ordering / I-Q convention; if needed,
+    # conjugate this table once the hardware sign is confirmed.
+    phase = np.exp(
+        (-1j * 2.0 * np.pi)
+        * doppler_cycles[:, None].astype(np.float64, copy=False)
+        * tx_delay_in_loops[None, :].astype(np.float64, copy=False)
+    ).astype(np.complex64, copy=False)
+    phase[:, 0] = np.complex64(1.0 + 0.0j)
+    return phase
+
+
+def apply_tdm_mimo_doppler_compensation(
+    snapshot_tx_rx: np.ndarray,
+    *,
+    doppler_bin: int,
+    compensation_table: np.ndarray | None,
+    out: np.ndarray | None = None,
+) -> np.ndarray:
+    """Compensate TDM-MIMO per-TX Doppler phase on snapshots with trailing axes [tx, rx].
+
+    Leading axes are preserved (typically [frame, tx, rx]); output has the same axes/order
+    as the input and is ready for virtual-array flattening in the configured antenna order.
+    """
+    snapshot = np.asarray(snapshot_tx_rx, dtype=np.complex64)
+    if out is not None and out.shape == snapshot.shape and out.dtype == np.complex64:
+        compensated = out
+        np.copyto(compensated, snapshot, casting="unsafe")
+    else:
+        compensated = np.array(snapshot, dtype=np.complex64, copy=True)
+    if compensated.ndim < 2:
+        return compensated
+    if compensation_table is None or compensation_table.size <= 0:
+        return compensated
+    dbin = int(doppler_bin)
+    if dbin < 0 or dbin >= int(compensation_table.shape[0]):
+        return compensated
+
+    phase_row = np.asarray(compensation_table[dbin], dtype=np.complex64).reshape(-1)
+    if phase_row.size != int(compensated.shape[-2]):
+        return compensated
+    phase_shape = (1,) * max(0, compensated.ndim - 2) + (int(phase_row.size), 1)
+    np.multiply(compensated, phase_row.reshape(phase_shape), out=compensated)
+    return compensated
 
 
 def _build_virtual_array_from_range_fft(
@@ -1511,7 +1906,9 @@ def _build_virtual_array_from_range_fft(
     *,
     max_bin: int,
     dsp_cfg: RealtimeDSPConfig,
+    geometry: VirtualArrayGeometry,
     work_buf: np.ndarray | None = None,
+    flat_work_buf: np.ndarray | None = None,
 ) -> np.ndarray:
     trimmed = range_fft[:, :, :, :max_bin, :]
     va_src = trimmed.transpose(0, 1, 3, 2, 4)
@@ -1525,12 +1922,76 @@ def _build_virtual_array_from_range_fft(
         va = work_buf
     else:
         va = np.ascontiguousarray(va_src)
-    return va.reshape(
+    va_flat = va.reshape(
         int(range_fft.shape[0]),
         int(range_fft.shape[1]),
         int(max_bin),
         int(dsp_cfg.virtual_ant),
     )
+    if geometry.identity_order:
+        return va_flat
+    if (
+        flat_work_buf is not None
+        and flat_work_buf.shape == va_flat.shape
+        and flat_work_buf.dtype == np.complex64
+        and flat_work_buf.flags.c_contiguous
+    ):
+        np.take(va_flat, geometry.order_flat, axis=-1, out=flat_work_buf)
+        return flat_work_buf
+    return np.take(va_flat, geometry.order_flat, axis=-1).astype(np.complex64, copy=False)
+
+
+def _build_complex_calibration_vector(calibration_cfg: CalibrationConfig, virtual_ant: int) -> np.ndarray:
+    size = max(1, int(virtual_ant))
+    real = np.asarray(calibration_cfg.vector_real[:size], dtype=np.float32)
+    imag = np.asarray(calibration_cfg.vector_imag[:size], dtype=np.float32)
+    if real.size < size:
+        real = np.pad(real, (0, size - real.size), constant_values=np.float32(1.0))
+    if imag.size < size:
+        imag = np.pad(imag, (0, size - imag.size), constant_values=np.float32(0.0))
+    return (real + (1j * imag)).astype(np.complex64, copy=False)
+
+
+def _apply_calibration_vector(virtual_array: np.ndarray, cal_vector: np.ndarray | None) -> np.ndarray:
+    if cal_vector is None or virtual_array.size <= 0 or virtual_array.ndim <= 0:
+        return virtual_array
+    cal = np.asarray(cal_vector, dtype=np.complex64).reshape(-1)
+    if cal.size != int(virtual_array.shape[-1]):
+        return virtual_array
+    cal_shape = (1,) * max(0, virtual_array.ndim - 1) + (int(cal.size),)
+    np.multiply(virtual_array, cal.reshape(cal_shape), out=virtual_array)
+    return virtual_array
+
+
+def _estimate_boresight_calibration_vector(virtual_array: np.ndarray) -> tuple[np.ndarray | None, int | None]:
+    if virtual_array.ndim != 4 or virtual_array.shape[2] <= 0 or virtual_array.shape[3] <= 0:
+        return None, None
+    avg_snapshot = virtual_array.mean(axis=(0, 1), dtype=np.complex64)
+    if avg_snapshot.ndim != 2 or avg_snapshot.shape[0] <= 0 or avg_snapshot.shape[1] <= 0:
+        return None, None
+    re = avg_snapshot.real
+    im = avg_snapshot.imag
+    energy = (re * re + im * im).sum(axis=-1, dtype=np.float32)
+    if energy.size <= 0 or not np.any(np.isfinite(energy)):
+        return None, None
+    target_bin = int(np.nanargmax(energy))
+    antenna_row = np.asarray(avg_snapshot[target_bin, :], dtype=np.complex64).reshape(-1)
+    if antenna_row.size <= 0:
+        return None, target_bin
+    ref = np.complex64(antenna_row[0])
+    if abs(ref) <= 1e-12:
+        return None, target_bin
+    relative_phases = np.angle(antenna_row * np.conj(ref)).astype(np.float32, copy=False)
+    cal_vector = np.exp((-1j) * relative_phases.astype(np.float64, copy=False)).astype(np.complex64, copy=False)
+    cal_vector[0] = np.complex64(1.0 + 0.0j)
+    return cal_vector, target_bin
+
+
+def _format_calibration_vector_for_log(cal_vector: np.ndarray) -> tuple[str, str]:
+    vec = np.asarray(cal_vector, dtype=np.complex64).reshape(-1)
+    real_str = ", ".join(f"{float(v):.6f}" for v in vec.real)
+    imag_str = ", ".join(f"{float(v):.6f}" for v in vec.imag)
+    return real_str, imag_str
 
 
 def _power_to_db(power_lin: np.ndarray) -> np.ndarray:
@@ -1539,6 +2000,130 @@ def _power_to_db(power_lin: np.ndarray) -> np.ndarray:
     np.log10(out, out=out)
     out *= np.float32(10.0)
     return out
+
+
+def _format_debug_top_peaks_range_angle(
+    heatmap_lin: np.ndarray,
+    *,
+    angle_axis_deg: np.ndarray,
+    range_bin_m: float,
+    top_k: int,
+    range_min_m: float | None = None,
+    range_max_m: float | None = None,
+    angle_min_deg: float | None = None,
+    angle_max_deg: float | None = None,
+) -> str:
+    src = np.asarray(heatmap_lin, dtype=np.float32)
+    if src.ndim != 2 or src.size <= 0:
+        return f"[DSP DEBUG] range_angle_top_peaks: shape={src.shape} (no 2D data)"
+    row_idx = np.arange(int(src.shape[0]), dtype=np.float32) * np.float32(range_bin_m)
+    angle_axis = np.asarray(angle_axis_deg, dtype=np.float32).reshape(-1)
+    valid_rows = np.ones(int(src.shape[0]), dtype=bool)
+    valid_cols = np.ones(int(src.shape[1]), dtype=bool)
+    if range_min_m is not None and np.isfinite(float(range_min_m)):
+        valid_rows &= row_idx >= np.float32(float(range_min_m))
+    if range_max_m is not None and np.isfinite(float(range_max_m)):
+        valid_rows &= row_idx <= np.float32(float(range_max_m))
+    eff_cols = min(int(src.shape[1]), int(angle_axis.size))
+    if eff_cols < int(src.shape[1]):
+        valid_cols[eff_cols:] = False
+    if angle_min_deg is not None and np.isfinite(float(angle_min_deg)):
+        valid_cols[:eff_cols] &= angle_axis[:eff_cols] >= np.float32(float(angle_min_deg))
+    if angle_max_deg is not None and np.isfinite(float(angle_max_deg)):
+        valid_cols[:eff_cols] &= angle_axis[:eff_cols] <= np.float32(float(angle_max_deg))
+    if not np.any(valid_rows):
+        return (
+            f"[DSP DEBUG] range_angle_top_peaks: shape={src.shape}, "
+            f"empty range filter [{range_min_m}, {range_max_m}] m"
+        )
+    if not np.any(valid_cols):
+        return (
+            f"[DSP DEBUG] range_angle_top_peaks: shape={src.shape}, "
+            f"empty angle filter [{angle_min_deg}, {angle_max_deg}] deg"
+        )
+    filtered = np.where(valid_rows[:, None] & valid_cols[None, :], src, np.float32(-np.inf))
+    finite_mask = np.isfinite(filtered)
+    if not np.any(finite_mask):
+        return f"[DSP DEBUG] range_angle_top_peaks: shape={src.shape}, no finite values in active filters"
+    k = max(1, min(int(top_k), int(np.count_nonzero(finite_mask))))
+    flat = filtered.reshape(-1)
+    idx = np.argpartition(flat, -k)[-k:]
+    idx = idx[np.argsort(flat[idx])[::-1]]
+    lines = [
+        f"[DSP DEBUG] range_angle_top_peaks: shape={src.shape}, top_k={k}, "
+        f"range_filter=[{range_min_m}, {range_max_m}] m, "
+        f"angle_filter=[{angle_min_deg}, {angle_max_deg}] deg"
+    ]
+    for rank, flat_idx in enumerate(idx, start=1):
+        rb, ab = np.unravel_index(int(flat_idx), src.shape)
+        angle_deg = float(angle_axis[ab]) if 0 <= ab < int(angle_axis.size) else float("nan")
+        range_m = float(rb) * float(range_bin_m)
+        lines.append(
+            f"  {rank:02d}. rb={rb:03d} ({range_m:6.3f} m)  ab={ab:03d} ({angle_deg:7.2f} deg)  power={float(src[rb, ab]):.3e}"
+        )
+    return "\n".join(lines)
+
+
+def _format_debug_top_peaks_xy(
+    view_db: np.ndarray,
+    *,
+    x_max_m: float,
+    y_max_m: float,
+    top_k: int,
+    range_min_m: float | None = None,
+    range_max_m: float | None = None,
+    angle_min_deg: float | None = None,
+    angle_max_deg: float | None = None,
+) -> str:
+    src = np.asarray(view_db, dtype=np.float32)
+    if src.ndim != 2 or src.size <= 0:
+        return f"[DSP DEBUG] xy_top_peaks: shape={src.shape} (no 2D data)"
+    y_axis = _build_display_axis(0.0, float(y_max_m), int(src.shape[0]))
+    x_axis = _build_display_axis(-float(x_max_m), float(x_max_m), int(src.shape[1]))
+    valid_rows = np.ones(int(src.shape[0]), dtype=bool)
+    x_grid_m, y_grid_m = np.meshgrid(x_axis, y_axis, indexing="xy")
+    theta_deg = np.rad2deg(np.arctan2(x_grid_m, np.maximum(y_grid_m, np.float32(1e-6)))).astype(np.float32, copy=False)
+    valid_angles = np.ones(src.shape, dtype=bool)
+    if range_min_m is not None and np.isfinite(float(range_min_m)):
+        valid_rows &= y_axis >= np.float32(float(range_min_m))
+    if range_max_m is not None and np.isfinite(float(range_max_m)):
+        valid_rows &= y_axis <= np.float32(float(range_max_m))
+    if angle_min_deg is not None and np.isfinite(float(angle_min_deg)):
+        valid_angles &= theta_deg >= np.float32(float(angle_min_deg))
+    if angle_max_deg is not None and np.isfinite(float(angle_max_deg)):
+        valid_angles &= theta_deg <= np.float32(float(angle_max_deg))
+    if not np.any(valid_rows):
+        return (
+            f"[DSP DEBUG] xy_top_peaks: shape={src.shape}, "
+            f"empty range filter [{range_min_m}, {range_max_m}] m"
+        )
+    if not np.any(valid_angles):
+        return (
+            f"[DSP DEBUG] xy_top_peaks: shape={src.shape}, "
+            f"empty angle filter [{angle_min_deg}, {angle_max_deg}] deg"
+        )
+    filtered = np.where(valid_rows[:, None] & valid_angles, src, np.float32(-np.inf))
+    finite_mask = np.isfinite(filtered)
+    if not np.any(finite_mask):
+        return f"[DSP DEBUG] xy_top_peaks: shape={src.shape}, no finite values in active filters"
+    k = max(1, min(int(top_k), int(np.count_nonzero(finite_mask))))
+    flat = filtered.reshape(-1)
+    idx = np.argpartition(flat, -k)[-k:]
+    idx = idx[np.argsort(flat[idx])[::-1]]
+    lines = [
+        f"[DSP DEBUG] xy_top_peaks: shape={src.shape}, top_k={k}, "
+        f"range_filter=[{range_min_m}, {range_max_m}] m, "
+        f"angle_filter=[{angle_min_deg}, {angle_max_deg}] deg"
+    ]
+    for rank, flat_idx in enumerate(idx, start=1):
+        yb, xb = np.unravel_index(int(flat_idx), src.shape)
+        x_m = float(x_axis[xb]) if 0 <= xb < int(x_axis.size) else float("nan")
+        y_m = float(y_axis[yb]) if 0 <= yb < int(y_axis.size) else float("nan")
+        angle_deg = float(theta_deg[yb, xb])
+        lines.append(
+            f"  {rank:02d}. yb={yb:03d} ({y_m:6.3f} m)  xb={xb:03d} ({x_m:7.3f} m)  angle={angle_deg:7.2f} deg  db={float(src[yb, xb]):7.2f}"
+        )
+    return "\n".join(lines)
 
 
 def _resolve_detection_threshold_db(
@@ -1554,6 +2139,44 @@ def _resolve_detection_threshold_db(
         ref_db = float(np.max(power_db))
         return max(float(min_power_db), ref_db + float(threshold_db))
     return max(float(min_power_db), float(threshold_db))
+
+
+def compute_detection_power_db_map(power_lin: np.ndarray) -> np.ndarray:
+    return _power_to_db(power_lin)
+
+
+def compute_detection_threshold_db(
+    power_db: np.ndarray,
+    *,
+    threshold_mode: DetectionThresholdMode,
+    threshold_db: float,
+    min_power_db: float,
+) -> float:
+    # TODO(CFAR): replace this global threshold with CA-CFAR / OS-CFAR while keeping
+    # the contract "power map in -> scalar/decision threshold out -> shared peak extractor".
+    return _resolve_detection_threshold_db(
+        power_db,
+        threshold_mode=threshold_mode,
+        threshold_db=threshold_db,
+        min_power_db=min_power_db,
+    )
+
+
+def extract_detection_peaks_2d(
+    power_db: np.ndarray,
+    *,
+    threshold_db: float,
+    win_row: int,
+    win_col: int,
+    max_peaks: int,
+) -> np.ndarray:
+    return _select_localmax_2d(
+        power_db,
+        threshold_db=threshold_db,
+        win_row=win_row,
+        win_col=win_col,
+        max_peaks=max_peaks,
+    )
 
 
 def _select_localmax_2d(
@@ -1603,13 +2226,17 @@ def detect_static_targets(
     static_cfg: DetectionConfigStatic,
     angle_cfg: AngleProcessingConfig,
     dsp_cfg: RealtimeDSPConfig,
+    virtual_array_geometry: VirtualArrayGeometry,
     w_angle: np.ndarray,
     angle_steering: np.ndarray,
     angle_axis_deg: np.ndarray,
     range_bin_m: float,
     max_bin: int,
     apply_angle_window: bool,
+    calibration_enabled: bool = False,
+    cal_vector: np.ndarray | None = None,
     virtual_array_work_buf: np.ndarray | None = None,
+    virtual_array_flat_work_buf: np.ndarray | None = None,
 ) -> tuple[list[Detection], np.ndarray]:
     if not static_cfg.enabled:
         return [], np.empty((0, 0), dtype=np.float32)
@@ -1622,8 +2249,12 @@ def detect_static_targets(
         range_fft,
         max_bin=max_bin,
         dsp_cfg=dsp_cfg,
+        geometry=virtual_array_geometry,
         work_buf=virtual_array_work_buf,
+        flat_work_buf=virtual_array_flat_work_buf,
     )
+    if calibration_enabled:
+        _apply_calibration_vector(virtual_array, cal_vector)
     if apply_angle_window:
         virtual_array *= w_angle
     static_heatmap = compute_angle_heatmap(
@@ -1631,15 +2262,16 @@ def detect_static_targets(
         angle_cfg=angle_cfg,
         dsp_cfg=dsp_cfg,
         angle_steering=angle_steering,
+        geometry=virtual_array_geometry,
     )
-    static_db = _power_to_db(static_heatmap)
-    threshold_db = _resolve_detection_threshold_db(
+    static_db = compute_detection_power_db_map(static_heatmap)
+    threshold_db = compute_detection_threshold_db(
         static_db,
         threshold_mode=static_cfg.threshold_mode,
         threshold_db=static_cfg.threshold_db,
         min_power_db=static_cfg.min_power_db,
     )
-    peak_idx = _select_localmax_2d(
+    peak_idx = extract_detection_peaks_2d(
         static_db,
         threshold_db=threshold_db,
         win_row=static_cfg.localmax_range_bins,
@@ -1750,14 +2382,14 @@ def detect_moving_targets(
 ) -> list[Detection]:
     if not moving_cfg.enabled or range_doppler_map.size <= 0:
         return []
-    moving_db = _power_to_db(range_doppler_map)
-    threshold_db = _resolve_detection_threshold_db(
+    moving_db = compute_detection_power_db_map(range_doppler_map)
+    threshold_db = compute_detection_threshold_db(
         moving_db,
         threshold_mode=moving_cfg.threshold_mode,
         threshold_db=moving_cfg.threshold_db,
         min_power_db=moving_cfg.min_power_db,
     )
-    peak_idx = _select_localmax_2d(
+    peak_idx = extract_detection_peaks_2d(
         moving_db,
         threshold_db=threshold_db,
         win_row=moving_cfg.localmax_range_bins,
@@ -1800,14 +2432,21 @@ def estimate_angle_for_moving_detections(
     apply_angle_window: bool,
     angle_cfg: AngleProcessingConfig,
     dsp_cfg: RealtimeDSPConfig,
+    virtual_array_geometry: VirtualArrayGeometry,
     angle_steering: np.ndarray,
     angle_axis_deg: np.ndarray,
+    calibration_enabled: bool = False,
+    cal_vector: np.ndarray | None = None,
+    tdm_mimo_compensation_table: np.ndarray | None = None,
 ) -> list[Detection]:
     if not detections or doppler_cube.ndim != 5:
         return detections
     n_frames = int(doppler_cube.shape[0])
     n_doppler = int(doppler_cube.shape[1])
     n_range = int(doppler_cube.shape[3])
+    snapshot_work = np.empty((n_frames, int(dsp_cfg.tx), int(dsp_cfg.rx)), dtype=np.complex64)
+    va = np.empty((n_frames, 1, 1, int(dsp_cfg.virtual_ant)), dtype=np.complex64)
+    va_view = va[:, 0, 0, :]
     for det in detections:
         if det.doppler_bin is None:
             continue
@@ -1815,9 +2454,20 @@ def estimate_angle_for_moving_detections(
         rbin = int(det.range_bin)
         if dbin < 0 or dbin >= n_doppler or rbin < 0 or rbin >= n_range:
             continue
-        snapshot = doppler_cube[:, dbin : dbin + 1, :, rbin : rbin + 1, :]
-        va = snapshot.transpose(0, 1, 3, 2, 4).reshape(n_frames, 1, 1, int(dsp_cfg.virtual_ant))
-        va = np.ascontiguousarray(va)
+        snapshot = doppler_cube[:, dbin, :, rbin, :]
+        snapshot_comp = apply_tdm_mimo_doppler_compensation(
+            snapshot,
+            doppler_bin=dbin,
+            compensation_table=tdm_mimo_compensation_table,
+            out=snapshot_work,
+        )
+        snapshot_flat = snapshot_comp.reshape(n_frames, int(dsp_cfg.virtual_ant))
+        if virtual_array_geometry.identity_order:
+            np.copyto(va_view, snapshot_flat, casting="unsafe")
+        else:
+            np.take(snapshot_flat, virtual_array_geometry.order_flat, axis=-1, out=va_view)
+        if calibration_enabled:
+            _apply_calibration_vector(va, cal_vector)
         if apply_angle_window:
             va *= w_angle
         angle_pow = compute_angle_heatmap(
@@ -1825,6 +2475,7 @@ def estimate_angle_for_moving_detections(
             angle_cfg=angle_cfg,
             dsp_cfg=dsp_cfg,
             angle_steering=angle_steering,
+            geometry=virtual_array_geometry,
         )
         if angle_pow.size <= 0:
             continue
@@ -2144,12 +2795,14 @@ def process_buffer(
     heatmap_ema_cfg: HeatmapEMAConfig,
     heatmap_spatial_filter_cfg: HeatmapSpatialFilterConfig,
     display_projection_cfg: DisplayProjectionConfig,
+    virtual_array_geometry: VirtualArrayGeometry,
     angle_steering: np.ndarray,
     angle_axis_deg: np.ndarray,
     display_projection_lut: dict[str, Any] | None,
     display_y_max_m: float,
     display_x_max_m: float,
     doppler_axis_mps: np.ndarray | None,
+    tdm_mimo_compensation_table: np.ndarray | None,
     detection_static_cfg: DetectionConfigStatic,
     detection_moving_cfg: DetectionConfigMoving,
     fusion_cfg: FusionConfig,
@@ -2157,7 +2810,11 @@ def process_buffer(
     detection_moving_bg_state: BackgroundSubtractionState,
     display_bg_state: BackgroundSubtractionState,
     heatmap_ema: np.ndarray | None,
+    calibration_enabled: bool,
+    cal_vector: np.ndarray,
+    pending_calibration: bool,
     virtual_array_work_buf: np.ndarray | None,
+    virtual_array_flat_work_buf: np.ndarray | None,
     doppler_work_buf: np.ndarray | None,
     profiles_db_work_buf: np.ndarray | None,
     heatmap_db_work_buf: np.ndarray | None,
@@ -2168,7 +2825,6 @@ def process_buffer(
     gui_latest_idx: Synchronized,
     gui_latest_seq: Synchronized,
     gui_lock,
-    max_bin: int,
     normalize_to_peak: bool,
     profiles_out_buf: np.ndarray,
     stat_raw_min_db: Synchronized,
@@ -2176,12 +2832,22 @@ def process_buffer(
     stat_norm_min_db: Synchronized,
     stat_norm_max_db: Synchronized,
     dsp_cfg: RealtimeDSPConfig,
-) -> tuple[np.ndarray | None, list[Detection]]:
+    processing_max_bin: int,
+    display_max_bin: int,
+    debug_print_top_peaks: bool = False,
+    debug_top_peaks_count: int = 10,
+    debug_top_peaks_range_min_m: float | None = None,
+    debug_top_peaks_range_max_m: float | None = None,
+    debug_top_peaks_angle_min_deg: float | None = None,
+    debug_top_peaks_angle_max_deg: float | None = None,
+) -> tuple[np.ndarray | None, list[Detection], np.ndarray]:
     try:
+        cal_vector_out = np.asarray(cal_vector, dtype=np.complex64).reshape(-1)
+
         # Raw complex stream -> Reshape -> radar tensor [frame, loop, tx, sample, rx].
         data = raw_buffer.reshape(n_frames,dsp_cfg.chirps // dsp_cfg.tx,dsp_cfg.tx,dsp_cfg.samples,dsp_cfg.rx,)
 
-        # Range-FFT pre-processing: static mean subtraction and range windowing.
+        # Range-FFT pre-processing: static mean subtraction 
         data = subtract_selected_mean(data, mean_before_range_fft)
 
         # Apply range window (broadcasting over all non-range dimensions) to reduce sidelobes before the range FFT.
@@ -2194,6 +2860,50 @@ def process_buffer(
         # Range bin to physical range conversion factor (meters per bin).
         range_bin_m = dsp_cfg.c * dsp_cfg.fs / (2.0 * dsp_cfg.slope * dsp_cfg.nfft_range)
 
+        if pending_calibration:
+            calibration_max_bin = max(1, min(max(int(processing_max_bin), int(display_max_bin)), dsp_cfg.nfft_range // 2))
+            calibration_virtual_array = _build_virtual_array_from_range_fft(
+                range_fft_common,
+                max_bin=calibration_max_bin,
+                dsp_cfg=dsp_cfg,
+                geometry=virtual_array_geometry,
+                work_buf=(
+                    None
+                    if virtual_array_work_buf is None
+                    else virtual_array_work_buf[
+                        :n_frames,
+                        : int(range_fft_common.shape[1]),
+                        :calibration_max_bin,
+                        :,
+                        :,
+                    ]
+                ),
+                flat_work_buf=(
+                    None
+                    if virtual_array_flat_work_buf is None
+                    else virtual_array_flat_work_buf[
+                        :n_frames,
+                        : int(range_fft_common.shape[1]),
+                        :calibration_max_bin,
+                        :,
+                    ]
+                ),
+            )
+            updated_cal_vector, target_bin = _estimate_boresight_calibration_vector(calibration_virtual_array)
+            if updated_cal_vector is None:
+                print("[DSP CAL] boresight calibration skipped: target/reference antenna not valid on current batch.")
+            else:
+                cal_vector_out = updated_cal_vector
+                real_str, imag_str = _format_calibration_vector_for_log(cal_vector_out)
+                print(f"[DSP CAL] boresight updated on range_bin={int(target_bin or 0)}")
+                print(f"[DSP CAL] vector_real: [{real_str}]")
+                print(f"[DSP CAL] vector_imag: [{imag_str}]")
+
+
+        # Split the shared range-FFT cube into three logical branches:
+        # static detection, moving detection, and display.
+        # Each branch reuses the common range-FFT output unless its own
+        # post-processing filters require an isolated copy.
         range_fft_detection_static = range_fft_common
         if detection_static_cfg.enabled:
             range_fft_detection_static_in = (
@@ -2208,6 +2918,7 @@ def process_buffer(
                 fft_workers=dsp_cfg.fft_workers,
                 apply_loop_average_after_background=apply_detection_loop_average_after_background,
             )
+
         range_fft_detection_moving = range_fft_common
         if detection_moving_cfg.enabled:
             range_fft_detection_moving_in = (
@@ -2222,11 +2933,14 @@ def process_buffer(
                 fft_workers=dsp_cfg.fft_workers,
                 apply_loop_average_after_background=False,
             )
+
         range_fft_display_in = (
             range_fft_common.copy()
             if _branch_needs_copy(display_post_range_fft_filters)
             else range_fft_common
         )
+        # chain of filters that are executed pn the Range FFT for the display branch.
+        # range_fft_in -> slow_time_filter -> subtract_selected_mean -> background_subtraction -> loop_average -> range_fft_display
         range_fft_display = apply_post_range_fft_filters(
             range_fft_display_in,
             display_post_range_fft_filters,
@@ -2245,23 +2959,42 @@ def process_buffer(
                 static_cfg=detection_static_cfg,
                 angle_cfg=angle_processing,
                 dsp_cfg=dsp_cfg,
+                virtual_array_geometry=virtual_array_geometry,
                 w_angle=w_angle,
                 angle_steering=angle_steering,
                 angle_axis_deg=angle_axis_deg,
                 range_bin_m=range_bin_m,
-                max_bin=max_bin,
+                max_bin=processing_max_bin,
                 apply_angle_window=apply_angle_window,
+                calibration_enabled=calibration_enabled,
+                cal_vector=cal_vector_out,
                 virtual_array_work_buf=(
                     None
                     if virtual_array_work_buf is None
-                    else virtual_array_work_buf[:n_frames, : int(range_fft_detection_static.shape[1]), :, :, :]
+                    else virtual_array_work_buf[
+                        :n_frames,
+                        : int(range_fft_detection_static.shape[1]),
+                        :processing_max_bin,
+                        :,
+                        :,
+                    ]
+                ),
+                virtual_array_flat_work_buf=(
+                    None
+                    if virtual_array_flat_work_buf is None
+                    else virtual_array_flat_work_buf[
+                        :n_frames,
+                        : int(range_fft_detection_static.shape[1]),
+                        :processing_max_bin,
+                        :,
+                    ]
                 ),
             )
         
         if detection_moving_cfg.enabled:
             doppler_cube, range_doppler_map = compute_range_doppler(
                 range_fft_detection_moving,
-                max_bin=max_bin,
+                max_bin=processing_max_bin,
                 dsp_cfg=dsp_cfg,
                 moving_cfg=detection_moving_cfg,
                 w_doppler=w_doppler,
@@ -2285,8 +3018,12 @@ def process_buffer(
                 apply_angle_window=apply_angle_window,
                 angle_cfg=angle_processing,
                 dsp_cfg=dsp_cfg,
+                virtual_array_geometry=virtual_array_geometry,
                 angle_steering=angle_steering,
                 angle_axis_deg=angle_axis_deg,
+                calibration_enabled=calibration_enabled,
+                cal_vector=cal_vector_out,
+                tdm_mimo_compensation_table=tdm_mimo_compensation_table,
             )
         fused_detections = fuse_detections(detections_static, detections_moving, fusion_cfg)
         tracking_detections = clean_detections_for_tracking(fused_detections, fusion_cfg)
@@ -2318,17 +3055,37 @@ def process_buffer(
                 profiles_out[:copy_rows, :fft_profile_bins] = profiles_db_va[:copy_rows, :].astype(np.float32, copy=False)
 
         # Build the virtual array after trimming range bins to limit memory traffic.
+        # [frame, loop, range_bin, virtual_ant]
         virtual_array = _build_virtual_array_from_range_fft(
             range_fft_display,
-            max_bin=max_bin,
+            max_bin=display_max_bin,
             dsp_cfg=dsp_cfg,
+            geometry=virtual_array_geometry,
             work_buf=(
                 None
                 if virtual_array_work_buf is None
-                else virtual_array_work_buf[:n_frames, : int(range_fft_display.shape[1]), :, :, :]
+                else virtual_array_work_buf[
+                    :n_frames,
+                    : int(range_fft_display.shape[1]),
+                    :display_max_bin,
+                    :,
+                    :,
+                ]
+            ),
+            flat_work_buf=(
+                None
+                if virtual_array_flat_work_buf is None
+                else virtual_array_flat_work_buf[
+                    :n_frames,
+                    : int(range_fft_display.shape[1]),
+                    :display_max_bin,
+                    :,
+                ]
             ),
         )
 
+        if calibration_enabled:
+            _apply_calibration_vector(virtual_array, cal_vector_out)
         if apply_angle_window:
             virtual_array *= w_angle
 
@@ -2337,6 +3094,7 @@ def process_buffer(
             angle_cfg=angle_processing,
             dsp_cfg=dsp_cfg,
             angle_steering=angle_steering,
+            geometry=virtual_array_geometry,
         )
 
         if not heatmap_ema_cfg.enabled: #bypass
@@ -2366,6 +3124,32 @@ def process_buffer(
         np.add(view_db, np.float32(1e-12), out=view_db)
         np.log10(view_db, out=view_db)
         view_db *= np.float32(10.0)
+
+        if debug_print_top_peaks:
+            print(
+                _format_debug_top_peaks_range_angle(
+                    heatmap_ema,
+                    angle_axis_deg=angle_axis_deg,
+                    range_bin_m=range_bin_m,
+                    top_k=debug_top_peaks_count,
+                    range_min_m=debug_top_peaks_range_min_m,
+                    range_max_m=debug_top_peaks_range_max_m,
+                    angle_min_deg=debug_top_peaks_angle_min_deg,
+                    angle_max_deg=debug_top_peaks_angle_max_deg,
+                )
+            )
+            print(
+                _format_debug_top_peaks_xy(
+                    view_db,
+                    x_max_m=display_x_max_m,
+                    y_max_m=display_y_max_m,
+                    top_k=debug_top_peaks_count,
+                    range_min_m=debug_top_peaks_range_min_m,
+                    range_max_m=debug_top_peaks_range_max_m,
+                    angle_min_deg=debug_top_peaks_angle_min_deg,
+                    angle_max_deg=debug_top_peaks_angle_max_deg,
+                )
+            )
 
         if view_db.size > 0:
             raw_max = float(np.max(view_db))
@@ -2406,16 +3190,17 @@ def process_buffer(
                 dst_prof[:n_prof] = prof_flat[:n_prof]
             gui_latest_idx.value = next_idx
             gui_latest_seq.value = int(gui_latest_seq.value) + 1
-        return heatmap_ema, tracking_detections
+        return heatmap_ema, tracking_detections, cal_vector_out
 
     except Exception as e:
         print(f"[DSP ERR] {e}")
-        return heatmap_ema, []
+        return heatmap_ema, [], np.asarray(cal_vector, dtype=np.complex64).reshape(-1)
 
 
 def dsp_worker(
     free_slots,
     dsp_ready_queue,
+    dsp_cmd_queue,
     shm_frames,
     slot_state,
     slot_ok,
@@ -2450,6 +3235,7 @@ def dsp_worker(
     dsp_cfg: RealtimeDSPConfig,
 ) -> None:
     selection = selection_from_yaml_dict(cfg_dict)
+    calibration_cfg = getattr(dsp_cfg, "calibration", calibration_from_yaml_dict(cfg_dict, virtual_ant=int(dsp_cfg.virtual_ant)))
     mean_before_range_fft, _ = mean_selections_from_yaml_dict(cfg_dict)
     detection_static_post_range_fft_filters = detection_static_post_range_fft_filters_from_yaml_dict(cfg_dict)
     detection_static_post_range_fft_filters, detection_static_filter_warnings = sanitize_detection_static_post_range_fft_filters(
@@ -2472,6 +3258,26 @@ def dsp_worker(
     fusion_cfg = fusion_from_yaml_dict(cfg_dict)
     tracking_cfg = tracking_from_yaml_dict(cfg_dict)
     tracker_cfg = tracker_from_yaml_dict(cfg_dict)
+    debug_block = cfg_dict.get("debug", {}) or {}
+    debug_print_top_peaks = bool(debug_block.get("print_top_peaks", False))
+    debug_top_peaks_count = max(1, int(_to_int(debug_block.get("print_top_peaks_count", 10), 10)))
+    range_min_raw = debug_block.get("print_top_peaks_range_min_m", None)
+    range_max_raw = debug_block.get("print_top_peaks_range_max_m", None)
+    angle_min_raw = debug_block.get("print_top_peaks_angle_min_deg", None)
+    angle_max_raw = debug_block.get("print_top_peaks_angle_max_deg", None)
+    debug_top_peaks_range_min_m = None if range_min_raw is None else _to_float(range_min_raw, float("nan"))
+    debug_top_peaks_range_max_m = None if range_max_raw is None else _to_float(range_max_raw, float("nan"))
+    debug_top_peaks_angle_min_deg = None if angle_min_raw is None else _to_float(angle_min_raw, float("nan"))
+    debug_top_peaks_angle_max_deg = None if angle_max_raw is None else _to_float(angle_max_raw, float("nan"))
+    if debug_top_peaks_range_min_m is not None and not np.isfinite(float(debug_top_peaks_range_min_m)):
+        debug_top_peaks_range_min_m = None
+    if debug_top_peaks_range_max_m is not None and not np.isfinite(float(debug_top_peaks_range_max_m)):
+        debug_top_peaks_range_max_m = None
+    if debug_top_peaks_angle_min_deg is not None and not np.isfinite(float(debug_top_peaks_angle_min_deg)):
+        debug_top_peaks_angle_min_deg = None
+    if debug_top_peaks_angle_max_deg is not None and not np.isfinite(float(debug_top_peaks_angle_max_deg)):
+        debug_top_peaks_angle_max_deg = None
+    virtual_array_geometry, virtual_array_warnings = build_virtual_array_geometry_from_yaml_dict(cfg_dict, dsp_cfg)
     tracking_runtime_enabled = bool(getattr(tracking_cfg, "enabled", False))
     if tracking_runtime_enabled and int(dsp_cfg.x_frames) > 1:
         print(
@@ -2479,7 +3285,12 @@ def dsp_worker(
             "Current tracker expects x_frames=1."
         )
         tracking_runtime_enabled = False
-    for warn_msg in detection_static_filter_warnings + detection_moving_filter_warnings + display_filter_warnings:
+    for warn_msg in (
+        detection_static_filter_warnings
+        + detection_moving_filter_warnings
+        + display_filter_warnings
+        + virtual_array_warnings
+    ):
         print(f"[DSP WARN] {warn_msg}")
     window_range, window_doppler, window_angle = build_windows(
         selection,
@@ -2493,8 +3304,17 @@ def dsp_worker(
     angle_steering = build_angle_steering_matrix(
         virtual_ant=dsp_cfg.virtual_ant,
         nfft_angle=dsp_cfg.nfft_angle,
+        geometry=virtual_array_geometry,
     )
-    angle_axis_deg = build_angle_axis_deg(dsp_cfg.nfft_angle)
+    angle_axis_deg = build_angle_axis_deg(dsp_cfg.nfft_angle, geometry=virtual_array_geometry)
+    if (
+        str(getattr(angle_processing, "mode", "fft")).strip().lower() == "fft"
+        and virtual_array_geometry.uniform_spacing_lambda is None
+    ):
+        print(
+            "[DSP WARN] angle_processing.mode='fft' requires a uniformly spaced virtual array; "
+            "for non-uniform phase centers only bartlett/mvdr use the geometry exactly."
+        )
     display_y_max_m = float(dsp_cfg.range_max_display)
     display_x_max_m = resolve_display_crossrange_max_m(display_y_max_m, angle_axis_deg, display_projection_cfg)
     display_projection_lut = build_display_projection_lut(
@@ -2514,10 +3334,21 @@ def dsp_worker(
         n_doppler,
         doppler_fft_shift=detection_moving_cfg.doppler_fft_shift,
     )
+    tdm_mimo_compensation_table = build_tdm_mimo_doppler_compensation_table(
+        n_doppler,
+        int(dsp_cfg.tx),
+        doppler_fft_shift=detection_moving_cfg.doppler_fft_shift,
+    )
 
     dr = dsp_cfg.c * dsp_cfg.fs / (2.0 * dsp_cfg.slope * dsp_cfg.nfft_range)
-    max_bin = int(np.floor(dsp_cfg.range_max_display / dr))
-    max_bin = max(1, min(max_bin, dsp_cfg.nfft_range // 2))
+    processing_range_max_m = float(
+        dsp_cfg.range_max_processing_m if dsp_cfg.range_max_processing_m > 0.0 else dsp_cfg.range_max_display
+    )
+    processing_max_bin = int(np.floor(processing_range_max_m / dr))
+    processing_max_bin = max(1, min(processing_max_bin, dsp_cfg.nfft_range // 2))
+    display_max_bin = int(np.floor(display_y_max_m / dr))
+    display_max_bin = max(1, min(display_max_bin, dsp_cfg.nfft_range // 2))
+    max_virtual_array_bin = max(processing_max_bin, display_max_bin)
 
     total_samples_needed = dsp_cfg.x_frames * dsp_cfg.chirps * dsp_cfg.samples * dsp_cfg.rx
     complex_per_frame = dsp_cfg.chirps * dsp_cfg.samples * dsp_cfg.rx
@@ -2525,11 +3356,15 @@ def dsp_worker(
     complex_data = np.zeros(total_samples_needed, dtype=np.complex64)
     profiles_out_buf = np.empty((dsp_cfg.range_profile_count, int(fft_plot_h)), dtype=np.float32)
     virtual_array_work_buf = np.empty(
-        (dsp_cfg.x_frames, n_doppler, max_bin, dsp_cfg.tx, dsp_cfg.rx),
+        (dsp_cfg.x_frames, n_doppler, max_virtual_array_bin, dsp_cfg.tx, dsp_cfg.rx),
+        dtype=np.complex64,
+    )
+    virtual_array_flat_work_buf = np.empty(
+        (dsp_cfg.x_frames, n_doppler, max_virtual_array_bin, dsp_cfg.virtual_ant),
         dtype=np.complex64,
     )
     doppler_work_buf = np.empty(
-        (dsp_cfg.x_frames, n_doppler, dsp_cfg.tx, max_bin, dsp_cfg.rx),
+        (dsp_cfg.x_frames, n_doppler, dsp_cfg.tx, processing_max_bin, dsp_cfg.rx),
         dtype=np.complex64,
     )
     profiles_db_work_buf = np.empty((dsp_cfg.tx, int(fft_plot_h), dsp_cfg.rx), dtype=np.float32)
@@ -2548,6 +3383,9 @@ def dsp_worker(
     shm_view = memoryview(shm_frames).cast("B")
     n_slots = len(slot_state)
     heatmap_ema = None
+    calibration_enabled = bool(calibration_cfg.enabled)
+    cal_vector = _build_complex_calibration_vector(calibration_cfg, int(dsp_cfg.virtual_ant))
+    pending_calibration = False
     detection_static_bg_state = BackgroundSubtractionState()
     detection_moving_bg_state = BackgroundSubtractionState()
     display_bg_state = BackgroundSubtractionState()
@@ -2556,6 +3394,9 @@ def dsp_worker(
         tracker = MultiObjectTracker(tracking_cfg=tracking_cfg, tracker_cfg=tracker_cfg)
     else:
         tracker = None
+    tracker_nominal_frame_dt_s = resolve_nominal_frame_period_s(cfg_dict, dsp_cfg, tracking_cfg)
+    tracker_time_s: float | None = None
+    last_tracker_seq: int | None = None
     tracks_xy_view = np.frombuffer(tracks_xy_dbuf, dtype=np.float32)
     tracks_meta_view = np.frombuffer(tracks_meta_dbuf, dtype=np.int32)
     tracks_state_view = np.frombuffer(tracks_state_dbuf, dtype=np.int32)
@@ -2646,7 +3487,22 @@ def dsp_worker(
             except Exception:
                 pass
 
+    def _poll_dsp_commands() -> None:
+        nonlocal pending_calibration
+        while True:
+            try:
+                cmd = dsp_cmd_queue.get_nowait()
+            except pyqueue.Empty:
+                break
+            if not isinstance(cmd, dict):
+                continue
+            cmd_type = str(cmd.get("type", "")).strip().lower()
+            if cmd_type == "calibrate_boresight":
+                pending_calibration = True
+                print("[DSP CAL] boresight calibration requested; waiting for next processed batch.")
+
     while True:
+        _poll_dsp_commands()
         if stop_evt.is_set():
             break
 
@@ -2696,10 +3552,12 @@ def dsp_worker(
             _release_slots_dsp(drop_slots)
 
         proc_slots = []
+        proc_seqs: list[int] = []
         bad_slots = []
-        for _, s, ok in ready:
+        for seq, s, ok in ready:
             if ok == 1:
                 proc_slots.append(int(s))
+                proc_seqs.append(int(seq))
             else:
                 bad_slots.append(int(s))
         if bad_slots:
@@ -2709,6 +3567,7 @@ def dsp_worker(
 
         n_proc = min(len(proc_slots), dsp_cfg.x_frames)
         slots_to_process = proc_slots[:n_proc]
+        proc_seqs = proc_seqs[:n_proc]
 
         # Current packing is IIIIQQQQ for RX=4, converted in-place to complex64.
         n_cplx = n_proc * complex_per_frame
@@ -2752,7 +3611,8 @@ def dsp_worker(
                 print("[DSP WARN] detection_static_filters.loop_average_after_background skipped because detection_static_filters.slow_time.mode=doppler_fft.")
                 warned_detection_loop_average_after_doppler = True
             apply_detection_loop_average_after_background = False
-        heatmap_ema, tracking_detections = process_buffer(
+        requested_calibration = bool(pending_calibration)
+        heatmap_ema, tracking_detections, cal_vector = process_buffer(
             complex_view,
             n_proc,
             window_range,
@@ -2771,12 +3631,14 @@ def dsp_worker(
             heatmap_ema_cfg,
             heatmap_spatial_filter_cfg,
             display_projection_cfg,
+            virtual_array_geometry,
             angle_steering,
             angle_axis_deg,
             display_projection_lut,
             display_y_max_m,
             display_x_max_m,
             doppler_axis_mps,
+            tdm_mimo_compensation_table,
             detection_static_cfg,
             detection_moving_cfg,
             fusion_cfg,
@@ -2784,7 +3646,11 @@ def dsp_worker(
             detection_moving_bg_state,
             display_bg_state,
             heatmap_ema,
+            calibration_enabled,
+            cal_vector,
+            requested_calibration,
             virtual_array_work_buf[:n_proc, :, :, :, :],
+            virtual_array_flat_work_buf[:n_proc, :, :, :],
             doppler_work_buf[:n_proc, :, :, :, :],
             profiles_db_work_buf,
             heatmap_db_work_buf,
@@ -2795,7 +3661,6 @@ def dsp_worker(
             gui_latest_idx,
             gui_latest_seq,
             gui_lock,
-            max_bin,
             normalize_to_peak,
             profiles_out_buf,
             stat_raw_min_db,
@@ -2803,9 +3668,35 @@ def dsp_worker(
             stat_norm_min_db,
             stat_norm_max_db,
             dsp_cfg,
+            processing_max_bin,
+            display_max_bin,
+            debug_print_top_peaks,
+            debug_top_peaks_count,
+            debug_top_peaks_range_min_m,
+            debug_top_peaks_range_max_m,
+            debug_top_peaks_angle_min_deg,
+            debug_top_peaks_angle_max_deg,
         )
+        if requested_calibration:
+            pending_calibration = False
         if tracker is not None and tracking_runtime_enabled:
-            active_tracks = tracker.step(tracking_detections, timestamp_s=time.perf_counter())
+            tracker_timestamp_s: float | None
+            if tracker_nominal_frame_dt_s is not None and proc_seqs:
+                latest_proc_seq = int(proc_seqs[-1])
+                if last_tracker_seq is None:
+                    tracker_time_s = float(latest_proc_seq) * float(tracker_nominal_frame_dt_s)
+                else:
+                    seq_delta = int(latest_proc_seq) - int(last_tracker_seq)
+                    if seq_delta <= 0:
+                        seq_delta = 1
+                    tracker_time_s = (
+                        float(tracker_time_s) if tracker_time_s is not None else float(last_tracker_seq) * float(tracker_nominal_frame_dt_s)
+                    ) + (float(seq_delta) * float(tracker_nominal_frame_dt_s))
+                last_tracker_seq = latest_proc_seq
+                tracker_timestamp_s = tracker_time_s
+            else:
+                tracker_timestamp_s = time.perf_counter()
+            active_tracks = tracker.step(tracking_detections, timestamp_s=tracker_timestamp_s)
         else:
             active_tracks = []
         _publish_tracks_latest_wins(active_tracks)

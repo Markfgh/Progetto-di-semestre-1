@@ -9,61 +9,89 @@ capture:
   samples: 256   # ADC samples/chirp.
   chirps: 256    # Chirps/frame.
   rx: 4          # Current IQ conversion assumes RX=4.
-  tx: 2          # Doppler axis calibration currently tuned for TX=2 TDM-MIMO.
+  tx: 2          # Uniform TDM-MIMO TX count; Doppler axis/compensation assume equal chirp spacing across TX.
   x_frames: 1    # Frames processed per DSP batch.
 
 fft:
   nfft_range: 512 # Typical: 256 or 512. Higher = finer range bins, more CPU.
-  nfft_angle: 256 # Typical: 128/256/512. Higher = finer angular grid, more CPU.
+  nfft_angle: 1024 # Typical: 128/256/512. Higher = finer angular grid, more CPU.
   workers: 8      # FFT worker threads.
 
 display:
-  vmax: 60
-             # Color scale max in RAW mode.
+  vmax: 60           # Color scale max in RAW mode.
   vmin: 50           # Color scale min in RAW mode.
   vmin_norm: -20     # Normalized mode: typical clean range -25..-15 dB.
   vmax_norm: 0       # Normalized mode peak.
-  projection_mode:   polar_stretched # Options: polar_stretched, cartesian.
-  projection_interp: bilinear  # Used only in cartesian mode: nearest, bilinear.
-  range_max: 8     # Hard limit shown on Y axis [m].
-  crossrange_max: auto # X extent [m]; use "auto" to derive it from angle FOV for the realtime heatmap.
+  projection_mode:   cartesian # Options: polar_stretched, cartesian.
+  projection_interp: nearest  # Used only in cartesian mode: nearest, bilinear.
+  range_max:  12.5    # Hard limit shown on Y axis [m].
+  crossrange_max: 4  # X extent [m]; use "auto" to derive it from angle FOV for the realtime heatmap.
   rangefft_db_min: 0
   rangefft_db_max: 95
   rangefft_lin_min: 0
   rangefft_lin_max: 15e7
 
+processing:
+  range_max_m: 12.5 # Physical processing/detection limit [m]. If missing, falls back to display.range_max.
+
 dsp:
-  window_range: blackman # Options: none, rectangular, hanning, hamming, blackman.
-  window_doppler: blackman # Applied on slow-time chirps before Doppler FFT.
-  window_angle: blackman  # Options: none, rectangular, hanning, hamming, blackman.
+  window_range: hamming # Options: none, rectangular, hanning, hamming, blackman.
+  window_doppler: hamming # Applied on slow-time chirps before Doppler FFT.
+  window_angle: hamming  # Options: none, rectangular, hanning, hamming, blackman.
+  calibration:
+    enabled: true
+    vector_real: [1.000000, 0.999575, 0.940848, 0.968703, 0.964520, 0.980703, 0.996999, 0.999461]
+    vector_imag: [0.000000, -0.029159, -0.338830, -0.248224, 0.264009, 0.195503, -0.077414, -0.032823]
 
   mean_before_range_fft:
     enabled: false
     axes: [sample] # Options: frame, loop, tx, sample, range_bin, rx.
                    # Suggested for realtime: [sample] (stable DC removal).
 
-  display_filters:
-    mean_after_range_fft:
-      enabled: false
-      axes: [range_bin] # Display-only flattening after range FFT.
+  mean_after_range_fft:
+    enabled: false
+    axes: [range_bin] # Usually keep disabled to avoid over-flattening targets.
 
+  slow_time:
+    enabled: false # Legacy/global slow-time filtering.
+    mode: mean_subtraction # Options: none, mean_subtraction, highpass, doppler_fft.
+    highpass_beta: 0.9 # Used only in highpass mode. Typical: 0.85..0.98.
+    doppler_fft_shift: true
+    doppler_zero_notch: false # In doppler_fft mode, can suppress static center line.
+
+  background_subtraction:
+    enabled: false # Legacy/global background subtraction.
+    mode: ema # Options: ema, running_mean, window_mean, frozen.
+    alpha: 0.02 # EMA speed: lower=more stable, higher=faster adaptation.
+    init_frames: 40 # Warmup frames before model init.
+    window_frames: 20 # Used by window_mean mode.
+    clamp_positive_only: false # Cleaner display floor, less negative artifacts.
+
+  loop_average_after_background:
+    enabled: false # If true reduces flicker, but can blur dynamics.
+
+  display_filters:
     slow_time:
-      enabled: false # Display branch only. Keeps heatmap independent from detection settings.
-      mode: highpass # Options: none, mean_subtraction, highpass, doppler_fft.
+      enabled: false # Keep disabled to match the legacy/global DSP path.
+      mode: mean_subtraction # Options: none, mean_subtraction, highpass, doppler_fft.
       highpass_beta: 0.9 # Used only in highpass mode. Typical: 0.85..0.98.
       doppler_fft_shift: true
       doppler_zero_notch: false # In doppler_fft mode, can suppress static center line.
 
+    mean_after_range_fft:
+      enabled: false
+      axes: [range_bin] # Display-only flattening after range FFT.
+
     background_subtraction:
-      enabled: false # Display branch only.
+      enabled: false # Keep disabled to match the legacy/global DSP path.
       mode: ema # Options: ema, running_mean, window_mean, frozen.
-      alpha: 0.02 # EMA speed: lower=more stable, higher=faster adaptation.
-      init_frames: 40 # Warmup frames before model init.
-      window_frames: 20 # Used by window_mean mode.
-      clamp_positive_only: true # Cleaner display floor, less negative artifacts.
+      alpha: 0.02
+      init_frames: 40
+      window_frames: 20
+      clamp_positive_only: true
 
     loop_average_after_background:
-      enabled: false # Display-only flicker reduction; skipped if slow_time.mode=doppler_fft.
+      enabled: false # Keep disabled to match the legacy/global DSP path.
 
   detection_static_filters:
     mean_after_range_fft:
@@ -108,19 +136,27 @@ dsp:
 
   angle_processing:
     mode: fft # Options: fft, bartlett, mvdr. "beamforming" is not a valid value.
-    mvdr_diagonal_loading: 0.02 # Used only if mode=mvdr. Typical: 0.005..0.05.
+    mvdr_diagonal_loading: 0.005 # Used only if mode=mvdr. Typical: 0.005..0.05.
+    aggregation: frame_loop # Legacy-equivalent behavior: average over frame and loop.
+    frame_index: 0
+    loop_index: 0
 
   heatmap_ema:
-    enabled: false # Display-only temporal smoothing of the heatmap.
-    alpha: 0.12 # Typical: 0.08..0.20. Lower=less jitter, more latency.
+    enabled: false
+    alpha: 0.10 # Typical: 0.08..0.20. Lower=less jitter, more latency.
 
   heatmap_spatial_filter:
     enabled: false
-    mode: gaussian_3x3 # Display-only smoothing in polar space. Options: none, gaussian_3x3.
+    mode: none # Display-only smoothing in polar space. Options: none, gaussian_3x3.
+
+antenna:
+  virtual_array_order: [7, 6, 5, 4, 3, 2, 1, 0]
+  virtual_array_phase_centers_lambda: [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]
+  virtual_array_phase_centers_m: null # Alternative unit in meters if radar.fc is valid.
 
 tracking:
   enabled: false # Enables/disables the multi-object tracker.
-  dt_s: 0.04096 # Fixed tracker time step [s]; here 256 chirps * 160 us = 40.96 ms.
+  dt_s: 0.04096 # Nominal frame period fallback [s]; the tracker now prefers real timestamp/sequence deltas when available.
   model: kalman_cv_2d # Dynamic model in use: constant-velocity 2D Kalman filter (x, y, vx, vy).
   max_tracks: 8 # Maximum number of live tracks kept at the same time.
   min_hits_to_confirm: 6 # Required matches before a track changes from tentative to confirmed.
@@ -194,6 +230,12 @@ process:
 
 debug:
   debug_stats: true # Enable DSP timing and range stats.
+  print_top_peaks: false # Print the top peaks for range-angle and XY display in the DSP shell.
+  print_top_peaks_count: 4
+  print_top_peaks_range_min_m: 0.0 # Optional lower bound for debug peak search.
+  print_top_peaks_range_max_m: 1.4 # Optional upper bound for debug peak search.
+  print_top_peaks_angle_min_deg: -90.0 # Optional lower bound for debug angle search.
+  print_top_peaks_angle_max_deg: 90.0 # Optional upper bound for debug angle search.
 
 sar:
   frames_per_position: 8
