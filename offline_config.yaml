@@ -1,11 +1,11 @@
 data:
   # Puoi mettere direttamente una run: logs/run_YYYYMMDD_HHMMSS
   # Se lasci "logs", SARReader prende automaticamente l'ultima run con capture_pos*.bin.
-  input_dir: logs\run_20260305_130033
+  input_dir: C:\py\RealTimePocessing\logs\run_20260401_111047
 
 scan:
   x_start: 1
-  x_end: 8
+  x_end: 1
   x_step: 1
   x_pitch_m: 0.007792 # 10mm pitch 
 

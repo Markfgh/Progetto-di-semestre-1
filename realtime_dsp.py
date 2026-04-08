@@ -39,6 +39,13 @@ _VALID_DISPLAY_PROJECTION_MODES = {"polar_stretched", "cartesian"}
 _VALID_DISPLAY_PROJECTION_INTERPS = {"nearest", "bilinear"}
 _VALID_SLOW_TIME_MODES = {"none", "mean_subtraction", "highpass", "doppler_fft"}
 _VALID_THRESHOLD_MODES = {"relative", "absolute"}
+_GAUSSIAN_3X3_KERNEL = (
+    np.array(
+        [[1.0, 2.0, 1.0], [2.0, 4.0, 2.0], [1.0, 2.0, 1.0]],
+        dtype=np.float32,
+    )
+    / np.float32(16.0)
+)
 
 _MEAN_AXIS_INDEX = {
     "frame": 0,
@@ -212,6 +219,8 @@ class RealtimeDSPConfig:
     fft_workers: int
     debug_stats: bool
     range_max_processing_m: float = 0.0
+    normalize_skip_range_bins: int = 0
+    zero_after_range_fft_bins: int = 0
     calibration: CalibrationConfig = CalibrationConfig()
 
 
@@ -222,6 +231,7 @@ class VirtualArrayGeometry:
     identity_order: bool
     uniform_half_lambda: bool
     uniform_spacing_lambda: float | None
+    angle_axis_sign: float = 1.0
 
 # Return a 1D FFT window of the requested type as float32.
 def _get_window_1d(win_type: str, size: int) -> np.ndarray:
@@ -848,6 +858,19 @@ def build_virtual_array_geometry_from_yaml_dict(
             )
             phase_centers_lambda = default_phase_centers
 
+    angle_axis_sign = 1.0
+    angle_sign_raw = block.get("angle_axis_sign", block.get("angle_sign", 1))
+    try:
+        angle_axis_sign = float(angle_sign_raw)
+        if not np.isfinite(angle_axis_sign) or angle_axis_sign == 0.0:
+            raise ValueError("deve essere +/-1")
+        angle_axis_sign = 1.0 if angle_axis_sign > 0.0 else -1.0
+    except Exception as exc:
+        warnings.append(
+            f"antenna.angle_axis_sign non valido ({exc}); using +1."
+        )
+        angle_axis_sign = 1.0
+
     identity_order = bool(np.array_equal(order_flat, default_order))
     uniform_spacing_lambda: float | None = None
     if phase_centers_lambda.size <= 1:
@@ -866,12 +889,26 @@ def build_virtual_array_geometry_from_yaml_dict(
             and np.isclose(float(spacing[0]), 0.5, atol=1e-3, rtol=0.0)
         )
 
+    if (
+        int(dsp_cfg.tx) == 2
+        and int(dsp_cfg.rx) == 4
+        and uniform_spacing_lambda is not None
+        and not np.isclose(float(uniform_spacing_lambda), 0.5, atol=1e-3, rtol=0.0)
+    ):
+        warnings.append(
+            "antenna.virtual_array_phase_centers_* uses spacing "
+            f"{float(uniform_spacing_lambda):.3f} lambda; "
+            "standard xWR14xx 2Tx/4Rx azimuth uses a half-lambda virtual ULA. "
+            "Angle estimates may be distorted."
+        )
+
     geometry = VirtualArrayGeometry(
         order_flat=order_flat,
         phase_centers_lambda=phase_centers_lambda.astype(np.float32, copy=False),
         identity_order=identity_order,
         uniform_half_lambda=uniform_half_lambda,
         uniform_spacing_lambda=uniform_spacing_lambda,
+        angle_axis_sign=float(angle_axis_sign),
     )
     return geometry, warnings
 
@@ -1267,21 +1304,17 @@ def apply_heatmap_spatial_filter(
     if heatmap.ndim != 2 or heatmap.shape[0] < 1 or heatmap.shape[1] < 1:
         return heatmap
     # 3x3 Gaussian blur for display smoothing only.
-    kernel = np.array(
-        [[1.0, 2.0, 1.0], [2.0, 4.0, 2.0], [1.0, 2.0, 1.0]],
-        dtype=np.float32,
-    ) / np.float32(16.0)
-    padded = np.pad(heatmap.astype(np.float32, copy=False), ((1, 1), (1, 1)), mode="edge")
+    padded = np.pad(np.asarray(heatmap, dtype=np.float32), ((1, 1), (1, 1)), mode="edge")
     out = (
-        padded[:-2, :-2] * kernel[0, 0]
-        + padded[:-2, 1:-1] * kernel[0, 1]
-        + padded[:-2, 2:] * kernel[0, 2]
-        + padded[1:-1, :-2] * kernel[1, 0]
-        + padded[1:-1, 1:-1] * kernel[1, 1]
-        + padded[1:-1, 2:] * kernel[1, 2]
-        + padded[2:, :-2] * kernel[2, 0]
-        + padded[2:, 1:-1] * kernel[2, 1]
-        + padded[2:, 2:] * kernel[2, 2]
+        padded[:-2, :-2] * _GAUSSIAN_3X3_KERNEL[0, 0]
+        + padded[:-2, 1:-1] * _GAUSSIAN_3X3_KERNEL[0, 1]
+        + padded[:-2, 2:] * _GAUSSIAN_3X3_KERNEL[0, 2]
+        + padded[1:-1, :-2] * _GAUSSIAN_3X3_KERNEL[1, 0]
+        + padded[1:-1, 1:-1] * _GAUSSIAN_3X3_KERNEL[1, 1]
+        + padded[1:-1, 2:] * _GAUSSIAN_3X3_KERNEL[1, 2]
+        + padded[2:, :-2] * _GAUSSIAN_3X3_KERNEL[2, 0]
+        + padded[2:, 1:-1] * _GAUSSIAN_3X3_KERNEL[2, 1]
+        + padded[2:, 2:] * _GAUSSIAN_3X3_KERNEL[2, 2]
     )
     return out.astype(np.float32, copy=False)
 
@@ -1398,21 +1431,78 @@ def compute_angle_heatmap(
     dsp_cfg: RealtimeDSPConfig,
     angle_steering: np.ndarray, # matrice di steering per Bartlett/MVDR, già normalizzata
     geometry: VirtualArrayGeometry | None = None,
+    ant_spacing: float | None = None,
 ) -> np.ndarray:
     # in [frame, loop, range_bin, angle_bin] -> [range_bin, angle_bin] con eventuale aggregazione su frame/loop a seconda di angle_cfg
     def _aggregate_angle_power(power: np.ndarray) -> np.ndarray:
         if power.ndim != 4:
             return np.asarray(power, dtype=np.float32)
+        num_frames = int(power.shape[0])
+        num_loops = int(power.shape[1])
         mode = str(getattr(angle_cfg, "aggregation", "frame_loop")).strip().lower()
+        frame_idx = min(max(0, int(getattr(angle_cfg, "frame_index", 0))), max(0, num_frames - 1))
+        loop_idx = min(max(0, int(getattr(angle_cfg, "loop_index", 0))), max(0, num_loops - 1))
         if mode == "frame":
-            return power.mean(axis=0, dtype=np.float32)
+            # Average frames while keeping a single selected loop snapshot.
+            return power[:, loop_idx, :, :].mean(axis=0, dtype=np.float32)
         if mode == "loop":
-            return power.mean(axis=1, dtype=np.float32)
+            # Average loops while keeping a single selected frame snapshot.
+            return power[frame_idx, :, :, :].mean(axis=0, dtype=np.float32)
         if mode == "none":
-            frame_idx = min(max(0, int(getattr(angle_cfg, "frame_index", 0))), int(power.shape[0]) - 1)
-            loop_idx = min(max(0, int(getattr(angle_cfg, "loop_index", 0))), int(power.shape[1]) - 1)
             return power[frame_idx, loop_idx, :, :].astype(np.float32, copy=False)
         return power.mean(axis=(0, 1), dtype=np.float32)
+
+    def _build_uniform_steering(n_ant: int, n_angle: int, spacing_lambda: float) -> np.ndarray:
+        spacing = float(spacing_lambda)
+        if not np.isfinite(spacing) or abs(spacing) <= 1e-8:
+            spacing = 0.5
+        phase_centers_lambda = (
+            np.arange(max(0, int(n_ant)), dtype=np.float32) * np.float32(spacing)
+        ).astype(np.float32, copy=False)
+        u = _build_angle_u_axis(n_angle, spacing_lambda=spacing)
+        phase = (-1j * np.float32(2.0 * np.pi)) * phase_centers_lambda[:, None] * u[None, :]
+        steering = np.exp(phase).astype(np.complex64, copy=False)
+        col_energy = (steering.real * steering.real + steering.imag * steering.imag).sum(axis=0, dtype=np.float32)
+        col_norm = np.sqrt(np.maximum(col_energy, np.float32(1e-8))).astype(np.float32, copy=False)
+        steering /= col_norm[np.newaxis, :].astype(np.complex64, copy=False)
+        return steering
+
+    def _resolve_bartlett_mvdr_steering(n_ant: int, n_angle: int) -> np.ndarray:
+        spacing_lambda: float | None = None
+        if ant_spacing is not None:
+            try:
+                spacing_candidate = float(ant_spacing)
+            except (TypeError, ValueError):
+                spacing_candidate = float("nan")
+            if np.isfinite(spacing_candidate) and abs(spacing_candidate) > 1e-8:
+                spacing_lambda = spacing_candidate
+        if spacing_lambda is not None:
+            return _build_uniform_steering(n_ant, n_angle, spacing_lambda)
+
+        steering = np.asarray(angle_steering, dtype=np.complex64)
+        if steering.ndim == 2 and steering.shape[0] >= n_ant and steering.shape[1] >= n_angle:
+            return steering[:n_ant, :n_angle]
+
+        if geometry is not None and geometry.uniform_spacing_lambda is not None:
+            return _build_uniform_steering(n_ant, n_angle, float(geometry.uniform_spacing_lambda))
+
+        phase_centers_lambda = _default_virtual_array_phase_centers_lambda(n_ant)
+        if geometry is not None:
+            phase_centers_raw = np.asarray(geometry.phase_centers_lambda, dtype=np.float32).reshape(-1)
+            if phase_centers_raw.size >= n_ant:
+                phase_centers_lambda = phase_centers_raw[:n_ant]
+        u = _build_angle_u_axis(n_angle, spacing_lambda=0.5)
+        phase = (-1j * np.float32(2.0 * np.pi)) * phase_centers_lambda[:, None] * u[None, :]
+        steering = np.exp(phase).astype(np.complex64, copy=False)
+        col_energy = (steering.real * steering.real + steering.imag * steering.imag).sum(axis=0, dtype=np.float32)
+        col_norm = np.sqrt(np.maximum(col_energy, np.float32(1e-8))).astype(np.float32, copy=False)
+        steering /= col_norm[np.newaxis, :].astype(np.complex64, copy=False)
+        return steering
+
+    def _resolve_frame_index(num_frames: int) -> int:
+        if num_frames <= 0:
+            return 0
+        return min(max(0, int(getattr(angle_cfg, "frame_index", 0))), num_frames - 1)
 
     # calculate angle heatmap with FFT; output is [range_bin, angle_bin]
     if angle_cfg.mode == "fft":
@@ -1432,45 +1522,72 @@ def compute_angle_heatmap(
         spacing_lambda = 0.5
         if geometry is not None and geometry.uniform_spacing_lambda is not None:
             spacing_lambda = float(geometry.uniform_spacing_lambda)
-        valid_u = np.abs(
-            _build_angle_u_axis(dsp_cfg.nfft_angle, spacing_lambda=spacing_lambda).astype(np.float64, copy=False)
-        ) <= 1.0
-        if np.any(~valid_u):
-            power[..., ~valid_u] = np.float32(0.0)
+        if not np.isfinite(spacing_lambda) or abs(spacing_lambda - 0.5) > 1e-8:
+            valid_u = np.abs(
+                _build_angle_u_axis(dsp_cfg.nfft_angle, spacing_lambda=spacing_lambda).astype(np.float64, copy=False)
+            ) <= 1.0
+            if np.any(~valid_u):
+                power[..., ~valid_u] = np.float32(0.0)
         # aggregate according to angle_cfg and return
         heatmap = _aggregate_angle_power(power)
         return heatmap.astype(np.float32, copy=False)
 
-    x = virtual_array.transpose(2, 0, 1, 3)
-    n_range = int(x.shape[0])
-    n_snap = int(x.shape[1] * x.shape[2])
-    n_ant = int(x.shape[3])
-    x = x.reshape(n_range, n_snap, n_ant).astype(np.complex64, copy=False)
-    steering = angle_steering[:n_ant, :]
-
+    if (
+        virtual_array.ndim != 4
+        or int(virtual_array.shape[0]) <= 0
+        or int(virtual_array.shape[1]) <= 0
+        or int(virtual_array.shape[2]) <= 0
+        or int(virtual_array.shape[3]) <= 0
+    ):
+        return np.empty((0, 0), dtype=np.float32)
+    num_frames = int(virtual_array.shape[0])
+    num_loops = int(virtual_array.shape[1])
+    num_range = int(virtual_array.shape[2])
+    num_ant = int(virtual_array.shape[3])
 
     if angle_cfg.mode == "bartlett":
-        y = np.einsum("rsm,mk->rsk", x, np.conj(steering), optimize=True)
-        yr = y.real
-        yi = y.imag
-        power = (yr * yr + yi * yi).astype(np.float32, copy=False)
-        return power.mean(axis=1, dtype=np.float32).astype(np.float32, copy=False)
+        steering = _resolve_bartlett_mvdr_steering(
+            num_ant,
+            int(dsp_cfg.nfft_angle),
+        ).astype(np.complex64, copy=False)
+        snapshots = np.asarray(virtual_array, dtype=np.complex64)
+        # Match the FFT path: beamform each snapshot first, then integrate the power incoherently.
+        beam = np.einsum("ak,flra->flrk", np.conj(steering), snapshots, optimize=True)
+        power = (beam.real * beam.real + beam.imag * beam.imag).astype(np.float32, copy=False)
+        heatmap = _aggregate_angle_power(power)
+        return heatmap.astype(np.float32, copy=False)
 
-    cov = np.einsum("rsm,rsn->rmn", np.conj(x), x, optimize=True).astype(np.complex64, copy=False)
-    if n_snap > 0:
-        cov /= np.float32(n_snap)
-    if angle_cfg.mvdr_diagonal_loading > 0.0:
-        ant = int(cov.shape[-1])
-        tr = np.trace(cov, axis1=-2, axis2=-1).real.astype(np.float32, copy=False)
-        tr /= np.float32(max(1, ant))
-        eye = np.eye(ant, dtype=np.complex64)[None, :, :]
-        load = (np.float32(angle_cfg.mvdr_diagonal_loading) * tr)[:, None, None].astype(np.complex64, copy=False)
-        cov = cov + (load * eye)
-    cov_inv = np.linalg.pinv(cov).astype(np.complex64, copy=False)
-    den_left = np.einsum("rmn,nk->rmk", cov_inv, steering, optimize=True)
-    den = np.einsum("mk,rmk->rk", np.conj(steering), den_left, optimize=True).real.astype(np.float32, copy=False)
-    np.maximum(den, np.float32(1e-8), out=den)
-    return (np.float32(1.0) / den).astype(np.float32, copy=False)
+    # MVDR always uses every available frame/loop snapshot in the batch to estimate covariance.
+    snapshots = np.asarray(virtual_array, dtype=np.complex64).reshape(num_frames * num_loops, num_range, num_ant)
+    num_snapshots = int(snapshots.shape[0])
+    range_fft_data = snapshots.transpose(0, 2, 1).astype(np.complex128, copy=False)  # [snapshot, ant, range]
+    steering = _resolve_bartlett_mvdr_steering(num_ant, int(dsp_cfg.nfft_angle)).astype(np.complex128, copy=False)
+
+    if num_snapshots < num_ant and not getattr(compute_angle_heatmap, "_mvdr_snapshot_warned", False):
+        print(
+            f"[DSP WARN] MVDR requires more snapshots than antennas; got snapshots={num_snapshots}, antennas={num_ant}."
+        )
+        compute_angle_heatmap._mvdr_snapshot_warned = True
+
+    x_by_range = range_fft_data.transpose(2, 1, 0).astype(np.complex128, copy=False)  # [range, ant, snapshot]
+    heatmap = np.empty((num_range, int(dsp_cfg.nfft_angle)), dtype=np.float32)
+    eye = np.eye(num_ant, dtype=np.complex128)
+    load_factor = np.float64(max(0.0, float(getattr(angle_cfg, "mvdr_diagonal_loading", 0.0))))
+    for range_idx in range(num_range):
+        x = x_by_range[range_idx]
+        cov = (x @ x.conj().T) / np.float64(max(1, num_snapshots))
+        trace_r = float(np.trace(cov).real)
+        if np.isfinite(trace_r) and trace_r > 0.0:
+            cov = cov + ((load_factor * trace_r / np.float64(max(1, num_ant))) * eye)
+        try:
+            cov_inv = np.linalg.pinv(cov)
+        except np.linalg.LinAlgError:
+            cov_inv = eye
+        den_left = cov_inv @ steering
+        den = np.einsum("ak,ak->k", np.conj(steering), den_left, optimize=True).real.astype(np.float32, copy=False)
+        np.maximum(den, np.float32(1e-8), out=den)
+        heatmap[range_idx, :] = np.float32(1.0) / den
+    return heatmap.astype(np.float32, copy=False)
 
 
 def build_angle_axis_deg(
@@ -1478,15 +1595,24 @@ def build_angle_axis_deg(
     geometry: VirtualArrayGeometry | None = None,
 ) -> np.ndarray:
     spacing_lambda = 0.5
+    angle_axis_sign = 1.0
     if geometry is not None and geometry.uniform_spacing_lambda is not None:
         spacing_lambda = float(geometry.uniform_spacing_lambda)
+    if geometry is not None:
+        try:
+            angle_axis_sign = float(getattr(geometry, "angle_axis_sign", 1.0))
+        except (TypeError, ValueError):
+            angle_axis_sign = 1.0
+        if not np.isfinite(angle_axis_sign) or angle_axis_sign == 0.0:
+            angle_axis_sign = 1.0
+        angle_axis_sign = 1.0 if angle_axis_sign > 0.0 else -1.0
     u = _build_angle_u_axis(nfft_angle, spacing_lambda=spacing_lambda)
     angle_axis = np.full(u.shape, np.float32(np.nan), dtype=np.float32)
     valid = np.abs(u.astype(np.float64, copy=False)) <= 1.0
     if np.any(valid):
         angle_axis[valid] = np.rad2deg(
             np.arcsin(u[valid].astype(np.float64, copy=False))
-        ).astype(np.float32, copy=False)
+        ).astype(np.float32, copy=False) * np.float32(angle_axis_sign)
     return angle_axis
 
 
@@ -2002,6 +2128,26 @@ def _power_to_db(power_lin: np.ndarray) -> np.ndarray:
     return out
 
 
+def _normalization_reference_db(
+    heatmap_lin: np.ndarray,
+    *,
+    skip_range_bins: int,
+) -> float | None:
+    src = np.asarray(heatmap_lin, dtype=np.float32)
+    if src.ndim != 2 or src.size <= 0:
+        return None
+    start_bin = max(0, int(skip_range_bins))
+    if start_bin >= int(src.shape[0]):
+        start_bin = 0
+    active = src[start_bin:, :]
+    if active.size <= 0:
+        return None
+    ref_lin = float(np.max(active))
+    if not np.isfinite(ref_lin) or ref_lin <= 0.0:
+        return None
+    return float(np.float32(10.0) * np.log10(np.float32(max(ref_lin, 1e-12))))
+
+
 def _format_debug_top_peaks_range_angle(
     heatmap_lin: np.ndarray,
     *,
@@ -2263,6 +2409,7 @@ def detect_static_targets(
         dsp_cfg=dsp_cfg,
         angle_steering=angle_steering,
         geometry=virtual_array_geometry,
+        ant_spacing=virtual_array_geometry.uniform_spacing_lambda,
     )
     static_db = compute_detection_power_db_map(static_heatmap)
     threshold_db = compute_detection_threshold_db(
@@ -2339,7 +2486,8 @@ def compute_range_doppler(
             np.multiply(trimmed, w_doppler, out=trimmed_work)
             doppler_in = trimmed_work
         else:
-            doppler_in = np.ascontiguousarray(trimmed * w_doppler)
+            doppler_in = np.empty(trimmed.shape, dtype=trimmed.dtype)
+            np.multiply(trimmed, w_doppler, out=doppler_in)
     else:
         if trimmed.flags.c_contiguous:
             doppler_in = trimmed
@@ -2476,6 +2624,7 @@ def estimate_angle_for_moving_detections(
             dsp_cfg=dsp_cfg,
             angle_steering=angle_steering,
             geometry=virtual_array_geometry,
+            ant_spacing=virtual_array_geometry.uniform_spacing_lambda,
         )
         if angle_pow.size <= 0:
             continue
@@ -2654,8 +2803,11 @@ def apply_background_subtraction(
     if not bg_cfg.enabled:
         return range_fft
 
-    frame_sum = range_fft.sum(axis=0, dtype=np.complex64)
+    mode = str(bg_cfg.mode)
     batch_frames = int(range_fft.shape[0])
+    frame_sum: np.ndarray | None = None
+    if (bg_state.model is None and mode != "window_mean") or mode in {"ema", "running_mean"}:
+        frame_sum = range_fft.sum(axis=0, dtype=np.complex64)
     model_initialized_now = False
 
     def _window_mean_push_batch() -> None:
@@ -2699,7 +2851,7 @@ def apply_background_subtraction(
         bg_state.window_head = int(head)
 
     if bg_state.model is None:
-        if bg_cfg.mode == "window_mean":
+        if mode == "window_mean":
             _window_mean_push_batch()
             bg_state.init_count += batch_frames
             if bg_state.init_count < bg_cfg.init_frames:
@@ -2712,6 +2864,7 @@ def apply_background_subtraction(
             )
             model_initialized_now = True
         else:
+            assert frame_sum is not None
             if bg_state.init_sum is None:
                 bg_state.init_sum = np.zeros_like(frame_sum, dtype=np.complex64)
             bg_state.init_sum += frame_sum
@@ -2743,12 +2896,14 @@ def apply_background_subtraction(
     # Avoid double counting the batch that completed background initialization.
     if model_initialized_now:
         return range_fft_out
-    frame_mean = frame_sum / np.float32(max(1, batch_frames))
-    if bg_cfg.mode == "ema":
+    if mode == "ema":
+        assert frame_sum is not None
+        frame_mean = frame_sum / np.float32(max(1, batch_frames))
         model *= np.float32(1.0 - bg_cfg.alpha)
         model += np.float32(bg_cfg.alpha) * frame_mean
         bg_state.model = model
-    elif bg_cfg.mode == "running_mean":
+    elif mode == "running_mean":
+        assert frame_sum is not None
         if bg_state.running_sum is None:
             bg_state.running_sum = np.array(frame_sum, dtype=np.complex64, copy=True)
             bg_state.running_count = batch_frames
@@ -2759,7 +2914,7 @@ def apply_background_subtraction(
             bg_state.running_sum / np.float32(max(1, bg_state.running_count)),
             dtype=np.complex64,
         )
-    elif bg_cfg.mode == "window_mean":
+    elif mode == "window_mean":
         _window_mean_push_batch()
         if bg_state.window_sum is not None and bg_state.window_count > 0:
             bg_state.model = np.asarray(
@@ -2856,6 +3011,10 @@ def process_buffer(
 
         # Range FFT with optional zero-padding and in-place computation to save memory.
         range_fft_common = fft.fft(data,n=dsp_cfg.nfft_range,axis=3,workers=dsp_cfg.fft_workers,overwrite_x=True,)
+        zero_after_range_fft_bins = int(getattr(dsp_cfg, "zero_after_range_fft_bins", 0))
+        if zero_after_range_fft_bins > 0:
+            zero_bins = min(zero_after_range_fft_bins, int(range_fft_common.shape[3]))
+            range_fft_common[:, :, :, :zero_bins, :] = np.complex64(0.0)
 
         # Range bin to physical range conversion factor (meters per bin).
         range_bin_m = dsp_cfg.c * dsp_cfg.fs / (2.0 * dsp_cfg.slope * dsp_cfg.nfft_range)
@@ -3095,6 +3254,7 @@ def process_buffer(
             dsp_cfg=dsp_cfg,
             angle_steering=angle_steering,
             geometry=virtual_array_geometry,
+            ant_spacing=virtual_array_geometry.uniform_spacing_lambda,
         )
 
         if not heatmap_ema_cfg.enabled: #bypass
@@ -3152,11 +3312,16 @@ def process_buffer(
             )
 
         if view_db.size > 0:
+            norm_ref_db = _normalization_reference_db(
+                heatmap_ema,
+                skip_range_bins=int(getattr(dsp_cfg, "normalize_skip_range_bins", 0)),
+            )
             raw_max = float(np.max(view_db))
             if dsp_cfg.debug_stats:
                 raw_min = float(np.min(view_db))
                 norm_max = 0.0
-                norm_min = float(raw_min - raw_max)
+                norm_peak = raw_max if norm_ref_db is None else float(norm_ref_db)
+                norm_min = float(raw_min - norm_peak)
                 try:
                     with stat_raw_min_db.get_lock():
                         stat_raw_min_db.value = raw_min
@@ -3169,7 +3334,7 @@ def process_buffer(
                 except Exception:
                     pass
             if normalize_to_peak:
-                view_db -= raw_max
+                view_db -= raw_max if norm_ref_db is None else float(norm_ref_db)
 
         # Latest-wins publish to the GUI double buffer.
         with gui_lock:

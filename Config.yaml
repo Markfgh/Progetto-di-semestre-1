@@ -14,7 +14,7 @@ capture:
 
 fft:
   nfft_range: 512 # Typical: 256 or 512. Higher = finer range bins, more CPU.
-  nfft_angle: 1024 # Typical: 128/256/512. Higher = finer angular grid, more CPU.
+  nfft_angle: 512 # Typical: 128/256/512. Higher = finer angular grid, more CPU.
   workers: 8      # FFT worker threads.
 
 display:
@@ -25,21 +25,26 @@ display:
   projection_mode:   cartesian # Options: polar_stretched, cartesian.
   projection_interp: nearest  # Used only in cartesian mode: nearest, bilinear.
   range_max:  12.5    # Hard limit shown on Y axis [m].
-  crossrange_max: 4  # X extent [m]; use "auto" to derive it from angle FOV for the realtime heatmap.
+  crossrange_max: 12.5  # X extent [m]; use "auto" to derive it from angle FOV for the realtime heatmap.
   rangefft_db_min: 0
   rangefft_db_max: 95
   rangefft_lin_min: 0
   rangefft_lin_max: 15e7
+  normalize_skip_range_bins: 4 # Normalized display: ignore the first N range bins when choosing the frame peak.
 
 processing:
   range_max_m: 12.5 # Physical processing/detection limit [m]. If missing, falls back to display.range_max.
 
 dsp:
-  window_range: hamming # Options: none, rectangular, hanning, hamming, blackman.
-  window_doppler: hamming # Applied on slow-time chirps before Doppler FFT.
-  window_angle: hamming  # Options: none, rectangular, hanning, hamming, blackman.
+  window_range: hanning # Options: none, rectangular, hanning, hamming, blackman.
+  window_doppler: hanning # Applied on slow-time chirps before Doppler FFT.
+  window_angle: hanning  # Options: none, rectangular, hanning, hamming, blackman.
+  zero_after_range_fft_bins: 0 # If > 0, zeroes the first N range bins globally right after range FFT.
+  
+  
+  
   calibration:
-    enabled: true
+    enabled: false
     vector_real: [1.000000, 0.999575, 0.940848, 0.968703, 0.964520, 0.980703, 0.996999, 0.999461]
     vector_imag: [0.000000, -0.029159, -0.338830, -0.248224, 0.264009, 0.195503, -0.077414, -0.032823]
 
@@ -135,11 +140,11 @@ dsp:
       clamp_positive_only: true
 
   angle_processing:
-    mode: fft # Options: fft, bartlett, mvdr. "beamforming" is not a valid value.
-    mvdr_diagonal_loading: 0.005 # Used only if mode=mvdr. Typical: 0.005..0.05.
-    aggregation: frame_loop # Legacy-equivalent behavior: average over frame and loop.
-    frame_index: 0
-    loop_index: 0
+    mode: fft # Options: fft, bartlett, mvdr. fft and bartlett honor aggregation/frame_index/loop_index; mvdr always uses all available frame x loop snapshots.
+    mvdr_diagonal_loading: 0.005 # Used only if mode=mvdr. Diagonal loading factor on the covariance matrix. Typical: 0.005..0.05.
+    aggregation: frame_loop # fft/bartlett only: frame_loop=all frames+loops, frame=all frames at loop_index, loop=all loops at frame_index, none=single [frame_index, loop_index].
+    frame_index: 0 # Used only by fft/bartlett when aggregation is loop or none.
+    loop_index: 0 # Used only by fft/bartlett when aggregation is frame or none.
 
   heatmap_ema:
     enabled: false
@@ -150,9 +155,10 @@ dsp:
     mode: none # Display-only smoothing in polar space. Options: none, gaussian_3x3.
 
 antenna:
-  virtual_array_order: [7, 6, 5, 4, 3, 2, 1, 0]
-  virtual_array_phase_centers_lambda: [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]
+  virtual_array_order:   [0, 1, 2, 3, 4, 5, 6, 7]
+  virtual_array_phase_centers_lambda: [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5] # null -> default half-lambda ULA, standard for IWR1443BOOST 2Tx/4Rx azimuth.
   virtual_array_phase_centers_m: null # Alternative unit in meters if radar.fc is valid.
+  angle_axis_sign: 1 # Set to -1 only if left/right is still mirrored because of mounting or channel-order convention.
 
 tracking:
   enabled: false # Enables/disables the multi-object tracker.

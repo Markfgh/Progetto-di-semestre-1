@@ -484,6 +484,8 @@ REALTIME_DSP_CFG = RealtimeDSPConfig(
     fft_workers=int(FFT_WORKERS),
     debug_stats=bool(DEBUG_STATS),
     range_max_processing_m=float(RANGE_MAX_PROCESSING),
+    normalize_skip_range_bins=max(0, int(cfg.get("display", {}).get("normalize_skip_range_bins", 0))),
+    zero_after_range_fft_bins=max(0, int(cfg.get("dsp", {}).get("zero_after_range_fft_bins", 0))),
     calibration=CALIBRATION_CFG,
 )
 
@@ -577,7 +579,7 @@ def radar_rx(
 
     IntegritÃ :
       - gap/reset sequenza (seq): il frame attraversato Ã¨ corrotto -> SCARTATO
-      - incoerenza byte_count: frame corrotto -> SCARTATO
+      - incoerenza byte_count non spiegata da seq_gap: hard resync sul boundary reale del frame
 
     Performance:
       - zero-copy interprocess: RX scrive raw frame in shared memory (ring di slot)
@@ -725,6 +727,21 @@ def radar_rx(
         last_byte_count = None
         _bump_counter(stream_resets)
 
+    def _hard_resync_from_byte_count(byte_count: int) -> None:
+        """
+        Realign the local frame cursor to the absolute stream position carried by byte_count.
+
+        If the packet starts mid-frame we logically consume the missing prefix and suppress
+        publication until the next physical frame boundary.
+        """
+        nonlocal w, frame_ok
+        frame_offset = int(byte_count % BYTES_PER_FRAME)
+        _discard_partial_frame()
+        if frame_offset > 0:
+            w = frame_offset
+            frame_ok = False
+        _bump_counter(stream_resets)
+
     def _acquire_slot_nonblocking() -> bool:
         """Prende uno slot senza mai bloccare. Se non disponibile -> drop frame (have_slot=False)."""
         nonlocal curr_slot, frame_view, have_slot
@@ -829,8 +846,9 @@ def radar_rx(
             _soft_reset_stream()
             rx_state = RX_RUNNING
 
+        current_payload_len = n_bytes - HEADER_LEN
         if payload_len_ref is None:
-            payload_len_ref = n_bytes - HEADER_LEN
+            payload_len_ref = current_payload_len
 
         # --- parse header ---
         seq = int.from_bytes(packet_view[0:4], "little", signed=False)
@@ -854,20 +872,25 @@ def radar_rx(
                 if back <= SEQ_REORDER_MAX_BACK:
                     continue
                 _soft_reset_stream()
-                payload_len_ref = n_bytes - HEADER_LEN
+                payload_len_ref = current_payload_len
                 seq_gap_pkts = 0
 
-        # --- byte_count check (robust alignment) ---
-        if last_byte_count is not None and payload_len_ref is not None:
-            expected = (last_byte_count + payload_len_ref) % MOD48
-            if bc != expected:
-                frame_ok = False
-        last_byte_count = bc
-
-        # --- GAP handling (consume missing bytes to keep frame alignment) ---
         if seq_gap_pkts > 0 and payload_len_ref is not None:
             with lost_pkts.get_lock():
                 lost_pkts.value += int(seq_gap_pkts)
+
+        # --- byte_count check (absolute stream alignment) ---
+        hard_resync = False
+        if last_byte_count is not None and payload_len_ref is not None:
+            expected = (last_byte_count + ((int(seq_gap_pkts) + 1) * int(payload_len_ref))) % MOD48
+            if bc != expected:
+                _hard_resync_from_byte_count(bc)
+                payload_len_ref = current_payload_len
+                hard_resync = True
+        last_byte_count = bc
+
+        # --- GAP handling (consume missing bytes to keep frame alignment) ---
+        if (not hard_resync) and seq_gap_pkts > 0 and payload_len_ref is not None:
             frame_ok = False
 
             bytes_missing = int(seq_gap_pkts) * int(payload_len_ref)

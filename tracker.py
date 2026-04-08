@@ -511,7 +511,7 @@ class MultiObjectTracker:
         reject_xy = 0
         reject_doppler = 0
         for track_idx, track in enumerate(self.tracks):
-            gate_xy = self._track_gate_xy(track, now_s)
+            gate_xy = self._track_gate_xy(track)
             track_doppler = self._expected_track_doppler(track)
             for meas_idx, meas in enumerate(measurements):
                 d_xy = float(math.hypot(meas.x_m - track.x_m, meas.y_m - track.y_m))
@@ -928,7 +928,7 @@ class MultiObjectTracker:
         track.vy_mps = 0.0
         track.doppler_mps = 0.0
 
-    def _track_gate_xy(self, track: Track, now_s: float) -> float:
+    def _track_gate_xy(self, track: Track) -> float:
         gate = max(self.tracker_cfg.gating_xy_m, 1e-3)
         if track.state == "tentative":
             gate *= 1.15
