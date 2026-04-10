@@ -20,12 +20,15 @@ import yaml
 from offline_dsp import (
     AvgMode,
     BpMode,
+    MotionMode,
     avg_mode_normalize as _avg_mode_normalize,
     back_projection_image as _back_projection_image,
     back_projection_image_mimo as _back_projection_image_mimo,
     bp_mode_normalize as _bp_mode_normalize,
-    build_virtual_array_x_offsets as _build_virtual_array_x_offsets,
+    build_mimo_geometry as _build_mimo_geometry,
+    motion_mode_normalize as _motion_mode_normalize,
     phase_sign_normalize as _phase_sign_normalize,
+    prepare_mimo_snapshots as _prepare_mimo_snapshots,
     reduce_avg_mode as _reduce_avg_mode,
 )
 
@@ -565,6 +568,18 @@ def _read_default_avg_mode(offline_config_path: str | Path) -> AvgMode:
     return _avg_mode_normalize(None if raw is None else str(raw))
 
 
+def _read_default_motion_mode(offline_config_path: str | Path) -> MotionMode:
+    cfg = _load_yaml_file(Path(offline_config_path))
+    bp_cfg = cfg.get("bp", {}) or {}
+    raw_motion = bp_cfg.get("motion_mode", None)
+    if raw_motion is not None:
+        return _motion_mode_normalize(str(raw_motion))
+    if bp_cfg.get("avg_mode", None) is not None:
+        motion_mode, _ = _motion_mode_from_legacy_avg_mode(bp_cfg.get("avg_mode"))
+        return motion_mode
+    return "static_zero_doppler"
+
+
 def _read_fft_workers(fallback_capture_cfg: str | Path) -> int:
     cfg = _load_yaml_file(Path(fallback_capture_cfg))
     fft_cfg = cfg.get("fft", {}) or {}
@@ -590,12 +605,186 @@ def _to_bool(field_name: str, value: Any) -> bool:
     raise ValueError(f"{field_name} non valido: {value!r}")
 
 
-def _read_bp_runtime_cfg(offline_config_path: str | Path) -> dict[str, Any]:
+def _to_float(field_name: str, value: Any, default: float | None = None) -> float:
+    if value is None:
+        if default is None:
+            raise ValueError(f"{field_name} mancante")
+        return float(default)
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} non valido: {value!r}") from exc
+
+
+def _parse_float_array(
+    field_name: str,
+    value: Any,
+    *,
+    expected_len: int,
+) -> np.ndarray | None:
+    if value is None:
+        return None
+    try:
+        arr = np.asarray(list(value), dtype=np.float32).reshape(-1)
+    except Exception as exc:
+        raise ValueError(f"{field_name} non valido: {value!r}") from exc
+    if arr.size != int(expected_len):
+        raise ValueError(f"{field_name} size={arr.size}, atteso {expected_len}")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{field_name} contiene valori non finiti")
+    return arr.astype(np.float32, copy=False)
+
+
+def _resolve_wavelength_m(cfg: dict[str, Any]) -> float:
+    radar = cfg.get("radar", {}) or {}
+    c_m_s = _to_float("radar.c", _pick(radar.get("c"), 3e8), 3e8)
+    fc_hz = _to_float("radar.fc", radar.get("fc"))
+    if not np.isfinite(c_m_s) or c_m_s <= 0.0:
+        raise ValueError("radar.c non valido")
+    if not np.isfinite(fc_hz) or fc_hz <= 0.0:
+        raise ValueError("radar.fc non valido")
+    wavelength_m = float(c_m_s) / float(fc_hz)
+    if not np.isfinite(wavelength_m) or wavelength_m <= 0.0:
+        raise ValueError("wavelength_m non valida")
+    return float(wavelength_m)
+
+
+def _default_virtual_array_order_flat(virtual_ant: int) -> np.ndarray:
+    return np.arange(max(0, int(virtual_ant)), dtype=np.int32)
+
+
+def _parse_virtual_array_order_entry(
+    entry: Any,
+    *,
+    tx: int,
+    rx: int,
+    virtual_ant: int,
+) -> int:
+    if isinstance(entry, dict):
+        if "flat" in entry:
+            idx = int(entry["flat"])
+        else:
+            idx = int(entry["tx"]) * int(rx) + int(entry["rx"])
+    elif isinstance(entry, (list, tuple)):
+        if len(entry) == 2:
+            idx = int(entry[0]) * int(rx) + int(entry[1])
+        elif len(entry) == 1:
+            idx = int(entry[0])
+        else:
+            raise ValueError(f"virtual_array_order entry non valido: {entry!r}")
+    else:
+        idx = int(entry)
+    if idx < 0 or idx >= int(virtual_ant):
+        raise ValueError(f"virtual_array_order index fuori range: {idx}")
+    return int(idx)
+
+
+def _resolve_virtual_array_order(cfg: dict[str, Any], *, tx: int, rx: int, virtual_ant: int) -> np.ndarray:
+    antenna_block = cfg.get("antenna", {}) or cfg.get("virtual_array", {}) or {}
+    default_order = _default_virtual_array_order_flat(virtual_ant)
+    order_raw = antenna_block.get("virtual_array_order", antenna_block.get("order", None))
+    if order_raw is None:
+        return default_order
+    order_list = list(order_raw)
+    if len(order_list) != int(virtual_ant):
+        raise ValueError(f"virtual_array_order size={len(order_list)} != virtual_ant={virtual_ant}")
+    parsed = np.asarray(
+        [
+            _parse_virtual_array_order_entry(
+                item,
+                tx=int(tx),
+                rx=int(rx),
+                virtual_ant=int(virtual_ant),
+            )
+            for item in order_list
+        ],
+        dtype=np.int32,
+    )
+    if np.unique(parsed).size != int(virtual_ant):
+        raise ValueError("virtual_array_order contiene duplicati")
+    return parsed.astype(np.int32, copy=False)
+
+
+def _resolve_config_virtual_phase_centers_m(
+    cfg: dict[str, Any],
+    *,
+    virtual_ant: int,
+    wavelength_m: float,
+) -> np.ndarray | None:
+    antenna_block = cfg.get("antenna", {}) or cfg.get("virtual_array", {}) or {}
+    phase_centers_m = _parse_float_array(
+        "antenna.virtual_array_phase_centers_m",
+        antenna_block.get("virtual_array_phase_centers_m", antenna_block.get("phase_centers_m", None)),
+        expected_len=int(virtual_ant),
+    )
+    if phase_centers_m is not None:
+        return phase_centers_m.astype(np.float32, copy=False)
+
+    phase_centers_lambda = _parse_float_array(
+        "antenna.virtual_array_phase_centers_lambda",
+        antenna_block.get("virtual_array_phase_centers_lambda", antenna_block.get("phase_centers_lambda", None)),
+        expected_len=int(virtual_ant),
+    )
+    if phase_centers_lambda is None:
+        return None
+    return (phase_centers_lambda * np.float32(float(wavelength_m))).astype(np.float32, copy=False)
+
+
+def _centered(arr: np.ndarray) -> np.ndarray:
+    arr_f = np.asarray(arr, dtype=np.float32).reshape(-1)
+    if arr_f.size <= 0:
+        return arr_f
+    return (arr_f - np.float32(float(np.mean(arr_f, dtype=np.float64)))).astype(np.float32, copy=False)
+
+
+def _resolve_bp_offsets_m(
+    bp_cfg: dict[str, Any],
+    *,
+    key_root: str,
+    expected_len: int,
+    wavelength_m: float,
+) -> np.ndarray | None:
+    offsets_m = _parse_float_array(
+        f"offline_config: bp.{key_root}_m",
+        bp_cfg.get(f"{key_root}_m", None),
+        expected_len=int(expected_len),
+    )
+    if offsets_m is not None:
+        return offsets_m.astype(np.float32, copy=False)
+
+    offsets_lambda = _parse_float_array(
+        f"offline_config: bp.{key_root}_lambda",
+        bp_cfg.get(f"{key_root}_lambda", None),
+        expected_len=int(expected_len),
+    )
+    if offsets_lambda is None:
+        return None
+    return (offsets_lambda * np.float32(float(wavelength_m))).astype(np.float32, copy=False)
+
+
+def _motion_mode_from_legacy_avg_mode(avg_mode_raw: Any) -> tuple[MotionMode, str]:
+    legacy = _avg_mode_normalize(None if avg_mode_raw is None else str(avg_mode_raw))
+    motion_mode: MotionMode = "all_doppler_incoherent" if legacy == "none" else "static_zero_doppler"
+    return (
+        motion_mode,
+        f"[OFFLINE WARN] bp.avg_mode={legacy} e' deprecato in mimo_sar; using motion_mode={motion_mode}.",
+    )
+
+
+def _read_bp_runtime_cfg(offline_config_path: str | Path, fallback_capture_cfg: str | Path) -> dict[str, Any]:
     cfg = _load_yaml_file(Path(offline_config_path))
+    fallback_cfg = _load_yaml_file(Path(fallback_capture_cfg))
     bp_cfg = cfg.get("bp", {}) or {}
+    warnings: list[str] = []
 
     mode: BpMode = _bp_mode_normalize(_pick(bp_cfg.get("mode"), "sar_only"))
     avg_mode: AvgMode = _avg_mode_normalize(_pick(bp_cfg.get("avg_mode"), "both"))
+    motion_mode_raw = bp_cfg.get("motion_mode", None)
+    if motion_mode_raw is None and bp_cfg.get("avg_mode", None) is not None and mode == "mimo_sar":
+        motion_mode, warning = _motion_mode_from_legacy_avg_mode(bp_cfg.get("avg_mode"))
+        warnings.append(str(warning))
+    else:
+        motion_mode = _motion_mode_normalize(_pick(motion_mode_raw, "static_zero_doppler"))
     use_virtual_antennas = _to_bool(
         "offline_config: bp.use_virtual_antennas",
         _pick(bp_cfg.get("use_virtual_antennas"), True),
@@ -614,12 +803,30 @@ def _read_bp_runtime_cfg(offline_config_path: str | Path) -> dict[str, Any]:
     if mode == "mimo_sar" and use_virtual_antennas and virtual_ant_pitch_m <= 0.0:
         raise ValueError("offline_config: bp.virtual_ant_pitch_m deve essere > 0 in mimo_sar")
 
+    wavelength_m = _resolve_wavelength_m(fallback_cfg)
+    tx_offsets_m = _resolve_bp_offsets_m(
+        bp_cfg,
+        key_root="tx_offsets",
+        expected_len=max(1, int(_pick(cfg.get("capture", {}).get("tx", None), fallback_cfg.get("capture", {}).get("tx", 2)))),
+        wavelength_m=float(wavelength_m),
+    )
+    rx_offsets_m = _resolve_bp_offsets_m(
+        bp_cfg,
+        key_root="rx_offsets",
+        expected_len=max(1, int(_pick(cfg.get("capture", {}).get("rx", None), fallback_cfg.get("capture", {}).get("rx", 4)))),
+        wavelength_m=float(wavelength_m),
+    )
+
     return {
         "mode": mode,
         "avg_mode": avg_mode,
+        "motion_mode": motion_mode,
         "use_virtual_antennas": bool(use_virtual_antennas),
         "coherent_sum": bool(coherent_sum),
         "virtual_ant_pitch_m": float(virtual_ant_pitch_m),
+        "tx_offsets_m": None if tx_offsets_m is None else tx_offsets_m.astype(np.float32, copy=False),
+        "rx_offsets_m": None if rx_offsets_m is None else rx_offsets_m.astype(np.float32, copy=False),
+        "warnings": warnings,
     }
 
 
@@ -627,7 +834,6 @@ def _resolve_effective_avg_mode(
     requested_avg_mode: AvgMode,
     *,
     bp_mode: BpMode,
-    coherent_sum: bool,
 ) -> tuple[AvgMode, str | None]:
     if bp_mode == "sar_only":
         if requested_avg_mode != "both":
@@ -636,14 +842,50 @@ def _resolve_effective_avg_mode(
                 f"[OFFLINE WARN] avg_mode={requested_avg_mode} ignored because bp.mode=sar_only collapses snapshots inside BP; forcing avg_mode=both to match current output.",
             )
         return "both", None
-    if coherent_sum:
-        if requested_avg_mode != "both":
-            return (
-                "both",
-                f"[OFFLINE WARN] avg_mode={requested_avg_mode} ignored because bp.coherent_sum=true collapses snapshots coherently inside BP; forcing avg_mode=both to match current output.",
-            )
-        return "both", None
     return requested_avg_mode, None
+
+
+def _resolve_offline_mimo_geometry(
+    offline_config_path: str | Path,
+    fallback_capture_cfg: str | Path,
+    *,
+    tx_i: int,
+    rx_i: int,
+    use_virtual_antennas: bool,
+    virtual_ant_pitch_m: float,
+    tx_offsets_override_m: np.ndarray | None,
+    rx_offsets_override_m: np.ndarray | None,
+) -> dict[str, Any]:
+    if tx_i <= 0 or rx_i <= 0:
+        raise ValueError(f"tx/rx non validi per geometria mimo: tx={tx_i}, rx={rx_i}")
+
+    fallback_cfg = _load_yaml_file(Path(fallback_capture_cfg))
+    if not bool(use_virtual_antennas):
+        zeros = np.zeros(int(tx_i * rx_i), dtype=np.float32)
+        return {
+            "x_tx_ant_m": zeros,
+            "x_rx_ant_m": zeros,
+            "geometry_source": "virtual_antennas_disabled",
+        }
+
+    radar_cfg = fallback_cfg.get("radar", {}) or {}
+    c_m_s = _to_float("radar.c", _pick(radar_cfg.get("c"), 3e8), 3e8)
+    fc_hz = _to_float("radar.fc", radar_cfg.get("fc"))
+    x_tx_by_ant, x_rx_by_ant = _build_mimo_geometry(
+        int(tx_i),
+        int(rx_i),
+        fc_hz=float(fc_hz),
+        c_m_s=float(c_m_s),
+        tx_offsets_m=None if tx_offsets_override_m is None else np.asarray(tx_offsets_override_m, dtype=np.float32).reshape(-1),
+        rx_offsets_m=None if rx_offsets_override_m is None else np.asarray(rx_offsets_override_m, dtype=np.float32).reshape(-1),
+    )
+    geometry_source = "config_offsets" if (tx_offsets_override_m is not None or rx_offsets_override_m is not None) else "default_iwr1443boost_azimuth"
+
+    return {
+        "x_tx_ant_m": x_tx_by_ant.astype(np.float32, copy=False),
+        "x_rx_ant_m": x_rx_by_ant.astype(np.float32, copy=False),
+        "geometry_source": geometry_source,
+    }
 
 
 # ---------------------------------------------------------------------
@@ -663,10 +905,29 @@ def _offline_reader_worker(
     shm_cleanup_transferred = False
     try:
         reader = SARReader(offline_config_path=offline_config_path, fallback_capture_cfg=fallback_capture_cfg)
-        bp_runtime_cfg = _read_bp_runtime_cfg(offline_config_path)
+        bp_runtime_cfg = _read_bp_runtime_cfg(offline_config_path, fallback_capture_cfg)
         fft_workers = _read_fft_workers(fallback_capture_cfg)
         bp_mode: BpMode = bp_runtime_cfg["mode"]
         data = reader.load(keep_raw=False)
+
+        mimo_geometry = None
+        if bp_mode == "mimo_sar":
+            mimo_geometry = _resolve_offline_mimo_geometry(
+                offline_config_path,
+                fallback_capture_cfg,
+                tx_i=int(data.tx),
+                rx_i=int(data.rx),
+                use_virtual_antennas=bool(bp_runtime_cfg["use_virtual_antennas"]),
+                virtual_ant_pitch_m=float(bp_runtime_cfg["virtual_ant_pitch_m"]),
+                tx_offsets_override_m=bp_runtime_cfg.get("tx_offsets_m"),
+                rx_offsets_override_m=bp_runtime_cfg.get("rx_offsets_m"),
+            )
+            warning = mimo_geometry.get("warning", None)
+            if warning:
+                print(str(warning))
+
+        for warning in bp_runtime_cfg.get("warnings", []):
+            print(str(warning))
 
         if bp_mode == "mimo_sar":
             # MIMO-SAR: preserva asse antenna [pos, frame, loop, ant, sample].
@@ -690,12 +951,17 @@ def _offline_reader_worker(
             "x_start_cfg": int(reader.config.x_start),
             "x_end_cfg": int(reader.config.x_end),
             "bp_mode": str(bp_mode),
+            "bp_motion_mode": str(bp_runtime_cfg["motion_mode"]),
             "bp_virtual_ant_pitch_m": float(bp_runtime_cfg["virtual_ant_pitch_m"]),
             "bp_use_virtual_antennas": bool(bp_runtime_cfg["use_virtual_antennas"]),
             "bp_coherent_sum": bool(bp_runtime_cfg["coherent_sum"]),
             "tx": int(data.tx),
             "rx": int(data.rx),
         }
+        if mimo_geometry is not None:
+            msg["bp_x_tx_ant_m"] = np.asarray(mimo_geometry["x_tx_ant_m"], dtype=np.float32)
+            msg["bp_x_rx_ant_m"] = np.asarray(mimo_geometry["x_rx_ant_m"], dtype=np.float32)
+            msg["bp_geometry_source"] = str(mimo_geometry["geometry_source"])
         _queue_put_latest(reader_to_dsp_q, msg)
         shm_cleanup_transferred = True
         _queue_put_latest(
@@ -705,6 +971,8 @@ def _offline_reader_worker(
                 "positions": int(data.positions.size),
                 "frames_per_pos": int(data.n_frames_per_position),
                 "bp_mode": str(bp_mode),
+                "motion_mode": str(bp_runtime_cfg["motion_mode"]),
+                "geometry_source": None if mimo_geometry is None else str(mimo_geometry["geometry_source"]),
             },
         )
     except Exception as exc:
@@ -770,11 +1038,13 @@ def _offline_dsp_worker(
     fs_hz: float,
     slope_hz_s: float,
     fc_hz: float,
+    fft_workers: int,
     nfft_range: int,
     range_max_m: float,
     crossrange_max_m: float,
     x_pitch_m: float,
     default_avg_mode: str,
+    default_motion_mode: str,
     phase_sign: int,
 ) -> None:
     shm_range_fft = None
@@ -825,22 +1095,23 @@ def _offline_dsp_worker(
             raise ValueError(f"init_msg: bp_virtual_ant_pitch_m non valido: {raw_virtual_pitch!r}") from exc
         if bp_mode == "mimo_sar" and use_virtual_antennas and virtual_ant_pitch_m <= 0.0:
             raise ValueError("bp_virtual_ant_pitch_m deve essere > 0 in mimo_sar")
+        motion_mode_requested: MotionMode = _motion_mode_normalize(default_motion_mode)
 
-        x_ant_m = np.zeros(1, dtype=np.float32)
+        tx_i = max(1, int(_pick(init_msg.get("tx"), 2)))
+        rx_i = max(1, int(_pick(init_msg.get("rx"), 4)))
+        x_tx_ant_m = np.zeros(1, dtype=np.float32)
+        x_rx_ant_m = np.zeros(1, dtype=np.float32)
+        geometry_source = "sar_only"
         n_ant_used = 1
         if bp_mode == "mimo_sar":
+            x_tx_ant_m = np.asarray(init_msg.get("bp_x_tx_ant_m"), dtype=np.float32).reshape(-1)
+            x_rx_ant_m = np.asarray(init_msg.get("bp_x_rx_ant_m"), dtype=np.float32).reshape(-1)
+            geometry_source = str(_pick(init_msg.get("bp_geometry_source"), "unknown"))
             n_ant_data = int(range_fft_data.shape[3])
-            tx_i = max(1, int(_pick(init_msg.get("tx"), 2)))
-            rx_i = max(1, int(_pick(init_msg.get("rx"), 4)))
-            n_ant_cfg = tx_i * rx_i
-            if n_ant_cfg != n_ant_data:
-                n_ant_cfg = n_ant_data
-            x_ant_m = _build_virtual_array_x_offsets(
-                n_ant_cfg,
-                pitch_m=float(virtual_ant_pitch_m),
-                use_virtual_antennas=bool(use_virtual_antennas),
-            )
-            n_ant_used = int(x_ant_m.size)
+            if x_tx_ant_m.size != n_ant_data or x_rx_ant_m.size != n_ant_data:
+                raise ValueError("bp_x_tx_ant_m/bp_x_rx_ant_m size != asse antenna range_fft")
+            n_ant_used = int(n_ant_data)
+            motion_mode_requested = _motion_mode_normalize(_pick(init_msg.get("bp_motion_mode"), default_motion_mode))
 
         n_bins_total = int(range_fft_data.shape[-1])
         dr_m = float(c_m_s) * float(fs_hz) / (2.0 * float(slope_hz_s) * float(nfft_range))
@@ -874,13 +1145,10 @@ def _offline_dsp_worker(
         if x_end < x_start:
             x_start, x_end = x_end, x_start
         avg_mode_requested: AvgMode = _avg_mode_normalize(default_avg_mode)
-        avg_mode, avg_mode_warning = _resolve_effective_avg_mode(
-            avg_mode_requested,
-            bp_mode=bp_mode,
-            coherent_sum=bool(coherent_sum),
-        )
+        avg_mode, avg_mode_warning = _resolve_effective_avg_mode(avg_mode_requested, bp_mode=bp_mode)
         if avg_mode_warning:
             print(avg_mode_warning)
+        motion_mode = motion_mode_requested
 
         _queue_put_latest(
             status_q,
@@ -892,12 +1160,15 @@ def _offline_dsp_worker(
                 "x_end": x_end,
                 "avg_mode": avg_mode,
                 "avg_mode_requested": str(avg_mode_requested),
+                "motion_mode": str(motion_mode),
                 "phase_sign": int(phase_sign_i),
                 "img_h": int(gui_h),
                 "img_w": int(gui_w),
                 "dr_m": float(dr_m),
                 "bp_mode": str(bp_mode),
                 "virtual_antennas": int(n_ant_used),
+                "geometry_source": str(geometry_source),
+                "doppler_bins_used": 1 if motion_mode == "static_zero_doppler" else max(1, int(range_fft_data.shape[2])),
             },
         )
 
@@ -931,22 +1202,31 @@ def _offline_dsp_worker(
                     pass
                 if x_end < x_start:
                     x_start, x_end = x_end, x_start
+                motion_mode_new = cmd.get("motion_mode", None)
                 avg_mode_new = cmd.get("avg_mode", None)
-                if avg_mode_new is not None:
+                if motion_mode_new is not None:
+                    motion_mode_requested = _motion_mode_normalize(str(motion_mode_new))
+                elif avg_mode_new is not None and bp_mode == "mimo_sar":
+                    motion_mode_requested, warning = _motion_mode_from_legacy_avg_mode(avg_mode_new)
+                    print(str(warning))
+                avg_mode_new = cmd.get("avg_mode", None)
+                if avg_mode_new is not None and bp_mode == "sar_only":
                     avg_mode_requested = _avg_mode_normalize(str(avg_mode_new))
-                    avg_mode, avg_mode_warning = _resolve_effective_avg_mode(
-                        avg_mode_requested,
-                        bp_mode=bp_mode,
-                        coherent_sum=bool(coherent_sum),
-                    )
+                    avg_mode, avg_mode_warning = _resolve_effective_avg_mode(avg_mode_requested, bp_mode=bp_mode)
                     if avg_mode_warning:
                         print(avg_mode_warning)
+                motion_mode = motion_mode_requested
                 dirty = True
 
             if stop_evt.is_set():
                 break
 
-            job_key = (int(x_start), int(x_end), str(avg_mode))
+            job_key = (
+                int(x_start),
+                int(x_end),
+                str(avg_mode) if bp_mode == "sar_only" else str(motion_mode),
+                bool(coherent_sum),
+            )
             if dirty or job_key != last_job_key or got_cmd:
                 t0 = time.perf_counter()
 
@@ -957,23 +1237,42 @@ def _offline_dsp_worker(
                 x_pos_m_sel = x_pos_m_full[sel_idx]
                 if bp_mode == "mimo_sar":
                     range_fft_sel = range_fft_data[sel_idx, :, :, :, :max_bin]
-                    reduced = _reduce_avg_mode(range_fft_sel, avg_mode)
-                    if reduced.ndim != 4:
-                        raise ValueError(f"reduce_avg_mode mimo_sar shape non valido: {reduced.shape!r}")
+                    n_pos_sel, n_frames_sel, n_loops_sel, n_ant_sel, n_bins_sel = range_fft_sel.shape
+                    if int(n_ant_sel) != int(tx_i) * int(rx_i):
+                        raise ValueError(
+                            f"asse antenna mimo={n_ant_sel} non coerente con tx/rx={tx_i}/{rx_i}"
+                        )
+                    raw_mimo = range_fft_sel.reshape(
+                        int(n_pos_sel),
+                        int(n_frames_sel),
+                        int(n_loops_sel),
+                        int(tx_i),
+                        int(rx_i),
+                        int(n_bins_sel),
+                    ).astype(np.complex64, copy=False)
+                    prepared = _prepare_mimo_snapshots(
+                        raw_mimo,
+                        n_tx=int(tx_i),
+                        motion_mode=motion_mode,
+                        window_doppler=None,
+                    )
                     img_db = _back_projection_image_mimo(
-                        reduced,
+                        prepared,
                         x_pos_m_sel,
-                        x_ant_m,
+                        x_tx_ant_m,
+                        x_rx_ant_m,
                         x_grid,
                         y_grid,
                         dr_m=dr_m,
                         fc_hz=fc_hz,
                         c_m_s=c_m_s,
                         max_bin=max_bin,
+                        motion_mode=motion_mode,
                         phase_sign=phase_sign_i,
                         chunk_size=16384,
                         coherent_sum=bool(coherent_sum),
                     )
+                    doppler_bins_used = 1 if motion_mode == "static_zero_doppler" else int(prepared.shape[2])
                 else:
                     range_fft_sel = range_fft_data[sel_idx, :, :, :max_bin]
                     reduced = _reduce_avg_mode(range_fft_sel, avg_mode)
@@ -991,6 +1290,7 @@ def _offline_dsp_worker(
                         phase_sign=phase_sign_i,
                         chunk_size=16384,
                     )
+                    doppler_bins_used = 1
 
                 with gui_lock:
                     prev_idx = int(gui_latest_idx.value)
@@ -1015,8 +1315,11 @@ def _offline_dsp_worker(
                         "x_end": int(x_end),
                         "avg_mode": str(avg_mode),
                         "avg_mode_requested": str(avg_mode_requested),
+                        "motion_mode": str(motion_mode),
                         "n_pos_used": int(sel_idx.size),
                         "bp_mode": str(bp_mode),
+                        "geometry_source": str(geometry_source),
+                        "doppler_bins_used": int(doppler_bins_used),
                         "elapsed_ms": float((t1 - t0) * 1000.0),
                     },
                 )
@@ -1066,6 +1369,7 @@ class OfflineBPRuntime:
         image_w: int,
         x_pitch_m: float | None = None,
         default_avg_mode: str | None = None,
+        default_motion_mode: str | None = None,
         phase_sign: int | None = None,
     ) -> None:
         self.offline_config_path = str(offline_config_path)
@@ -1079,9 +1383,13 @@ class OfflineBPRuntime:
         self.crossrange_max_m = float(crossrange_max_m)
         self.image_h = int(image_h)
         self.image_w = int(image_w)
+        self.fft_workers = int(_read_fft_workers(self.fallback_capture_cfg))
         self.x_pitch_m = float(x_pitch_m) if x_pitch_m is not None else _read_x_pitch_m(self.offline_config_path)
         self.default_avg_mode = _avg_mode_normalize(
             _pick(default_avg_mode, _read_default_avg_mode(self.offline_config_path))
+        )
+        self.default_motion_mode = _motion_mode_normalize(
+            _pick(default_motion_mode, _read_default_motion_mode(self.offline_config_path))
         )
         self.phase_sign = _phase_sign_normalize(
             _pick(phase_sign, _read_phase_sign(self.offline_config_path)),
@@ -1169,11 +1477,13 @@ class OfflineBPRuntime:
                 "fs_hz": float(self.fs_hz),
                 "slope_hz_s": float(self.slope_hz_s),
                 "fc_hz": float(self.fc_hz),
+                "fft_workers": int(self.fft_workers),
                 "nfft_range": int(self.nfft_range),
                 "range_max_m": float(self.range_max_m),
                 "crossrange_max_m": float(self.crossrange_max_m),
                 "x_pitch_m": float(self.x_pitch_m),
                 "default_avg_mode": str(self.default_avg_mode),
+                "default_motion_mode": str(self.default_motion_mode),
                 "phase_sign": int(self.phase_sign),
             },
         )
@@ -1250,6 +1560,7 @@ class OfflineBPRuntime:
         *,
         x_start: int | None = None,
         x_end: int | None = None,
+        motion_mode: str | None = None,
         avg_mode: str | None = None,
     ) -> None:
         if not self._started or self._cmd_q is None:
@@ -1258,6 +1569,7 @@ class OfflineBPRuntime:
             "type": "update",
             "x_start": x_start,
             "x_end": x_end,
+            "motion_mode": None if motion_mode is None else _motion_mode_normalize(motion_mode),
             "avg_mode": None if avg_mode is None else _avg_mode_normalize(avg_mode),
         }
         self._put_latest_cmd(cmd)

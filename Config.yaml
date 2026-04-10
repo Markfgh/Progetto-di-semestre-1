@@ -14,7 +14,7 @@ capture:
 
 fft:
   nfft_range: 512 # Typical: 256 or 512. Higher = finer range bins, more CPU.
-  nfft_angle: 512 # Typical: 128/256/512. Higher = finer angular grid, more CPU.
+  nfft_angle: 256 # Typical: 128/256/512. Higher = finer angular grid, more CPU.
   workers: 8      # FFT worker threads.
 
 display:
@@ -39,7 +39,7 @@ dsp:
   window_range: hanning # Options: none, rectangular, hanning, hamming, blackman.
   window_doppler: hanning # Applied on slow-time chirps before Doppler FFT.
   window_angle: hanning  # Options: none, rectangular, hanning, hamming, blackman.
-  zero_after_range_fft_bins: 0 # If > 0, zeroes the first N range bins globally right after range FFT.
+  zero_after_range_fft_bins: 6 # If > 0, zeroes the first N range bins globally right after range FFT.
   
   
   
@@ -49,7 +49,7 @@ dsp:
     vector_imag: [0.000000, -0.029159, -0.338830, -0.248224, 0.264009, 0.195503, -0.077414, -0.032823]
 
   mean_before_range_fft:
-    enabled: false
+    enabled: true # Keep enabled for a stable DC removal, especially in the presence of strong static targets.  
     axes: [sample] # Options: frame, loop, tx, sample, range_bin, rx.
                    # Suggested for realtime: [sample] (stable DC removal).
 
@@ -65,7 +65,7 @@ dsp:
     doppler_zero_notch: false # In doppler_fft mode, can suppress static center line.
 
   background_subtraction:
-    enabled: false # Legacy/global background subtraction.
+    enabled: false # Legacy/global background subtraction with a single shared background state.
     mode: ema # Options: ema, running_mean, window_mean, frozen.
     alpha: 0.02 # EMA speed: lower=more stable, higher=faster adaptation.
     init_frames: 40 # Warmup frames before model init.
@@ -116,7 +116,7 @@ dsp:
       alpha: 0.02
       init_frames: 40
       window_frames: 20
-      clamp_positive_only: true
+      clamp_positive_only: false
 
     loop_average_after_background:
       enabled: false # Static-detection branch only; skipped if slow_time.mode=doppler_fft.
@@ -128,20 +128,20 @@ dsp:
 
     slow_time:
       enabled: false # Supported here only with mode: none, mean_subtraction, highpass.
-      mode: highpass # Options: none, mean_subtraction, highpass. Doppler FFT is not supported here.
-      highpass_beta: 0.9
+      mode: mean_subtraction # Options: none, mean_subtraction, highpass. Doppler FFT is not supported here.
+      highpass_beta: 0.92
 
     background_subtraction:
-      enabled: false # Applied before the moving branch Doppler FFT, with its own background state.
-      mode: ema
+      enabled: true # Applied before the moving branch Doppler FFT, with its own background state.
+      mode: frozen # Options: ema, running_mean, window_mean, frozen.
       alpha: 0.02
       init_frames: 40
       window_frames: 20
-      clamp_positive_only: true
+      clamp_positive_only: false
 
   angle_processing:
     mode: fft # Options: fft, bartlett, mvdr. fft and bartlett honor aggregation/frame_index/loop_index; mvdr always uses all available frame x loop snapshots.
-    mvdr_diagonal_loading: 0.005 # Used only if mode=mvdr. Diagonal loading factor on the covariance matrix. Typical: 0.005..0.05.
+    mvdr_diagonal_loading: 0.02 # Stabilizza la covarianza per scene statiche (range tipico 0.01 - 0.05)
     aggregation: frame_loop # fft/bartlett only: frame_loop=all frames+loops, frame=all frames at loop_index, loop=all loops at frame_index, none=single [frame_index, loop_index].
     frame_index: 0 # Used only by fft/bartlett when aggregation is loop or none.
     loop_index: 0 # Used only by fft/bartlett when aggregation is frame or none.
@@ -158,32 +158,32 @@ antenna:
   virtual_array_order:   [0, 1, 2, 3, 4, 5, 6, 7]
   virtual_array_phase_centers_lambda: [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5] # null -> default half-lambda ULA, standard for IWR1443BOOST 2Tx/4Rx azimuth.
   virtual_array_phase_centers_m: null # Alternative unit in meters if radar.fc is valid.
-  angle_axis_sign: 1 # Set to -1 only if left/right is still mirrored because of mounting or channel-order convention.
+  angle_axis_sign: -1 # Set to -1 only if left/right is still mirrored because of mounting or channel-order convention.
 
 tracking:
   enabled: false # Enables/disables the multi-object tracker.
   dt_s: 0.04096 # Nominal frame period fallback [s]; the tracker now prefers real timestamp/sequence deltas when available.
   model: kalman_cv_2d # Dynamic model in use: constant-velocity 2D Kalman filter (x, y, vx, vy).
   max_tracks: 8 # Maximum number of live tracks kept at the same time.
-  min_hits_to_confirm: 6 # Required matches before a track changes from tentative to confirmed.
-  max_missed_tentative: 1 # How many unmatched frames are allowed for a tentative track.
-  max_missed_confirmed: 25 # How many unmatched frames are allowed for a confirmed track.
+  min_hits_to_confirm: 3 # Required matches before a track changes from tentative to confirmed.
+  max_missed_tentative: 2 # How many unmatched frames are allowed for a tentative track.
+  max_missed_confirmed: 18 # How many unmatched frames are allowed for a confirmed track.
   max_track_age: 0 # Maximum age in frames; 0 disables age-based deletion.
-  gating_xy_m: 1.20 # Maximum XY distance [m] allowed to associate a detection with a track.
-  gating_doppler_mps: 0.40 # Maximum doppler difference [m/s] allowed during association.
+  gating_xy_m: 0.80 # Maximum XY distance [m] allowed to associate a detection with a track.
+  gating_doppler_mps: 0.35 # Maximum doppler difference [m/s] allowed during association.
   process_noise_pos: 0.2 # Process noise on position: higher = more flexible but less stable tracks.
   process_noise_vel: 0.15 # Process noise on velocity: higher = Kalman accepts faster velocity changes.
-  measurement_noise_xy: 0.12 # Measurement noise on x/y [m]: higher = less trust in each instant detection.
-  moving_speed_threshold_mps: 0.18 # Estimated speed threshold above which a target tends to be classified as moving.
-  stopped_speed_threshold_mps: 0.16 # Estimated speed threshold below which a target tends to be classified as stopped.
+  measurement_noise_xy: 0.10 # Measurement noise on x/y [m]: higher = less trust in each instant detection.
+  moving_speed_threshold_mps: 0.22 # Estimated speed threshold above which a target tends to be classified as moving.
+  stopped_speed_threshold_mps: 0.10 # Estimated speed threshold below which a target tends to be classified as stopped.
   doppler_moving_threshold_mps: 0.15 # Alternative absolute doppler threshold used to classify a target as moving.
-  motion_confirm_frames_moving: 3 # Number of consistent frames needed to confirm the moving state.
-  motion_confirm_frames_stopped: 2 # Number of consistent frames needed to confirm the stopped state.
-  stopped_memory_s: 20.0 # Keeps a stopped confirmed track alive longer when the moving branch drops it.
-  stopped_resume_gate_m: 1.0 # If the target restarts near the stop point, reacquire the same track.
-  stop_position_alpha: 0.6 # 0..1 smoothing applied to the stored stop position; higher = faster updates.
-  birth_min_separation_m: 0.5 # Minimum distance from existing tracks to avoid duplicate new-track allocation.
-  use_doppler_in_cost: false # Use doppler in the association cost, not only XY distance.
+  motion_confirm_frames_moving: 2 # Number of consistent frames needed to confirm the moving state.
+  motion_confirm_frames_stopped: 3 # Number of consistent frames needed to confirm the stopped state.
+  stopped_memory_s: 5.0 # Keeps a stopped confirmed track alive longer when the moving branch drops it.
+  stopped_resume_gate_m: 0.8 # If the target restarts near the stop point, reacquire the same track.
+  stop_position_alpha: 0.35 # 0..1 smoothing applied to the stored stop position; higher = faster updates.
+  birth_min_separation_m: 0.35 # Minimum distance from existing tracks to avoid duplicate new-track allocation.
+  use_doppler_in_cost: true # Use doppler in the association cost, not only XY distance.
   history_len: 12 # Number of past positions stored for each track.
   debug_log: false # If true, prints tracker stats and details to the console.
   # Legacy aliases still accepted by the parser:
@@ -192,29 +192,29 @@ tracking:
 
 detection_static:
   enabled: false
-  threshold_mode: absolute # Options: relative, absolute.
-  threshold_db: 8 # Relative mode: threshold = max_db + threshold_db.
-  localmax_range_bins: 5 # NMS neighborhood in range bins.
-  localmax_angle_bins: 20 # NMS neighborhood in angle bins.
+  threshold_mode: relative # Options: relative, absolute.
+  threshold_db: -6 # Relative mode: threshold = max_db + threshold_db.
+  localmax_range_bins: 4 # NMS neighborhood in range bins.
+  localmax_angle_bins: 12 # NMS neighborhood in angle bins.
   min_power_db: 8 # Absolute safety floor (also in relative mode).
-  max_detections: 8 # Cap per frame.
+  max_detections: 12 # Cap per frame.
 
 detection_moving:
   enabled: false # Moving target detection is more computationally expensive due to the Doppler FFT, so disabled by default.
   threshold_mode: relative # Options: relative, absolute.
-  threshold_db: 0
-  localmax_range_bins: 12
-  localmax_doppler_bins: 6
+  threshold_db: -7
+  localmax_range_bins: 4
+  localmax_doppler_bins: 3
   zero_doppler_exclusion_bins: 0 # Keep near-zero Doppler so a moving target can be retained when it stops.
-  min_power_db: 10
-  max_detections: 8
+  min_power_db: 8
+  max_detections: 12
 
 fusion:
   enabled: false
-  merge_xy_m: 0.25
+  merge_xy_m: 0.30
   merge_range_m: 0.20
-  merge_angle_deg: 3.0
-  prefer_moving_when_doppler_valid: false # If true, the fused track state is set to moving when the moving branch has a valid detection, even if the static branch has a stronger detection.
+  merge_angle_deg: 4.0
+  prefer_moving_when_doppler_valid: true # If true, the fused track state is set to moving when the moving branch has a valid detection, even if the static branch has a stronger detection.
 
 rx:
   stall_timeout_s: 2.0

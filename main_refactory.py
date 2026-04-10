@@ -1348,7 +1348,7 @@ def main():
         print(
             f"[OFFLINE] ready pos={offline_info.get('pos_min')}..{offline_info.get('pos_max')} "
             f"default={offline_info.get('x_start')}..{offline_info.get('x_end')} "
-            f"avg={offline_info.get('avg_mode')}"
+            f"motion={offline_info.get('motion_mode')}"
         )
     except Exception as exc:
         offline_error = str(exc)
@@ -1452,7 +1452,7 @@ def main():
     PROC_IMG_SERIES_TAG = "proc_img_series"
     PROC_IN_XSTART = "proc_in_xstart"
     PROC_IN_XEND = "proc_in_xend"
-    PROC_AVG_MODE = "proc_avg_mode"
+    PROC_MOTION_MODE = "proc_motion_mode"
     PROC_TXT_STATUS = "proc_txt_status"
     PROC_IN_VMIN = "proc_in_vmin"
     PROC_IN_VMAX = "proc_in_vmax"
@@ -1545,10 +1545,10 @@ def main():
     off_x_end = int(offline_info.get("x_end", off_pos_max)) if offline_info else off_pos_max
     if off_x_end < off_x_start:
         off_x_start, off_x_end = off_x_end, off_x_start
-    off_avg_mode = str(offline_info.get("avg_mode", "both")) if offline_info else "both"
-    off_avg_modes = ["both", "loop", "frame", "none"]
-    if off_avg_mode not in off_avg_modes:
-        off_avg_mode = "both"
+    off_motion_mode = str(offline_info.get("motion_mode", "static_zero_doppler")) if offline_info else "static_zero_doppler"
+    off_motion_modes = ["static_zero_doppler", "all_doppler_incoherent"]
+    if off_motion_mode not in off_motion_modes:
+        off_motion_mode = "static_zero_doppler"
     off_norm_enabled = True
     if off_norm_enabled:
         off_vmin = float(VMIN_NORM)
@@ -1573,7 +1573,7 @@ def main():
     off_ui_pending = {
         "x_start": int(off_x_start),
         "x_end": int(off_x_end),
-        "avg_mode": str(off_avg_mode),
+        "motion_mode": str(off_motion_mode),
         "vmin": float(off_vmin),
         "vmax": float(off_vmax),
         "rmax": float(off_rmax),
@@ -1887,9 +1887,9 @@ def main():
         except (TypeError, ValueError):
             return
 
-        avg_mode = str(dpg.get_value(PROC_AVG_MODE)).strip().lower()
-        if avg_mode not in off_avg_modes:
-            avg_mode = "both"
+        motion_mode = str(dpg.get_value(PROC_MOTION_MODE)).strip().lower()
+        if motion_mode not in off_motion_modes:
+            motion_mode = "static_zero_doppler"
 
         x_start_cl = max(off_pos_min, min(off_pos_max, x_start))
         x_end_cl = max(off_pos_min, min(off_pos_max, x_end))
@@ -1917,9 +1917,9 @@ def main():
         off_ui_pending["xmax"] = float(xmax_cl)
         off_ui_pending["x_start"] = int(x_start_cl)
         off_ui_pending["x_end"] = int(x_end_cl)
-        off_ui_pending["avg_mode"] = str(avg_mode)
+        off_ui_pending["motion_mode"] = str(motion_mode)
         off_status_text = (
-            f"Pending update | x={x_start_cl}:{x_end_cl} | avg={avg_mode} | "
+            f"Pending update | x={x_start_cl}:{x_end_cl} | motion={motion_mode} | "
             f"v={vmin:.1f}:{vmax:.1f}"
         )
         if dpg.does_item_exist(PROC_TXT_STATUS):
@@ -2274,10 +2274,10 @@ def main():
                             on_enter=False,
                         )
                         dpg.add_combo(
-                            off_avg_modes,
-                            label="Averaging",
-                            tag=PROC_AVG_MODE,
-                            default_value=str(off_avg_mode),
+                            off_motion_modes,
+                            label="Motion mode",
+                            tag=PROC_MOTION_MODE,
+                            default_value=str(off_motion_mode),
                             width=220,
                             callback=_apply_offline_params,
                         )
@@ -2325,7 +2325,7 @@ def main():
         )
 
     if offline_runtime is None:
-        for tag in (PROC_IN_XSTART, PROC_IN_XEND, PROC_AVG_MODE):
+        for tag in (PROC_IN_XSTART, PROC_IN_XEND, PROC_MOTION_MODE):
             if dpg.does_item_exist(tag):
                 dpg.configure_item(tag, enabled=False)
     else:
@@ -2490,7 +2490,7 @@ def main():
                         offline_runtime.update_params(
                             x_start=int(off_ui_pending["x_start"]),
                             x_end=int(off_ui_pending["x_end"]),
-                            avg_mode=str(off_ui_pending["avg_mode"]),
+                            motion_mode=str(off_ui_pending["motion_mode"]),
                         )
                     except Exception as e:
                         off_status_text = f"ERR update: {e}"
@@ -2505,7 +2505,9 @@ def main():
                     proc_frame[:, :] = frame_db
                     off_status_text = (
                         f"x={info.get('x_start')}:{info.get('x_end')} | "
-                        f"avg={info.get('avg_mode')} | "
+                        f"motion={info.get('motion_mode')} | "
+                        f"dop={info.get('doppler_bins_used', 'n/a')} | "
+                        f"geom={info.get('geometry_source', 'n/a')} | "
                         f"pos={info.get('n_pos_used', 'n/a')} | "
                         f"BP={float(info.get('elapsed_ms', 0.0)):.1f} ms"
                     )

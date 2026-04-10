@@ -1,7 +1,7 @@
 data:
   # Puoi mettere direttamente una run: logs/run_YYYYMMDD_HHMMSS
   # Se lasci "logs", SARReader prende automaticamente l'ultima run con capture_pos*.bin.
-  input_dir: C:\py\RealTimePocessing\logs\run_20260401_111047
+  input_dir: logs
 
 scan:
   x_start: 1
@@ -12,8 +12,13 @@ scan:
 bp:
   mode: mimo_sar # opzioni: sar_only | mimo_sar
   phase_sign: -1 # usa +1 se vuoi invertire il verso di fase
-  avg_mode: both # gestito dal controller runtime (frame/loop), mai antenna in mimo_sar
-  virtual_ant_pitch_m: 0.001948 # prima approssimazione phase-center: array lineare uniforme
+  motion_mode: static_zero_doppler # opzioni: static_zero_doppler | all_doppler_incoherent
+  avg_mode: both # deprecato in mimo_sar: se motion_mode manca, forza static_zero_doppler
+  tx_offsets_lambda: null # override opzionale coordinate TX fisiche lungo X in lambda
+  rx_offsets_lambda: null # override opzionale coordinate RX fisiche lungo X in lambda
+  tx_offsets_m: null # alternativa in metri
+  rx_offsets_m: null # alternativa in metri
+  virtual_ant_pitch_m: 0.001948 # fallback legacy phase-center, non piu' geometria primaria in mimo_sar
   use_virtual_antennas: true
   coherent_sum: true
 
