@@ -368,6 +368,7 @@ def _apply_process_affinity(label: str, pid: int, cpus, enabled: bool) -> None:
 
 
 from offline_processing import OfflineBPRuntime
+from mmwave_studio_bridge import DCA1000Config, MmwaveStudioBridge, MmwaveStudioError, RadarConnectionConfig
 from realtime_dsp import (
     RealtimeDSPConfig,
     build_angle_axis_deg,
@@ -562,6 +563,7 @@ def radar_rx(
     cap_saved: Synchronized,
     lost_pkts: Synchronized,
     rx_pkts: Synchronized,
+    rx_last_packet_time_s: Synchronized,
     rx_put_drops: Synchronized,
     rx_frames_ok: Synchronized,
     stall_events: Synchronized,
@@ -826,6 +828,11 @@ def radar_rx(
             n_bytes, _ = sock.recvfrom_into(packet_mv)
             pkts_local += 1
             recv_perf = time.perf_counter()
+            try:
+                with rx_last_packet_time_s.get_lock():
+                    rx_last_packet_time_s.value = time.time()
+            except Exception:
+                pass
             if recv_perf - t_flush >= 0.1:
                 with rx_pkts.get_lock():
                     rx_pkts.value += pkts_local
@@ -1190,10 +1197,24 @@ def main():
 
     stop_evt = mp.Event()
     sar_pos_counter = Value("L", 0)  # GUI-only counter (pos id generator)
+    mmwave_bridge = MmwaveStudioBridge()
+    mmwave_radar_cfg = RadarConnectionConfig(
+        uart_com_port=3,
+        baudrate=921600,
+        timeout_ms=1000,
+    )
+    mmwave_dca_cfg = DCA1000Config(
+        pc_ip="192.168.33.30",
+        capture_card_ip="192.168.33.180",
+        capture_card_mac="12:34:56:78:90:12",
+        mode_device_type=1,
+        adc_data_path=Path(r"C:\ti\mmwave_studio_02_01_01_00\mmWaveStudio\PostProc\adc_data.bin"),
+    )
 
     # Stats
     lost_pkts = Value("L", 0)
     rx_pkts = Value("L", 0)
+    rx_last_packet_time_s = Value("d", time.time())
     rx_put_drops = Value("L", 0)
     rx_frames_ok = Value("L", 0)
     rx_stall_events = Value("L", 0)
@@ -1234,6 +1255,7 @@ def main():
             cap_saved,
             lost_pkts,
             rx_pkts,
+            rx_last_packet_time_s,
             rx_put_drops,
             rx_frames_ok,
             rx_stall_events,
@@ -1430,6 +1452,10 @@ def main():
     BTN_NORM_TAG = "btn_norm_toggle"
     BTN_FFT_VIEW_TAG = "btn_fft_view"
     BTN_FFT_MODE_TAG = "btn_fft_mode"
+    BTN_MMWAVE_CONNECT_TAG = "btn_mmwave_connect"
+    BTN_MMWAVE_STREAM_TAG = "btn_mmwave_stream"
+    TXT_MMWAVE_STATUS_TAG = "txt_mmwave_status"
+    TXT_MMWAVE_LINKS_TAG = "txt_mmwave_links"
 
     TEX_TAG = "heat_tex"
     HEAT_PLOT_TAG = "heat_plot"
@@ -1600,6 +1626,10 @@ def main():
 
     # 5) Callbacks
     def _shutdown():
+        try:
+            mmwave_bridge.disconnect_hardware()
+        except Exception:
+            pass
         stop_evt.set()
         if offline_runtime is not None:
             try:
@@ -1766,6 +1796,150 @@ def main():
         except Exception:
             pass
         dpg.set_value(TXT_POS_TAG, f"Pos Counter: {pid}")
+
+    def _mmwave_connect_label(connected: bool) -> str:
+        return "mmWave: Disconnect" if connected else "mmWave: Connect"
+
+    def _mmwave_stream_label(streaming: bool) -> str:
+        return "Radar: Stop" if streaming else "Radar: Start"
+
+    mmwave_last_rx_pkt_t = time.time()
+    mmwave_outage_dca_done = False
+    mmwave_outage_heavy_done = False
+    mmwave_auto_rearm_armed = False
+    MMWAVE_RX_IDLE_DCA_REARM_S = 1.00
+    MMWAVE_RX_IDLE_HEAVY_REARM_S = 3.0
+
+    def _sync_mmwave_udp_activity(now_wall: float | None = None) -> float:
+        nonlocal mmwave_last_rx_pkt_t, mmwave_outage_dca_done, mmwave_outage_heavy_done
+        try:
+            with rx_last_packet_time_s.get_lock():
+                shared_last = float(rx_last_packet_time_s.value)
+        except Exception:
+            shared_last = float(mmwave_last_rx_pkt_t)
+        if now_wall is None:
+            now_wall = time.time()
+        if shared_last > float(mmwave_last_rx_pkt_t):
+            mmwave_last_rx_pkt_t = float(shared_last)
+            mmwave_outage_dca_done = False
+            mmwave_outage_heavy_done = False
+        return float(now_wall - mmwave_last_rx_pkt_t)
+
+    def _refresh_mmwave_controls() -> None:
+        state = mmwave_bridge.get_gui_state()
+        if dpg.does_item_exist(BTN_MMWAVE_CONNECT_TAG):
+            dpg.configure_item(BTN_MMWAVE_CONNECT_TAG, label=_mmwave_connect_label(state.connected))
+        if dpg.does_item_exist(BTN_MMWAVE_STREAM_TAG):
+            dpg.configure_item(BTN_MMWAVE_STREAM_TAG, label=_mmwave_stream_label(state.streaming))
+            dpg.configure_item(BTN_MMWAVE_STREAM_TAG, enabled=bool(state.connected))
+        if dpg.does_item_exist(TXT_MMWAVE_STATUS_TAG):
+            status_text = state.last_error if state.last_error else state.last_message
+            if not status_text:
+                status_text = "mmWave Studio bridge idle"
+            dpg.set_value(TXT_MMWAVE_STATUS_TAG, status_text)
+        if dpg.does_item_exist(TXT_MMWAVE_LINKS_TAG):
+            udp_idle_s = max(0.0, _sync_mmwave_udp_activity())
+            udp_receiving = bool(state.streaming and udp_idle_s <= MMWAVE_RX_IDLE_DCA_REARM_S)
+            link_lines = [
+                "LINK STATUS",
+                f"{'RSTD':<18}{'ON' if state.rstd_connected else 'OFF'}",
+                f"{'Radar link':<18}{'ON' if state.radar_connected else 'OFF'}",
+                f"{'DCA ready':<18}{'ON' if state.dca_ready else 'OFF'}",
+                f"{'Streaming req':<18}{'ON' if state.streaming else 'OFF'}",
+                f"{'UDP receiving':<18}{'ON' if udp_receiving else 'OFF'}",
+                f"{'UDP idle s':<18}{udp_idle_s:>6.1f}",
+                f"{'Last rearm s':<18}{float(state.last_rearm_s):>6.1f}",
+            ]
+            dpg.set_value(TXT_MMWAVE_LINKS_TAG, "\n".join(link_lines))
+
+    def _maybe_rearm_mmwave_stream(now_perf: float) -> None:
+        nonlocal mmwave_last_rx_pkt_t, mmwave_outage_dca_done, mmwave_outage_heavy_done, mmwave_auto_rearm_armed
+        state = mmwave_bridge.get_gui_state()
+        if not mmwave_auto_rearm_armed or not state.connected or not state.streaming:
+            return
+        _ = now_perf
+        idle_s = max(0.0, _sync_mmwave_udp_activity())
+        if (not mmwave_outage_dca_done) and idle_s >= MMWAVE_RX_IDLE_DCA_REARM_S:
+            mmwave_outage_dca_done = True
+            print(f"[gui] mmWave auto-rearm (DCA ARM): UDP idle for {idle_s:.3f}s", flush=True)
+            try:
+                mmwave_bridge.rearm_dca_only(
+                    mmwave_dca_cfg.adc_data_path,
+                    capture_mode=1,
+                    arm_delay_s=0.10,
+                )
+            except MmwaveStudioError as exc:
+                mmwave_bridge.set_status(error=f"Auto DCA-arm failed: {exc}")
+            except Exception as exc:
+                mmwave_bridge.set_status(error=f"Unexpected auto DCA-arm error: {exc}")
+            _refresh_mmwave_controls()
+            return
+        if mmwave_outage_dca_done and (not mmwave_outage_heavy_done) and idle_s >= MMWAVE_RX_IDLE_HEAVY_REARM_S:
+            mmwave_outage_heavy_done = True
+            print(f"[gui] mmWave auto-rearm (heavy): UDP idle for {idle_s:.3f}s", flush=True)
+            try:
+                mmwave_bridge.rearm_streaming(
+                    mmwave_dca_cfg.adc_data_path,
+                    capture_mode=1,
+                    arm_delay_s=0.25,
+                    stop_delay_s=0.25,
+                )
+            except MmwaveStudioError as exc:
+                mmwave_bridge.set_status(error=f"Auto heavy rearm failed: {exc}")
+            except Exception as exc:
+                mmwave_bridge.set_status(error=f"Unexpected auto heavy rearm error: {exc}")
+            _refresh_mmwave_controls()
+
+    def _on_mmwave_connect_toggle():
+        nonlocal mmwave_last_rx_pkt_t, mmwave_outage_dca_done, mmwave_outage_heavy_done, mmwave_auto_rearm_armed
+        if dpg.does_item_exist(TXT_MMWAVE_STATUS_TAG):
+            dpg.set_value(TXT_MMWAVE_STATUS_TAG, "mmWave connect/disconnect in progress...")
+        print("[gui] mmWave connect button pressed", flush=True)
+        try:
+            mmwave_bridge.toggle_connection(radar=mmwave_radar_cfg, dca=mmwave_dca_cfg)
+            mmwave_last_rx_pkt_t = time.time()
+            mmwave_outage_dca_done = False
+            mmwave_outage_heavy_done = False
+            if not mmwave_bridge.get_gui_state().connected:
+                mmwave_auto_rearm_armed = False
+        except MmwaveStudioError as exc:
+            state = mmwave_bridge.get_gui_state()
+            mmwave_bridge.set_status(
+                message=state.last_message or "mmWave connect failed",
+                error=str(exc),
+            )
+        except Exception as exc:
+            mmwave_bridge.set_status(error=f"Unexpected mmWave error: {exc}")
+        _refresh_mmwave_controls()
+
+    def _on_mmwave_stream_toggle():
+        nonlocal mmwave_last_rx_pkt_t, mmwave_outage_dca_done, mmwave_outage_heavy_done, mmwave_auto_rearm_armed
+        if dpg.does_item_exist(TXT_MMWAVE_STATUS_TAG):
+            dpg.set_value(TXT_MMWAVE_STATUS_TAG, "Radar start/stop in progress...")
+        print("[gui] Radar start/stop button pressed", flush=True)
+        try:
+            mmwave_bridge.toggle_streaming(
+                mmwave_dca_cfg.adc_data_path,
+                capture_mode=1,
+                arm_delay_s=1.0,
+                stop_delay_s=2.0,
+            )
+            mmwave_last_rx_pkt_t = time.time()
+            mmwave_outage_dca_done = False
+            mmwave_outage_heavy_done = False
+            mmwave_auto_rearm_armed = bool(mmwave_bridge.get_gui_state().streaming)
+        except MmwaveStudioError as exc:
+            error_message = str(exc)
+            if not mmwave_bridge.is_hw_connected:
+                mmwave_bridge.set_status(
+                    message="Connect hardware before starting the radar",
+                    error=error_message,
+                )
+            else:
+                mmwave_bridge.set_status(error=error_message)
+        except Exception as exc:
+            mmwave_bridge.set_status(error=f"Unexpected radar streaming error: {exc}")
+        _refresh_mmwave_controls()
 
     def _on_calibrate_boresight():
         try:
@@ -1987,11 +2161,31 @@ def main():
                             height=32,
                         )
                         dpg.add_spacer(height=14)
+                        dpg.add_text("MMWAVE STUDIO CONTROL", color=(255, 200, 0))
+                        dpg.add_separator()
+                        dpg.add_button(
+                            label=_mmwave_connect_label(False),
+                            tag=BTN_MMWAVE_CONNECT_TAG,
+                            callback=_on_mmwave_connect_toggle,
+                            width=-1,
+                            height=36,
+                        )
+                        dpg.add_button(
+                            label=_mmwave_stream_label(False),
+                            tag=BTN_MMWAVE_STREAM_TAG,
+                            callback=_on_mmwave_stream_toggle,
+                            width=-1,
+                            height=36,
+                        )
+                        dpg.add_text("mmWave Studio bridge idle", tag=TXT_MMWAVE_STATUS_TAG, wrap=-1)
+                        dpg.add_text("", tag=TXT_MMWAVE_LINKS_TAG, wrap=-1)
+                        dpg.add_spacer(height=14)
                         dpg.add_text("SAR CONTROL", color=(255, 200, 0))
                         dpg.add_separator()
                         dpg.add_button(label="CAPTURE FRAME", callback=_on_capture, width=-1, height=40)
                         dpg.add_text("Pos Counter: 0", tag=TXT_POS_TAG)
                         dpg.add_text("", tag=TXT_LOG_TAG, wrap=-1)
+                        _refresh_mmwave_controls()
 
                         if DEBUG_STATS:
                             dpg.add_spacer(height=14)
@@ -2569,7 +2763,6 @@ def main():
                 with rx_pkts.get_lock(): pkts_now = rx_pkts.value
                 pkts_delta = pkts_now - pkts_prev
                 pkts_prev = pkts_now
-                
                 total = pkts_delta + lost_delta
                 loss_pct = (100.0 * lost_delta / total) if total > 0 else 0.0
                 pkt_rate = (pkts_delta / dt_mon) if dt_mon > 0 else 0.0
@@ -2627,6 +2820,7 @@ def main():
                     f"{'saved':<12}{int(cap_saved.value):>8d}/{int(FRAMES_PER_POSITION)}\n"
                     f"{'sar_pos':<12}{int(sar_pos_counter.value):>8d}"
                 )
+                _refresh_mmwave_controls()
             # 2. GUI TEXTURE UPDATE (double-buffer latest-wins)
             seq_now = int(gui_latest_seq.value)
             if seq_now != gui_last_seq:
@@ -2821,6 +3015,7 @@ def main():
                                     dpg.configure_item(hide_tag, show=False)
                             break
 
+            _maybe_rearm_mmwave_stream(now)
             dpg.render_dearpygui_frame()
 
     except KeyboardInterrupt:

@@ -135,12 +135,12 @@ dsp:
       enabled: true # Applied before the moving branch Doppler FFT, with its own background state.
       mode: frozen # Options: ema, running_mean, window_mean, frozen.
       alpha: 0.02
-      init_frames: 40
+      init_frames: 100
       window_frames: 20
       clamp_positive_only: false
 
   angle_processing:
-    mode: fft # Options: fft, bartlett, mvdr. fft and bartlett honor aggregation/frame_index/loop_index; mvdr always uses all available frame x loop snapshots.
+    mode: bartlett # Options: fft, bartlett, mvdr. fft and bartlett honor aggregation/frame_index/loop_index; mvdr always uses all available frame x loop snapshots.
     mvdr_diagonal_loading: 0.02 # Stabilizza la covarianza per scene statiche (range tipico 0.01 - 0.05)
     aggregation: frame_loop # fft/bartlett only: frame_loop=all frames+loops, frame=all frames at loop_index, loop=all loops at frame_index, none=single [frame_index, loop_index].
     frame_index: 0 # Used only by fft/bartlett when aggregation is loop or none.
