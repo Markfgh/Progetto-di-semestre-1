@@ -29,7 +29,7 @@ HeatmapSpatialFilterMode = Literal["none", "gaussian_3x3"]
 DisplayProjectionMode = Literal["polar_stretched", "cartesian"]
 DisplayProjectionInterp = Literal["nearest", "bilinear"]
 SlowTimeMode = Literal["none", "mean_subtraction", "highpass", "doppler_fft"]
-DetectionThresholdMode = Literal["relative", "absolute"]
+DetectionThresholdMode = Literal["relative", "absolute", "ca_cfar", "os_cfar"]
 DetectionSource = Literal["static", "moving", "fused"]
 _VALID_MEAN_AXES = {"frame", "loop", "tx", "sample", "range_bin", "rx"}
 _VALID_BACKGROUND_MODES = {"ema", "running_mean", "window_mean", "frozen"}
@@ -38,7 +38,7 @@ _VALID_HEATMAP_SPATIAL_FILTER_MODES = {"none", "gaussian_3x3"}
 _VALID_DISPLAY_PROJECTION_MODES = {"polar_stretched", "cartesian"}
 _VALID_DISPLAY_PROJECTION_INTERPS = {"nearest", "bilinear"}
 _VALID_SLOW_TIME_MODES = {"none", "mean_subtraction", "highpass", "doppler_fft"}
-_VALID_THRESHOLD_MODES = {"relative", "absolute"}
+_VALID_THRESHOLD_MODES = {"relative", "absolute", "ca_cfar", "os_cfar"}
 _GAUSSIAN_3X3_KERNEL = (
     np.array(
         [[1.0, 2.0, 1.0], [2.0, 4.0, 2.0], [1.0, 2.0, 1.0]],
@@ -160,6 +160,12 @@ class DetectionConfigStatic:
     localmax_angle_bins: int = 2
     min_power_db: float = 5.0
     max_detections: int = 64
+    cfar_train_range_bins: int = 8
+    cfar_guard_range_bins: int = 2
+    cfar_train_col_bins: int = 8
+    cfar_guard_col_bins: int = 2
+    cfar_threshold_db: float = 12.0
+    os_cfar_rank: int = 0
 
 
 @dataclass(frozen=True)
@@ -173,6 +179,12 @@ class DetectionConfigMoving:
     min_power_db: float = 5.0
     doppler_fft_shift: bool = True
     max_detections: int = 64
+    cfar_train_range_bins: int = 8
+    cfar_guard_range_bins: int = 2
+    cfar_train_col_bins: int = 4
+    cfar_guard_col_bins: int = 1
+    cfar_threshold_db: float = 12.0
+    os_cfar_rank: int = 0
 
 
 @dataclass(frozen=True)
@@ -986,6 +998,12 @@ def detection_static_from_yaml_dict(cfg: dict[str, Any]) -> DetectionConfigStati
         localmax_angle_bins=max(0, _to_int(block.get("localmax_angle_bins", 2), 2)),
         min_power_db=_to_float(block.get("min_power_db", 5.0), 5.0),
         max_detections=max(1, _to_int(block.get("max_detections", 64), 64)),
+        cfar_train_range_bins=max(0, _to_int(block.get("cfar_train_range_bins", 8), 8)),
+        cfar_guard_range_bins=max(0, _to_int(block.get("cfar_guard_range_bins", 2), 2)),
+        cfar_train_col_bins=max(0, _to_int(block.get("cfar_train_col_bins", 8), 8)),
+        cfar_guard_col_bins=max(0, _to_int(block.get("cfar_guard_col_bins", 2), 2)),
+        cfar_threshold_db=_to_float(block.get("cfar_threshold_db", 12.0), 12.0),
+        os_cfar_rank=max(0, _to_int(block.get("os_cfar_rank", 0), 0)),
     )
 
 
@@ -1001,6 +1019,12 @@ def detection_moving_from_yaml_dict(cfg: dict[str, Any]) -> DetectionConfigMovin
         min_power_db=_to_float(block.get("min_power_db", 5.0), 5.0),
         doppler_fft_shift=bool(block.get("doppler_fft_shift", True)),
         max_detections=max(1, _to_int(block.get("max_detections", 64), 64)),
+        cfar_train_range_bins=max(0, _to_int(block.get("cfar_train_range_bins", 8), 8)),
+        cfar_guard_range_bins=max(0, _to_int(block.get("cfar_guard_range_bins", 2), 2)),
+        cfar_train_col_bins=max(0, _to_int(block.get("cfar_train_col_bins", 4), 4)),
+        cfar_guard_col_bins=max(0, _to_int(block.get("cfar_guard_col_bins", 1), 1)),
+        cfar_threshold_db=_to_float(block.get("cfar_threshold_db", 12.0), 12.0),
+        os_cfar_rank=max(0, _to_int(block.get("os_cfar_rank", 0), 0)),
     )
 
 
@@ -2365,13 +2389,149 @@ def compute_detection_threshold_db(
     threshold_db: float,
     min_power_db: float,
 ) -> float:
-    # TODO(CFAR): replace this global threshold with CA-CFAR / OS-CFAR while keeping
-    # the contract "power map in -> scalar/decision threshold out -> shared peak extractor".
     return _resolve_detection_threshold_db(
         power_db,
         threshold_mode=threshold_mode,
         threshold_db=threshold_db,
         min_power_db=min_power_db,
+    )
+
+
+def _cfar_training_values_for_cell(
+    power_lin: np.ndarray,
+    *,
+    row: int,
+    col: int,
+    train_row: int,
+    guard_row: int,
+    train_col: int,
+    guard_col: int,
+) -> np.ndarray | None:
+    n_rows, n_cols = int(power_lin.shape[0]), int(power_lin.shape[1])
+    r0 = int(row) - guard_row - train_row
+    r1 = int(row) + guard_row + train_row + 1
+    c0 = int(col) - guard_col - train_col
+    c1 = int(col) + guard_col + train_col + 1
+    if r0 < 0 or c0 < 0 or r1 > n_rows or c1 > n_cols:
+        return None
+
+    window = power_lin[r0:r1, c0:c1]
+    training_mask = np.ones(window.shape, dtype=bool)
+    gr0 = train_row
+    gr1 = train_row + (2 * guard_row) + 1
+    gc0 = train_col
+    gc1 = train_col + (2 * guard_col) + 1
+    training_mask[gr0:gr1, gc0:gc1] = False
+    training = window[training_mask]
+    if training.size <= 0:
+        return None
+    training = training[np.isfinite(training)]
+    if training.size <= 0:
+        return None
+    return training
+
+
+def compute_cfar_threshold_db_map(
+    power_lin: np.ndarray,
+    *,
+    threshold_mode: DetectionThresholdMode,
+    train_range_bins: int,
+    guard_range_bins: int,
+    train_col_bins: int,
+    guard_col_bins: int,
+    threshold_offset_db: float,
+    min_power_db: float,
+    os_cfar_rank: int,
+) -> np.ndarray:
+    power = np.asarray(power_lin, dtype=np.float32)
+    threshold_map = np.full(power.shape, np.float32(np.inf), dtype=np.float32)
+    if power.ndim != 2 or power.size <= 0 or threshold_mode not in {"ca_cfar", "os_cfar"}:
+        return threshold_map
+
+    train_row = int(max(0, train_range_bins))
+    guard_row = int(max(0, guard_range_bins))
+    train_col = int(max(0, train_col_bins))
+    guard_col = int(max(0, guard_col_bins))
+    if train_row <= 0 and train_col <= 0:
+        return threshold_map
+
+    n_rows, n_cols = int(power.shape[0]), int(power.shape[1])
+    row_margin = train_row + guard_row
+    col_margin = train_col + guard_col
+    offset_lin = np.float32(10.0 ** (float(threshold_offset_db) / 10.0))
+    min_lin = np.float32(10.0 ** (float(min_power_db) / 10.0))
+
+    for row in range(row_margin, n_rows - row_margin):
+        for col in range(col_margin, n_cols - col_margin):
+            training = _cfar_training_values_for_cell(
+                power,
+                row=row,
+                col=col,
+                train_row=train_row,
+                guard_row=guard_row,
+                train_col=train_col,
+                guard_col=guard_col,
+            )
+            if training is None:
+                continue
+            if threshold_mode == "ca_cfar":
+                noise_lin = np.float32(np.mean(training, dtype=np.float32))
+            else:
+                rank = int(os_cfar_rank)
+                if rank <= 0:
+                    rank = int(math.ceil(0.75 * float(training.size)))
+                rank = min(max(1, rank), int(training.size))
+                noise_lin = np.float32(np.partition(training, rank - 1)[rank - 1])
+            threshold_lin = max(float(min_lin), float(noise_lin) * float(offset_lin))
+            threshold_map[row, col] = np.float32(10.0 * math.log10(max(threshold_lin, 1e-12)))
+    return threshold_map
+
+
+def compute_cfar_candidate_mask(
+    power_lin: np.ndarray,
+    *,
+    threshold_mode: DetectionThresholdMode,
+    train_range_bins: int,
+    guard_range_bins: int,
+    train_col_bins: int,
+    guard_col_bins: int,
+    threshold_offset_db: float,
+    min_power_db: float,
+    os_cfar_rank: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    threshold_map = compute_cfar_threshold_db_map(
+        power_lin,
+        threshold_mode=threshold_mode,
+        train_range_bins=train_range_bins,
+        guard_range_bins=guard_range_bins,
+        train_col_bins=train_col_bins,
+        guard_col_bins=guard_col_bins,
+        threshold_offset_db=threshold_offset_db,
+        min_power_db=min_power_db,
+        os_cfar_rank=os_cfar_rank,
+    )
+    power_db = compute_detection_power_db_map(power_lin)
+    mask = np.isfinite(power_db) & np.isfinite(threshold_map) & (power_db >= threshold_map)
+    return mask, threshold_map
+
+
+def _format_cfar_debug(
+    *,
+    branch: str,
+    mode: DetectionThresholdMode,
+    candidates: int,
+    train_range_bins: int,
+    guard_range_bins: int,
+    train_col_bins: int,
+    guard_col_bins: int,
+    threshold_db: float,
+    os_cfar_rank: int,
+) -> str:
+    return (
+        f"[DSP DEBUG] {branch}_cfar: mode={mode} candidates={int(candidates)} "
+        f"train_range={int(train_range_bins)} guard_range={int(guard_range_bins)} "
+        f"train_col={int(train_col_bins)} guard_col={int(guard_col_bins)} "
+        f"threshold_db={float(threshold_db):.2f} os_rank={int(os_cfar_rank)}"
     )
 
 
@@ -2382,6 +2542,7 @@ def extract_detection_peaks_2d(
     win_row: int,
     win_col: int,
     max_peaks: int,
+    candidates_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     return _select_localmax_2d(
         power_db,
@@ -2389,6 +2550,7 @@ def extract_detection_peaks_2d(
         win_row=win_row,
         win_col=win_col,
         max_peaks=max_peaks,
+        candidates_mask=candidates_mask,
     )
 
 
@@ -2399,14 +2561,22 @@ def _select_localmax_2d(
     win_row: int,
     win_col: int,
     max_peaks: int,
+    candidates_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     if power_db.size <= 0 or max_peaks <= 0:
         return np.empty((0, 2), dtype=np.int32)
-    candidates_mask = power_db >= np.float32(threshold_db)
-    if not np.any(candidates_mask):
+    if candidates_mask is None:
+        candidates_mask_eff = power_db >= np.float32(threshold_db)
+    else:
+        candidates_mask_eff = np.asarray(candidates_mask, dtype=bool)
+        if candidates_mask_eff.shape != power_db.shape:
+            candidates_mask_eff = np.zeros(power_db.shape, dtype=bool)
+        else:
+            candidates_mask_eff = candidates_mask_eff & np.isfinite(power_db)
+    if not np.any(candidates_mask_eff):
         return np.empty((0, 2), dtype=np.int32)
-    candidates = np.argwhere(candidates_mask)
-    strengths = power_db[candidates_mask]
+    candidates = np.argwhere(candidates_mask_eff)
+    strengths = power_db[candidates_mask_eff]
     order = np.argsort(strengths)[::-1]
     suppressed = np.zeros(power_db.shape, dtype=bool)
     selected: list[tuple[int, int]] = []
@@ -2479,18 +2649,47 @@ def detect_static_targets(
         ant_spacing=virtual_array_geometry.uniform_spacing_lambda,
     )
     static_db = compute_detection_power_db_map(static_heatmap)
-    threshold_db = compute_detection_threshold_db(
-        static_db,
-        threshold_mode=static_cfg.threshold_mode,
-        threshold_db=static_cfg.threshold_db,
-        min_power_db=static_cfg.min_power_db,
-    )
+    candidates_mask: np.ndarray | None = None
+    if static_cfg.threshold_mode in {"ca_cfar", "os_cfar"}:
+        candidates_mask, _ = compute_cfar_candidate_mask(
+            static_heatmap,
+            threshold_mode=static_cfg.threshold_mode,
+            train_range_bins=static_cfg.cfar_train_range_bins,
+            guard_range_bins=static_cfg.cfar_guard_range_bins,
+            train_col_bins=static_cfg.cfar_train_col_bins,
+            guard_col_bins=static_cfg.cfar_guard_col_bins,
+            threshold_offset_db=static_cfg.cfar_threshold_db,
+            min_power_db=static_cfg.min_power_db,
+            os_cfar_rank=static_cfg.os_cfar_rank,
+        )
+        print(
+            _format_cfar_debug(
+                branch="static",
+                mode=static_cfg.threshold_mode,
+                candidates=int(np.count_nonzero(candidates_mask)),
+                train_range_bins=static_cfg.cfar_train_range_bins,
+                guard_range_bins=static_cfg.cfar_guard_range_bins,
+                train_col_bins=static_cfg.cfar_train_col_bins,
+                guard_col_bins=static_cfg.cfar_guard_col_bins,
+                threshold_db=static_cfg.cfar_threshold_db,
+                os_cfar_rank=static_cfg.os_cfar_rank,
+            )
+        )
+        threshold_db = float(static_cfg.min_power_db)
+    else:
+        threshold_db = compute_detection_threshold_db(
+            static_db,
+            threshold_mode=static_cfg.threshold_mode,
+            threshold_db=static_cfg.threshold_db,
+            min_power_db=static_cfg.min_power_db,
+        )
     peak_idx = extract_detection_peaks_2d(
         static_db,
         threshold_db=threshold_db,
         win_row=static_cfg.localmax_range_bins,
         win_col=static_cfg.localmax_angle_bins,
         max_peaks=static_cfg.max_detections,
+        candidates_mask=candidates_mask,
     )
     detections: list[Detection] = []
     for r_bin, a_bin in peak_idx:
@@ -2598,18 +2797,47 @@ def detect_moving_targets(
     if not moving_cfg.enabled or range_doppler_map.size <= 0:
         return []
     moving_db = compute_detection_power_db_map(range_doppler_map)
-    threshold_db = compute_detection_threshold_db(
-        moving_db,
-        threshold_mode=moving_cfg.threshold_mode,
-        threshold_db=moving_cfg.threshold_db,
-        min_power_db=moving_cfg.min_power_db,
-    )
+    candidates_mask: np.ndarray | None = None
+    if moving_cfg.threshold_mode in {"ca_cfar", "os_cfar"}:
+        candidates_mask, _ = compute_cfar_candidate_mask(
+            range_doppler_map,
+            threshold_mode=moving_cfg.threshold_mode,
+            train_range_bins=moving_cfg.cfar_train_range_bins,
+            guard_range_bins=moving_cfg.cfar_guard_range_bins,
+            train_col_bins=moving_cfg.cfar_train_col_bins,
+            guard_col_bins=moving_cfg.cfar_guard_col_bins,
+            threshold_offset_db=moving_cfg.cfar_threshold_db,
+            min_power_db=moving_cfg.min_power_db,
+            os_cfar_rank=moving_cfg.os_cfar_rank,
+        )
+        print(
+            _format_cfar_debug(
+                branch="moving",
+                mode=moving_cfg.threshold_mode,
+                candidates=int(np.count_nonzero(candidates_mask)),
+                train_range_bins=moving_cfg.cfar_train_range_bins,
+                guard_range_bins=moving_cfg.cfar_guard_range_bins,
+                train_col_bins=moving_cfg.cfar_train_col_bins,
+                guard_col_bins=moving_cfg.cfar_guard_col_bins,
+                threshold_db=moving_cfg.cfar_threshold_db,
+                os_cfar_rank=moving_cfg.os_cfar_rank,
+            )
+        )
+        threshold_db = float(moving_cfg.min_power_db)
+    else:
+        threshold_db = compute_detection_threshold_db(
+            moving_db,
+            threshold_mode=moving_cfg.threshold_mode,
+            threshold_db=moving_cfg.threshold_db,
+            min_power_db=moving_cfg.min_power_db,
+        )
     peak_idx = extract_detection_peaks_2d(
         moving_db,
         threshold_db=threshold_db,
         win_row=moving_cfg.localmax_range_bins,
         win_col=moving_cfg.localmax_doppler_bins,
         max_peaks=moving_cfg.max_detections,
+        candidates_mask=candidates_mask,
     )
     detections: list[Detection] = []
     for r_bin, d_bin in peak_idx:

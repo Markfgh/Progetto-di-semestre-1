@@ -13,8 +13,8 @@ capture:
   x_frames: 1    # Frames processed per DSP batch.
 
 fft:
-  nfft_range: 512 # Typical: 256 or 512. Higher = finer range bins, more CPU.
-  nfft_angle: 256 # Typical: 128/256/512. Higher = finer angular grid, more CPU.
+  nfft_range: 256 # Typical: 256 or 512. Higher = finer range bins, more CPU.
+  nfft_angle: 128 # Typical: 128/256/512. Higher = finer angular grid, more CPU.
   workers: 8      # FFT worker threads.
 
 display:
@@ -24,8 +24,8 @@ display:
   vmax_norm: 0       # Normalized mode peak.
   projection_mode:   cartesian # Options: polar_stretched, cartesian.
   projection_interp: nearest  # Used only in cartesian mode: nearest, bilinear.
-  range_max:  12.5    # Hard limit shown on Y axis [m].
-  crossrange_max: 12.5  # X extent [m]; use "auto" to derive it from angle FOV for the realtime heatmap.
+  range_max:  3    # Hard limit shown on Y axis [m].
+  crossrange_max: 2  # X extent [m]; use "auto" to derive it from angle FOV for the realtime heatmap.
   rangefft_db_min: 0
   rangefft_db_max: 95
   rangefft_lin_min: 0
@@ -92,7 +92,7 @@ dsp:
       mode: frozen # Options: ema, running_mean, window_mean, frozen.
       alpha: 0.02
       init_frames: 40
-      window_frames: 20
+      window_frames: 40
       clamp_positive_only: true
 
     loop_average_after_background:
@@ -111,11 +111,11 @@ dsp:
       doppler_zero_notch: false
 
     background_subtraction:
-      enabled: false # Static-detection branch only, with its own background state.
-      mode: ema
+      enabled: true # Static-detection branch only, with its own background state.
+      mode: frozen
       alpha: 0.02
       init_frames: 40
-      window_frames: 20
+      window_frames: 40
       clamp_positive_only: false
 
     loop_average_after_background:
@@ -132,15 +132,15 @@ dsp:
       highpass_beta: 0.92
 
     background_subtraction:
-      enabled: false # Applied before the moving branch Doppler FFT, with its own background state.
+      enabled: true # Applied before the moving branch Doppler FFT, with its own background state.
       mode: frozen # Options: ema, running_mean, window_mean, frozen.
       alpha: 0.02
-      init_frames: 100
-      window_frames: 20
+      init_frames: 40
+      window_frames: 40
       clamp_positive_only: false
 
   angle_processing:
-    mode: bartlett # Options: fft, bartlett, mvdr. fft and bartlett honor aggregation/frame_index/loop_index; mvdr always uses all available frame x loop snapshots.
+    mode: fft # Options: fft, bartlett, mvdr. fft and bartlett honor aggregation/frame_index/loop_index; mvdr always uses all available frame x loop snapshots.
     mvdr_diagonal_loading: 0.02 # Stabilizza la covarianza per scene statiche (range tipico 0.01 - 0.05)
     aggregation: frame_loop # fft/bartlett only: frame_loop=all frames+loops, frame=all frames at loop_index, loop=all loops at frame_index, none=single [frame_index, loop_index].
     frame_index: 0 # Used only by fft/bartlett when aggregation is loop or none.
@@ -159,7 +159,7 @@ antenna:
   angle_axis_sign: 1 # Set to -1 only for a real mounting/cabling mirror, not to compensate DSP sign.
 
 tracking:
-  enabled: false # Enables/disables the multi-object tracker.
+  enabled: true # Enables/disables the multi-object tracker.
   dt_s: 0.04096 # Nominal frame period fallback [s]; the tracker now prefers real timestamp/sequence deltas when available.
   model: kalman_cv_2d # Dynamic model in use: constant-velocity 2D Kalman filter (x, y, vx, vy).
   max_tracks: 8 # Maximum number of live tracks kept at the same time.
@@ -189,26 +189,38 @@ tracking:
   # dynamic_speed_threshold_mps, static_speed_threshold_mps, classification_confirm_frames
 
 detection_static:
-  enabled: false
-  threshold_mode: relative # Options: relative, absolute.
+  enabled: true
+  threshold_mode: ca_cfar # Options: relative, absolute, ca_cfar, os_cfar.
   threshold_db: -6 # Relative mode: threshold = max_db + threshold_db.
   localmax_range_bins: 4 # NMS neighborhood in range bins.
   localmax_angle_bins: 12 # NMS neighborhood in angle bins.
   min_power_db: 8 # Absolute safety floor (also in relative mode).
   max_detections: 12 # Cap per frame.
+  cfar_train_range_bins: 8 # CFAR training cells before/after the CUT on range.
+  cfar_guard_range_bins: 2 # CFAR guard cells before/after the CUT on range.
+  cfar_train_col_bins: 8 # CFAR training cells before/after the CUT on angle.
+  cfar_guard_col_bins: 2 # CFAR guard cells before/after the CUT on angle.
+  cfar_threshold_db: 12 # CFAR offset above local noise estimate.
+  os_cfar_rank: 0 # 0 = automatic 75% rank; otherwise 1-based rank in sorted training cells.
 
 detection_moving:
-  enabled: false # Moving target detection is more computationally expensive due to the Doppler FFT, so disabled by default.
-  threshold_mode: relative # Options: relative, absolute.
+  enabled: true # Moving target detection is more computationally expensive due to the Doppler FFT, so disabled by default.
+  threshold_mode: ca_cfar # Options: relative, absolute, ca_cfar, os_cfar.
   threshold_db: -7
   localmax_range_bins: 4
   localmax_doppler_bins: 3
   zero_doppler_exclusion_bins: 0 # Keep near-zero Doppler so a moving target can be retained when it stops.
   min_power_db: 8
   max_detections: 12
+  cfar_train_range_bins: 8 # CFAR training cells before/after the CUT on range.
+  cfar_guard_range_bins: 2 # CFAR guard cells before/after the CUT on range.
+  cfar_train_col_bins: 4 # CFAR training cells before/after the CUT on Doppler.
+  cfar_guard_col_bins: 1 # CFAR guard cells before/after the CUT on Doppler.
+  cfar_threshold_db: 12 # CFAR offset above local noise estimate.
+  os_cfar_rank: 0 # 0 = automatic 75% rank; otherwise 1-based rank in sorted training cells.
 
 fusion:
-  enabled: false
+  enabled: true
   merge_xy_m: 0.30
   merge_range_m: 0.20
   merge_angle_deg: 4.0
