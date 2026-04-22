@@ -18,8 +18,8 @@ fft:
   workers: 8      # FFT worker threads.
 
 display:
-  vmax: 60           # Color scale max in RAW mode.
-  vmin: 50           # Color scale min in RAW mode.
+  vmax: 94           # Color scale max in RAW mode.
+  vmin: 77           # Color scale min in RAW mode.
   vmin_norm: -20     # Normalized mode: typical clean range -25..-15 dB.
   vmax_norm: 0       # Normalized mode peak.
   projection_mode:   cartesian # Options: polar_stretched, cartesian.
@@ -65,11 +65,11 @@ dsp:
     doppler_zero_notch: false # In doppler_fft mode, can suppress static center line.
 
   background_subtraction:
-    enabled: false # Legacy/global background subtraction with a single shared background state.
-    mode: ema # Options: ema, running_mean, window_mean, frozen.
+    enabled: true # Legacy/global background subtraction with a single shared background state.
+    mode: frozen # Options: ema, running_mean, window_mean, frozen.
     alpha: 0.02 # EMA speed: lower=more stable, higher=faster adaptation.
     init_frames: 40 # Warmup frames before model init.
-    window_frames: 20 # Used by window_mean mode.
+    window_frames: 40 # Used by window_mean mode.
     clamp_positive_only: false # Cleaner display floor, less negative artifacts.
 
   loop_average_after_background:
@@ -88,8 +88,8 @@ dsp:
       axes: [range_bin] # Display-only flattening after range FFT.
 
     background_subtraction:
-      enabled: false # Keep disabled to match the legacy/global DSP path.
-      mode: ema # Options: ema, running_mean, window_mean, frozen.
+      enabled: true # Display heatmap background removal; overrides the legacy/global background_subtraction block above.
+      mode: frozen # Options: ema, running_mean, window_mean, frozen.
       alpha: 0.02
       init_frames: 40
       window_frames: 20
@@ -132,7 +132,7 @@ dsp:
       highpass_beta: 0.92
 
     background_subtraction:
-      enabled: true # Applied before the moving branch Doppler FFT, with its own background state.
+      enabled: false # Applied before the moving branch Doppler FFT, with its own background state.
       mode: frozen # Options: ema, running_mean, window_mean, frozen.
       alpha: 0.02
       init_frames: 100
@@ -156,9 +156,7 @@ dsp:
 
 antenna:
   virtual_array_order:   [0, 1, 2, 3, 4, 5, 6, 7]
-  virtual_array_phase_centers_lambda: [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5] # null -> default half-lambda ULA, standard for IWR1443BOOST 2Tx/4Rx azimuth.
-  virtual_array_phase_centers_m: null # Alternative unit in meters if radar.fc is valid.
-  angle_axis_sign: -1 # Set to -1 only if left/right is still mirrored because of mounting or channel-order convention.
+  angle_axis_sign: 1 # Set to -1 only for a real mounting/cabling mirror, not to compensate DSP sign.
 
 tracking:
   enabled: false # Enables/disables the multi-object tracker.

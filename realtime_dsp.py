@@ -232,6 +232,7 @@ class VirtualArrayGeometry:
     uniform_half_lambda: bool
     uniform_spacing_lambda: float | None
     angle_axis_sign: float = 1.0
+    angle_u_to_sin_scale: float = 2.0
 
 # Return a 1D FFT window of the requested type as float32.
 def _get_window_1d(win_type: str, size: int) -> np.ndarray:
@@ -754,7 +755,23 @@ def _default_virtual_array_order_flat(virtual_ant: int) -> np.ndarray:
 
 
 def _default_virtual_array_phase_centers_lambda(virtual_ant: int) -> np.ndarray:
-    return (np.float32(0.5) * np.arange(max(0, int(virtual_ant)), dtype=np.float32)).astype(np.float32, copy=False)
+    return (np.float32(0.25) * np.arange(max(0, int(virtual_ant)), dtype=np.float32)).astype(np.float32, copy=False)
+
+
+def _default_angle_u_to_sin_scale() -> float:
+    return 2.0
+
+
+def _resolve_angle_u_to_sin_scale(geometry: VirtualArrayGeometry | None = None) -> float:
+    scale = float(_default_angle_u_to_sin_scale())
+    if geometry is not None:
+        try:
+            scale = float(getattr(geometry, "angle_u_to_sin_scale", scale))
+        except (TypeError, ValueError):
+            scale = float(_default_angle_u_to_sin_scale())
+    if not np.isfinite(scale) or abs(scale) <= 1e-8:
+        scale = float(_default_angle_u_to_sin_scale())
+    return abs(scale)
 
 
 def _parse_virtual_array_order_entry(
@@ -854,7 +871,7 @@ def build_virtual_array_geometry_from_yaml_dict(
                 phase_centers_lambda = (parsed / np.float32(wavelength_m)).astype(np.float32, copy=False)
         except Exception as exc:
             warnings.append(
-                f"antenna.virtual_array_phase_centers_* non valido ({exc}); using legacy half-lambda ULA."
+                f"antenna.virtual_array_phase_centers_* non valido ({exc}); using default bistatic phase centers."
             )
             phase_centers_lambda = default_phase_centers
 
@@ -893,12 +910,12 @@ def build_virtual_array_geometry_from_yaml_dict(
         int(dsp_cfg.tx) == 2
         and int(dsp_cfg.rx) == 4
         and uniform_spacing_lambda is not None
-        and not np.isclose(float(uniform_spacing_lambda), 0.5, atol=1e-3, rtol=0.0)
+        and not np.isclose(float(uniform_spacing_lambda), 0.25, atol=1e-3, rtol=0.0)
     ):
         warnings.append(
             "antenna.virtual_array_phase_centers_* uses spacing "
             f"{float(uniform_spacing_lambda):.3f} lambda; "
-            "standard xWR14xx 2Tx/4Rx azimuth uses a half-lambda virtual ULA. "
+            "bistatic phase-center xWR14xx 2Tx/4Rx azimuth uses a quarter-lambda virtual ULA. "
             "Angle estimates may be distorted."
         )
 
@@ -909,6 +926,7 @@ def build_virtual_array_geometry_from_yaml_dict(
         uniform_half_lambda=uniform_half_lambda,
         uniform_spacing_lambda=uniform_spacing_lambda,
         angle_axis_sign=float(angle_axis_sign),
+        angle_u_to_sin_scale=float(_default_angle_u_to_sin_scale()),
     )
     return geometry, warnings
 
@@ -1384,13 +1402,13 @@ def _branch_needs_copy(filters_cfg: PostRangeFftFilterConfig) -> bool:
     return not filters_cfg.slow_time.enabled or filters_cfg.slow_time.mode == "none"
 
 
-def _build_angle_u_axis(nfft_angle: int, spacing_lambda: float = 0.5) -> np.ndarray:
+def _build_angle_u_axis(nfft_angle: int, spacing_lambda: float = 0.25) -> np.ndarray:
     nfft_angle = max(1, int(nfft_angle))
     if nfft_angle == 1:
         return np.asarray([0.0], dtype=np.float32)
     spacing = float(spacing_lambda)
     if not np.isfinite(spacing) or abs(spacing) <= 1e-8:
-        spacing = 0.5
+        spacing = 0.25
     u = (np.fft.fftshift(np.fft.fftfreq(nfft_angle, d=1.0)) / np.float32(spacing)).astype(
         np.float32,
         copy=False,
@@ -1411,7 +1429,7 @@ def build_angle_steering_matrix(
         raise ValueError(
             f"phase_centers_lambda size={phase_centers_lambda.size} != virtual_ant={int(virtual_ant)}"
         )
-    spacing_lambda = 0.5
+    spacing_lambda = 0.25
     if geometry is not None and geometry.uniform_spacing_lambda is not None:
         spacing_lambda = float(geometry.uniform_spacing_lambda)
     u = _build_angle_u_axis(nfft_angle, spacing_lambda=spacing_lambda)
@@ -1455,7 +1473,7 @@ def compute_angle_heatmap(
     def _build_uniform_steering(n_ant: int, n_angle: int, spacing_lambda: float) -> np.ndarray:
         spacing = float(spacing_lambda)
         if not np.isfinite(spacing) or abs(spacing) <= 1e-8:
-            spacing = 0.5
+            spacing = 0.25
         phase_centers_lambda = (
             np.arange(max(0, int(n_ant)), dtype=np.float32) * np.float32(spacing)
         ).astype(np.float32, copy=False)
@@ -1491,7 +1509,7 @@ def compute_angle_heatmap(
             phase_centers_raw = np.asarray(geometry.phase_centers_lambda, dtype=np.float32).reshape(-1)
             if phase_centers_raw.size >= n_ant:
                 phase_centers_lambda = phase_centers_raw[:n_ant]
-        u = _build_angle_u_axis(n_angle, spacing_lambda=0.5)
+        u = _build_angle_u_axis(n_angle, spacing_lambda=0.25)
         phase = (-1j * np.float32(2.0 * np.pi)) * phase_centers_lambda[:, None] * u[None, :]
         steering = np.exp(phase).astype(np.complex64, copy=False)
         col_energy = (steering.real * steering.real + steering.imag * steering.imag).sum(axis=0, dtype=np.float32)
@@ -1506,28 +1524,30 @@ def compute_angle_heatmap(
 
     # calculate angle heatmap with FFT; output is [range_bin, angle_bin]
     if angle_cfg.mode == "fft":
-        angle_fft = fft.fft(
+        # Steering/Bartlett/MVDR use the physical snapshot convention
+        # exp(-j 2*pi*x*u). Use the matching inverse-DFT sign here so the
+        # FFT branch reports the same positive angle as the beamformers.
+        angle_fft = fft.ifft(
             virtual_array,
             n=dsp_cfg.nfft_angle,
             axis=3,
             workers=dsp_cfg.fft_workers,
             overwrite_x=True,
-        )
+        ) * np.float32(max(1, int(dsp_cfg.nfft_angle)))
         # power calculation
         re = angle_fft.real 
         im = angle_fft.imag
         power = (re * re + im * im).astype(np.float32, copy=False) 
         # shift zero angle to center bin
         power  = np.fft.fftshift(power , axes=-1)
-        spacing_lambda = 0.5
+        spacing_lambda = 0.25
         if geometry is not None and geometry.uniform_spacing_lambda is not None:
             spacing_lambda = float(geometry.uniform_spacing_lambda)
-        if not np.isfinite(spacing_lambda) or abs(spacing_lambda - 0.5) > 1e-8:
-            valid_u = np.abs(
-                _build_angle_u_axis(dsp_cfg.nfft_angle, spacing_lambda=spacing_lambda).astype(np.float64, copy=False)
-            ) <= 1.0
-            if np.any(~valid_u):
-                power[..., ~valid_u] = np.float32(0.0)
+        valid_u = np.abs(
+            _build_angle_u_axis(dsp_cfg.nfft_angle, spacing_lambda=spacing_lambda).astype(np.float64, copy=False)
+        ) <= float(_resolve_angle_u_to_sin_scale(geometry))
+        if np.any(~valid_u):
+            power[..., ~valid_u] = np.float32(0.0)
         # aggregate according to angle_cfg and return
         heatmap = _aggregate_angle_power(power)
         return heatmap.astype(np.float32, copy=False)
@@ -1573,20 +1593,68 @@ def compute_angle_heatmap(
     heatmap = np.empty((num_range, int(dsp_cfg.nfft_angle)), dtype=np.float32)
     eye = np.eye(num_ant, dtype=np.complex128)
     load_factor = np.float64(max(0.0, float(getattr(angle_cfg, "mvdr_diagonal_loading", 0.0))))
+    empty_trace_eps = np.float64(1e-12)
+    min_empty_loading = np.float64(1e-12)
+    den_floor = np.float32(1e-8)
+    mvdr_fallback_bins = 0
+
+    def _bartlett_range_power(x_range: np.ndarray) -> np.ndarray:
+        beam = np.einsum("ak,as->sk", np.conj(steering), x_range, optimize=True)
+        power = (beam.real * beam.real + beam.imag * beam.imag).mean(axis=0, dtype=np.float64)
+        return power.astype(np.float32, copy=False)
+
+    def _solve_loaded_covariance(cov_loaded: np.ndarray) -> np.ndarray:
+        try:
+            chol = np.linalg.cholesky(cov_loaded)
+            y = np.linalg.solve(chol, steering)
+            return np.linalg.solve(chol.conj().T, y)
+        except np.linalg.LinAlgError:
+            return np.linalg.solve(cov_loaded, steering)
+
     for range_idx in range(num_range):
         x = x_by_range[range_idx]
         cov = (x @ x.conj().T) / np.float64(max(1, num_snapshots))
+        cov = np.float64(0.5) * (cov + cov.conj().T)
         trace_r = float(np.trace(cov).real)
-        if np.isfinite(trace_r) and trace_r > 0.0:
-            cov = cov + ((load_factor * trace_r / np.float64(max(1, num_ant))) * eye)
+        if not np.isfinite(trace_r):
+            heatmap[range_idx, :] = _bartlett_range_power(x)
+            mvdr_fallback_bins += 1
+            continue
+
+        load_diag = np.float64(0.0)
+        if trace_r > 0.0:
+            load_diag = load_factor * np.float64(trace_r) / np.float64(max(1, num_ant))
+            # Near-empty bins need a tiny absolute floor; otherwise R can collapse to exactly zero.
+            if np.float64(trace_r) <= empty_trace_eps:
+                load_diag = max(load_diag, min_empty_loading)
+        else:
+            load_diag = min_empty_loading
+        if load_diag > 0.0:
+            cov = cov + (load_diag * eye)
+
         try:
-            cov_inv = np.linalg.pinv(cov)
+            den_left = _solve_loaded_covariance(cov)
+            den = np.einsum("ak,ak->k", np.conj(steering), den_left, optimize=True).real
         except np.linalg.LinAlgError:
-            cov_inv = eye
-        den_left = cov_inv @ steering
-        den = np.einsum("ak,ak->k", np.conj(steering), den_left, optimize=True).real.astype(np.float32, copy=False)
-        np.maximum(den, np.float32(1e-8), out=den)
+            heatmap[range_idx, :] = _bartlett_range_power(x)
+            mvdr_fallback_bins += 1
+            continue
+
+        if not np.all(np.isfinite(den)) or np.any(den <= 0.0):
+            heatmap[range_idx, :] = _bartlett_range_power(x)
+            mvdr_fallback_bins += 1
+            continue
+
+        den = den.astype(np.float32, copy=False)
+        np.maximum(den, den_floor, out=den)
         heatmap[range_idx, :] = np.float32(1.0) / den
+    compute_angle_heatmap._mvdr_total_bins = int(num_range)
+    compute_angle_heatmap._mvdr_fallback_bins = int(mvdr_fallback_bins)
+    if mvdr_fallback_bins > 0 and bool(getattr(dsp_cfg, "debug_stats", False)):
+        report_key = (int(num_range), int(mvdr_fallback_bins))
+        if getattr(compute_angle_heatmap, "_mvdr_fallback_last_report", None) != report_key:
+            print(f"[DSP WARN] MVDR local Bartlett fallback bins={mvdr_fallback_bins}/{num_range}")
+            compute_angle_heatmap._mvdr_fallback_last_report = report_key
     return heatmap.astype(np.float32, copy=False)
 
 
@@ -1594,7 +1662,7 @@ def build_angle_axis_deg(
     nfft_angle: int,
     geometry: VirtualArrayGeometry | None = None,
 ) -> np.ndarray:
-    spacing_lambda = 0.5
+    spacing_lambda = 0.25
     angle_axis_sign = 1.0
     if geometry is not None and geometry.uniform_spacing_lambda is not None:
         spacing_lambda = float(geometry.uniform_spacing_lambda)
@@ -1607,11 +1675,12 @@ def build_angle_axis_deg(
             angle_axis_sign = 1.0
         angle_axis_sign = 1.0 if angle_axis_sign > 0.0 else -1.0
     u = _build_angle_u_axis(nfft_angle, spacing_lambda=spacing_lambda)
+    sin_scale = np.float64(_resolve_angle_u_to_sin_scale(geometry))
     angle_axis = np.full(u.shape, np.float32(np.nan), dtype=np.float32)
-    valid = np.abs(u.astype(np.float64, copy=False)) <= 1.0
+    valid = np.abs(u.astype(np.float64, copy=False)) <= sin_scale
     if np.any(valid):
         angle_axis[valid] = np.rad2deg(
-            np.arcsin(u[valid].astype(np.float64, copy=False))
+            np.arcsin(u[valid].astype(np.float64, copy=False) / sin_scale)
         ).astype(np.float32, copy=False) * np.float32(angle_axis_sign)
     return angle_axis
 
@@ -1982,8 +2051,6 @@ def build_tdm_mimo_doppler_compensation_table(
     tx_delay_in_loops = (np.arange(tx_count, dtype=np.float32) / np.float32(tx_count)).astype(np.float32, copy=False)
     # numpy/scipy FFT sign convention: a target at Doppler bin k carries an extra phase
     # exp(+j 2*pi*f_d*t_tx) on TX acquired t_tx later. Undo it before virtual-array flattening.
-    # TODO(hardware): validate sign against real board chirp ordering / I-Q convention; if needed,
-    # conjugate this table once the hardware sign is confirmed.
     phase = np.exp(
         (-1j * 2.0 * np.pi)
         * doppler_cycles[:, None].astype(np.float64, copy=False)

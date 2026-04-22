@@ -18,8 +18,8 @@ bp:
   rx_offsets_lambda: null # override opzionale coordinate RX fisiche lungo X in lambda
   tx_offsets_m: null # alternativa in metri
   rx_offsets_m: null # alternativa in metri
-  virtual_ant_pitch_m: 0.001948 # fallback legacy phase-center, non piu' geometria primaria in mimo_sar
-  use_virtual_antennas: true
+  virtual_ant_pitch_m: 0.001948 # deprecato/ignorato in mimo_sar: phase center = 0.5 * (x_tx + x_rx)
+  use_virtual_antennas: true # deprecato/ignorato in mimo_sar: la geometria fisica TX/RX resta attiva
   coherent_sum: true
 
 

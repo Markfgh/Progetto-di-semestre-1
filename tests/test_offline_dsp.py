@@ -5,6 +5,8 @@ import numpy as np
 from offline_dsp import (
     _interp_cubic_complex,
     _interp_linear_complex,
+    build_mimo_back_projection_plan,
+    back_projection_power_mimo_snapshot,
     back_projection_image_mimo,
     build_mimo_geometry,
     prepare_mimo_snapshots,
@@ -100,6 +102,141 @@ def test_bistatic_bp_point_target() -> None:
     assert float(img_db[target_row, target_col]) >= float(np.mean(img_db, dtype=np.float32)) + 6.0
 
 
+def test_bistatic_bp_point_target_at_30deg() -> None:
+    c_m_s = np.float32(3e8)
+    fc_hz = np.float32(77e9)
+    dr_m = np.float32(0.02)
+    n_bins = 256
+    lambda_m = (c_m_s / fc_hz).astype(np.float32, copy=False)
+    x_tx_phys, x_rx_phys = _physical_iwr1443_geometry(lambda_m)
+    x_tx_ant_m, x_rx_ant_m = build_mimo_geometry(2, 4, fc_hz=float(fc_hz), c_m_s=float(c_m_s))
+
+    target_range = np.float32(2.0)
+    target_angle = np.float32(30.0)
+    target_x = (target_range * np.sin(np.deg2rad(target_angle))).astype(np.float32, copy=False)
+    target_y = (target_range * np.cos(np.deg2rad(target_angle))).astype(np.float32, copy=False)
+    x_pos_m = np.linspace(-0.30, 0.30, 31, dtype=np.float32)
+    k_bistatic = np.float32((2.0 * np.pi * float(fc_hz)) / float(c_m_s))
+
+    snapshots = np.zeros((int(x_pos_m.size), 1, 8, n_bins), dtype=np.complex64)
+    for pos_i, xpos in enumerate(x_pos_m):
+        for ant_i in range(8):
+            r_tx = np.hypot(target_x - (xpos + x_tx_phys[ant_i]), target_y).astype(np.float32, copy=False)
+            r_rx = np.hypot(target_x - (xpos + x_rx_phys[ant_i]), target_y).astype(np.float32, copy=False)
+            r_total = (r_tx + r_rx).astype(np.float32, copy=False)
+            r_eq = (np.float32(0.5) * r_total).astype(np.float32, copy=False)
+            snapshots[pos_i, 0, ant_i, :] = _target_profile(
+                n_bins=n_bins,
+                bin_float=float(r_eq / dr_m),
+                phase=np.exp(-1j * np.float32(k_bistatic * r_total)),
+            )
+
+    x_axis = np.linspace(0.4, 1.6, 121, dtype=np.float32)
+    y_axis = np.linspace(1.2, 2.2, 121, dtype=np.float32)
+    x_grid, y_grid = np.meshgrid(x_axis, y_axis)
+    img_db = back_projection_image_mimo(
+        snapshots,
+        x_pos_m,
+        x_tx_ant_m,
+        x_rx_ant_m,
+        x_grid,
+        y_grid,
+        dr_m=float(dr_m),
+        fc_hz=float(fc_hz),
+        c_m_s=float(c_m_s),
+        max_bin=n_bins,
+        motion_mode="static_zero_doppler",
+        phase_sign=1,
+    )
+
+    peak_row, peak_col = np.unravel_index(int(np.argmax(img_db)), img_db.shape)
+    target_row, target_col = _target_cell(x_axis, y_axis, float(target_x), float(target_y))
+    assert abs(int(peak_row) - int(target_row)) <= 3
+    assert abs(int(peak_col) - int(target_col)) <= 3
+    assert float(img_db[target_row, target_col]) >= float(np.mean(img_db, dtype=np.float32)) + 6.0
+
+
+def test_incoherent_mimo_bp_sums_power_not_amplitude() -> None:
+    snapshots = np.zeros((1, 2, 8), dtype=np.complex64)
+    snapshots[0, 0, 3] = np.complex64(3.0 + 0.0j)
+    snapshots[0, 1, 3] = np.complex64(0.0 + 4.0j)
+
+    img_power = back_projection_power_mimo_snapshot(
+        snapshots,
+        np.asarray([0.0], dtype=np.float32),
+        np.asarray([0.0, 0.0], dtype=np.float32),
+        np.asarray([0.0, 0.0], dtype=np.float32),
+        np.asarray([[0.0]], dtype=np.float32),
+        np.asarray([[3.0]], dtype=np.float32),
+        dr_m=1.0,
+        fc_hz=77e9,
+        c_m_s=3e8,
+        max_bin=8,
+        coherent_sum=False,
+    )
+
+    np.testing.assert_allclose(img_power, np.asarray([[25.0]], dtype=np.float32), atol=1e-5, rtol=0.0)
+
+
+def test_mimo_bp_plan_matches_direct_path() -> None:
+    snapshots = np.zeros((2, 2, 16), dtype=np.complex64)
+    snapshots[0, 0, 4] = np.complex64(1.0 + 2.0j)
+    snapshots[0, 1, 5] = np.complex64(0.5 - 0.25j)
+    snapshots[1, 0, 6] = np.complex64(2.0 - 1.0j)
+    snapshots[1, 1, 4] = np.complex64(-0.75 + 0.5j)
+
+    x_pos_m = np.asarray([-0.02, 0.02], dtype=np.float32)
+    x_tx_ant_m = np.asarray([0.0, 0.01], dtype=np.float32)
+    x_rx_ant_m = np.asarray([0.0, 0.015], dtype=np.float32)
+    x_axis = np.linspace(-0.05, 0.05, 7, dtype=np.float32)
+    y_axis = np.linspace(0.15, 0.45, 9, dtype=np.float32)
+    x_grid, y_grid = np.meshgrid(x_axis, y_axis)
+
+    plan = build_mimo_back_projection_plan(
+        x_pos_m,
+        x_tx_ant_m,
+        x_rx_ant_m,
+        x_grid,
+        y_grid,
+        dr_m=0.05,
+        fc_hz=77e9,
+        c_m_s=3e8,
+        max_bin=16,
+        phase_sign=-1,
+    )
+    direct = back_projection_power_mimo_snapshot(
+        snapshots,
+        x_pos_m,
+        x_tx_ant_m,
+        x_rx_ant_m,
+        x_grid,
+        y_grid,
+        dr_m=0.05,
+        fc_hz=77e9,
+        c_m_s=3e8,
+        max_bin=16,
+        phase_sign=-1,
+        coherent_sum=True,
+    )
+    planned = back_projection_power_mimo_snapshot(
+        snapshots,
+        x_pos_m,
+        x_tx_ant_m,
+        x_rx_ant_m,
+        x_grid,
+        y_grid,
+        dr_m=0.05,
+        fc_hz=77e9,
+        c_m_s=3e8,
+        max_bin=16,
+        phase_sign=-1,
+        coherent_sum=True,
+        bp_plan=plan,
+    )
+
+    np.testing.assert_allclose(planned, direct, atol=1e-5, rtol=1e-5)
+
+
 def test_tdm_compensation_static_target_survives_zero_bin() -> None:
     n_pos, n_frames, n_loops, n_tx, n_rx, n_bins, target_bin = 1, 1, 32, 2, 4, 64, 18
 
@@ -114,22 +251,38 @@ def test_tdm_compensation_static_target_survives_zero_bin() -> None:
     assert zero_energy / max(total_energy, 1e-12) >= 0.85
 
 
+def test_tdm_static_target_does_not_split_to_nyquist() -> None:
+    n_pos, n_frames, n_loops, n_tx, n_rx, n_bins, target_bin = 1, 1, 32, 2, 4, 64, 18
+
+    raw = np.zeros((n_pos, n_frames, n_loops, n_tx, n_rx, n_bins), dtype=np.complex64)
+    raw[:, :, :, :, :, target_bin] = np.complex64(1.0 + 0.0j)
+
+    all_bins = prepare_mimo_snapshots(raw, n_tx=n_tx, motion_mode="all_doppler_incoherent")
+    doppler_energy = np.sum(
+        np.abs(all_bins[:, :, :, :, target_bin]) ** np.float32(2.0),
+        axis=(0, 1, 3),
+        dtype=np.float32,
+    )
+
+    zero_idx = int(n_loops // 2)
+    nyquist_idx = 0
+    total_energy = float(np.sum(doppler_energy, dtype=np.float32))
+    assert float(doppler_energy[zero_idx]) / max(total_energy, 1e-12) >= 0.99
+    assert float(doppler_energy[nyquist_idx]) / max(total_energy, 1e-12) <= 1e-6
+
+
 def test_tdm_compensation_moving_target_attenuated_in_zero_bin() -> None:
     n_pos, n_frames, n_loops, n_tx, n_rx, n_bins, target_bin = 1, 1, 32, 2, 4, 64, 18
-    c_m_s = np.float32(3e8)
-    fc_hz = np.float32(77e9)
-    lambda_m = c_m_s / fc_hz
-    chirp_period_s = np.float32(160e-6)
-    velocity_m_s = np.float32(0.5)
+    target_doppler_bin = 3
+    doppler_cycles = np.float32(target_doppler_bin / n_loops)
 
     raw = np.zeros((n_pos, n_frames, n_loops, n_tx, n_rx, n_bins), dtype=np.complex64)
     loop_idx = np.arange(n_loops, dtype=np.float32)
     for tx_i in range(n_tx):
-        t_chirp = (loop_idx * np.float32(n_tx) + np.float32(tx_i)) * chirp_period_s
         phase = np.exp(
             1j * np.float32(2.0 * np.pi)
-            * (np.float32(2.0) * velocity_m_s / lambda_m)
-            * t_chirp
+            * doppler_cycles
+            * (loop_idx + (np.float32(tx_i) / np.float32(n_tx)))
         ).astype(np.complex64, copy=False)
         raw[:, :, :, tx_i, :, target_bin] = phase.reshape(1, 1, n_loops, 1)
 
@@ -138,13 +291,15 @@ def test_tdm_compensation_moving_target_attenuated_in_zero_bin() -> None:
 
     zero_energy = float(np.sum(np.abs(zero_bin[:, :, :, target_bin]) ** 2))
     doppler_energy = np.sum(np.abs(all_bins[:, :, :, :, target_bin]) ** np.float32(2.0), axis=(0, 1, 3), dtype=np.float32)
+    expected_idx = int(n_loops // 2 + target_doppler_bin)
     correct_doppler_energy = float(np.max(doppler_energy))
+    assert int(np.argmax(doppler_energy)) == expected_idx
     zero_db = 10.0 * np.log10(max(zero_energy, 1e-12))
     correct_db = 10.0 * np.log10(max(correct_doppler_energy, 1e-12))
     assert zero_db <= correct_db - 15.0
 
     total_doppler = float(np.sum(doppler_energy))
-    assert correct_doppler_energy / max(total_doppler, 1e-12) >= 0.70
+    assert correct_doppler_energy / max(total_doppler, 1e-12) >= 0.99
 
 
 def test_cubic_vs_linear_interpolation() -> None:

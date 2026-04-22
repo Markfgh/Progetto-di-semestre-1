@@ -1,6 +1,7 @@
 import socket
 import time
 import queue as pyqueue
+import atexit
 from pathlib import Path
 from multiprocessing import Process, Queue, Value
 from array import array
@@ -369,6 +370,7 @@ def _apply_process_affinity(label: str, pid: int, cpus, enabled: bool) -> None:
 
 from offline_processing import OfflineBPRuntime
 from mmwave_studio_bridge import DCA1000Config, MmwaveStudioBridge, MmwaveStudioError, RadarConnectionConfig
+from shutdown_utils import cleanup_processes, close_queues
 from realtime_dsp import (
     RealtimeDSPConfig,
     build_angle_axis_deg,
@@ -608,9 +610,16 @@ def radar_rx(
     U32_HALF = 1 << 31
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF_BYTES)
-    sock.bind((PC_IP, PORT))
-    sock.settimeout(0.2)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF_BYTES)
+        sock.bind((PC_IP, PORT))
+        sock.settimeout(0.2)
+    except Exception:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        raise
 
     packet_buf = bytearray(2048)
     packet_mv = memoryview(packet_buf)
@@ -819,118 +828,132 @@ def radar_rx(
         frame_ok = True
         _free_current_slot()
 
-    while not stop_evt.is_set():
-        now_perf = time.perf_counter()
-        _poll_commands(now_perf)
-        _maybe_enable_capture(now_perf)
-
-        try:
-            n_bytes, _ = sock.recvfrom_into(packet_mv)
-            pkts_local += 1
-            recv_perf = time.perf_counter()
+    try:
+        while not stop_evt.is_set():
+            now_perf = time.perf_counter()
+            _poll_commands(now_perf)
+            _maybe_enable_capture(now_perf)
+    
             try:
-                with rx_last_packet_time_s.get_lock():
-                    rx_last_packet_time_s.value = time.time()
-            except Exception:
-                pass
-            if recv_perf - t_flush >= 0.1:
-                with rx_pkts.get_lock():
-                    rx_pkts.value += pkts_local
-                pkts_local = 0
-                t_flush = recv_perf
-        except socket.timeout:
-            if rx_state == RX_RUNNING and (time.perf_counter() - last_packet_perf) >= STALL_TIMEOUT_S:
-                rx_state = RX_STALLED
-                _bump_counter(stall_events)
-            continue
-
-        if n_bytes <= HEADER_LEN:
-            continue
-
-        last_packet_perf = time.perf_counter()
-
-        if rx_state == RX_STALLED:
-            _soft_reset_stream()
-            rx_state = RX_RUNNING
-
-        current_payload_len = n_bytes - HEADER_LEN
-        if payload_len_ref is None:
-            payload_len_ref = current_payload_len
-
-        # --- parse header ---
-        seq = int.from_bytes(packet_view[0:4], "little", signed=False)
-
-        # uint48 little-endian
-        bc = int.from_bytes(packet_view[4:10], "little", signed=False) & (MOD48 - 1)
-
-        # --- seq continuity: forward, reorder, restart ---
-        seq_gap_pkts = 0
-        if last_seq is not None:
-            delta = (int(seq) - int(last_seq)) & (U32_MOD - 1)
-            if delta == 0:
-                # duplicate packet
+                n_bytes, _ = sock.recvfrom_into(packet_mv)
+                pkts_local += 1
+                recv_perf = time.perf_counter()
+                try:
+                    with rx_last_packet_time_s.get_lock():
+                        rx_last_packet_time_s.value = time.time()
+                except Exception:
+                    pass
+                if recv_perf - t_flush >= 0.1:
+                    with rx_pkts.get_lock():
+                        rx_pkts.value += pkts_local
+                    pkts_local = 0
+                    t_flush = recv_perf
+            except socket.timeout:
+                if rx_state == RX_RUNNING and (time.perf_counter() - last_packet_perf) >= STALL_TIMEOUT_S:
+                    rx_state = RX_STALLED
+                    _bump_counter(stall_events)
                 continue
-            if delta < U32_HALF:
-                # forward progression (also handles uint32 wrap-around)
-                seq_gap_pkts = int(delta - 1)
-            else:
-                # backward packet: small back = reorder, large back = stream restart
-                back = (int(last_seq) - int(seq)) & (U32_MOD - 1)
-                if back <= SEQ_REORDER_MAX_BACK:
-                    continue
+    
+            if n_bytes <= HEADER_LEN:
+                continue
+    
+            last_packet_perf = time.perf_counter()
+    
+            if rx_state == RX_STALLED:
                 _soft_reset_stream()
+                rx_state = RX_RUNNING
+    
+            current_payload_len = n_bytes - HEADER_LEN
+            if payload_len_ref is None:
                 payload_len_ref = current_payload_len
-                seq_gap_pkts = 0
-
-        if seq_gap_pkts > 0 and payload_len_ref is not None:
-            with lost_pkts.get_lock():
-                lost_pkts.value += int(seq_gap_pkts)
-
-        # --- byte_count check (absolute stream alignment) ---
-        hard_resync = False
-        if last_byte_count is not None and payload_len_ref is not None:
-            expected = (last_byte_count + ((int(seq_gap_pkts) + 1) * int(payload_len_ref))) % MOD48
-            if bc != expected:
-                _hard_resync_from_byte_count(bc)
-                payload_len_ref = current_payload_len
-                hard_resync = True
-        last_byte_count = bc
-
-        # --- GAP handling (consume missing bytes to keep frame alignment) ---
-        if (not hard_resync) and seq_gap_pkts > 0 and payload_len_ref is not None:
-            frame_ok = False
-
-            bytes_missing = int(seq_gap_pkts) * int(payload_len_ref)
-            while bytes_missing > 0 and (not stop_evt.is_set()):
+    
+            # --- parse header ---
+            seq = int.from_bytes(packet_view[0:4], "little", signed=False)
+    
+            # uint48 little-endian
+            bc = int.from_bytes(packet_view[4:10], "little", signed=False) & (MOD48 - 1)
+    
+            # --- seq continuity: forward, reorder, restart ---
+            seq_gap_pkts = 0
+            if last_seq is not None:
+                delta = (int(seq) - int(last_seq)) & (U32_MOD - 1)
+                if delta == 0:
+                    # duplicate packet
+                    continue
+                if delta < U32_HALF:
+                    # forward progression (also handles uint32 wrap-around)
+                    seq_gap_pkts = int(delta - 1)
+                else:
+                    # backward packet: small back = reorder, large back = stream restart
+                    back = (int(last_seq) - int(seq)) & (U32_MOD - 1)
+                    if back <= SEQ_REORDER_MAX_BACK:
+                        continue
+                    _soft_reset_stream()
+                    payload_len_ref = current_payload_len
+                    seq_gap_pkts = 0
+    
+            if seq_gap_pkts > 0 and payload_len_ref is not None:
+                with lost_pkts.get_lock():
+                    lost_pkts.value += int(seq_gap_pkts)
+    
+            # --- byte_count check (absolute stream alignment) ---
+            hard_resync = False
+            if last_byte_count is not None and payload_len_ref is not None:
+                expected = (last_byte_count + ((int(seq_gap_pkts) + 1) * int(payload_len_ref))) % MOD48
+                if bc != expected:
+                    _hard_resync_from_byte_count(bc)
+                    payload_len_ref = current_payload_len
+                    hard_resync = True
+            last_byte_count = bc
+    
+            # --- GAP handling (consume missing bytes to keep frame alignment) ---
+            if (not hard_resync) and seq_gap_pkts > 0 and payload_len_ref is not None:
+                frame_ok = False
+    
+                bytes_missing = int(seq_gap_pkts) * int(payload_len_ref)
+                while bytes_missing > 0 and (not stop_evt.is_set()):
+                    _ensure_slot()
+                    take = min(bytes_missing, BYTES_PER_FRAME - w)
+                    # consume without writing (keep alignment)
+                    w += take
+                    bytes_missing -= take
+                    if w == BYTES_PER_FRAME:
+                        _publish_frame()
+    
+            last_seq = seq
+    
+            # --- process current payload ---
+            off = HEADER_LEN
+            current_payload_len = n_bytes - off
+            payload_cursor = 0
+    
+            while payload_cursor < current_payload_len and (not stop_evt.is_set()):
                 _ensure_slot()
-                take = min(bytes_missing, BYTES_PER_FRAME - w)
-                # consume without writing (keep alignment)
-                w += take
-                bytes_missing -= take
+                chunk_size = min(current_payload_len - payload_cursor, BYTES_PER_FRAME - w)
+    
+                if have_slot and (frame_view is not None):
+                    start_src = off + payload_cursor
+                    frame_view[w : w + chunk_size] = packet_view[start_src : start_src + chunk_size]
+    
+                w += chunk_size
+                payload_cursor += chunk_size
+    
                 if w == BYTES_PER_FRAME:
                     _publish_frame()
-
-        last_seq = seq
-
-        # --- process current payload ---
-        off = HEADER_LEN
-        current_payload_len = n_bytes - off
-        payload_cursor = 0
-
-        while payload_cursor < current_payload_len and (not stop_evt.is_set()):
-            _ensure_slot()
-            chunk_size = min(current_payload_len - payload_cursor, BYTES_PER_FRAME - w)
-
-            if have_slot and (frame_view is not None):
-                start_src = off + payload_cursor
-                frame_view[w : w + chunk_size] = packet_view[start_src : start_src + chunk_size]
-
-            w += chunk_size
-            payload_cursor += chunk_size
-
-            if w == BYTES_PER_FRAME:
-                _publish_frame()
-
+    
+    
+    finally:
+        try:
+            _discard_partial_frame()
+        except Exception:
+            pass
+        payload_len_ref = None
+        last_seq = None
+        last_byte_count = None
+        try:
+            sock.close()
+        except Exception:
+            pass
 
 def logger_worker(
     free_slots: Queue,
@@ -1056,148 +1079,252 @@ def logger_worker(
             except Exception:
                 pass
 
-    while not stop_evt.is_set():
-        capid = int(cap_id.value)
-        posid = int(cap_pos_id.value)
-
-        # Detect a new CAPTURE click (cap_id increments in RX when GUI sends CAPTURE)
-        if capid != last_seen_cap_id:
-            last_seen_cap_id = capid
-            pending_cap_id = capid
-            pending_pos_id = posid
-            # cap_active will be set to 1 by RX after settling_delay_s
-            # (logger must NOT enable capture by itself)
-            with cap_saved.get_lock():
-                cap_saved.value = 0
-
-        # Start logging only when capture is ACTIVE (set by RX) and we have a pending click
-        if fbin is None:
-            if pending_cap_id is None or int(cap_active.value) != 1:
+    try:
+        while not stop_evt.is_set():
+            capid = int(cap_id.value)
+            posid = int(cap_pos_id.value)
+    
+            # Detect a new CAPTURE click (cap_id increments in RX when GUI sends CAPTURE)
+            if capid != last_seen_cap_id:
+                last_seen_cap_id = capid
+                pending_cap_id = capid
+                pending_pos_id = posid
+                # cap_active will be set to 1 by RX after settling_delay_s
+                # (logger must NOT enable capture by itself)
+                with cap_saved.get_lock():
+                    cap_saved.value = 0
+    
+            # Start logging only when capture is ACTIVE (set by RX) and we have a pending click
+            if fbin is None:
+                if pending_cap_id is None or int(cap_active.value) != 1:
+                    time.sleep(0.002)
+                    continue
+                _open_file(int(pending_pos_id))
+                pending_cap_id = None
+                pending_pos_id = None
+    
+            # If capture was externally stopped, close the file and idle
+            if int(cap_active.value) != 1:
+                _close_file()
                 time.sleep(0.002)
                 continue
-            _open_file(int(pending_pos_id))
-            pending_cap_id = None
-            pending_pos_id = None
+    
+            # scan a bounded number of slots per tick to keep CPU low
+            did_work = False
+            while saved_local < int(frames_per_position):
+                s, ok = _claim_slot_for_logger(int(posid))
+                if s < 0:
+                    break
+    
+                try:
+                    if ok == 1:
+                        base = int(s) * BYTES_PER_FRAME
+                        assert buf is not None and fbin is not None
+                        buf[buf_used : buf_used + BYTES_PER_FRAME] = shm_view[base : base + BYTES_PER_FRAME]
+                        buf_used += BYTES_PER_FRAME
+                        saved_local += 1
+                        did_work = True
 
-        # If capture was externally stopped, close the file and idle
-        if int(cap_active.value) != 1:
-            _close_file()
-            time.sleep(0.002)
-            continue
+                        with cap_saved.get_lock():
+                            cap_saved.value = int(saved_local)
 
-        # scan a bounded number of slots per tick to keep CPU low
-        did_work = False
-        while saved_local < int(frames_per_position):
-            s, ok = _claim_slot_for_logger(int(posid))
-            if s < 0:
-                break
-
-            if ok == 1:
-                base = int(s) * BYTES_PER_FRAME
-                assert buf is not None and fbin is not None
-                buf[buf_used : buf_used + BYTES_PER_FRAME] = shm_view[base : base + BYTES_PER_FRAME]
-                buf_used += BYTES_PER_FRAME
-                saved_local += 1
-                did_work = True
-
-                with cap_saved.get_lock():
-                    cap_saved.value = int(saved_local)
-
-                if buf_used >= BYTES_PER_FRAME * int(block_frames):
+                        if buf_used >= BYTES_PER_FRAME * int(block_frames):
+                            fbin.write(buf[:buf_used])
+                            if log_bytes is not None:
+                                with log_bytes.get_lock():
+                                    log_bytes.value += int(buf_used)
+                            buf_used = 0
+                finally:
+                    # always release logger ownership, even for corrupt slot
+                    _finalize_logger_slot(int(s))
+    
+            # stop condition: reached target
+            if saved_local >= int(frames_per_position):
+                if buf_used:
                     fbin.write(buf[:buf_used])
                     if log_bytes is not None:
                         with log_bytes.get_lock():
                             log_bytes.value += int(buf_used)
                     buf_used = 0
-
-            # always release logger ownership, even for corrupt slot
-            _finalize_logger_slot(int(s))
-
-        # stop condition: reached target
-        if saved_local >= int(frames_per_position):
-            if buf_used:
-                fbin.write(buf[:buf_used])
-                if log_bytes is not None:
-                    with log_bytes.get_lock():
-                        log_bytes.value += int(buf_used)
-                buf_used = 0
-            try:
-                fbin.flush()
-            except Exception:
-                pass
-            _close_file()
-            with cap_active.get_lock():
-                cap_active.value = 0
-            continue
-
-
-        if not did_work:
-            time.sleep(0.002)
-
+                try:
+                    fbin.flush()
+                except Exception:
+                    pass
+                _close_file()
+                with cap_active.get_lock():
+                    cap_active.value = 0
+                continue
+    
+    
+            if not did_work:
+                time.sleep(0.002)
+    
+    
+    finally:
+        _close_file()
 
 def main():
+    shutdown_state = {
+        "in_progress": False,
+        "done": False,
+        "dpg_context_created": False,
+        "dpg_context_destroyed": False,
+    }
+    shutdown_resources = {
+        "processes": [],
+        "queues": [],
+        "mp_refs": [],
+        "stop_evt": None,
+        "offline_runtime": None,
+        "mmwave_bridge": None,
+    }
+    mmwave_auto_rearm_armed = False
+
+    def _track_process(proc):
+        if proc is not None:
+            shutdown_resources["processes"].append(proc)
+        return proc
+
+    def _track_queue(queue_obj):
+        if queue_obj is not None:
+            shutdown_resources["queues"].append(queue_obj)
+        return queue_obj
+
+    def _track_mp_ref(obj):
+        if obj is not None:
+            shutdown_resources["mp_refs"].append(obj)
+        return obj
+
+    def _shutdown():
+        nonlocal mmwave_auto_rearm_armed
+        if shutdown_state["done"] or shutdown_state["in_progress"]:
+            return
+        shutdown_state["in_progress"] = True
+        try:
+            mmwave_auto_rearm_armed = False
+
+            bridge = shutdown_resources.get("mmwave_bridge")
+            if bridge is not None:
+                try:
+                    if bridge.is_streaming:
+                        bridge.stop_streaming(stop_delay_s=0.25)
+                except Exception:
+                    pass
+                try:
+                    bridge.disconnect_hardware(stop_delay_s=0.25)
+                except TypeError:
+                    try:
+                        bridge.disconnect_hardware()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            stop_evt_obj = shutdown_resources.get("stop_evt")
+            if stop_evt_obj is not None:
+                try:
+                    stop_evt_obj.set()
+                except Exception:
+                    pass
+
+            offline_runtime_obj = shutdown_resources.get("offline_runtime")
+            if offline_runtime_obj is not None:
+                try:
+                    offline_runtime_obj.stop()
+                except Exception:
+                    pass
+
+            cleanup_processes(
+                shutdown_resources.get("processes", ()),
+                graceful_timeout_s=0.4,
+                terminate_timeout_s=0.2,
+                close_handles=True,
+            )
+            close_queues(shutdown_resources.get("queues", ()))
+
+            shutdown_resources["processes"].clear()
+            shutdown_resources["queues"].clear()
+            shutdown_resources["mp_refs"].clear()
+            shutdown_resources["stop_evt"] = None
+            shutdown_resources["offline_runtime"] = None
+            shutdown_resources["mmwave_bridge"] = None
+
+            if shutdown_state["dpg_context_created"] and not shutdown_state["dpg_context_destroyed"]:
+                try:
+                    dpg.destroy_context()
+                except Exception:
+                    pass
+                shutdown_state["dpg_context_destroyed"] = True
+        finally:
+            shutdown_state["done"] = True
+            shutdown_state["in_progress"] = False
+
+    atexit.register(_shutdown)
+
     # --- SETUP CODE E PROCESSI ---
-    free_slots = Queue()
-    dsp_ready_queue = Queue()
+    free_slots = _track_queue(Queue())
+    dsp_ready_queue = _track_queue(Queue())
 
     # Ring slots (user requested 64)
     N_SLOTS = 64
-    shm_frames = RawArray("B", N_SLOTS * BYTES_PER_FRAME)
+    shm_frames = _track_mp_ref(RawArray("B", N_SLOTS * BYTES_PER_FRAME))
     for i in range(N_SLOTS):
         free_slots.put(i)
 
     # Slot metadata (shared)
     # slot_state: 0=FREE, 1=READY
-    slot_state = RawArray("b", N_SLOTS)
-    slot_ok = RawArray("b", N_SLOTS)
-    slot_pos_id = RawArray("i", N_SLOTS)
+    slot_state = _track_mp_ref(RawArray("b", N_SLOTS))
+    slot_ok = _track_mp_ref(RawArray("b", N_SLOTS))
+    slot_pos_id = _track_mp_ref(RawArray("i", N_SLOTS))
     for i in range(N_SLOTS):
         slot_state[i] = 0
         slot_ok[i] = 0
         slot_pos_id[i] = -1
 
     # slot_usemask: bit0=DSP, bit1=LOGGER (capture)
-    slot_usemask = RawArray("B", N_SLOTS)
-    slot_pub_seq = RawArray("Q", N_SLOTS)
+    slot_usemask = _track_mp_ref(RawArray("B", N_SLOTS))
+    slot_pub_seq = _track_mp_ref(RawArray("Q", N_SLOTS))
     for i in range(N_SLOTS):
         slot_usemask[i] = 0
         slot_pub_seq[i] = 0
 
-    publish_lock = mp.Lock()  # atomic publish lock (seq+slot+state)
+    publish_lock = _track_mp_ref(mp.Lock())  # atomic publish lock (seq+slot+state)
 
 
     # Capture shared state
-    cap_active = Value("i", 0)   # 1 while capturing
-    cap_pos_id = Value("i", 0)   # current position id (from GUI)
-    cap_id = Value("I", 0)       # increments each CAPTURE command
-    cap_saved = Value("i", 0)    # frames saved for current position
+    cap_active = _track_mp_ref(Value("i", 0))   # 1 while capturing
+    cap_pos_id = _track_mp_ref(Value("i", 0))   # current position id (from GUI)
+    cap_id = _track_mp_ref(Value("I", 0))       # increments each CAPTURE command
+    cap_saved = _track_mp_ref(Value("i", 0))    # frames saved for current position
 
     dr_shared = C * FS / (2.0 * SLOPE * NFFT_RANGE)
     gui_h = int(np.floor(RANGE_MAX_DISPLAY / dr_shared))
     gui_h = max(1, min(gui_h, NFFT_RANGE // 2))
     fft_plot_h = max(1, int(NFFT_RANGE))
     gui_w = int(NFFT_ANGLE)
-    gui_dbuf = RawArray("f", 2 * gui_h * gui_w)
-    gui_prof_dbuf = RawArray("f", 2 * RANGE_PROFILE_COUNT * fft_plot_h)
-    gui_latest_idx = Value("i", -1)
-    gui_latest_seq = Value("Q", 0)
-    gui_lock = mp.Lock()
+    gui_dbuf = _track_mp_ref(RawArray("f", 2 * gui_h * gui_w))
+    gui_prof_dbuf = _track_mp_ref(RawArray("f", 2 * RANGE_PROFILE_COUNT * fft_plot_h))
+    gui_latest_idx = _track_mp_ref(Value("i", -1))
+    gui_latest_seq = _track_mp_ref(Value("Q", 0))
+    gui_lock = _track_mp_ref(mp.Lock())
     track_cfg = cfg.get("tracking", {}) or {}
     track_max_shared = max(1, int(track_cfg.get("max_tracks", 30)))
-    gui_tracks_xy_dbuf = RawArray("f", track_max_shared * 4)   # x, y, vx, vy
-    gui_tracks_meta_dbuf = RawArray("i", track_max_shared * 4)  # id, confirmed, age, missed
-    gui_tracks_state_dbuf = RawArray("i", track_max_shared * 2)  # motion_state_code, has_stop
-    gui_tracks_stop_xy_dbuf = RawArray("f", track_max_shared * 2)  # stop_x, stop_y
-    gui_tracks_count = Value("i", 0)
-    gui_tracks_seq = Value("Q", 0)
-    gui_tracks_lock = mp.Lock()
+    gui_tracks_xy_dbuf = _track_mp_ref(RawArray("f", track_max_shared * 4))   # x, y, vx, vy
+    gui_tracks_meta_dbuf = _track_mp_ref(RawArray("i", track_max_shared * 4))  # id, confirmed, age, missed
+    gui_tracks_state_dbuf = _track_mp_ref(RawArray("i", track_max_shared * 2))  # motion_state_code, has_stop
+    gui_tracks_stop_xy_dbuf = _track_mp_ref(RawArray("f", track_max_shared * 2))  # stop_x, stop_y
+    gui_tracks_count = _track_mp_ref(Value("i", 0))
+    gui_tracks_seq = _track_mp_ref(Value("Q", 0))
+    gui_tracks_lock = _track_mp_ref(mp.Lock())
 
-    cmd_q = Queue(maxsize=16)
-    dsp_cmd_q = Queue(maxsize=16)
+    cmd_q = _track_queue(Queue(maxsize=16))
+    dsp_cmd_q = _track_queue(Queue(maxsize=16))
 
-    stop_evt = mp.Event()
-    sar_pos_counter = Value("L", 0)  # GUI-only counter (pos id generator)
+    stop_evt = _track_mp_ref(mp.Event())
+    shutdown_resources["stop_evt"] = stop_evt
+    sar_pos_counter = _track_mp_ref(Value("L", 0))  # GUI-only counter (pos id generator)
     mmwave_bridge = MmwaveStudioBridge()
+    shutdown_resources["mmwave_bridge"] = mmwave_bridge
     mmwave_radar_cfg = RadarConnectionConfig(
         uart_com_port=3,
         baudrate=921600,
@@ -1212,22 +1339,22 @@ def main():
     )
 
     # Stats
-    lost_pkts = Value("L", 0)
-    rx_pkts = Value("L", 0)
-    rx_last_packet_time_s = Value("d", time.time())
-    rx_put_drops = Value("L", 0)
-    rx_frames_ok = Value("L", 0)
-    rx_stall_events = Value("L", 0)
-    rx_stream_resets = Value("L", 0)
-    dsp_skip = Value("L", 0)
-    dsp_ms_avg = Value("d", 0.0)
-    dsp_ms_p95 = Value("d", 0.0)
-    log_bytes = Value("L", 0)
-    norm_to_peak = Value("b", 1)
-    stat_raw_min_db = Value("d", float("nan"))
-    stat_raw_max_db = Value("d", float("nan"))
-    stat_norm_min_db = Value("d", float("nan"))
-    stat_norm_max_db = Value("d", float("nan"))
+    lost_pkts = _track_mp_ref(Value("L", 0))
+    rx_pkts = _track_mp_ref(Value("L", 0))
+    rx_last_packet_time_s = _track_mp_ref(Value("d", time.time()))
+    rx_put_drops = _track_mp_ref(Value("L", 0))
+    rx_frames_ok = _track_mp_ref(Value("L", 0))
+    rx_stall_events = _track_mp_ref(Value("L", 0))
+    rx_stream_resets = _track_mp_ref(Value("L", 0))
+    dsp_skip = _track_mp_ref(Value("L", 0))
+    dsp_ms_avg = _track_mp_ref(Value("d", 0.0))
+    dsp_ms_p95 = _track_mp_ref(Value("d", 0.0))
+    log_bytes = _track_mp_ref(Value("L", 0))
+    norm_to_peak = _track_mp_ref(Value("b", 1))
+    stat_raw_min_db = _track_mp_ref(Value("d", float("nan")))
+    stat_raw_max_db = _track_mp_ref(Value("d", float("nan")))
+    stat_norm_min_db = _track_mp_ref(Value("d", float("nan")))
+    stat_norm_max_db = _track_mp_ref(Value("d", float("nan")))
 
     run_id = time.strftime("%Y%m%d_%H%M%S")
     out_root = Path(__file__).with_name("logs")
@@ -1264,6 +1391,7 @@ def main():
             SETTLING_DELAY_S,
         ),
     )
+    _track_process(p_rx)
 
     p_log = Process(
         target=logger_worker,
@@ -1286,6 +1414,7 @@ def main():
             16,  # block_frames
         ),
     )
+    _track_process(p_log)
 
     p_dsp = Process(
         target=dsp_worker,
@@ -1327,6 +1456,7 @@ def main():
             REALTIME_DSP_CFG,
         ),
     )
+    _track_process(p_dsp)
 
     p_rx.daemon = True
     p_log.daemon = True
@@ -1366,6 +1496,7 @@ def main():
             image_h=int(gui_h),
             image_w=int(gui_w),
         )
+        shutdown_resources["offline_runtime"] = offline_runtime
         offline_info = offline_runtime.start(timeout_s=45.0)
         print(
             f"[OFFLINE] ready pos={offline_info.get('pos_min')}..{offline_info.get('pos_max')} "
@@ -1374,7 +1505,13 @@ def main():
         )
     except Exception as exc:
         offline_error = str(exc)
+        try:
+            if offline_runtime is not None:
+                offline_runtime.stop()
+        except Exception:
+            pass
         offline_runtime = None
+        shutdown_resources["offline_runtime"] = None
         print(f"[OFFLINE WARN] {offline_error}")
 
     # =========================================================================
@@ -1422,6 +1559,7 @@ def main():
 
     # 2) DearPyGui Init
     dpg.create_context()
+    shutdown_state["dpg_context_created"] = True
 
     # Font
     font_mono = None
@@ -1625,36 +1763,6 @@ def main():
         )
 
     # 5) Callbacks
-    def _shutdown():
-        try:
-            mmwave_bridge.disconnect_hardware()
-        except Exception:
-            pass
-        stop_evt.set()
-        if offline_runtime is not None:
-            try:
-                offline_runtime.stop()
-            except Exception:
-                pass
-        # allow workers to exit cleanly
-        for p in (p_rx, p_log, p_dsp):
-            try:
-                p.join(timeout=0.2)
-            except Exception:
-                pass
-        # hard-kill if still alive
-        for p in (p_rx, p_log, p_dsp):
-            try:
-                if p.is_alive():
-                    p.terminate()
-            except Exception:
-                pass
-        for p in (p_rx, p_log, p_dsp):
-            try:
-                p.join(timeout=0.2)
-            except Exception:
-                pass
-
     dpg.set_exit_callback(_shutdown)
 
     def _build_jet_lut(size: int = 2048):
@@ -3022,7 +3130,6 @@ def main():
         pass
     finally:
         _shutdown()
-        dpg.destroy_context()
 
 
 

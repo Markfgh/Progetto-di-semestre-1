@@ -314,11 +314,11 @@ class MmwaveStudioBridge:
             print(f"[mmwave] {self._last_message}", flush=True)
             return self.get_gui_state()
 
-    def disconnect_hardware(self) -> GuiBridgeState:
+    def disconnect_hardware(self, *, stop_delay_s: float = 2.0) -> GuiBridgeState:
         with self._lock:
             if self._streaming:
                 try:
-                    self.stop_streaming()
+                    self.stop_streaming(stop_delay_s=stop_delay_s)
                 except Exception:
                     pass
             if self._hw_connected:

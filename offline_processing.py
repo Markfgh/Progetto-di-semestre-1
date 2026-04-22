@@ -25,12 +25,14 @@ from offline_dsp import (
     back_projection_image as _back_projection_image,
     back_projection_image_mimo as _back_projection_image_mimo,
     bp_mode_normalize as _bp_mode_normalize,
+    build_mimo_back_projection_plan as _build_mimo_back_projection_plan,
     build_mimo_geometry as _build_mimo_geometry,
     motion_mode_normalize as _motion_mode_normalize,
     phase_sign_normalize as _phase_sign_normalize,
     prepare_mimo_snapshots as _prepare_mimo_snapshots,
     reduce_avg_mode as _reduce_avg_mode,
 )
+from shutdown_utils import cleanup_processes, close_queues
 
 _CAPTURE_FILE_RE = re.compile(r"^capture_pos(-?\d+)\.bin$")
 _CAPTURE_HEADER_MAGIC = b"RTPBIN1\x00"
@@ -649,94 +651,6 @@ def _resolve_wavelength_m(cfg: dict[str, Any]) -> float:
     return float(wavelength_m)
 
 
-def _default_virtual_array_order_flat(virtual_ant: int) -> np.ndarray:
-    return np.arange(max(0, int(virtual_ant)), dtype=np.int32)
-
-
-def _parse_virtual_array_order_entry(
-    entry: Any,
-    *,
-    tx: int,
-    rx: int,
-    virtual_ant: int,
-) -> int:
-    if isinstance(entry, dict):
-        if "flat" in entry:
-            idx = int(entry["flat"])
-        else:
-            idx = int(entry["tx"]) * int(rx) + int(entry["rx"])
-    elif isinstance(entry, (list, tuple)):
-        if len(entry) == 2:
-            idx = int(entry[0]) * int(rx) + int(entry[1])
-        elif len(entry) == 1:
-            idx = int(entry[0])
-        else:
-            raise ValueError(f"virtual_array_order entry non valido: {entry!r}")
-    else:
-        idx = int(entry)
-    if idx < 0 or idx >= int(virtual_ant):
-        raise ValueError(f"virtual_array_order index fuori range: {idx}")
-    return int(idx)
-
-
-def _resolve_virtual_array_order(cfg: dict[str, Any], *, tx: int, rx: int, virtual_ant: int) -> np.ndarray:
-    antenna_block = cfg.get("antenna", {}) or cfg.get("virtual_array", {}) or {}
-    default_order = _default_virtual_array_order_flat(virtual_ant)
-    order_raw = antenna_block.get("virtual_array_order", antenna_block.get("order", None))
-    if order_raw is None:
-        return default_order
-    order_list = list(order_raw)
-    if len(order_list) != int(virtual_ant):
-        raise ValueError(f"virtual_array_order size={len(order_list)} != virtual_ant={virtual_ant}")
-    parsed = np.asarray(
-        [
-            _parse_virtual_array_order_entry(
-                item,
-                tx=int(tx),
-                rx=int(rx),
-                virtual_ant=int(virtual_ant),
-            )
-            for item in order_list
-        ],
-        dtype=np.int32,
-    )
-    if np.unique(parsed).size != int(virtual_ant):
-        raise ValueError("virtual_array_order contiene duplicati")
-    return parsed.astype(np.int32, copy=False)
-
-
-def _resolve_config_virtual_phase_centers_m(
-    cfg: dict[str, Any],
-    *,
-    virtual_ant: int,
-    wavelength_m: float,
-) -> np.ndarray | None:
-    antenna_block = cfg.get("antenna", {}) or cfg.get("virtual_array", {}) or {}
-    phase_centers_m = _parse_float_array(
-        "antenna.virtual_array_phase_centers_m",
-        antenna_block.get("virtual_array_phase_centers_m", antenna_block.get("phase_centers_m", None)),
-        expected_len=int(virtual_ant),
-    )
-    if phase_centers_m is not None:
-        return phase_centers_m.astype(np.float32, copy=False)
-
-    phase_centers_lambda = _parse_float_array(
-        "antenna.virtual_array_phase_centers_lambda",
-        antenna_block.get("virtual_array_phase_centers_lambda", antenna_block.get("phase_centers_lambda", None)),
-        expected_len=int(virtual_ant),
-    )
-    if phase_centers_lambda is None:
-        return None
-    return (phase_centers_lambda * np.float32(float(wavelength_m))).astype(np.float32, copy=False)
-
-
-def _centered(arr: np.ndarray) -> np.ndarray:
-    arr_f = np.asarray(arr, dtype=np.float32).reshape(-1)
-    if arr_f.size <= 0:
-        return arr_f
-    return (arr_f - np.float32(float(np.mean(arr_f, dtype=np.float64)))).astype(np.float32, copy=False)
-
-
 def _resolve_bp_offsets_m(
     bp_cfg: dict[str, Any],
     *,
@@ -771,6 +685,28 @@ def _motion_mode_from_legacy_avg_mode(avg_mode_raw: Any) -> tuple[MotionMode, st
     )
 
 
+def _append_deprecated_mimo_geometry_warnings(
+    *,
+    warnings: list[str],
+    source_label: str,
+    cfg: dict[str, Any],
+) -> None:
+    antenna_block = cfg.get("antenna", {}) or cfg.get("virtual_array", {}) or {}
+    for key in (
+        "virtual_array_order",
+        "order",
+        "virtual_array_phase_centers_m",
+        "phase_centers_m",
+        "virtual_array_phase_centers_lambda",
+        "phase_centers_lambda",
+    ):
+        if key in antenna_block:
+            warnings.append(
+                f"[OFFLINE WARN] {source_label}: antenna.{key} is deprecated/ignored in mimo_sar; "
+                "offline MIMO-SAR uses physical bistatic TX/RX geometry."
+            )
+
+
 def _read_bp_runtime_cfg(offline_config_path: str | Path, fallback_capture_cfg: str | Path) -> dict[str, Any]:
     cfg = _load_yaml_file(Path(offline_config_path))
     fallback_cfg = _load_yaml_file(Path(fallback_capture_cfg))
@@ -778,6 +714,17 @@ def _read_bp_runtime_cfg(offline_config_path: str | Path, fallback_capture_cfg: 
     warnings: list[str] = []
 
     mode: BpMode = _bp_mode_normalize(_pick(bp_cfg.get("mode"), "sar_only"))
+    if mode == "mimo_sar":
+        _append_deprecated_mimo_geometry_warnings(
+            warnings=warnings,
+            source_label="offline_config",
+            cfg=cfg,
+        )
+        _append_deprecated_mimo_geometry_warnings(
+            warnings=warnings,
+            source_label="capture_config",
+            cfg=fallback_cfg,
+        )
     avg_mode: AvgMode = _avg_mode_normalize(_pick(bp_cfg.get("avg_mode"), "both"))
     motion_mode_raw = bp_cfg.get("motion_mode", None)
     if motion_mode_raw is None and bp_cfg.get("avg_mode", None) is not None and mode == "mimo_sar":
@@ -785,23 +732,43 @@ def _read_bp_runtime_cfg(offline_config_path: str | Path, fallback_capture_cfg: 
         warnings.append(str(warning))
     else:
         motion_mode = _motion_mode_normalize(_pick(motion_mode_raw, "static_zero_doppler"))
-    use_virtual_antennas = _to_bool(
-        "offline_config: bp.use_virtual_antennas",
-        _pick(bp_cfg.get("use_virtual_antennas"), True),
-    )
+    use_virtual_antennas = True
+    if bp_cfg.get("use_virtual_antennas", None) is not None:
+        try:
+            use_virtual_antennas = _to_bool(
+                "offline_config: bp.use_virtual_antennas",
+                bp_cfg.get("use_virtual_antennas"),
+            )
+        except ValueError:
+            warnings.append(
+                "[OFFLINE WARN] bp.use_virtual_antennas is deprecated/ignored in mimo_sar."
+            )
+            use_virtual_antennas = True
+    if mode == "mimo_sar" and not bool(use_virtual_antennas):
+        warnings.append(
+            "[OFFLINE WARN] bp.use_virtual_antennas=false is deprecated/ignored in mimo_sar; "
+            "physical TX/RX bistatic geometry remains enabled."
+        )
+        use_virtual_antennas = True
     coherent_sum = _to_bool(
         "offline_config: bp.coherent_sum",
         _pick(bp_cfg.get("coherent_sum"), True),
     )
 
     raw_pitch = _pick(bp_cfg.get("virtual_ant_pitch_m"), 0.00195)
+    virtual_ant_pitch_m = 0.00195
     try:
         virtual_ant_pitch_m = float(raw_pitch)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"offline_config: bp.virtual_ant_pitch_m non valido: {raw_pitch!r}") from exc
-
-    if mode == "mimo_sar" and use_virtual_antennas and virtual_ant_pitch_m <= 0.0:
-        raise ValueError("offline_config: bp.virtual_ant_pitch_m deve essere > 0 in mimo_sar")
+    except (TypeError, ValueError):
+        warnings.append(
+            f"[OFFLINE WARN] bp.virtual_ant_pitch_m={raw_pitch!r} is deprecated/ignored in mimo_sar."
+        )
+        virtual_ant_pitch_m = 0.00195
+    if mode == "mimo_sar" and bp_cfg.get("virtual_ant_pitch_m", None) is not None:
+        warnings.append(
+            "[OFFLINE WARN] bp.virtual_ant_pitch_m is deprecated/ignored in mimo_sar; "
+            "phase centers are derived from 0.5 * (x_tx + x_rx)."
+        )
 
     wavelength_m = _resolve_wavelength_m(fallback_cfg)
     tx_offsets_m = _resolve_bp_offsets_m(
@@ -846,13 +813,10 @@ def _resolve_effective_avg_mode(
 
 
 def _resolve_offline_mimo_geometry(
-    offline_config_path: str | Path,
     fallback_capture_cfg: str | Path,
     *,
     tx_i: int,
     rx_i: int,
-    use_virtual_antennas: bool,
-    virtual_ant_pitch_m: float,
     tx_offsets_override_m: np.ndarray | None,
     rx_offsets_override_m: np.ndarray | None,
 ) -> dict[str, Any]:
@@ -860,14 +824,6 @@ def _resolve_offline_mimo_geometry(
         raise ValueError(f"tx/rx non validi per geometria mimo: tx={tx_i}, rx={rx_i}")
 
     fallback_cfg = _load_yaml_file(Path(fallback_capture_cfg))
-    if not bool(use_virtual_antennas):
-        zeros = np.zeros(int(tx_i * rx_i), dtype=np.float32)
-        return {
-            "x_tx_ant_m": zeros,
-            "x_rx_ant_m": zeros,
-            "geometry_source": "virtual_antennas_disabled",
-        }
-
     radar_cfg = fallback_cfg.get("radar", {}) or {}
     c_m_s = _to_float("radar.c", _pick(radar_cfg.get("c"), 3e8), 3e8)
     fc_hz = _to_float("radar.fc", radar_cfg.get("fc"))
@@ -913,12 +869,9 @@ def _offline_reader_worker(
         mimo_geometry = None
         if bp_mode == "mimo_sar":
             mimo_geometry = _resolve_offline_mimo_geometry(
-                offline_config_path,
                 fallback_capture_cfg,
                 tx_i=int(data.tx),
                 rx_i=int(data.rx),
-                use_virtual_antennas=bool(bp_runtime_cfg["use_virtual_antennas"]),
-                virtual_ant_pitch_m=float(bp_runtime_cfg["virtual_ant_pitch_m"]),
                 tx_offsets_override_m=bp_runtime_cfg.get("tx_offsets_m"),
                 rx_offsets_override_m=bp_runtime_cfg.get("rx_offsets_m"),
             )
@@ -1080,21 +1033,10 @@ def _offline_dsp_worker(
         if positions.ndim != 1 or positions.size != range_fft_data.shape[0]:
             raise ValueError("positions non coerente con range_fft")
 
-        use_virtual_antennas = _to_bool(
-            "init_msg: bp_use_virtual_antennas",
-            _pick(init_msg.get("bp_use_virtual_antennas"), True),
-        )
         coherent_sum = _to_bool(
             "init_msg: bp_coherent_sum",
             _pick(init_msg.get("bp_coherent_sum"), True),
         )
-        raw_virtual_pitch = _pick(init_msg.get("bp_virtual_ant_pitch_m"), 0.00195)
-        try:
-            virtual_ant_pitch_m = float(raw_virtual_pitch)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"init_msg: bp_virtual_ant_pitch_m non valido: {raw_virtual_pitch!r}") from exc
-        if bp_mode == "mimo_sar" and use_virtual_antennas and virtual_ant_pitch_m <= 0.0:
-            raise ValueError("bp_virtual_ant_pitch_m deve essere > 0 in mimo_sar")
         motion_mode_requested: MotionMode = _motion_mode_normalize(default_motion_mode)
 
         tx_i = max(1, int(_pick(init_msg.get("tx"), 2)))
@@ -1174,6 +1116,10 @@ def _offline_dsp_worker(
 
         last_job_key = None
         dirty = True
+        prepared_cache_key = None
+        prepared_cache = None
+        bp_plan_cache_key = None
+        bp_plan_cache = None
 
         while not stop_evt.is_set():
             got_cmd = False
@@ -1242,20 +1188,56 @@ def _offline_dsp_worker(
                         raise ValueError(
                             f"asse antenna mimo={n_ant_sel} non coerente con tx/rx={tx_i}/{rx_i}"
                         )
-                    raw_mimo = range_fft_sel.reshape(
-                        int(n_pos_sel),
-                        int(n_frames_sel),
-                        int(n_loops_sel),
-                        int(tx_i),
-                        int(rx_i),
-                        int(n_bins_sel),
-                    ).astype(np.complex64, copy=False)
-                    prepared = _prepare_mimo_snapshots(
-                        raw_mimo,
-                        n_tx=int(tx_i),
-                        motion_mode=motion_mode,
-                        window_doppler=None,
+                    sel_key = tuple(int(v) for v in sel_idx.tolist())
+                    prepared_key = (sel_key, str(motion_mode), int(max_bin), int(tx_i), int(rx_i))
+                    if prepared_cache_key == prepared_key and prepared_cache is not None:
+                        prepared = prepared_cache
+                    else:
+                        raw_mimo = range_fft_sel.reshape(
+                            int(n_pos_sel),
+                            int(n_frames_sel),
+                            int(n_loops_sel),
+                            int(tx_i),
+                            int(rx_i),
+                            int(n_bins_sel),
+                        ).astype(np.complex64, copy=False)
+                        prepared = _prepare_mimo_snapshots(
+                            raw_mimo,
+                            n_tx=int(tx_i),
+                            motion_mode=motion_mode,
+                            window_doppler=None,
+                        )
+                        prepared_cache_key = prepared_key
+                        prepared_cache = prepared
+
+                    bp_plan_key = (
+                        sel_key,
+                        int(gui_h),
+                        int(gui_w),
+                        int(max_bin),
+                        int(phase_sign_i),
+                        float(dr_m),
+                        float(fc_hz),
+                        float(c_m_s),
                     )
+                    if bp_plan_cache_key == bp_plan_key and bp_plan_cache is not None:
+                        bp_plan = bp_plan_cache
+                    else:
+                        bp_plan = _build_mimo_back_projection_plan(
+                            x_pos_m_sel,
+                            x_tx_ant_m,
+                            x_rx_ant_m,
+                            x_grid,
+                            y_grid,
+                            dr_m=dr_m,
+                            fc_hz=fc_hz,
+                            c_m_s=c_m_s,
+                            max_bin=max_bin,
+                            phase_sign=phase_sign_i,
+                        )
+                        bp_plan_cache_key = bp_plan_key
+                        bp_plan_cache = bp_plan
+
                     img_db = _back_projection_image_mimo(
                         prepared,
                         x_pos_m_sel,
@@ -1271,6 +1253,7 @@ def _offline_dsp_worker(
                         phase_sign=phase_sign_i,
                         chunk_size=16384,
                         coherent_sum=bool(coherent_sum),
+                        bp_plan=bp_plan,
                     )
                     doppler_bins_used = 1 if motion_mode == "static_zero_doppler" else int(prepared.shape[2])
                 else:
@@ -1432,84 +1415,100 @@ class OfflineBPRuntime:
             self._drain_status()
             return self.last_info
 
-        # Reset stato locale prima di un nuovo avvio.
-        self._ready = False
-        self._last_seq = 0
-        self._last_error = None
-        self._last_info = {}
-        self._frame_cache.fill(0.0)
-        with self.gui_lock:
-            self.gui_latest_idx.value = -1
-            self.gui_latest_seq.value = 0
+        try:
+            # Reset stato locale prima di un nuovo avvio.
+            self._ready = False
+            self._last_seq = 0
+            self._last_error = None
+            self._last_info = {}
+            self._frame_cache.fill(0.0)
+            with self.gui_lock:
+                self.gui_latest_idx.value = -1
+                self.gui_latest_seq.value = 0
 
-        self._reader_to_dsp_q = mp.Queue(maxsize=1)
-        self._cmd_q = mp.Queue(maxsize=4)
-        self._status_q = mp.Queue(maxsize=64)
-        self._stop_evt = mp.Event()
+            self._reader_to_dsp_q = mp.Queue(maxsize=1)
+            self._cmd_q = mp.Queue(maxsize=4)
+            self._status_q = mp.Queue(maxsize=64)
+            self._stop_evt = mp.Event()
 
-        self._reader_p = Process(
-            target=_offline_reader_worker,
-            args=(
-                self.offline_config_path,
-                self.fallback_capture_cfg,
-                int(self.nfft_range),
-                self._reader_to_dsp_q,
-                self._status_q,
-                self._stop_evt,
-            ),
-        )
-        self._dsp_p = Process(
-            target=_offline_dsp_worker,
-            args=(
-                self._reader_to_dsp_q,
-                self._cmd_q,
-                self._status_q,
-                self.gui_dbuf,
-                int(self.image_h),
-                int(self.image_w),
-                self.gui_latest_idx,
-                self.gui_latest_seq,
-                self.gui_lock,
-                self._stop_evt,
-            ),
-            kwargs={
-                "c_m_s": float(self.c_m_s),
-                "fs_hz": float(self.fs_hz),
-                "slope_hz_s": float(self.slope_hz_s),
-                "fc_hz": float(self.fc_hz),
-                "fft_workers": int(self.fft_workers),
-                "nfft_range": int(self.nfft_range),
-                "range_max_m": float(self.range_max_m),
-                "crossrange_max_m": float(self.crossrange_max_m),
-                "x_pitch_m": float(self.x_pitch_m),
-                "default_avg_mode": str(self.default_avg_mode),
-                "default_motion_mode": str(self.default_motion_mode),
-                "phase_sign": int(self.phase_sign),
-            },
-        )
-        self._reader_p.daemon = True
-        self._dsp_p.daemon = True
-        self._reader_p.start()
-        self._dsp_p.start()
-        self._started = True
+            self._reader_p = Process(
+                target=_offline_reader_worker,
+                args=(
+                    self.offline_config_path,
+                    self.fallback_capture_cfg,
+                    int(self.nfft_range),
+                    self._reader_to_dsp_q,
+                    self._status_q,
+                    self._stop_evt,
+                ),
+            )
+            self._dsp_p = Process(
+                target=_offline_dsp_worker,
+                args=(
+                    self._reader_to_dsp_q,
+                    self._cmd_q,
+                    self._status_q,
+                    self.gui_dbuf,
+                    int(self.image_h),
+                    int(self.image_w),
+                    self.gui_latest_idx,
+                    self.gui_latest_seq,
+                    self.gui_lock,
+                    self._stop_evt,
+                ),
+                kwargs={
+                    "c_m_s": float(self.c_m_s),
+                    "fs_hz": float(self.fs_hz),
+                    "slope_hz_s": float(self.slope_hz_s),
+                    "fc_hz": float(self.fc_hz),
+                    "fft_workers": int(self.fft_workers),
+                    "nfft_range": int(self.nfft_range),
+                    "range_max_m": float(self.range_max_m),
+                    "crossrange_max_m": float(self.crossrange_max_m),
+                    "x_pitch_m": float(self.x_pitch_m),
+                    "default_avg_mode": str(self.default_avg_mode),
+                    "default_motion_mode": str(self.default_motion_mode),
+                    "phase_sign": int(self.phase_sign),
+                },
+            )
+            self._reader_p.daemon = True
+            self._dsp_p.daemon = True
+            self._reader_p.start()
+            self._dsp_p.start()
+            self._started = True
 
-        t_deadline = time.perf_counter() + float(timeout_s)
-        while time.perf_counter() < t_deadline:
+            t_deadline = time.perf_counter() + float(timeout_s)
+            while time.perf_counter() < t_deadline:
+                self._drain_status()
+                if self._ready:
+                    return self.last_info
+                if self._last_error is not None:
+                    raise RuntimeError(self._last_error)
+                if self._dsp_p is not None and (not self._dsp_p.is_alive()):
+                    break
+                time.sleep(0.02)
+
             self._drain_status()
-            if self._ready:
-                return self.last_info
-            if self._last_error is not None:
-                raise RuntimeError(self._last_error)
-            if self._dsp_p is not None and (not self._dsp_p.is_alive()):
-                break
-            time.sleep(0.02)
-
-        self._drain_status()
-        err = self._last_error or "timeout start offline runtime"
-        raise RuntimeError(err)
+            err = self._last_error or "timeout start offline runtime"
+            raise RuntimeError(err)
+        except Exception as exc:
+            err = str(exc)
+            try:
+                self.stop()
+            finally:
+                self._last_error = err
+            raise
 
     def stop(self) -> None:
-        if not self._started:
+        if (
+            not self._started
+            and self._reader_p is None
+            and self._dsp_p is None
+            and self._reader_to_dsp_q is None
+            and self._cmd_q is None
+            and self._status_q is None
+            and self._stop_evt is None
+        ):
             return
 
         try:
@@ -1523,28 +1522,14 @@ class OfflineBPRuntime:
         except Exception:
             pass
 
-        for proc in (self._reader_p, self._dsp_p):
-            if proc is None:
-                continue
-            try:
-                proc.join(timeout=0.4)
-            except Exception:
-                pass
-        for proc in (self._reader_p, self._dsp_p):
-            if proc is None:
-                continue
-            try:
-                if proc.is_alive():
-                    proc.terminate()
-            except Exception:
-                pass
-        for proc in (self._reader_p, self._dsp_p):
-            if proc is None:
-                continue
-            try:
-                proc.join(timeout=0.2)
-            except Exception:
-                pass
+        cleanup_processes(
+            (self._reader_p, self._dsp_p),
+            graceful_timeout_s=0.4,
+            terminate_timeout_s=0.2,
+            close_handles=True,
+        )
+        self._cleanup_queued_shared_memory()
+        close_queues((self._reader_to_dsp_q, self._cmd_q, self._status_q))
 
         self._started = False
         self._ready = False
@@ -1554,6 +1539,41 @@ class OfflineBPRuntime:
         self._cmd_q = None
         self._status_q = None
         self._stop_evt = None
+
+    def _cleanup_queued_shared_memory(self) -> None:
+        if self._reader_to_dsp_q is None:
+            return
+        while True:
+            try:
+                msg = self._reader_to_dsp_q.get_nowait()
+            except pyqueue.Empty:
+                break
+            except Exception:
+                break
+            if not isinstance(msg, dict):
+                continue
+            shm_name = msg.get("range_fft_shm_name")
+            if shm_name is None:
+                continue
+            shm_obj = None
+            try:
+                shm_obj = shared_memory.SharedMemory(name=str(shm_name))
+                try:
+                    shm_obj.unlink()
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    pass
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+            finally:
+                if shm_obj is not None:
+                    try:
+                        shm_obj.close()
+                    except Exception:
+                        pass
 
     def update_params(
         self,
