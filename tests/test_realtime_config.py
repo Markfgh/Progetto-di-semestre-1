@@ -122,6 +122,15 @@ def test_config_parsers_sanitize_invalid_values_and_legacy_aliases() -> None:
     assert display_filters.mean_after_range_fft.axes == ("range_bin",)
     assert any("removing 'loop'" in warning for warning in display_warnings)
 
+    assert realtime_dsp.cfar_numba_from_yaml_dict({}) == realtime_dsp.CfarNumbaConfig()
+    assert realtime_dsp.dsp_diagnostics_from_yaml_dict({}) == realtime_dsp.DspDiagnosticsConfig()
+    cfar_numba = realtime_dsp.cfar_numba_from_yaml_dict(
+        {"dsp": {"cfar_numba": {"enabled": "true", "warmup_on_start": "yes", "self_check_on_start": "on"}}}
+    )
+    assert cfar_numba.enabled
+    assert cfar_numba.warmup_on_start
+    assert cfar_numba.self_check_on_start
+
 
 def test_virtual_array_geometry_falls_back_on_invalid_user_geometry() -> None:
     geometry, warnings = realtime_dsp.build_virtual_array_geometry_from_yaml_dict(

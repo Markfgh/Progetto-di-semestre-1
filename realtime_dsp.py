@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, replace
+import io
 import math
+import os
+import platform
 import queue as pyqueue
+import sys
 import time
 from multiprocessing.sharedctypes import Synchronized
 from typing import Any, Literal
@@ -12,11 +17,20 @@ import numpy as np
 import pyfftw
 import scipy.fft as fft
 
+try:
+    import numba as _numba
+except Exception as _numba_import_exc:  # pragma: no cover - depends on optional local install
+    _numba = None
+    _NUMBA_IMPORT_ERROR = _numba_import_exc
+else:  # pragma: no cover - exercised only when numba is installed
+    _NUMBA_IMPORT_ERROR = None
+
 from tracker import MultiObjectTracker, Track, TrackerConfig, TrackingConfig
 
 # Diciamo a SciPy di usare il motore di FFTW sotto il cofano
 pyfftw.interfaces.cache.enable()
 fft.set_global_backend(pyfftw.interfaces.scipy_fft)
+_PYFFTW_BACKEND_ACTIVE = True
 
 # Realtime DSP only: window setup, batch processing, and worker loop.
 WindowType = Literal["none", "rectangular", "hanning", "hamming", "blackman"]
@@ -56,12 +70,89 @@ _MEAN_AXIS_INDEX = {
     "rx": 4,
 }
 
+_CFAR_NUMBA_ENABLED = False
+_CFAR_NUMBA_SELF_CHECKED = False
+_CFAR_NUMBA_DISABLED_REASON = "not configured"
+_CFAR_NUMBA_LAST_ERROR = ""
+_DSP_RUNTIME_DIAGNOSTICS_LOGGED = False
+
+
+if _numba is not None:
+
+    @_numba.njit(cache=True, fastmath=False)
+    def _ca_cfar_threshold_db_map_numba_kernel(
+        power,
+        threshold_map,
+        train_row,
+        guard_row,
+        train_col,
+        guard_col,
+        offset_lin,
+        min_lin,
+    ):
+        n_rows = power.shape[0]
+        n_cols = power.shape[1]
+        row_margin = train_row + guard_row
+        col_margin = train_col + guard_col
+        r_guard0_off = train_row
+        r_guard1_off = train_row + (2 * guard_row) + 1
+        c_guard0_off = train_col
+        c_guard1_off = train_col + (2 * guard_col) + 1
+
+        for row in range(row_margin, n_rows - row_margin):
+            r0 = row - row_margin
+            for col in range(col_margin, n_cols - col_margin):
+                c0 = col - col_margin
+                total = np.float32(0.0)
+                count = 0
+                win_rows = (2 * row_margin) + 1
+                win_cols = (2 * col_margin) + 1
+                for wr in range(win_rows):
+                    in_guard_row = r_guard0_off <= wr < r_guard1_off
+                    rr = r0 + wr
+                    for wc in range(win_cols):
+                        if in_guard_row and c_guard0_off <= wc < c_guard1_off:
+                            continue
+                        value = power[rr, c0 + wc]
+                        if np.isfinite(value):
+                            total += value
+                            count += 1
+                if count <= 0:
+                    continue
+
+                noise_lin = np.float32(total / np.float32(count))
+                threshold_lin = float(min_lin)
+                candidate_lin = float(noise_lin) * float(offset_lin)
+                if candidate_lin > threshold_lin:
+                    threshold_lin = candidate_lin
+
+                threshold_for_log = threshold_lin
+                if threshold_for_log == threshold_for_log and threshold_for_log < 1e-12:
+                    threshold_for_log = 1e-12
+                threshold_map[row, col] = np.float32(10.0 * math.log10(threshold_for_log))
+
+else:
+    _ca_cfar_threshold_db_map_numba_kernel = None
+
+
 # The DSP config is passed as a single packed struct to avoid relying on globals in the worker process.
 @dataclass(frozen=True)
 class DspSelection:
     window_range: WindowType = "blackman"
     window_doppler: WindowType = "hanning"
     window_angle: WindowType = "hanning"
+
+
+@dataclass(frozen=True)
+class CfarNumbaConfig:
+    enabled: bool = False
+    warmup_on_start: bool = False
+    self_check_on_start: bool = False
+
+
+@dataclass(frozen=True)
+class DspDiagnosticsConfig:
+    log_cpu_runtime: bool = False
 
 
 @dataclass(frozen=True)
@@ -723,6 +814,20 @@ def _to_float(value: Any, default: float) -> float:
         return float(default)
 
 
+def _to_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return bool(value)
+    if value is None:
+        return bool(default)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "disabled"}:
+            return False
+    return bool(value)
+
+
 def _to_optional_float(value: Any) -> float | None:
     if value is None:
         return None
@@ -735,6 +840,28 @@ def _to_optional_float(value: Any) -> float | None:
     if not np.isfinite(parsed):
         return None
     return float(parsed)
+
+
+def cfar_numba_from_yaml_dict(cfg: dict[str, Any]) -> CfarNumbaConfig:
+    dsp = cfg.get("dsp", {}) or {}
+    block = dsp.get("cfar_numba", {}) or {}
+    if not isinstance(block, dict):
+        block = {}
+    return CfarNumbaConfig(
+        enabled=_to_bool(block.get("enabled", False), False),
+        warmup_on_start=_to_bool(block.get("warmup_on_start", False), False),
+        self_check_on_start=_to_bool(block.get("self_check_on_start", False), False),
+    )
+
+
+def dsp_diagnostics_from_yaml_dict(cfg: dict[str, Any]) -> DspDiagnosticsConfig:
+    dsp = cfg.get("dsp", {}) or {}
+    block = dsp.get("diagnostics", {}) or {}
+    if not isinstance(block, dict):
+        block = {}
+    return DspDiagnosticsConfig(
+        log_cpu_runtime=_to_bool(block.get("log_cpu_runtime", False), False),
+    )
 
 
 def resolve_processing_range_max_m(cfg: dict[str, Any]) -> float:
@@ -2431,7 +2558,7 @@ def _cfar_training_values_for_cell(
     return training
 
 
-def compute_cfar_threshold_db_map(
+def _compute_cfar_threshold_db_map_python(
     power_lin: np.ndarray,
     *,
     threshold_mode: DetectionThresholdMode,
@@ -2487,6 +2614,234 @@ def compute_cfar_threshold_db_map(
     return threshold_map
 
 
+def _compute_ca_cfar_threshold_db_map_numba(
+    power: np.ndarray,
+    *,
+    train_row: int,
+    guard_row: int,
+    train_col: int,
+    guard_col: int,
+    threshold_offset_db: float,
+    min_power_db: float,
+) -> np.ndarray | None:
+    global _CFAR_NUMBA_ENABLED, _CFAR_NUMBA_DISABLED_REASON, _CFAR_NUMBA_LAST_ERROR
+
+    if not _CFAR_NUMBA_ENABLED or _ca_cfar_threshold_db_map_numba_kernel is None:
+        return None
+    threshold_map = np.full(power.shape, np.float32(np.inf), dtype=np.float32)
+    if power.ndim != 2 or power.size <= 0:
+        return threshold_map
+    if train_row <= 0 and train_col <= 0:
+        return threshold_map
+
+    offset_lin = np.float32(10.0 ** (float(threshold_offset_db) / 10.0))
+    min_lin = np.float32(10.0 ** (float(min_power_db) / 10.0))
+    try:
+        _ca_cfar_threshold_db_map_numba_kernel(
+            power,
+            threshold_map,
+            int(train_row),
+            int(guard_row),
+            int(train_col),
+            int(guard_col),
+            offset_lin,
+            min_lin,
+        )
+        return threshold_map
+    except Exception as exc:  # pragma: no cover - defensive fallback for local JIT/runtime issues
+        _CFAR_NUMBA_ENABLED = False
+        _CFAR_NUMBA_DISABLED_REASON = f"runtime failure: {exc}"
+        _CFAR_NUMBA_LAST_ERROR = str(exc)
+        print(f"[DSP NUMBA WARN] CA-CFAR JIT disabled; falling back to Python ({exc})")
+        return None
+
+
+def _candidate_mask_from_threshold_map(power_lin: np.ndarray, threshold_map: np.ndarray) -> np.ndarray:
+    with np.errstate(divide="ignore", invalid="ignore"):
+        power_db = compute_detection_power_db_map(power_lin)
+    return np.isfinite(power_db) & np.isfinite(threshold_map) & (power_db >= threshold_map)
+
+
+def self_check_ca_cfar_numba() -> tuple[bool, str]:
+    if _numba is None or _ca_cfar_threshold_db_map_numba_kernel is None:
+        return False, f"numba unavailable: {_NUMBA_IMPORT_ERROR}"
+
+    rng = np.random.default_rng(20260422)
+    cases: list[tuple[np.ndarray, tuple[int, int, int, int], float, float]] = []
+
+    small = np.ones((4, 5), dtype=np.float32)
+    small[0, 0] = np.nan
+    cases.append((small, (3, 1, 2, 1), 6.0, -120.0))
+
+    edge = np.arange(81, dtype=np.float32).reshape(9, 9) + np.float32(1.0)
+    edge[4, 4] = np.float32(200.0)
+    edge[2, 7] = np.inf
+    edge[7, 2] = -np.inf
+    cases.append((edge, (1, 1, 1, 1), 3.0, -110.0))
+
+    mixed = rng.lognormal(mean=1.0, sigma=0.7, size=(17, 23)).astype(np.float32)
+    mixed[3, 5] = np.nan
+    mixed[8, 12] = np.inf
+    mixed[12, 3] = -np.inf
+    cases.append((mixed, (2, 1, 3, 1), 9.5, -80.0))
+
+    large = rng.lognormal(mean=2.0, sigma=0.9, size=(96, 128)).astype(np.float32)
+    large[20, 30] = np.float32(1e6)
+    large[40, 60] = np.nan
+    large[70, 80] = np.inf
+    cases.append((large, (8, 2, 4, 1), 12.0, 8.0))
+
+    for idx, (power, params, offset_db, min_db) in enumerate(cases, start=1):
+        train_row, guard_row, train_col, guard_col = params
+        py_map = _compute_cfar_threshold_db_map_python(
+            power,
+            threshold_mode="ca_cfar",
+            train_range_bins=train_row,
+            guard_range_bins=guard_row,
+            train_col_bins=train_col,
+            guard_col_bins=guard_col,
+            threshold_offset_db=offset_db,
+            min_power_db=min_db,
+            os_cfar_rank=0,
+        )
+        jit_map = np.full(power.shape, np.float32(np.inf), dtype=np.float32)
+        offset_lin = np.float32(10.0 ** (float(offset_db) / 10.0))
+        min_lin = np.float32(10.0 ** (float(min_db) / 10.0))
+        try:
+            _ca_cfar_threshold_db_map_numba_kernel(
+                np.asarray(power, dtype=np.float32),
+                jit_map,
+                int(train_row),
+                int(guard_row),
+                int(train_col),
+                int(guard_col),
+                offset_lin,
+                min_lin,
+            )
+        except Exception as exc:
+            return False, f"case {idx} JIT failed: {exc}"
+        if jit_map.dtype != np.float32:
+            return False, f"case {idx} dtype changed: {jit_map.dtype}"
+        if not np.allclose(py_map, jit_map, rtol=2e-5, atol=2e-4, equal_nan=True):
+            diff = np.nanmax(np.abs(py_map.astype(np.float64) - jit_map.astype(np.float64)))
+            return False, f"case {idx} threshold mismatch max_abs_diff={float(diff):.6g}"
+        py_mask = _candidate_mask_from_threshold_map(power, py_map)
+        jit_mask = _candidate_mask_from_threshold_map(power, jit_map)
+        if not np.array_equal(py_mask, jit_mask):
+            return False, f"case {idx} candidate_mask mismatch"
+    return True, f"{len(cases)} deterministic cases passed"
+
+
+def configure_cfar_numba_runtime(
+    cfg: CfarNumbaConfig,
+    *,
+    log: bool = True,
+) -> None:
+    global _CFAR_NUMBA_ENABLED, _CFAR_NUMBA_SELF_CHECKED, _CFAR_NUMBA_DISABLED_REASON, _CFAR_NUMBA_LAST_ERROR
+
+    _CFAR_NUMBA_SELF_CHECKED = False
+    _CFAR_NUMBA_LAST_ERROR = ""
+    if not cfg.enabled:
+        _CFAR_NUMBA_ENABLED = False
+        _CFAR_NUMBA_DISABLED_REASON = "disabled by config"
+        if log:
+            print("[DSP NUMBA] CA-CFAR JIT disabled by config; Python CFAR path active.")
+        return
+    if _numba is None or _ca_cfar_threshold_db_map_numba_kernel is None:
+        _CFAR_NUMBA_ENABLED = False
+        _CFAR_NUMBA_DISABLED_REASON = f"numba unavailable: {_NUMBA_IMPORT_ERROR}"
+        if log:
+            print(f"[DSP NUMBA WARN] CA-CFAR JIT requested but unavailable ({_NUMBA_IMPORT_ERROR}); Python fallback active.")
+        return
+
+    _CFAR_NUMBA_ENABLED = True
+    _CFAR_NUMBA_DISABLED_REASON = ""
+    if cfg.self_check_on_start:
+        ok, msg = self_check_ca_cfar_numba()
+        _CFAR_NUMBA_SELF_CHECKED = True
+        if not ok:
+            _CFAR_NUMBA_ENABLED = False
+            _CFAR_NUMBA_DISABLED_REASON = f"self-check failed: {msg}"
+            _CFAR_NUMBA_LAST_ERROR = msg
+            if log:
+                print(f"[DSP NUMBA WARN] CA-CFAR JIT self-check failed; Python fallback active ({msg})")
+            return
+        if log:
+            print(f"[DSP NUMBA] CA-CFAR JIT enabled; self-check OK ({msg}).")
+    elif cfg.warmup_on_start:
+        warmup = np.ones((9, 9), dtype=np.float32)
+        maybe_map = _compute_ca_cfar_threshold_db_map_numba(
+            warmup,
+            train_row=1,
+            guard_row=1,
+            train_col=1,
+            guard_col=1,
+            threshold_offset_db=6.0,
+            min_power_db=-120.0,
+        )
+        if maybe_map is None:
+            if log:
+                print(f"[DSP NUMBA WARN] CA-CFAR JIT warmup failed; Python fallback active ({_CFAR_NUMBA_DISABLED_REASON})")
+            return
+        if log:
+            print("[DSP NUMBA] CA-CFAR JIT enabled; warmup OK.")
+    elif log:
+        print("[DSP NUMBA] CA-CFAR JIT enabled; first CA-CFAR call will compile if cache is cold.")
+
+
+def cfar_numba_runtime_status() -> dict[str, Any]:
+    return {
+        "enabled": bool(_CFAR_NUMBA_ENABLED),
+        "available": bool(_numba is not None and _ca_cfar_threshold_db_map_numba_kernel is not None),
+        "self_checked": bool(_CFAR_NUMBA_SELF_CHECKED),
+        "disabled_reason": str(_CFAR_NUMBA_DISABLED_REASON),
+        "last_error": str(_CFAR_NUMBA_LAST_ERROR),
+        "numba_version": None if _numba is None else str(getattr(_numba, "__version__", "unknown")),
+    }
+
+
+def compute_cfar_threshold_db_map(
+    power_lin: np.ndarray,
+    *,
+    threshold_mode: DetectionThresholdMode,
+    train_range_bins: int,
+    guard_range_bins: int,
+    train_col_bins: int,
+    guard_col_bins: int,
+    threshold_offset_db: float,
+    min_power_db: float,
+    os_cfar_rank: int,
+) -> np.ndarray:
+    power = np.asarray(power_lin, dtype=np.float32)
+    if threshold_mode == "ca_cfar":
+        train_row = int(max(0, train_range_bins))
+        guard_row = int(max(0, guard_range_bins))
+        train_col = int(max(0, train_col_bins))
+        guard_col = int(max(0, guard_col_bins))
+        maybe_map = _compute_ca_cfar_threshold_db_map_numba(
+            power,
+            train_row=train_row,
+            guard_row=guard_row,
+            train_col=train_col,
+            guard_col=guard_col,
+            threshold_offset_db=threshold_offset_db,
+            min_power_db=min_power_db,
+        )
+        if maybe_map is not None:
+            return maybe_map
+    return _compute_cfar_threshold_db_map_python(
+        power,
+        threshold_mode=threshold_mode,
+        train_range_bins=train_range_bins,
+        guard_range_bins=guard_range_bins,
+        train_col_bins=train_col_bins,
+        guard_col_bins=guard_col_bins,
+        threshold_offset_db=threshold_offset_db,
+        min_power_db=min_power_db,
+        os_cfar_rank=os_cfar_rank,
+    )
+
+
 def compute_cfar_candidate_mask(
     power_lin: np.ndarray,
     *,
@@ -2510,29 +2865,10 @@ def compute_cfar_candidate_mask(
         min_power_db=min_power_db,
         os_cfar_rank=os_cfar_rank,
     )
-    power_db = compute_detection_power_db_map(power_lin)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        power_db = compute_detection_power_db_map(power_lin)
     mask = np.isfinite(power_db) & np.isfinite(threshold_map) & (power_db >= threshold_map)
     return mask, threshold_map
-
-
-def _format_cfar_debug(
-    *,
-    branch: str,
-    mode: DetectionThresholdMode,
-    candidates: int,
-    train_range_bins: int,
-    guard_range_bins: int,
-    train_col_bins: int,
-    guard_col_bins: int,
-    threshold_db: float,
-    os_cfar_rank: int,
-) -> str:
-    return (
-        f"[DSP DEBUG] {branch}_cfar: mode={mode} candidates={int(candidates)} "
-        f"train_range={int(train_range_bins)} guard_range={int(guard_range_bins)} "
-        f"train_col={int(train_col_bins)} guard_col={int(guard_col_bins)} "
-        f"threshold_db={float(threshold_db):.2f} os_rank={int(os_cfar_rank)}"
-    )
 
 
 def extract_detection_peaks_2d(
@@ -2661,19 +2997,6 @@ def detect_static_targets(
             threshold_offset_db=static_cfg.cfar_threshold_db,
             min_power_db=static_cfg.min_power_db,
             os_cfar_rank=static_cfg.os_cfar_rank,
-        )
-        print(
-            _format_cfar_debug(
-                branch="static",
-                mode=static_cfg.threshold_mode,
-                candidates=int(np.count_nonzero(candidates_mask)),
-                train_range_bins=static_cfg.cfar_train_range_bins,
-                guard_range_bins=static_cfg.cfar_guard_range_bins,
-                train_col_bins=static_cfg.cfar_train_col_bins,
-                guard_col_bins=static_cfg.cfar_guard_col_bins,
-                threshold_db=static_cfg.cfar_threshold_db,
-                os_cfar_rank=static_cfg.os_cfar_rank,
-            )
         )
         threshold_db = float(static_cfg.min_power_db)
     else:
@@ -2809,19 +3132,6 @@ def detect_moving_targets(
             threshold_offset_db=moving_cfg.cfar_threshold_db,
             min_power_db=moving_cfg.min_power_db,
             os_cfar_rank=moving_cfg.os_cfar_rank,
-        )
-        print(
-            _format_cfar_debug(
-                branch="moving",
-                mode=moving_cfg.threshold_mode,
-                candidates=int(np.count_nonzero(candidates_mask)),
-                train_range_bins=moving_cfg.cfar_train_range_bins,
-                guard_range_bins=moving_cfg.cfar_guard_range_bins,
-                train_col_bins=moving_cfg.cfar_train_col_bins,
-                guard_col_bins=moving_cfg.cfar_guard_col_bins,
-                threshold_db=moving_cfg.cfar_threshold_db,
-                os_cfar_rank=moving_cfg.os_cfar_rank,
-            )
         )
         threshold_db = float(moving_cfg.min_power_db)
     else:
@@ -3223,6 +3533,222 @@ def _convert_rx4_iiiiqqqq_to_complex64(dst_frame: np.ndarray, src_i16_frame: np.
     block_view = src_i16_frame.reshape(-1, 8)
     dst_frame.real[:] = block_view[:, :4].reshape(-1)  # type: ignore[index]
     dst_frame.imag[:] = block_view[:, 4:].reshape(-1)  # type: ignore[index]
+
+
+def _format_cpu_list(cpus: list[int] | None) -> str:
+    if cpus is None:
+        return "unavailable"
+    if not cpus:
+        return "[]"
+    if len(cpus) <= 32:
+        return str(cpus)
+    return f"{cpus[:16]} ... {cpus[-8:]} (count={len(cpus)})"
+
+
+def _effective_process_affinity() -> tuple[list[int] | None, str]:
+    try:
+        if hasattr(os, "sched_getaffinity"):
+            return sorted(int(c) for c in os.sched_getaffinity(0)), "os.sched_getaffinity"
+    except Exception:
+        pass
+    try:
+        import psutil  # type: ignore
+
+        return sorted(int(c) for c in psutil.Process(os.getpid()).cpu_affinity()), "psutil"
+    except Exception:
+        pass
+    if os.name == "nt":
+        try:
+            import ctypes
+            import ctypes.wintypes as wt
+
+            kernel32 = ctypes.windll.kernel32
+            GetCurrentProcess = kernel32.GetCurrentProcess
+            GetCurrentProcess.restype = wt.HANDLE
+            GetProcessAffinityMask = kernel32.GetProcessAffinityMask
+            GetProcessAffinityMask.argtypes = [wt.HANDLE, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
+            GetProcessAffinityMask.restype = wt.BOOL
+            proc_mask = ctypes.c_size_t(0)
+            sys_mask = ctypes.c_size_t(0)
+            ok = GetProcessAffinityMask(GetCurrentProcess(), ctypes.byref(proc_mask), ctypes.byref(sys_mask))
+            if ok:
+                mask = int(proc_mask.value)
+                cpus = [idx for idx in range(max(1, mask.bit_length())) if mask & (1 << idx)]
+                return cpus, "WinAPI"
+        except Exception:
+            pass
+    return None, "unavailable"
+
+
+def _effective_process_priority() -> tuple[str, str]:
+    try:
+        import psutil  # type: ignore
+
+        return str(psutil.Process(os.getpid()).nice()), "psutil"
+    except Exception:
+        pass
+    try:
+        if hasattr(os, "getpriority") and hasattr(os, "PRIO_PROCESS"):
+            return str(os.getpriority(os.PRIO_PROCESS, 0)), "os.getpriority"
+    except Exception:
+        pass
+    if os.name == "nt":
+        try:
+            import ctypes
+            import ctypes.wintypes as wt
+
+            kernel32 = ctypes.windll.kernel32
+            GetCurrentProcess = kernel32.GetCurrentProcess
+            GetCurrentProcess.restype = wt.HANDLE
+            GetPriorityClass = kernel32.GetPriorityClass
+            GetPriorityClass.argtypes = [wt.HANDLE]
+            GetPriorityClass.restype = wt.DWORD
+            value = int(GetPriorityClass(GetCurrentProcess()))
+            names = {
+                0x00000040: "idle",
+                0x00004000: "below_normal",
+                0x00000020: "normal",
+                0x00008000: "above_normal",
+                0x00000080: "high",
+                0x00000100: "realtime",
+            }
+            return names.get(value, f"0x{value:x}"), "WinAPI"
+        except Exception:
+            pass
+    return "unavailable", "unavailable"
+
+
+def _capture_callable_text(fn) -> tuple[str, str | None]:
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            result = fn()
+    except Exception as exc:
+        return "", str(exc)
+    text = buf.getvalue().strip()
+    if not text and result is not None:
+        text = repr(result)
+    return text, None
+
+
+def _print_compact_diagnostic_block(label: str, text: str, *, max_lines: int = 48, max_chars: int = 260) -> None:
+    lines = [line.rstrip() for line in str(text).splitlines() if line.strip()]
+    if not lines:
+        print(f"[DSP RUNTIME] {label}: unavailable")
+        return
+    print(f"[DSP RUNTIME] {label}:")
+    for line in lines[:max_lines]:
+        clean = line.strip()
+        if len(clean) > max_chars:
+            clean = clean[: max_chars - 3] + "..."
+        print(f"[DSP RUNTIME]   {clean}")
+    if len(lines) > max_lines:
+        print(f"[DSP RUNTIME]   ... ({len(lines) - max_lines} more lines omitted)")
+
+
+def _log_dsp_runtime_diagnostics_once(
+    cfg_dict: dict[str, Any],
+    dsp_cfg: RealtimeDSPConfig,
+    diagnostics_cfg: DspDiagnosticsConfig,
+) -> None:
+    global _DSP_RUNTIME_DIAGNOSTICS_LOGGED
+    if _DSP_RUNTIME_DIAGNOSTICS_LOGGED or not diagnostics_cfg.log_cpu_runtime:
+        return
+    _DSP_RUNTIME_DIAGNOSTICS_LOGGED = True
+
+    try:
+        logical_cpus = int(os.cpu_count() or 1)
+    except Exception:
+        logical_cpus = 1
+    affinity_cpus, affinity_source = _effective_process_affinity()
+    visible_cpus = len(affinity_cpus) if affinity_cpus is not None else logical_cpus
+    priority_value, priority_source = _effective_process_priority()
+    process_cfg = cfg_dict.get("process", {}) or {}
+    affinity_cfg = process_cfg.get("affinity", {}) or {}
+    priority_cfg = process_cfg.get("priority", {}) or {}
+    pyfftw_cache = "unknown"
+    try:
+        is_enabled = getattr(pyfftw.interfaces.cache, "is_enabled", None)
+        pyfftw_cache = str(bool(is_enabled())) if callable(is_enabled) else "enabled"
+    except Exception:
+        pass
+
+    # Runtime diagnostics verify what the local Ryzen process can actually use
+    # (affinity, FFT workers, SIMD-dispatched NumPy code, JIT), instead of
+    # assuming AVX512 or all cores are exposed by the OS/configuration.
+    try:
+        platform_text = platform.platform()
+    except Exception:
+        platform_text = "unavailable"
+    print(
+        "[DSP RUNTIME] "
+        f"platform={platform_text} os={os.name} python={sys.version.split()[0]} "
+        f"pid={os.getpid()}"
+    )
+    print(
+        "[DSP RUNTIME] "
+        f"logical_cpus={logical_cpus} visible_by_affinity={visible_cpus} "
+        f"effective_affinity={_format_cpu_list(affinity_cpus)} source={affinity_source}"
+    )
+    print(
+        "[DSP RUNTIME] "
+        f"fft_workers={int(getattr(dsp_cfg, 'fft_workers', 1))} "
+        f"pyfftw_backend_active={bool(_PYFFTW_BACKEND_ACTIVE)} "
+        f"pyfftw_version={getattr(pyfftw, '__version__', 'unknown')} "
+        f"pyfftw_cache={pyfftw_cache}"
+    )
+    print(
+        "[DSP RUNTIME] "
+        f"process.affinity enabled={_to_bool(affinity_cfg.get('enabled', False), False)} "
+        f"requested_dsp={affinity_cfg.get('dsp', 'auto')} "
+        f"process.priority enabled={_to_bool(priority_cfg.get('enabled', False), False)} "
+        f"requested_dsp={priority_cfg.get('dsp', 'normal')} "
+        f"effective_priority={priority_value} source={priority_source}"
+    )
+    status = cfar_numba_runtime_status()
+    if _numba is None:
+        print(f"[DSP RUNTIME] numba=unavailable error={_NUMBA_IMPORT_ERROR}")
+    else:
+        num_threads = "unknown"
+        threading_layer = "unknown"
+        try:
+            num_threads = str(_numba.get_num_threads())
+        except Exception:
+            pass
+        try:
+            threading_layer = str(_numba.threading_layer())
+        except Exception as exc:
+            threading_layer = f"uninitialized ({exc})"
+        numba_config = getattr(_numba, "config", None)
+        cpu_name = getattr(numba_config, "CPU_NAME", None) if numba_config is not None else None
+        cpu_features = getattr(numba_config, "CPU_FEATURES", None) if numba_config is not None else None
+        print(
+            "[DSP RUNTIME] "
+            f"numba_version={status['numba_version']} numba_threads={num_threads} "
+            f"threading_layer={threading_layer} cpu_name={cpu_name or 'auto'} "
+            f"cpu_features={cpu_features or 'auto'} cfar_jit_enabled={status['enabled']} "
+            f"cfar_self_checked={status['self_checked']} disabled_reason={status['disabled_reason'] or 'none'}"
+        )
+
+    show_runtime = getattr(np, "show_runtime", None)
+    if callable(show_runtime):
+        runtime_text, runtime_err = _capture_callable_text(show_runtime)
+        if runtime_err is None:
+            _print_compact_diagnostic_block("numpy.show_runtime", runtime_text, max_lines=32)
+        else:
+            print(f"[DSP RUNTIME] numpy.show_runtime unavailable: {runtime_err}")
+    else:
+        print("[DSP RUNTIME] numpy.show_runtime unavailable")
+
+    show_config = getattr(np, "show_config", None)
+    if callable(show_config):
+        config_text, config_err = _capture_callable_text(show_config)
+        if config_err is None:
+            _print_compact_diagnostic_block("numpy.show_config", config_text, max_lines=64)
+        else:
+            print(f"[DSP RUNTIME] numpy.show_config unavailable: {config_err}")
+    else:
+        print("[DSP RUNTIME] numpy.show_config unavailable")
 
 
 # Process one DSP batch and publish the updated heatmap/profile views to the GUI buffers.
@@ -3694,8 +4220,12 @@ def dsp_worker(
     cfg_dict: dict[str, Any],
     dsp_cfg: RealtimeDSPConfig,
 ) -> None:
+    dsp_block = cfg_dict.get("dsp", {}) or {}
     selection = selection_from_yaml_dict(cfg_dict)
     calibration_cfg = getattr(dsp_cfg, "calibration", calibration_from_yaml_dict(cfg_dict, virtual_ant=int(dsp_cfg.virtual_ant)))
+    cfar_numba_cfg = cfar_numba_from_yaml_dict(cfg_dict)
+    diagnostics_cfg = dsp_diagnostics_from_yaml_dict(cfg_dict)
+    configure_cfar_numba_runtime(cfar_numba_cfg, log=("cfar_numba" in dsp_block))
     mean_before_range_fft, _ = mean_selections_from_yaml_dict(cfg_dict)
     detection_static_post_range_fft_filters = detection_static_post_range_fft_filters_from_yaml_dict(cfg_dict)
     detection_static_post_range_fft_filters, detection_static_filter_warnings = sanitize_detection_static_post_range_fft_filters(
@@ -3882,6 +4412,8 @@ def dsp_worker(
         )
         for s in range(n_slots)
     ]
+
+    _log_dsp_runtime_diagnostics_once(cfg_dict, dsp_cfg, diagnostics_cfg)
 
     if dsp_cfg.rx != 4:
         raise ValueError("DSP: conversione I/Q attuale assume RX=4 (packing IIIIQQQQ).")

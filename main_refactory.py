@@ -503,7 +503,7 @@ PRIO_DSP = str(prio_cfg.get("dsp", "normal"))
 
 # --- PROCESS AFFINITY ---
 aff_cfg = proc_cfg.get("affinity", {}) or {}
-AFF_ENABLED = bool(aff_cfg.get("enabled", True))
+AFF_ENABLED = bool(aff_cfg.get("enabled", False))
 auto_sets = _default_affinity_sets(LOGICAL_CPUS)
 AFF_MAIN = _parse_cpu_set(aff_cfg.get("main", auto_sets["main"]), LOGICAL_CPUS)
 AFF_RX = _parse_cpu_set(aff_cfg.get("rx", auto_sets["rx"]), LOGICAL_CPUS)
@@ -1476,6 +1476,8 @@ def main():
 
     print(f"[LOGGER] dir: {out_dir}")
     print(f"[FFT] workers={FFT_WORKERS} logical_cpus={LOGICAL_CPUS}")
+    print(f"[PRIO] enabled={PRIO_ENABLED} main={PRIO_MAIN} rx={PRIO_RX} log={PRIO_LOG} dsp={PRIO_DSP}")
+    print(f"[AFF] enabled={AFF_ENABLED} main={AFF_MAIN} rx={AFF_RX} log={AFF_LOG} dsp={AFF_DSP}")
     if DEBUG_STATS and psutil is None:
         print("[STATS] psutil not available: using Windows fallback for CPU%.")
 

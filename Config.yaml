@@ -30,7 +30,7 @@ display:
   rangefft_db_max: 95
   rangefft_lin_min: 0
   rangefft_lin_max: 15e7
-  normalize_skip_range_bins: 4 # Normalized display: ignore the first N range bins when choosing the frame peak.
+  normalize_skip_range_bins: 0 # Normalized display: ignore the first N range bins when choosing the frame peak.
 
 processing:
   range_max_m: 12.5 # Physical processing/detection limit [m]. If missing, falls back to display.range_max.
@@ -39,7 +39,15 @@ dsp:
   window_range: hanning # Options: none, rectangular, hanning, hamming, blackman.
   window_doppler: hanning # Applied on slow-time chirps before Doppler FFT.
   window_angle: hanning  # Options: none, rectangular, hanning, hamming, blackman.
-  zero_after_range_fft_bins: 6 # If > 0, zeroes the first N range bins globally right after range FFT.
+  zero_after_range_fft_bins: 0 # If > 0, zeroes the first N range bins globally right after range FFT.
+
+  cfar_numba:
+    enabled: true # Optional JIT for CA-CFAR only; OS-CFAR remains on the Python path.
+    warmup_on_start: true # Compile/cache before the realtime loop to avoid a first-frame spike.
+    self_check_on_start: true # Disable JIT automatically if Python/JIT equivalence fails.
+
+  diagnostics:
+    log_cpu_runtime: true # Logs actual CPU affinity/SIMD/FFT/JIT runtime exposure for this DSP process.
   
   
   
@@ -140,7 +148,7 @@ dsp:
       clamp_positive_only: false
 
   angle_processing:
-    mode: fft # Options: fft, bartlett, mvdr. fft and bartlett honor aggregation/frame_index/loop_index; mvdr always uses all available frame x loop snapshots.
+    mode: bartlett # Options: fft, bartlett, mvdr. fft and bartlett honor aggregation/frame_index/loop_index; mvdr always uses all available frame x loop snapshots.
     mvdr_diagonal_loading: 0.02 # Stabilizza la covarianza per scene statiche (range tipico 0.01 - 0.05)
     aggregation: frame_loop # fft/bartlett only: frame_loop=all frames+loops, frame=all frames at loop_index, loop=all loops at frame_index, none=single [frame_index, loop_index].
     frame_index: 0 # Used only by fft/bartlett when aggregation is loop or none.
@@ -164,13 +172,13 @@ tracking:
   model: kalman_cv_2d # Dynamic model in use: constant-velocity 2D Kalman filter (x, y, vx, vy).
   max_tracks: 8 # Maximum number of live tracks kept at the same time.
   min_hits_to_confirm: 3 # Required matches before a track changes from tentative to confirmed.
-  max_missed_tentative: 2 # How many unmatched frames are allowed for a tentative track.
+  max_missed_tentative: 3 # How many unmatched frames are allowed for a tentative track.
   max_missed_confirmed: 18 # How many unmatched frames are allowed for a confirmed track.
   max_track_age: 0 # Maximum age in frames; 0 disables age-based deletion.
-  gating_xy_m: 0.80 # Maximum XY distance [m] allowed to associate a detection with a track.
-  gating_doppler_mps: 0.35 # Maximum doppler difference [m/s] allowed during association.
-  process_noise_pos: 0.2 # Process noise on position: higher = more flexible but less stable tracks.
-  process_noise_vel: 0.15 # Process noise on velocity: higher = Kalman accepts faster velocity changes.
+  gating_xy_m: 1.0 # Maximum XY distance [m] allowed to associate a detection with a track.
+  gating_doppler_mps: 0.50 # Maximum doppler difference [m/s] allowed during association.
+  process_noise_pos: 0.3 # Process noise on position: higher = more flexible but less stable tracks.
+  process_noise_vel: 0.25 # Process noise on velocity: higher = Kalman accepts faster velocity changes.
   measurement_noise_xy: 0.10 # Measurement noise on x/y [m]: higher = less trust in each instant detection.
   moving_speed_threshold_mps: 0.22 # Estimated speed threshold above which a target tends to be classified as moving.
   stopped_speed_threshold_mps: 0.10 # Estimated speed threshold below which a target tends to be classified as stopped.
@@ -190,41 +198,41 @@ tracking:
 
 detection_static:
   enabled: true
-  threshold_mode: ca_cfar # Options: relative, absolute, ca_cfar, os_cfar.
-  threshold_db: -6 # Relative mode: threshold = max_db + threshold_db.
-  localmax_range_bins: 4 # NMS neighborhood in range bins.
-  localmax_angle_bins: 12 # NMS neighborhood in angle bins.
-  min_power_db: 8 # Absolute safety floor (also in relative mode).
+  threshold_mode: relative # Options: relative, absolute, ca_cfar, os_cfar.
+  threshold_db: -10 # Relative mode: threshold = max_db + threshold_db.
+  localmax_range_bins: 1 # NMS neighborhood in range bins.
+  localmax_angle_bins: 1 # NMS neighborhood in angle bins.
+  min_power_db: 6 # Absolute safety floor (also in relative mode).
   max_detections: 12 # Cap per frame.
   cfar_train_range_bins: 8 # CFAR training cells before/after the CUT on range.
   cfar_guard_range_bins: 2 # CFAR guard cells before/after the CUT on range.
   cfar_train_col_bins: 8 # CFAR training cells before/after the CUT on angle.
   cfar_guard_col_bins: 2 # CFAR guard cells before/after the CUT on angle.
-  cfar_threshold_db: 12 # CFAR offset above local noise estimate.
+  cfar_threshold_db: 10 # CFAR offset above local noise estimate.
   os_cfar_rank: 0 # 0 = automatic 75% rank; otherwise 1-based rank in sorted training cells.
 
 detection_moving:
   enabled: true # Moving target detection is more computationally expensive due to the Doppler FFT, so disabled by default.
   threshold_mode: ca_cfar # Options: relative, absolute, ca_cfar, os_cfar.
   threshold_db: -7
-  localmax_range_bins: 4
-  localmax_doppler_bins: 3
-  zero_doppler_exclusion_bins: 0 # Keep near-zero Doppler so a moving target can be retained when it stops.
-  min_power_db: 8
+  localmax_range_bins: 2
+  localmax_doppler_bins: 2
+  zero_doppler_exclusion_bins: 1 # Keep near-zero Doppler so a moving target can be retained when it stops.
+  min_power_db: 6
   max_detections: 12
   cfar_train_range_bins: 8 # CFAR training cells before/after the CUT on range.
   cfar_guard_range_bins: 2 # CFAR guard cells before/after the CUT on range.
   cfar_train_col_bins: 4 # CFAR training cells before/after the CUT on Doppler.
   cfar_guard_col_bins: 1 # CFAR guard cells before/after the CUT on Doppler.
-  cfar_threshold_db: 12 # CFAR offset above local noise estimate.
+  cfar_threshold_db: 10 # CFAR offset above local noise estimate.
   os_cfar_rank: 0 # 0 = automatic 75% rank; otherwise 1-based rank in sorted training cells.
 
 fusion:
   enabled: true
-  merge_xy_m: 0.30
-  merge_range_m: 0.20
-  merge_angle_deg: 4.0
-  prefer_moving_when_doppler_valid: true # If true, the fused track state is set to moving when the moving branch has a valid detection, even if the static branch has a stronger detection.
+  merge_xy_m: 0.50
+  merge_range_m: 0.40
+  merge_angle_deg: 8.0
+  prefer_moving_when_doppler_valid: false # If true, the fused track state is set to moving when the moving branch has a valid detection, even if the static branch has a stronger detection.
 
 rx:
   stall_timeout_s: 2.0

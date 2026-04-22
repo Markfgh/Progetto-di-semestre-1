@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 import realtime_dsp
 
@@ -37,6 +38,23 @@ def test_ca_cfar_detects_isolated_target_and_rejects_edges() -> None:
     assert bool(mask[4, 4])
     assert not bool(mask[0, 0])
     assert not np.isfinite(float(threshold_map[0, 0]))
+
+
+def test_ca_cfar_numba_self_check_when_available() -> None:
+    status = realtime_dsp.cfar_numba_runtime_status()
+    if not status["available"]:
+        pytest.skip("Numba is optional and not installed")
+
+    try:
+        realtime_dsp.configure_cfar_numba_runtime(
+            realtime_dsp.CfarNumbaConfig(enabled=True, warmup_on_start=True, self_check_on_start=True),
+            log=False,
+        )
+        status = realtime_dsp.cfar_numba_runtime_status()
+        assert status["enabled"]
+        assert status["self_checked"]
+    finally:
+        realtime_dsp.configure_cfar_numba_runtime(realtime_dsp.CfarNumbaConfig(enabled=False), log=False)
 
 
 def test_os_cfar_uses_rank_so_training_outlier_does_not_hide_target() -> None:
