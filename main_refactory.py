@@ -377,6 +377,7 @@ from realtime_dsp import (
     calibration_from_yaml_dict,
     display_projection_from_yaml_dict,
     dsp_worker,
+    range_angle_moving_from_yaml_dict,
     resolve_processing_range_max_m,
     resolve_display_crossrange_max_m,
 )
@@ -457,6 +458,80 @@ except (TypeError, ValueError):
 RANGE_PROFILE_COUNT = max(1, min(int(RANGE_PROFILE_COUNT), int(VIRTUAL_ANT)))
 RANGEFFT_PLOT_COUNT = int(TX)
 RANGEFFT_LINES_PER_PLOT = int(RX)
+
+
+def _fallback_heatmap_velocity_scale_mps() -> tuple[float, float]:
+    radar_cfg = cfg.get("radar", {}) or {}
+    capture_cfg = cfg.get("capture", {}) or {}
+    chirp_period_s = None
+    for block in (radar_cfg, capture_cfg):
+        for key in (
+            "chirp_period_s",
+            "chirp_repetition_s",
+            "pri_s",
+            "t_chirp_s",
+            "tc_s",
+            "chirp_time_s",
+        ):
+            try:
+                value = float(block.get(key, float("nan")))
+            except (TypeError, ValueError):
+                value = float("nan")
+            if np.isfinite(value) and value > 0.0:
+                chirp_period_s = value
+                break
+        if chirp_period_s is not None:
+            break
+    if chirp_period_s is None:
+        return -1.0, 1.0
+    try:
+        fc_hz = float(FC)
+    except (TypeError, ValueError):
+        fc_hz = float("nan")
+    if not np.isfinite(fc_hz) or fc_hz <= 0.0:
+        return -1.0, 1.0
+    n_doppler = max(1, int(CHIRPS // max(1, TX)))
+    cycles = np.fft.fftshift(np.fft.fftfreq(n_doppler, d=1.0)).astype(np.float32, copy=False)
+    wavelength_m = float(C) / fc_hz
+    effective_pri_s = float(chirp_period_s) * float(max(1, TX))
+    axis_mps = cycles * np.float32(wavelength_m * 0.5 / effective_pri_s)
+    vmax = float(np.max(np.abs(axis_mps))) if axis_mps.size > 0 else 1.0
+    if not np.isfinite(vmax) or vmax <= 0.0:
+        vmax = 1.0
+    return -vmax, vmax
+
+
+def _default_heatmap_velocity_scale_mps() -> tuple[float, float]:
+    fallback_vmin, fallback_vmax = _fallback_heatmap_velocity_scale_mps()
+    display_cfg = cfg.get("display", {}) or {}
+
+    def _optional_finite_float(raw_value):
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            return None
+        return value if np.isfinite(value) else None
+
+    cfg_vmin = _optional_finite_float(display_cfg.get("velocity_vmin_mps", None))
+    cfg_vmax = _optional_finite_float(display_cfg.get("velocity_vmax_mps", None))
+    vmin = float(cfg_vmin) if cfg_vmin is not None else float(fallback_vmin)
+    vmax = float(cfg_vmax) if cfg_vmax is not None else float(fallback_vmax)
+    if not np.isfinite(vmin):
+        vmin = -1.0
+    if not np.isfinite(vmax):
+        vmax = 1.0
+    if vmax <= vmin:
+        fallback_span = max(float(fallback_vmax - fallback_vmin), 1e-3)
+        if cfg_vmin is not None and cfg_vmax is None:
+            vmax = vmin + fallback_span
+        elif cfg_vmax is not None and cfg_vmin is None:
+            vmin = vmax - fallback_span
+        else:
+            vmax = vmin + 1e-3
+    return float(vmin), float(vmax)
+
+
+HEATMAP_VELOCITY_VMIN_MPS, HEATMAP_VELOCITY_VMAX_MPS = _default_heatmap_velocity_scale_mps()
 # --- CODE QUEUE ---
 DEBUG_STATS = bool(cfg["debug"]["debug_stats"])
 
@@ -469,6 +544,8 @@ else:
     FFT_WORKERS = int(_fft_workers_raw)
 FFT_WORKERS = max(1, min(FFT_WORKERS, LOGICAL_CPUS))
 CALIBRATION_CFG = calibration_from_yaml_dict(cfg, virtual_ant=int(VIRTUAL_ANT))
+RANGE_ANGLE_MOVING_CFG = range_angle_moving_from_yaml_dict(cfg)
+HEATMAP_VELOCITY_DEAD_ZONE = float(getattr(RANGE_ANGLE_MOVING_CFG, "velocity_dead_zone", 0.08))
 REALTIME_DSP_CFG = RealtimeDSPConfig(
     c=float(C),
     fs=float(FS),
@@ -490,6 +567,7 @@ REALTIME_DSP_CFG = RealtimeDSPConfig(
     normalize_skip_range_bins=max(0, int(cfg.get("display", {}).get("normalize_skip_range_bins", 0))),
     zero_after_range_fft_bins=max(0, int(cfg.get("dsp", {}).get("zero_after_range_fft_bins", 0))),
     calibration=CALIBRATION_CFG,
+    range_angle_moving=RANGE_ANGLE_MOVING_CFG,
 )
 
 # --- PROCESS PRIORITY ---
@@ -1303,6 +1381,7 @@ def main():
     fft_plot_h = max(1, int(NFFT_RANGE))
     gui_w = int(NFFT_ANGLE)
     gui_dbuf = _track_mp_ref(RawArray("f", 2 * gui_h * gui_w))
+    gui_alpha_dbuf = _track_mp_ref(RawArray("f", 2 * gui_h * gui_w))
     gui_prof_dbuf = _track_mp_ref(RawArray("f", 2 * RANGE_PROFILE_COUNT * fft_plot_h))
     gui_latest_idx = _track_mp_ref(Value("i", -1))
     gui_latest_seq = _track_mp_ref(Value("Q", 0))
@@ -1351,6 +1430,7 @@ def main():
     dsp_ms_p95 = _track_mp_ref(Value("d", 0.0))
     log_bytes = _track_mp_ref(Value("L", 0))
     norm_to_peak = _track_mp_ref(Value("b", 1))
+    heatmap_view_mode = _track_mp_ref(Value("i", 0))  # 0=power XY, 1=projected XY moving velocity
     stat_raw_min_db = _track_mp_ref(Value("d", float("nan")))
     stat_raw_max_db = _track_mp_ref(Value("d", float("nan")))
     stat_norm_min_db = _track_mp_ref(Value("d", float("nan")))
@@ -1454,6 +1534,8 @@ def main():
             stop_evt,
             cfg,
             REALTIME_DSP_CFG,
+            heatmap_view_mode,
+            gui_alpha_dbuf,
         ),
     )
     _track_process(p_dsp)
@@ -1520,10 +1602,16 @@ def main():
     # GUI SETUP (RESPONSIVE - CLEAN)
     # =========================================================================
 
-    # display state (cartesian X-Y only)
+    # display state (mode 0: cartesian X-Y power, mode 1: projected X-Y moving velocity)
     norm_enabled_init = bool(norm_to_peak.value)
+    heatmap_mode_init = int(heatmap_view_mode.value)
+    if heatmap_mode_init not in (0, 1):
+        heatmap_mode_init = 0
     dr_plot = float(dr_shared)
-    if norm_enabled_init:
+    if heatmap_mode_init == 1:
+        vis_vmin = float(HEATMAP_VELOCITY_VMIN_MPS)
+        vis_vmax = float(HEATMAP_VELOCITY_VMAX_MPS)
+    elif norm_enabled_init:
         vis_vmin = float(VMIN_NORM)
         vis_vmax = float(VMAX_NORM)
     else:
@@ -1533,6 +1621,7 @@ def main():
         vis_vmax = vis_vmin + 1.0
     vis_rmax = float(RANGE_MAX_DISPLAY)
     vis_xmax = float(HEATMAP_CROSSRANGE_MAX_DISPLAY)
+    vis_heatmap_mode = int(heatmap_mode_init)
     vis_fft_mode_db = True
     vis_fft_view_full = False
     vis_fft_xmin = 0.0
@@ -1557,6 +1646,7 @@ def main():
         "fft_vmax": vis_fft_vmax,
         "fft_mode_db": bool(fft_mode_db),
         "fft_view_full": bool(fft_view_full),
+        "heatmap_mode": int(vis_heatmap_mode),
     }
 
     # 2) DearPyGui Init
@@ -1590,6 +1680,7 @@ def main():
     TXT_POS_TAG = "txt_pos_counter"
     TXT_LOG_TAG = "txt_log"
     BTN_NORM_TAG = "btn_norm_toggle"
+    BTN_HEATMAP_MODE_TAG = "btn_heatmap_mode"
     BTN_FFT_VIEW_TAG = "btn_fft_view"
     BTN_FFT_MODE_TAG = "btn_fft_mode"
     BTN_MMWAVE_CONNECT_TAG = "btn_mmwave_connect"
@@ -1629,6 +1720,8 @@ def main():
     PROC_CMAP_NUM_FMT = "%+6.1f"
     CMAP_SCALE_TAG = "cmap_scale"
     CMAP_NUM_FMT = "%+6.1f"
+    CMAP_VELOCITY_NUM_FMT = "%+5.2f"
+    CMAP_VELOCITY_TAG = "cmap_velocity_bwr"
     RANGEFFT_PLOT_TAG = "rangefft_plot"
     RANGEFFT_XAXIS_TAG = "rangefft_xaxis"
     RANGEFFT_YAXIS_TAG = "rangefft_yaxis"
@@ -1775,6 +1868,40 @@ def main():
         a = np.ones_like(x, dtype=np.float32)
         return np.stack((r, g, b, a), axis=-1).astype(np.float32, copy=False)
 
+    def _build_velocity_lut(size: int = 2048):
+        x = np.linspace(0.0, 1.0, int(size), dtype=np.float32)
+        cyan = np.asarray([0.0, 225.0, 255.0], dtype=np.float32) / np.float32(255.0)
+        orange = np.asarray([255.0, 95.0, 0.0], dtype=np.float32) / np.float32(255.0)
+        center = np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
+        signed = (x - np.float32(0.5)) * np.float32(2.0)
+        dead_zone_value = float(HEATMAP_VELOCITY_DEAD_ZONE)
+        if not np.isfinite(dead_zone_value):
+            dead_zone_value = 0.08
+        dead_zone = np.float32(min(0.99, max(0.0, dead_zone_value)))
+        mag = (np.abs(signed) - dead_zone) / (np.float32(1.0) - dead_zone)
+        np.clip(mag, 0.0, 1.0, out=mag)
+        mag = np.power(mag, np.float32(0.55), dtype=np.float32)
+        target = np.where(signed[:, None] < np.float32(0.0), cyan[None, :], orange[None, :])
+        rgb = center[None, :] + (target - center[None, :]) * mag[:, None]
+        a = np.ones((int(size), 1), dtype=np.float32)
+        return np.concatenate((rgb, a), axis=1).astype(np.float32, copy=False)
+
+    try:
+        velocity_cmap_preview = _build_velocity_lut(256)
+        velocity_cmap_colors = [
+            tuple(int(round(float(c) * 255.0)) for c in rgba)
+            for rgba in velocity_cmap_preview
+        ]
+        with dpg.colormap_registry():
+            dpg.add_colormap(
+                velocity_cmap_colors,
+                False,
+                label="Velocity Cyan-Black-Orange",
+                tag=CMAP_VELOCITY_TAG,
+            )
+    except Exception:
+        pass
+
     def _fft_mode_label(mode_db: bool) -> str:
         return "FFT SCALE: dB" if mode_db else "FFT SCALE: LINEAR"
 
@@ -1864,6 +1991,13 @@ def main():
         except (ValueError, TypeError):
             return  # mentre scrivi '-', '.', '' ecc.
 
+        heatmap_mode_now = _get_heatmap_mode()
+        vmin, vmax = _sanitize_heatmap_scale_inputs(heatmap_mode_now, vmin, vmax, sender=sender)
+        if dpg.does_item_exist(IN_VMIN) and float(dpg.get_value(IN_VMIN)) != float(vmin):
+            dpg.set_value(IN_VMIN, vmin)
+        if dpg.does_item_exist(IN_VMAX) and float(dpg.get_value(IN_VMAX)) != float(vmax):
+            dpg.set_value(IN_VMAX, vmax)
+
         # HARD clamp su Rmax/Xmax
         rmax_cl = max(0.0, min(rmax, RMAX_HARD_MAX))
         xmax_cl = max(0.0, min(xmax, XMAX_HARD_MAX))
@@ -1893,6 +2027,7 @@ def main():
         ui_pending["fft_vmax"] = fft_vmax
         ui_pending["fft_mode_db"] = bool(fft_mode_db)
         ui_pending["fft_view_full"] = bool(fft_view_full)
+        ui_pending["heatmap_mode"] = int(heatmap_mode_now)
 
         ui_dirty = True
 
@@ -2060,6 +2195,110 @@ def main():
     def _norm_toggle_label(enabled: bool) -> str:
         return "NORM: ON" if enabled else "NORM: OFF"
 
+    def _heatmap_mode_label(mode: int) -> str:
+        return "HEATMAP: XY MOVING VELOCITY" if int(mode) == 1 else "HEATMAP: POWER"
+
+    def _heatmap_norm_label(mode: int, enabled: bool) -> str:
+        if int(mode) == 1:
+            return "NORM: OFF (VELOCITY)"
+        return _norm_toggle_label(enabled)
+
+    def _heatmap_vscale_for_mode(mode: int, norm_enabled: bool):
+        if int(mode) == 1:
+            vmin = float(HEATMAP_VELOCITY_VMIN_MPS)
+            vmax = float(HEATMAP_VELOCITY_VMAX_MPS)
+            if not np.isfinite(vmin):
+                vmin = -1.0
+            if not np.isfinite(vmax):
+                vmax = 1.0
+            if vmax <= vmin:
+                vmax = vmin + 1e-3
+            return vmin, vmax
+        return _base_vscale_for_mode(norm_enabled)
+
+    def _sanitize_heatmap_scale_inputs(mode: int, vmin: float, vmax: float, *, sender=None):
+        if int(mode) == 1:
+            default_vmin, default_vmax = _heatmap_vscale_for_mode(1, False)
+            if not np.isfinite(vmin):
+                vmin = float(default_vmin)
+            if not np.isfinite(vmax):
+                vmax = float(default_vmax)
+            if vmax <= vmin:
+                vmax = vmin + 1e-3
+            return float(vmin), float(vmax)
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+        return float(vmin), float(vmax)
+
+    def _get_heatmap_mode() -> int:
+        try:
+            with heatmap_view_mode.get_lock():
+                mode = int(heatmap_view_mode.value)
+        except Exception:
+            mode = 0
+        return 1 if mode == 1 else 0
+
+    def _update_heatmap_scale_input_labels(mode: int):
+        unit = "m/s" if int(mode) == 1 else "dB"
+        if dpg.does_item_exist(IN_VMIN):
+            dpg.configure_item(IN_VMIN, label=f"Vmin ({unit})")
+        if dpg.does_item_exist(IN_VMAX):
+            dpg.configure_item(IN_VMAX, label=f"Vmax ({unit})")
+        if dpg.does_item_exist(IN_XMAX):
+            dpg.configure_item(IN_XMAX, label="Xmax (m)", enabled=True)
+
+    def _set_realtime_xy_overlays_visible(visible: bool):
+        show = bool(visible)
+        for tag in (
+            GUIDE_NEG20_TAG,
+            GUIDE_POS20_TAG,
+            TRACK_SCATTER_CONF_TAG,
+            TRACK_SCATTER_UNCONF_TAG,
+            TRACK_SCATTER_MOVING_TAG,
+            TRACK_SCATTER_STOPPED_TAG,
+            TRACK_SCATTER_UNKNOWN_TAG,
+            TRACK_STOP_MARKER_TAG,
+            TRACK_VEL_SERIES_TAG,
+        ):
+            if dpg.does_item_exist(tag):
+                dpg.configure_item(tag, show=show)
+        if not show and supports_plot_annotation and track_annotation_tags:
+            for ann_tag in track_annotation_tags:
+                if dpg.does_item_exist(ann_tag):
+                    dpg.configure_item(ann_tag, show=False)
+
+    def _apply_heatmap_plot_geometry(mode: int, rmax: float, xmax: float):
+        if dpg.does_item_exist(IMG_SERIES_TAG):
+            dpg.configure_item(
+                IMG_SERIES_TAG,
+                bounds_min=(-float(HEATMAP_CROSSRANGE_MAX_DISPLAY), 0.0),
+                bounds_max=(+float(HEATMAP_CROSSRANGE_MAX_DISPLAY), float(RANGE_MAX_DISPLAY)),
+            )
+        if dpg.does_item_exist(XAXIS_TAG):
+            dpg.configure_item(XAXIS_TAG, label="X (m)")
+            dpg.set_axis_limits(XAXIS_TAG, -float(xmax), +float(xmax))
+        if dpg.does_item_exist(YAXIS_TAG):
+            dpg.configure_item(YAXIS_TAG, label="Y (m)")
+            dpg.set_axis_limits(YAXIS_TAG, 0.0, float(rmax))
+        _set_realtime_xy_overlays_visible(True)
+
+    def _apply_heatmap_mode_controls(mode: int):
+        norm_enabled = _get_norm_enabled()
+        if dpg.does_item_exist(BTN_HEATMAP_MODE_TAG):
+            dpg.configure_item(BTN_HEATMAP_MODE_TAG, label=_heatmap_mode_label(mode))
+        if dpg.does_item_exist(BTN_NORM_TAG):
+            dpg.configure_item(
+                BTN_NORM_TAG,
+                label=_heatmap_norm_label(mode, norm_enabled),
+                enabled=(int(mode) == 0),
+            )
+        _update_heatmap_scale_input_labels(mode)
+        if dpg.does_item_exist(CMAP_SCALE_TAG):
+            fmt = CMAP_VELOCITY_NUM_FMT if int(mode) == 1 else CMAP_NUM_FMT
+            cmap = CMAP_VELOCITY_TAG if int(mode) == 1 and dpg.does_item_exist(CMAP_VELOCITY_TAG) else dpg.mvPlotColormap_Jet
+            dpg.configure_item(CMAP_SCALE_TAG, format=fmt, colormap=cmap)
+        _set_realtime_xy_overlays_visible(True)
+
     def _base_vscale_for_mode(enabled: bool):
         if enabled:
             vmin = float(VMIN_NORM)
@@ -2079,6 +2318,10 @@ def main():
             return True
 
     def _toggle_norm(sender=None, app_data=None):
+        if _get_heatmap_mode() == 1:
+            if dpg.does_item_exist(BTN_NORM_TAG):
+                dpg.configure_item(BTN_NORM_TAG, label=_heatmap_norm_label(1, False), enabled=False)
+            return
         try:
             with norm_to_peak.get_lock():
                 norm_to_peak.value = 0 if int(norm_to_peak.value) else 1
@@ -2086,12 +2329,28 @@ def main():
         except Exception:
             enabled = True
         if dpg.does_item_exist(BTN_NORM_TAG):
-            dpg.configure_item(BTN_NORM_TAG, label=_norm_toggle_label(enabled))
-        base_vmin, base_vmax = _base_vscale_for_mode(enabled)
+            dpg.configure_item(BTN_NORM_TAG, label=_heatmap_norm_label(0, enabled), enabled=True)
+        base_vmin, base_vmax = _heatmap_vscale_for_mode(0, enabled)
         if dpg.does_item_exist(IN_VMIN):
             dpg.set_value(IN_VMIN, base_vmin)
         if dpg.does_item_exist(IN_VMAX):
             dpg.set_value(IN_VMAX, base_vmax)
+        _apply_params()
+
+    def _toggle_heatmap_mode(sender=None, app_data=None):
+        try:
+            with heatmap_view_mode.get_lock():
+                heatmap_view_mode.value = 0 if int(heatmap_view_mode.value) == 1 else 1
+                mode = int(heatmap_view_mode.value)
+        except Exception:
+            mode = 0
+        mode = 1 if mode == 1 else 0
+        base_vmin, base_vmax = _heatmap_vscale_for_mode(mode, _get_norm_enabled())
+        if dpg.does_item_exist(IN_VMIN):
+            dpg.set_value(IN_VMIN, base_vmin)
+        if dpg.does_item_exist(IN_VMAX):
+            dpg.set_value(IN_VMAX, base_vmax)
+        _apply_heatmap_mode_controls(mode)
         _apply_params()
 
     def _toggle_fft_mode(sender=None, app_data=None):
@@ -2254,8 +2513,16 @@ def main():
                         dpg.add_text("DISPLAY PARAMETERS", color=(255, 200, 0))
                         dpg.add_separator()
                         dpg.add_spacer(width=20)
-                        dpg.add_input_float(label="Vmin (dB)", tag=IN_VMIN, default_value=vis_vmin, step=1.0, width=CTRL_W,callback=_apply_params, on_enter=False)
-                        dpg.add_input_float(label="Vmax (dB)", tag=IN_VMAX, default_value=vis_vmax, step=1.0, width=CTRL_W,callback=_apply_params, on_enter=False)
+                        dpg.add_button(
+                            label=_heatmap_mode_label(vis_heatmap_mode),
+                            tag=BTN_HEATMAP_MODE_TAG,
+                            callback=_toggle_heatmap_mode,
+                            width=-1,
+                            height=32,
+                        )
+                        dpg.add_spacer(height=6)
+                        dpg.add_input_float(label=("Vmin (m/s)" if vis_heatmap_mode == 1 else "Vmin (dB)"), tag=IN_VMIN, default_value=vis_vmin, step=1.0, width=CTRL_W,callback=_apply_params, on_enter=False)
+                        dpg.add_input_float(label=("Vmax (m/s)" if vis_heatmap_mode == 1 else "Vmax (dB)"), tag=IN_VMAX, default_value=vis_vmax, step=1.0, width=CTRL_W,callback=_apply_params, on_enter=False)
                         dpg.add_input_float(label="Rmax (m)", tag=IN_RMAX, default_value=vis_rmax, step=0.5, width=CTRL_W,
                                           min_value=0.0, max_value=RMAX_HARD_MAX, min_clamped=True, max_clamped=True,
                                           callback=_apply_params, on_enter=False)
@@ -2264,11 +2531,12 @@ def main():
                                           callback=_apply_params, on_enter=False)
                         dpg.add_spacer(height=8)
                         dpg.add_button(
-                            label=_norm_toggle_label(_get_norm_enabled()),
+                            label=_heatmap_norm_label(vis_heatmap_mode, _get_norm_enabled()),
                             tag=BTN_NORM_TAG,
                             callback=_toggle_norm,
                             width=-1,
                             height=32,
+                            enabled=(vis_heatmap_mode == 0),
                         )
                         dpg.add_spacer(height=14)
                         dpg.add_text("MMWAVE STUDIO CONTROL", color=(255, 200, 0))
@@ -2376,10 +2644,14 @@ def main():
                             tag=CMAP_SCALE_TAG,
                             min_scale=vis_vmin,
                             max_scale=vis_vmax,
-                            format=CMAP_NUM_FMT,
+                            format=(CMAP_VELOCITY_NUM_FMT if vis_heatmap_mode == 1 else CMAP_NUM_FMT),
                             width=-1,
                             height=-1,
-                            colormap=dpg.mvPlotColormap_Jet,
+                            colormap=(
+                                CMAP_VELOCITY_TAG
+                                if vis_heatmap_mode == 1 and dpg.does_item_exist(CMAP_VELOCITY_TAG)
+                                else dpg.mvPlotColormap_Jet
+                            ),
                         )
                         if font_mono:
                             dpg.bind_item_font(CMAP_SCALE_TAG, font_mono)
@@ -2614,6 +2886,9 @@ def main():
                         if font_mono:
                             dpg.bind_item_font(PROC_CMAP_SCALE_TAG, font_mono)
 
+    _update_heatmap_scale_input_labels(vis_heatmap_mode)
+    _apply_heatmap_mode_controls(vis_heatmap_mode)
+    _apply_heatmap_plot_geometry(vis_heatmap_mode, vis_rmax, vis_xmax)
     _update_fft_scale_input_labels(fft_mode_db)
     # Applicazione parametri DOPO creazione items
     _apply_params()
@@ -2655,6 +2930,7 @@ def main():
     gui_last_seq = 0
     tracks_last_seq = 0
     gui_frame = np.zeros((gui_h, gui_w), dtype=np.float32)
+    gui_alpha_frame = np.zeros((gui_h, gui_w), dtype=np.float32)
     rangefft_frame = np.full((RANGE_PROFILE_COUNT, fft_plot_h), -120.0, dtype=np.float32)
     gui_tracks_xy_view = np.frombuffer(gui_tracks_xy_dbuf, dtype=np.float32, count=track_max_shared * 4)
     gui_tracks_meta_view = np.frombuffer(gui_tracks_meta_dbuf, dtype=np.int32, count=track_max_shared * 4)
@@ -2665,6 +2941,8 @@ def main():
     range_axis_m = np.arange(fft_plot_h, dtype=np.float32) * np.float32(dr_plot)
     x_range_cache = {}
     jet_lut = _build_jet_lut(2048)
+    velocity_lut = _build_velocity_lut(2048)
+    velocity_nodata_rgba = np.asarray([0.015, 0.015, 0.018, 1.0], dtype=np.float32)
     norm_frame = np.empty((gui_h, gui_w), dtype=np.float32)
     lut_idx = np.empty((gui_h, gui_w), dtype=np.int32)
     rgba_frame = np.empty((gui_h, gui_w, 4), dtype=np.float32)
@@ -2701,9 +2979,9 @@ def main():
                 fft_vmax = float(ui_pending["fft_vmax"])
                 fft_mode_db = bool(ui_pending["fft_mode_db"])
                 fft_view_full = bool(ui_pending.get("fft_view_full", False))
+                heatmap_mode_now = 1 if int(ui_pending.get("heatmap_mode", 0)) == 1 else 0
+                vmin, vmax = _sanitize_heatmap_scale_inputs(heatmap_mode_now, float(vmin), float(vmax))
                 fft_xmin, fft_xmax, _ = _clamp_fft_x_window(fft_xmin, fft_xmax, rmax, fft_view_full)
-                if vmax <= vmin:
-                    vmax = vmin + 1.0
                 fft_eps = 1.0
                 if fft_vmax <= fft_vmin:
                     fft_vmax = fft_vmin + fft_eps
@@ -2712,6 +2990,7 @@ def main():
                 vis_vmax = vmax
                 vis_rmax = rmax
                 vis_xmax = xmax
+                vis_heatmap_mode = int(heatmap_mode_now)
                 vis_fft_xmin = fft_xmin
                 vis_fft_xmax = fft_xmax
                 vis_fft_mode_db = fft_mode_db
@@ -2719,20 +2998,29 @@ def main():
                 vis_fft_vmin = fft_vmin
                 vis_fft_vmax = fft_vmax
 
-                # update axis limits (meters). L'immagine resta su bounds fissi per mantenere texture 1:1.
-                if dpg.does_item_exist(XAXIS_TAG) and dpg.does_item_exist(YAXIS_TAG):
-                    dpg.set_axis_limits(XAXIS_TAG, -vis_xmax, +vis_xmax)
-                    dpg.set_axis_limits(YAXIS_TAG, 0.0, float(vis_rmax))
-                if dpg.does_item_exist(GUIDE_NEG20_TAG):
+                _apply_heatmap_plot_geometry(vis_heatmap_mode, vis_rmax, vis_xmax)
+                if vis_heatmap_mode == 0 and dpg.does_item_exist(GUIDE_NEG20_TAG):
                     guide_neg_x, guide_y = _guide_line_points(-1.0, vis_rmax)
                     dpg.set_value(GUIDE_NEG20_TAG, [guide_neg_x, guide_y])
-                if dpg.does_item_exist(GUIDE_POS20_TAG):
+                if vis_heatmap_mode == 0 and dpg.does_item_exist(GUIDE_POS20_TAG):
                     guide_pos_x, guide_y = _guide_line_points(+1.0, vis_rmax)
                     dpg.set_value(GUIDE_POS20_TAG, [guide_pos_x, guide_y])
 
                 # colorbar
                 if dpg.does_item_exist(CMAP_SCALE_TAG):
-                    dpg.configure_item(CMAP_SCALE_TAG, min_scale=vis_vmin, max_scale=vis_vmax, format=CMAP_NUM_FMT)
+                    fmt = CMAP_VELOCITY_NUM_FMT if vis_heatmap_mode == 1 else CMAP_NUM_FMT
+                    cmap = (
+                        CMAP_VELOCITY_TAG
+                        if vis_heatmap_mode == 1 and dpg.does_item_exist(CMAP_VELOCITY_TAG)
+                        else dpg.mvPlotColormap_Jet
+                    )
+                    dpg.configure_item(CMAP_SCALE_TAG, min_scale=vis_vmin, max_scale=vis_vmax, format=fmt, colormap=cmap)
+                _apply_heatmap_mode_controls(vis_heatmap_mode)
+                if vis_heatmap_mode == 1:
+                    if dpg.does_item_exist(IN_VMIN):
+                        dpg.set_value(IN_VMIN, vis_vmin)
+                    if dpg.does_item_exist(IN_VMAX):
+                        dpg.set_value(IN_VMAX, vis_vmax)
                 if dpg.does_item_exist(BTN_FFT_VIEW_TAG):
                     dpg.configure_item(BTN_FFT_VIEW_TAG, label=_fft_view_label(vis_fft_view_full))
                 if dpg.does_item_exist(BTN_FFT_MODE_TAG):
@@ -2941,6 +3229,13 @@ def main():
                         base = idx * gui_h * gui_w
                         src_flat = np.frombuffer(gui_dbuf, dtype=np.float32, count=gui_h * gui_w, offset=base * 4)
                         gui_frame.reshape(-1)[:] = src_flat
+                        alpha_flat = np.frombuffer(
+                            gui_alpha_dbuf,
+                            dtype=np.float32,
+                            count=gui_h * gui_w,
+                            offset=base * 4,
+                        )
+                        gui_alpha_frame.reshape(-1)[:] = alpha_flat
                         prof_base = idx * RANGE_PROFILE_COUNT * fft_plot_h
                         prof_flat = np.frombuffer(
                             gui_prof_dbuf,
@@ -2955,13 +3250,29 @@ def main():
                 if denom < 1e-6:
                     denom = 1e-6
 
-                np.subtract(gui_frame, float(vis_vmin), out=norm_frame)
-                norm_frame *= float(1.0 / denom)
-                np.clip(norm_frame, 0.0, 1.0, out=norm_frame)
-                np.multiply(norm_frame, lut_last, out=norm_frame)
+                active_lut = velocity_lut if int(vis_heatmap_mode) == 1 else jet_lut
+                active_lut_last = float(active_lut.shape[0] - 1)
+                if int(vis_heatmap_mode) == 1:
+                    valid_heatmap = np.isfinite(gui_frame) & np.isfinite(gui_alpha_frame) & (gui_alpha_frame > np.float32(0.0))
+                    np.subtract(gui_frame, float(vis_vmin), out=norm_frame, where=valid_heatmap)
+                    norm_frame[~valid_heatmap] = np.float32(0.0)
+                    norm_frame *= float(1.0 / denom)
+                    np.clip(norm_frame, 0.0, 1.0, out=norm_frame)
+                else:
+                    np.subtract(gui_frame, float(vis_vmin), out=norm_frame)
+                    norm_frame *= float(1.0 / denom)
+                    np.clip(norm_frame, 0.0, 1.0, out=norm_frame)
+                np.nan_to_num(norm_frame, copy=False, nan=0.0, posinf=1.0, neginf=0.0)
+                np.multiply(norm_frame, active_lut_last, out=norm_frame)
                 np.rint(norm_frame, out=norm_frame)
                 lut_idx[:, :] = norm_frame
-                np.take(jet_lut, lut_idx[::-1, :], axis=0, out=rgba_frame)
+                np.take(active_lut, lut_idx[::-1, :], axis=0, out=rgba_frame)
+                if int(vis_heatmap_mode) == 1:
+                    alpha_display = gui_alpha_frame[::-1, :]
+                    np.nan_to_num(alpha_display, copy=False, nan=0.0, posinf=1.0, neginf=0.0)
+                    np.clip(alpha_display, 0.0, 1.0, out=alpha_display)
+                    rgba_frame[:, :, 3] = alpha_display
+                    rgba_frame[alpha_display <= np.float32(0.0), :3] = velocity_nodata_rgba[:3]
                 tex_np[:] = rgba_frame.reshape(-1)
                 dpg.set_value(TEX_TAG, tex_buf)
 

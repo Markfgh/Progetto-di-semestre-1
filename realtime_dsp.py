@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import contextlib
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import io
 import math
 import os
@@ -42,6 +42,7 @@ AngleProcessingMode = Literal["fft", "bartlett", "mvdr"]
 HeatmapSpatialFilterMode = Literal["none", "gaussian_3x3"]
 DisplayProjectionMode = Literal["polar_stretched", "cartesian"]
 DisplayProjectionInterp = Literal["nearest", "bilinear"]
+DisplayHeatmapMode = Literal["power_xy", "range_angle_moving"]
 SlowTimeMode = Literal["none", "mean_subtraction", "highpass", "doppler_fft"]
 DetectionThresholdMode = Literal["relative", "absolute", "ca_cfar", "os_cfar"]
 DetectionSource = Literal["static", "moving", "fused"]
@@ -51,6 +52,7 @@ _VALID_ANGLE_PROCESSING_MODES = {"fft", "bartlett", "mvdr"}
 _VALID_HEATMAP_SPATIAL_FILTER_MODES = {"none", "gaussian_3x3"}
 _VALID_DISPLAY_PROJECTION_MODES = {"polar_stretched", "cartesian"}
 _VALID_DISPLAY_PROJECTION_INTERPS = {"nearest", "bilinear"}
+_VALID_DISPLAY_HEATMAP_MODES = {"power_xy", "range_angle_moving"}
 _VALID_SLOW_TIME_MODES = {"none", "mean_subtraction", "highpass", "doppler_fft"}
 _VALID_THRESHOLD_MODES = {"relative", "absolute", "ca_cfar", "os_cfar"}
 _GAUSSIAN_3X3_KERNEL = (
@@ -303,6 +305,21 @@ class Detection:
 
 
 @dataclass(frozen=True)
+class VelocityXYConfig:
+    relative_power_floor_db: float = -20.0
+    median_power_floor_scale: float = 8.0
+    min_dominance_ratio: float = 0.35
+
+
+@dataclass(frozen=True)
+class RangeAngleMovingConfig:
+    relative_power_floor_db: float = -12.0
+    min_power_db: float = 6.0
+    min_dominance_ratio: float = 0.65
+    velocity_dead_zone: float = 0.08
+
+
+@dataclass(frozen=True)
 class RealtimeDSPConfig:
     # Packed config passed to the DSP process to avoid relying on globals.
     c: float
@@ -325,6 +342,8 @@ class RealtimeDSPConfig:
     normalize_skip_range_bins: int = 0
     zero_after_range_fft_bins: int = 0
     calibration: CalibrationConfig = CalibrationConfig()
+    velocity_xy: VelocityXYConfig = field(default_factory=VelocityXYConfig)
+    range_angle_moving: RangeAngleMovingConfig = field(default_factory=RangeAngleMovingConfig)
 
 
 @dataclass(frozen=True)
@@ -812,6 +831,89 @@ def _to_float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return float(default)
+
+
+def velocity_xy_from_yaml_dict(cfg: dict[str, Any]) -> VelocityXYConfig:
+    dsp = cfg.get("dsp", {}) or {}
+    block = dsp.get("velocity_xy", {}) or {}
+    defaults = VelocityXYConfig()
+
+    relative_power_floor_db = _to_float(
+        block.get("relative_power_floor_db", defaults.relative_power_floor_db),
+        defaults.relative_power_floor_db,
+    )
+    if not np.isfinite(relative_power_floor_db):
+        relative_power_floor_db = defaults.relative_power_floor_db
+
+    median_power_floor_scale = _to_float(
+        block.get("median_power_floor_scale", defaults.median_power_floor_scale),
+        defaults.median_power_floor_scale,
+    )
+    if not np.isfinite(median_power_floor_scale) or median_power_floor_scale < 0.0:
+        median_power_floor_scale = defaults.median_power_floor_scale
+
+    min_dominance_ratio = _to_float(
+        block.get("min_dominance_ratio", defaults.min_dominance_ratio),
+        defaults.min_dominance_ratio,
+    )
+    if not np.isfinite(min_dominance_ratio):
+        min_dominance_ratio = defaults.min_dominance_ratio
+    min_dominance_ratio = min(1.0, max(0.0, float(min_dominance_ratio)))
+
+    return VelocityXYConfig(
+        relative_power_floor_db=float(relative_power_floor_db),
+        median_power_floor_scale=float(median_power_floor_scale),
+        min_dominance_ratio=float(min_dominance_ratio),
+    )
+
+
+def range_angle_moving_from_yaml_dict(cfg: dict[str, Any]) -> RangeAngleMovingConfig:
+    dsp = cfg.get("dsp", {}) or {}
+    block = dsp.get("range_angle_moving", {}) or {}
+    defaults = RangeAngleMovingConfig()
+
+    relative_power_floor_db = _to_float(
+        block.get("relative_power_floor_db", defaults.relative_power_floor_db),
+        defaults.relative_power_floor_db,
+    )
+    if not np.isfinite(relative_power_floor_db):
+        relative_power_floor_db = defaults.relative_power_floor_db
+
+    min_power_db = _to_float(
+        block.get("min_power_db", defaults.min_power_db),
+        defaults.min_power_db,
+    )
+    if not np.isfinite(min_power_db):
+        min_power_db = defaults.min_power_db
+
+    min_dominance_ratio = _to_float(
+        block.get("min_dominance_ratio", defaults.min_dominance_ratio),
+        defaults.min_dominance_ratio,
+    )
+    if not np.isfinite(min_dominance_ratio):
+        min_dominance_ratio = defaults.min_dominance_ratio
+    min_dominance_ratio = min(1.0, max(0.0, float(min_dominance_ratio)))
+
+    velocity_dead_zone = _to_float(
+        block.get(
+            "velocity_dead_zone",
+            block.get(
+                "velocity_dead_zone_fraction",
+                block.get("dead_zone", defaults.velocity_dead_zone),
+            ),
+        ),
+        defaults.velocity_dead_zone,
+    )
+    if not np.isfinite(velocity_dead_zone):
+        velocity_dead_zone = defaults.velocity_dead_zone
+    velocity_dead_zone = min(0.99, max(0.0, float(velocity_dead_zone)))
+
+    return RangeAngleMovingConfig(
+        relative_power_floor_db=float(relative_power_floor_db),
+        min_power_db=float(min_power_db),
+        min_dominance_ratio=float(min_dominance_ratio),
+        velocity_dead_zone=float(velocity_dead_zone),
+    )
 
 
 def _to_bool(value: Any, default: bool = False) -> bool:
@@ -1850,6 +1952,25 @@ def _normalize_display_projection_interp(value: Any) -> DisplayProjectionInterp:
     return interp_raw  # type: ignore[return-value]
 
 
+def _normalize_display_heatmap_mode(value: Any) -> DisplayHeatmapMode:
+    mode_raw = str(value or "power_xy").strip().lower()
+    if mode_raw == "velocity_xy":
+        return "range_angle_moving"
+    if mode_raw not in _VALID_DISPLAY_HEATMAP_MODES:
+        return "power_xy"
+    return mode_raw  # type: ignore[return-value]
+
+
+def _warn_velocity_display_once(message: str) -> None:
+    key = str(message)
+    warned = getattr(_warn_velocity_display_once, "_warned", set())
+    if key in warned:
+        return
+    print(f"[DSP WARN] {message}")
+    warned.add(key)
+    _warn_velocity_display_once._warned = warned
+
+
 def _build_display_axis(min_m: float, max_m: float, size: int) -> np.ndarray:
     size = int(size)
     if size <= 0:
@@ -2098,9 +2219,36 @@ def project_heatmap_for_display(
     v01 = src_view[r0, c1]
     v10 = src_view[r1, c0]
     v11 = src_view[r1, c1]
-    top = v00 + ((v01 - v00) * wa)
-    bottom = v10 + ((v11 - v10) * wa)
-    dst_flat[valid] = top + ((bottom - top) * wr)
+    finite00 = np.isfinite(v00)
+    finite01 = np.isfinite(v01)
+    finite10 = np.isfinite(v10)
+    finite11 = np.isfinite(v11)
+    if bool(np.all(finite00) and np.all(finite01) and np.all(finite10) and np.all(finite11)):
+        top = v00 + ((v01 - v00) * wa)
+        bottom = v10 + ((v11 - v10) * wa)
+        dst_flat[valid] = top + ((bottom - top) * wr)
+        return dst
+
+    w00 = (np.float32(1.0) - wr) * (np.float32(1.0) - wa)
+    w01 = (np.float32(1.0) - wr) * wa
+    w10 = wr * (np.float32(1.0) - wa)
+    w11 = wr * wa
+    weight_sum = (
+        np.where(finite00, w00, np.float32(0.0))
+        + np.where(finite01, w01, np.float32(0.0))
+        + np.where(finite10, w10, np.float32(0.0))
+        + np.where(finite11, w11, np.float32(0.0))
+    ).astype(np.float32, copy=False)
+    weighted = (
+        np.where(finite00, v00 * w00, np.float32(0.0))
+        + np.where(finite01, v01 * w01, np.float32(0.0))
+        + np.where(finite10, v10 * w10, np.float32(0.0))
+        + np.where(finite11, v11 * w11, np.float32(0.0))
+    ).astype(np.float32, copy=False)
+    supported = weight_sum >= np.float32(0.25)
+    valid_idx = np.flatnonzero(valid)
+    if np.any(supported):
+        dst_flat[valid_idx[supported]] = (weighted[supported] / weight_sum[supported]).astype(np.float32, copy=False)
     return dst
 
 
@@ -3043,21 +3191,21 @@ def detect_static_targets(
     return detections, static_heatmap
 
 
-def compute_range_doppler(
+def _compute_doppler_cube(
     range_fft: np.ndarray,
     *,
     max_bin: int,
     dsp_cfg: RealtimeDSPConfig,
-    moving_cfg: DetectionConfigMoving,
     w_doppler: np.ndarray,
     apply_doppler_window: bool,
+    doppler_fft_shift: bool,
     doppler_work_buf: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> np.ndarray:
     if range_fft.ndim != 5 or max_bin <= 0:
-        return np.empty((0, 0, 0, 0, 0), dtype=np.complex64), np.empty((0, 0), dtype=np.float32)
+        return np.empty((0, 0, 0, 0, 0), dtype=np.complex64)
     n_loops = int(range_fft.shape[1])
     if n_loops <= 0:
-        return np.empty((0, 0, 0, 0, 0), dtype=np.complex64), np.empty((0, 0), dtype=np.float32)
+        return np.empty((0, 0, 0, 0, 0), dtype=np.complex64)
 
     trimmed = range_fft[:, :, :, :max_bin, :]
     trimmed_work = doppler_work_buf
@@ -3092,9 +3240,32 @@ def compute_range_doppler(
         workers=dsp_cfg.fft_workers,
         overwrite_x=False,
     )
-    if moving_cfg.doppler_fft_shift:
+    if doppler_fft_shift:
         doppler_cube = np.fft.fftshift(doppler_cube, axes=1)
-    doppler_cube = doppler_cube.astype(np.complex64, copy=False)
+    return doppler_cube.astype(np.complex64, copy=False)
+
+
+def compute_range_doppler(
+    range_fft: np.ndarray,
+    *,
+    max_bin: int,
+    dsp_cfg: RealtimeDSPConfig,
+    moving_cfg: DetectionConfigMoving,
+    w_doppler: np.ndarray,
+    apply_doppler_window: bool,
+    doppler_work_buf: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    doppler_cube = _compute_doppler_cube(
+        range_fft,
+        max_bin=max_bin,
+        dsp_cfg=dsp_cfg,
+        w_doppler=w_doppler,
+        apply_doppler_window=apply_doppler_window,
+        doppler_fft_shift=bool(moving_cfg.doppler_fft_shift),
+        doppler_work_buf=doppler_work_buf,
+    )
+    if doppler_cube.size <= 0:
+        return doppler_cube, np.empty((0, 0), dtype=np.float32)
 
     re = doppler_cube.real
     im = doppler_cube.imag
@@ -3108,6 +3279,175 @@ def compute_range_doppler(
         d1 = min(int(range_doppler_map.shape[1]), zero_idx + excl + 1)
         range_doppler_map[:, d0:d1] = 0.0
     return doppler_cube, range_doppler_map
+
+
+def compute_range_angle_moving_velocity_map(
+    range_fft_doppler: np.ndarray,
+    *,
+    max_bin: int,
+    dsp_cfg: RealtimeDSPConfig,
+    w_doppler: np.ndarray,
+    w_angle: np.ndarray,
+    apply_doppler_window: bool,
+    apply_angle_window: bool,
+    doppler_fft_shift: bool,
+    doppler_axis_mps: np.ndarray | None,
+    tdm_mimo_compensation_table: np.ndarray | None,
+    virtual_array_geometry: VirtualArrayGeometry,
+    angle_steering: np.ndarray,
+    angle_axis_deg: np.ndarray | None = None,
+    calibration_enabled: bool = False,
+    cal_vector: np.ndarray | None = None,
+    doppler_work_buf: np.ndarray | None = None,
+    virtual_array_work_buf: np.ndarray | None = None,
+    virtual_array_flat_work_buf: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build collapsed range-angle moving maps for display.
+
+    The input is the moving-branch pre-Doppler range FFT, so this view stays
+    Doppler-consistent without inheriting display-only filtering.
+
+    The output pair is (dominant signed velocity m/s, normalized moving-power
+    alpha). Beamforming is deliberately Bartlett for a stable Doppler/range/angle
+    cube without adding MVDR covariance cost to every display frame.
+    """
+    n_range = max(0, int(max_bin))
+    n_angle = max(1, int(dsp_cfg.nfft_angle))
+    velocity_ra = np.zeros((n_range, n_angle), dtype=np.float32)
+    alpha_ra = np.zeros((n_range, n_angle), dtype=np.float32)
+    if n_range <= 0:
+        return velocity_ra, alpha_ra
+
+    n_loops = int(range_fft_doppler.shape[1]) if getattr(range_fft_doppler, "ndim", 0) == 5 else 0
+    doppler_axis = None if doppler_axis_mps is None else np.asarray(doppler_axis_mps, dtype=np.float32).reshape(-1)
+    if doppler_axis is None or int(doppler_axis.size) != n_loops or n_loops <= 0:
+        _warn_velocity_display_once(
+            "velocity heatmap disabled: Doppler velocity axis is unavailable or incompatible; publishing no-data map."
+        )
+        return velocity_ra, alpha_ra
+
+    doppler_cube = _compute_doppler_cube(
+        range_fft_doppler,
+        max_bin=n_range,
+        dsp_cfg=dsp_cfg,
+        w_doppler=w_doppler,
+        apply_doppler_window=apply_doppler_window,
+        doppler_fft_shift=bool(doppler_fft_shift),
+        doppler_work_buf=doppler_work_buf,
+    )
+    if doppler_cube.size <= 0 or doppler_cube.ndim != 5:
+        return velocity_ra, alpha_ra
+
+    n_frames = int(doppler_cube.shape[0])
+    n_doppler = int(doppler_cube.shape[1])
+    n_tx = int(doppler_cube.shape[2])
+    n_rx = int(doppler_cube.shape[4])
+    n_virtual = int(dsp_cfg.virtual_ant)
+    if n_tx * n_rx != n_virtual:
+        _warn_velocity_display_once(
+            f"velocity heatmap disabled: tx*rx={n_tx * n_rx} does not match virtual_ant={n_virtual}."
+        )
+        return velocity_ra, alpha_ra
+
+    comp_table = None if tdm_mimo_compensation_table is None else np.asarray(tdm_mimo_compensation_table, dtype=np.complex64)
+    if comp_table is not None and comp_table.ndim == 2 and comp_table.shape[0] >= n_doppler and comp_table.shape[1] >= n_tx:
+        phase = comp_table[:n_doppler, :n_tx].reshape(1, n_doppler, n_tx, 1, 1)
+        np.multiply(doppler_cube, phase, out=doppler_cube)
+
+    va_src = doppler_cube.transpose(0, 1, 3, 2, 4)
+    if (
+        virtual_array_work_buf is not None
+        and virtual_array_work_buf.shape == va_src.shape
+        and virtual_array_work_buf.dtype == np.complex64
+        and virtual_array_work_buf.flags.c_contiguous
+    ):
+        np.copyto(virtual_array_work_buf, va_src, casting="unsafe")
+        va_tx_rx = virtual_array_work_buf
+    else:
+        va_tx_rx = np.ascontiguousarray(va_src)
+    va_flat = va_tx_rx.reshape(n_frames, n_doppler, n_range, n_virtual)
+    if not virtual_array_geometry.identity_order:
+        if (
+            virtual_array_flat_work_buf is not None
+            and virtual_array_flat_work_buf.shape == va_flat.shape
+            and virtual_array_flat_work_buf.dtype == np.complex64
+            and virtual_array_flat_work_buf.flags.c_contiguous
+        ):
+            np.take(va_flat, virtual_array_geometry.order_flat, axis=-1, out=virtual_array_flat_work_buf)
+            va_flat = virtual_array_flat_work_buf
+        else:
+            va_flat = np.take(va_flat, virtual_array_geometry.order_flat, axis=-1).astype(np.complex64, copy=False)
+
+    if calibration_enabled:
+        _apply_calibration_vector(va_flat, cal_vector)
+    if apply_angle_window:
+        va_flat *= w_angle
+
+    steering = np.asarray(angle_steering, dtype=np.complex64)
+    if steering.ndim != 2 or steering.shape[0] < n_virtual or steering.shape[1] < n_angle:
+        steering = build_angle_steering_matrix(n_virtual, n_angle, geometry=virtual_array_geometry)
+    steering = steering[:n_virtual, :n_angle].astype(np.complex64, copy=False)
+
+    beam = np.einsum("ak,fdra->fdrk", np.conj(steering), va_flat, optimize=True)
+    beam_power = (beam.real * beam.real + beam.imag * beam.imag).astype(np.float32, copy=False)
+    if n_frames > 1:
+        power_dra = beam_power.mean(axis=0, dtype=np.float32)
+    else:
+        power_dra = beam_power[0]
+    if power_dra.size <= 0:
+        return velocity_ra, alpha_ra
+
+    max_power = np.max(power_dra, axis=0)
+    dominant_doppler = np.argmax(power_dra, axis=0)
+    finite_power = np.isfinite(max_power)
+    if not np.any(finite_power):
+        return velocity_ra, alpha_ra
+
+    peak_power = float(np.max(max_power[finite_power]))
+    if not np.isfinite(peak_power) or peak_power <= 0.0:
+        return velocity_ra, alpha_ra
+    velocity_cfg = getattr(dsp_cfg, "range_angle_moving", RangeAngleMovingConfig())
+    rel_floor_db = float(getattr(velocity_cfg, "relative_power_floor_db", -12.0))
+    if not np.isfinite(rel_floor_db):
+        rel_floor_db = -12.0
+    min_power_db = float(getattr(velocity_cfg, "min_power_db", 6.0))
+    if not np.isfinite(min_power_db):
+        min_power_db = 6.0
+    min_dominance = float(getattr(velocity_cfg, "min_dominance_ratio", 0.65))
+    if not np.isfinite(min_dominance):
+        min_dominance = 0.65
+    min_dominance = min(1.0, max(0.0, min_dominance))
+
+    rel_floor = peak_power * float(10.0 ** (rel_floor_db / 10.0))
+    abs_floor = float(10.0 ** (min_power_db / 10.0))
+    power_floor = np.float32(max(rel_floor, abs_floor, 1e-12))
+
+    sum_power = power_dra.sum(axis=0, dtype=np.float32)
+    dominance = max_power / np.maximum(sum_power, np.float32(1e-12))
+    reliable = finite_power & (max_power >= power_floor) & (dominance >= np.float32(min_dominance))
+    if angle_axis_deg is not None:
+        angle_axis = np.asarray(angle_axis_deg, dtype=np.float32).reshape(-1)
+        finite_angle = np.zeros(n_angle, dtype=bool)
+        angle_count = min(n_angle, int(angle_axis.size))
+        if angle_count > 0:
+            finite_angle[:angle_count] = np.isfinite(angle_axis[:angle_count])
+        reliable &= finite_angle.reshape(1, n_angle)
+    if np.any(reliable):
+        velocity_ra[reliable] = doppler_axis[dominant_doppler[reliable]]
+        alpha_ra[reliable] = (max_power[reliable] / np.float32(peak_power)).astype(np.float32, copy=False)
+        np.clip(alpha_ra, 0.0, 1.0, out=alpha_ra)
+    return velocity_ra, alpha_ra
+
+
+def compute_velocity_angle_map(
+    range_fft_doppler: np.ndarray,
+    **kwargs: Any,
+) -> np.ndarray:
+    """Legacy compatibility wrapper for the former mode-1 velocity map."""
+    velocity_ra, alpha_ra = compute_range_angle_moving_velocity_map(range_fft_doppler, **kwargs)
+    out = velocity_ra.astype(np.float32, copy=True)
+    out[alpha_ra <= np.float32(0.0)] = np.float32(np.nan)
+    return out
 
 
 def detect_moving_targets(
@@ -3816,9 +4156,12 @@ def process_buffer(
     debug_top_peaks_range_max_m: float | None = None,
     debug_top_peaks_angle_min_deg: float | None = None,
     debug_top_peaks_angle_max_deg: float | None = None,
+    display_heatmap_mode: str = "power_xy",
+    gui_heat_alpha_views: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[np.ndarray | None, list[Detection], np.ndarray]:
     try:
         cal_vector_out = np.asarray(cal_vector, dtype=np.complex64).reshape(-1)
+        display_mode = _normalize_display_heatmap_mode(display_heatmap_mode)
 
         # Raw complex stream -> Reshape -> radar tensor [frame, loop, tx, sample, rx].
         data = raw_buffer.reshape(n_frames,dsp_cfg.chirps // dsp_cfg.tx,dsp_cfg.tx,dsp_cfg.samples,dsp_cfg.rx,)
@@ -3900,7 +4243,8 @@ def process_buffer(
             )
 
         range_fft_detection_moving = range_fft_common
-        if detection_moving_cfg.enabled:
+        need_moving_doppler_branch = bool(detection_moving_cfg.enabled or display_mode == "range_angle_moving")
+        if need_moving_doppler_branch:
             range_fft_detection_moving_in = (
                 range_fft_common.copy()
                 if _branch_needs_copy(detection_moving_pre_doppler_filters)
@@ -3982,7 +4326,7 @@ def process_buffer(
                 doppler_work_buf=(
                     None
                     if doppler_work_buf is None
-                    else doppler_work_buf[:n_frames, : int(range_fft_detection_moving.shape[1]), :, :, :]
+                    else doppler_work_buf[:n_frames, : int(range_fft_detection_moving.shape[1]), :, :processing_max_bin, :]
                 ),
             )
             detections_moving = detect_moving_targets(
@@ -4034,139 +4378,244 @@ def process_buffer(
             if copy_rows > 0:
                 profiles_out[:copy_rows, :fft_profile_bins] = profiles_db_va[:copy_rows, :].astype(np.float32, copy=False)
 
-        # Build the virtual array after trimming range bins to limit memory traffic.
-        # [frame, loop, range_bin, virtual_ant]
-        virtual_array = _build_virtual_array_from_range_fft(
-            range_fft_display,
-            max_bin=display_max_bin,
-            dsp_cfg=dsp_cfg,
-            geometry=virtual_array_geometry,
-            work_buf=(
-                None
-                if virtual_array_work_buf is None
-                else virtual_array_work_buf[
-                    :n_frames,
-                    : int(range_fft_display.shape[1]),
-                    :display_max_bin,
-                    :,
-                    :,
-                ]
-            ),
-            flat_work_buf=(
-                None
-                if virtual_array_flat_work_buf is None
-                else virtual_array_flat_work_buf[
-                    :n_frames,
-                    : int(range_fft_display.shape[1]),
-                    :display_max_bin,
-                    :,
-                ]
-            ),
-        )
-
-        if calibration_enabled:
-            _apply_calibration_vector(virtual_array, cal_vector_out)
-        if apply_angle_window:
-            virtual_array *= w_angle
-
-        heatmap = compute_angle_heatmap(
-            virtual_array,
-            angle_cfg=angle_processing,
-            dsp_cfg=dsp_cfg,
-            angle_steering=angle_steering,
-            geometry=virtual_array_geometry,
-            ant_spacing=virtual_array_geometry.uniform_spacing_lambda,
-        )
-
-        if not heatmap_ema_cfg.enabled: #bypass
-            heatmap_ema = heatmap
-        elif heatmap_ema is None: #initialize
-            heatmap_ema = heatmap
-        else: # update
-            heatmap_ema *= (1.0 - heatmap_ema_cfg.alpha)
-            heatmap_ema += (heatmap_ema_cfg.alpha * heatmap)
-        heatmap_ema = apply_heatmap_spatial_filter(heatmap_ema, heatmap_spatial_filter_cfg)
-
-        # Display path only: project the linear polar heatmap onto the GUI grid, then convert to dB.
-        view_db = project_heatmap_for_display(
-            heatmap_ema,
-            angle_axis_deg=angle_axis_deg,
-            dr_m=range_bin_m,
-            gui_h=gui_h,
-            gui_w=gui_w,
-            y_max_m=display_y_max_m,
-            x_max_m=display_x_max_m,
-            projection_mode=display_projection_cfg.projection_mode,
-            projection_interp=display_projection_cfg.projection_interp,
-            out=heatmap_db_work_buf,
-            fill_value=0.0,
-            precomputed_lut=display_projection_lut,
-        )
-        np.add(view_db, np.float32(1e-12), out=view_db)
-        np.log10(view_db, out=view_db)
-        view_db *= np.float32(10.0)
-
-        if debug_print_top_peaks:
-            print(
-                _format_debug_top_peaks_range_angle(
-                    heatmap_ema,
-                    angle_axis_deg=angle_axis_deg,
-                    range_bin_m=range_bin_m,
-                    top_k=debug_top_peaks_count,
-                    range_min_m=debug_top_peaks_range_min_m,
-                    range_max_m=debug_top_peaks_range_max_m,
-                    angle_min_deg=debug_top_peaks_angle_min_deg,
-                    angle_max_deg=debug_top_peaks_angle_max_deg,
-                )
+        publish_fill_value = np.float32(-120.0)
+        view_alpha: np.ndarray | None = None
+        if display_mode == "range_angle_moving":
+            velocity_ra, alpha_ra = compute_range_angle_moving_velocity_map(
+                range_fft_detection_moving,
+                max_bin=display_max_bin,
+                dsp_cfg=dsp_cfg,
+                w_doppler=w_doppler,
+                w_angle=w_angle,
+                apply_doppler_window=apply_doppler_window,
+                apply_angle_window=apply_angle_window,
+                doppler_fft_shift=bool(detection_moving_cfg.doppler_fft_shift),
+                doppler_axis_mps=doppler_axis_mps,
+                tdm_mimo_compensation_table=tdm_mimo_compensation_table,
+                virtual_array_geometry=virtual_array_geometry,
+                angle_steering=angle_steering,
+                angle_axis_deg=angle_axis_deg,
+                calibration_enabled=calibration_enabled,
+                cal_vector=cal_vector_out,
+                doppler_work_buf=(
+                    None
+                    if doppler_work_buf is None
+                    else doppler_work_buf[:n_frames, : int(range_fft_detection_moving.shape[1]), :, :display_max_bin, :]
+                ),
+                virtual_array_work_buf=(
+                    None
+                    if virtual_array_work_buf is None
+                    else virtual_array_work_buf[
+                        :n_frames,
+                        : int(range_fft_detection_moving.shape[1]),
+                        :display_max_bin,
+                        :,
+                        :,
+                    ]
+                ),
+                virtual_array_flat_work_buf=(
+                    None
+                    if virtual_array_flat_work_buf is None
+                    else virtual_array_flat_work_buf[
+                        :n_frames,
+                        : int(range_fft_detection_moving.shape[1]),
+                        :display_max_bin,
+                        :,
+                    ]
+                ),
             )
-            print(
-                _format_debug_top_peaks_xy(
-                    view_db,
-                    x_max_m=display_x_max_m,
-                    y_max_m=display_y_max_m,
-                    top_k=debug_top_peaks_count,
-                    range_min_m=debug_top_peaks_range_min_m,
-                    range_max_m=debug_top_peaks_range_max_m,
-                    angle_min_deg=debug_top_peaks_angle_min_deg,
-                    angle_max_deg=debug_top_peaks_angle_max_deg,
-                )
+            velocity_ra_for_projection = velocity_ra.astype(np.float32, copy=True)
+            velocity_ra_for_projection[alpha_ra <= np.float32(0.0)] = np.float32(np.nan)
+            view_display = project_heatmap_for_display(
+                velocity_ra_for_projection,
+                angle_axis_deg=angle_axis_deg,
+                dr_m=range_bin_m,
+                gui_h=gui_h,
+                gui_w=gui_w,
+                y_max_m=display_y_max_m,
+                x_max_m=display_x_max_m,
+                projection_mode="cartesian",
+                projection_interp=display_projection_cfg.projection_interp,
+                out=heatmap_db_work_buf,
+                fill_value=0.0,
+                precomputed_lut=display_projection_lut,
             )
-
-        if view_db.size > 0:
-            norm_ref_db = _normalization_reference_db(
-                heatmap_ema,
-                skip_range_bins=int(getattr(dsp_cfg, "normalize_skip_range_bins", 0)),
+            view_alpha = project_heatmap_for_display(
+                alpha_ra,
+                angle_axis_deg=angle_axis_deg,
+                dr_m=range_bin_m,
+                gui_h=gui_h,
+                gui_w=gui_w,
+                y_max_m=display_y_max_m,
+                x_max_m=display_x_max_m,
+                projection_mode="cartesian",
+                projection_interp=display_projection_cfg.projection_interp,
+                out=None,
+                fill_value=0.0,
+                precomputed_lut=display_projection_lut,
             )
-            raw_max = float(np.max(view_db))
-            if dsp_cfg.debug_stats:
-                raw_min = float(np.min(view_db))
-                norm_max = 0.0
-                norm_peak = raw_max if norm_ref_db is None else float(norm_ref_db)
-                norm_min = float(raw_min - norm_peak)
+            publish_fill_value = np.float32(0.0)
+            if view_display.size > 0 and dsp_cfg.debug_stats:
                 try:
+                    valid_alpha = view_alpha > np.float32(0.0) if view_alpha is not None else np.ones(view_display.shape, dtype=bool)
+                    finite_view = view_display[valid_alpha]
+                    raw_min = float(np.min(finite_view)) if finite_view.size > 0 else float("nan")
+                    raw_max = float(np.max(finite_view)) if finite_view.size > 0 else float("nan")
                     with stat_raw_min_db.get_lock():
                         stat_raw_min_db.value = raw_min
                     with stat_raw_max_db.get_lock():
                         stat_raw_max_db.value = raw_max
                     with stat_norm_min_db.get_lock():
-                        stat_norm_min_db.value = norm_min
+                        stat_norm_min_db.value = raw_min
                     with stat_norm_max_db.get_lock():
-                        stat_norm_max_db.value = norm_max
+                        stat_norm_max_db.value = raw_max
                 except Exception:
                     pass
-            if normalize_to_peak:
-                view_db -= raw_max if norm_ref_db is None else float(norm_ref_db)
+        else:
+            # Build the virtual array after trimming range bins to limit memory traffic.
+            # [frame, loop, range_bin, virtual_ant]
+            virtual_array = _build_virtual_array_from_range_fft(
+                range_fft_display,
+                max_bin=display_max_bin,
+                dsp_cfg=dsp_cfg,
+                geometry=virtual_array_geometry,
+                work_buf=(
+                    None
+                    if virtual_array_work_buf is None
+                    else virtual_array_work_buf[
+                        :n_frames,
+                        : int(range_fft_display.shape[1]),
+                        :display_max_bin,
+                        :,
+                        :,
+                    ]
+                ),
+                flat_work_buf=(
+                    None
+                    if virtual_array_flat_work_buf is None
+                    else virtual_array_flat_work_buf[
+                        :n_frames,
+                        : int(range_fft_display.shape[1]),
+                        :display_max_bin,
+                        :,
+                    ]
+                ),
+            )
+
+            if calibration_enabled:
+                _apply_calibration_vector(virtual_array, cal_vector_out)
+            if apply_angle_window:
+                virtual_array *= w_angle
+
+            heatmap = compute_angle_heatmap(
+                virtual_array,
+                angle_cfg=angle_processing,
+                dsp_cfg=dsp_cfg,
+                angle_steering=angle_steering,
+                geometry=virtual_array_geometry,
+                ant_spacing=virtual_array_geometry.uniform_spacing_lambda,
+            )
+
+            if not heatmap_ema_cfg.enabled: #bypass
+                heatmap_ema = heatmap
+            elif heatmap_ema is None: #initialize
+                heatmap_ema = heatmap
+            else: # update
+                heatmap_ema *= (1.0 - heatmap_ema_cfg.alpha)
+                heatmap_ema += (heatmap_ema_cfg.alpha * heatmap)
+            heatmap_ema = apply_heatmap_spatial_filter(heatmap_ema, heatmap_spatial_filter_cfg)
+
+            # Display path only: project the linear polar heatmap onto the GUI grid, then convert to dB.
+            view_display = project_heatmap_for_display(
+                heatmap_ema,
+                angle_axis_deg=angle_axis_deg,
+                dr_m=range_bin_m,
+                gui_h=gui_h,
+                gui_w=gui_w,
+                y_max_m=display_y_max_m,
+                x_max_m=display_x_max_m,
+                projection_mode=display_projection_cfg.projection_mode,
+                projection_interp=display_projection_cfg.projection_interp,
+                out=heatmap_db_work_buf,
+                fill_value=0.0,
+                precomputed_lut=display_projection_lut,
+            )
+            np.add(view_display, np.float32(1e-12), out=view_display)
+            np.log10(view_display, out=view_display)
+            view_display *= np.float32(10.0)
+
+            if debug_print_top_peaks:
+                print(
+                    _format_debug_top_peaks_range_angle(
+                        heatmap_ema,
+                        angle_axis_deg=angle_axis_deg,
+                        range_bin_m=range_bin_m,
+                        top_k=debug_top_peaks_count,
+                        range_min_m=debug_top_peaks_range_min_m,
+                        range_max_m=debug_top_peaks_range_max_m,
+                        angle_min_deg=debug_top_peaks_angle_min_deg,
+                        angle_max_deg=debug_top_peaks_angle_max_deg,
+                    )
+                )
+                print(
+                    _format_debug_top_peaks_xy(
+                        view_display,
+                        x_max_m=display_x_max_m,
+                        y_max_m=display_y_max_m,
+                        top_k=debug_top_peaks_count,
+                        range_min_m=debug_top_peaks_range_min_m,
+                        range_max_m=debug_top_peaks_range_max_m,
+                        angle_min_deg=debug_top_peaks_angle_min_deg,
+                        angle_max_deg=debug_top_peaks_angle_max_deg,
+                    )
+                )
+
+            if view_display.size > 0:
+                norm_ref_db = _normalization_reference_db(
+                    heatmap_ema,
+                    skip_range_bins=int(getattr(dsp_cfg, "normalize_skip_range_bins", 0)),
+                )
+                raw_max = float(np.max(view_display))
+                if dsp_cfg.debug_stats:
+                    raw_min = float(np.min(view_display))
+                    norm_max = 0.0
+                    norm_peak = raw_max if norm_ref_db is None else float(norm_ref_db)
+                    norm_min = float(raw_min - norm_peak)
+                    try:
+                        with stat_raw_min_db.get_lock():
+                            stat_raw_min_db.value = raw_min
+                        with stat_raw_max_db.get_lock():
+                            stat_raw_max_db.value = raw_max
+                        with stat_norm_min_db.get_lock():
+                            stat_norm_min_db.value = norm_min
+                        with stat_norm_max_db.get_lock():
+                            stat_norm_max_db.value = norm_max
+                    except Exception:
+                        pass
+                if normalize_to_peak:
+                    view_display -= raw_max if norm_ref_db is None else float(norm_ref_db)
 
         # Latest-wins publish to the GUI double buffer.
         with gui_lock:
             prev_idx = int(gui_latest_idx.value)
             next_idx = 1 if prev_idx == 0 else 0
             dst = gui_heat_views[next_idx]
-            dst.fill(-120.0)
-            flat = view_db.reshape(-1)
+            dst.fill(publish_fill_value)
+            flat = view_display.reshape(-1)
             n = min(dst.size, flat.size)
             if n > 0:
                 dst[:n] = flat[:n]
+
+            if gui_heat_alpha_views is not None:
+                dst_alpha = gui_heat_alpha_views[next_idx]
+                if view_alpha is None:
+                    dst_alpha.fill(np.float32(1.0))
+                else:
+                    dst_alpha.fill(np.float32(0.0))
+                    alpha_flat = view_alpha.reshape(-1)
+                    n_alpha = min(dst_alpha.size, alpha_flat.size)
+                    if n_alpha > 0:
+                        dst_alpha[:n_alpha] = alpha_flat[:n_alpha]
 
             dst_prof = gui_profile_views[next_idx]
             dst_prof.fill(-120.0)
@@ -4219,6 +4668,8 @@ def dsp_worker(
     stop_evt,
     cfg_dict: dict[str, Any],
     dsp_cfg: RealtimeDSPConfig,
+    heatmap_view_mode: Synchronized | None = None,
+    gui_alpha_dbuf=None,
 ) -> None:
     dsp_block = cfg_dict.get("dsp", {}) or {}
     selection = selection_from_yaml_dict(cfg_dict)
@@ -4354,7 +4805,7 @@ def dsp_worker(
         dtype=np.complex64,
     )
     doppler_work_buf = np.empty(
-        (dsp_cfg.x_frames, n_doppler, dsp_cfg.tx, processing_max_bin, dsp_cfg.rx),
+        (dsp_cfg.x_frames, n_doppler, dsp_cfg.tx, max_virtual_array_bin, dsp_cfg.rx),
         dtype=np.complex64,
     )
     profiles_db_work_buf = np.empty((dsp_cfg.tx, int(fft_plot_h), dsp_cfg.rx), dtype=np.float32)
@@ -4364,6 +4815,12 @@ def dsp_worker(
         np.frombuffer(gui_dbuf, dtype=np.float32, count=gui_heat_size, offset=0),
         np.frombuffer(gui_dbuf, dtype=np.float32, count=gui_heat_size, offset=gui_heat_size * 4),
     )
+    gui_heat_alpha_views: tuple[np.ndarray, np.ndarray] | None = None
+    if gui_alpha_dbuf is not None:
+        gui_heat_alpha_views = (
+            np.frombuffer(gui_alpha_dbuf, dtype=np.float32, count=gui_heat_size, offset=0),
+            np.frombuffer(gui_alpha_dbuf, dtype=np.float32, count=gui_heat_size, offset=gui_heat_size * 4),
+        )
     gui_prof_size = int(dsp_cfg.range_profile_count) * int(fft_plot_h)
     gui_profile_views = (
         np.frombuffer(gui_prof_dbuf, dtype=np.float32, count=gui_prof_size, offset=0),
@@ -4579,6 +5036,17 @@ def dsp_worker(
                 normalize_to_peak = bool(norm_to_peak.value)
         except Exception:
             normalize_to_peak = True
+        try:
+            if heatmap_view_mode is None:
+                heatmap_mode_value = 0
+            else:
+                with heatmap_view_mode.get_lock():
+                    heatmap_mode_value = int(heatmap_view_mode.value)
+        except Exception:
+            heatmap_mode_value = 0
+        display_heatmap_mode = "range_angle_moving" if int(heatmap_mode_value) == 1 else "power_xy"
+        if display_heatmap_mode == "range_angle_moving":
+            normalize_to_peak = False
         apply_display_loop_average_after_background = bool(
             display_post_range_fft_filters.loop_average_after_background.enabled
         )
@@ -4668,6 +5136,8 @@ def dsp_worker(
             debug_top_peaks_range_max_m,
             debug_top_peaks_angle_min_deg,
             debug_top_peaks_angle_max_deg,
+            display_heatmap_mode=display_heatmap_mode,
+            gui_heat_alpha_views=gui_heat_alpha_views,
         )
         if requested_calibration:
             pending_calibration = False

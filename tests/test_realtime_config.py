@@ -89,6 +89,29 @@ def test_config_parsers_sanitize_invalid_values_and_legacy_aliases() -> None:
     fusion_cfg = realtime_dsp.fusion_from_yaml_dict(cfg)
     tracking_cfg = realtime_dsp.tracking_from_yaml_dict(cfg)
     tracker_cfg = realtime_dsp.tracker_from_yaml_dict(cfg)
+    velocity_xy_cfg = realtime_dsp.velocity_xy_from_yaml_dict(
+        {
+            "dsp": {
+                "velocity_xy": {
+                    "relative_power_floor_db": "nan",
+                    "median_power_floor_scale": -1.0,
+                    "min_dominance_ratio": 2.0,
+                }
+            }
+        }
+    )
+    range_angle_moving_cfg = realtime_dsp.range_angle_moving_from_yaml_dict(
+        {
+            "dsp": {
+                "range_angle_moving": {
+                    "relative_power_floor_db": "nan",
+                    "min_power_db": "nan",
+                    "min_dominance_ratio": 2.0,
+                    "velocity_dead_zone": "nan",
+                }
+            }
+        }
+    )
 
     assert static_cfg.threshold_mode == "relative"
     assert static_cfg.localmax_range_bins == 0
@@ -104,6 +127,45 @@ def test_config_parsers_sanitize_invalid_values_and_legacy_aliases() -> None:
     assert tracking_cfg.max_missed_confirmed == 4
     assert tracker_cfg.model == "kalman_cv_2d"
     assert tracker_cfg.gating_xy_m == 0.0
+    assert velocity_xy_cfg.relative_power_floor_db == -20.0
+    assert velocity_xy_cfg.median_power_floor_scale == 8.0
+    assert velocity_xy_cfg.min_dominance_ratio == 1.0
+    assert range_angle_moving_cfg.relative_power_floor_db == -12.0
+    assert range_angle_moving_cfg.min_power_db == 6.0
+    assert range_angle_moving_cfg.min_dominance_ratio == 1.0
+    assert range_angle_moving_cfg.velocity_dead_zone == 0.08
+
+    velocity_xy_cfg = realtime_dsp.velocity_xy_from_yaml_dict(
+        {
+            "dsp": {
+                "velocity_xy": {
+                    "relative_power_floor_db": -18.0,
+                    "median_power_floor_scale": 5.0,
+                    "min_dominance_ratio": 0.42,
+                }
+            }
+        }
+    )
+    assert velocity_xy_cfg.relative_power_floor_db == -18.0
+    assert velocity_xy_cfg.median_power_floor_scale == 5.0
+    assert velocity_xy_cfg.min_dominance_ratio == 0.42
+
+    range_angle_moving_cfg = realtime_dsp.range_angle_moving_from_yaml_dict(
+        {
+            "dsp": {
+                "range_angle_moving": {
+                    "relative_power_floor_db": -18.0,
+                    "min_power_db": 2.5,
+                    "min_dominance_ratio": 0.42,
+                    "velocity_dead_zone": 0.21,
+                }
+            }
+        }
+    )
+    assert range_angle_moving_cfg.relative_power_floor_db == -18.0
+    assert range_angle_moving_cfg.min_power_db == 2.5
+    assert range_angle_moving_cfg.min_dominance_ratio == 0.42
+    assert range_angle_moving_cfg.velocity_dead_zone == 0.21
 
     moving_filters = realtime_dsp.detection_moving_pre_doppler_filters_from_yaml_dict(cfg)
     moving_filters, moving_warnings = realtime_dsp.sanitize_detection_moving_pre_doppler_filters(moving_filters)

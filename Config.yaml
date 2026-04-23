@@ -22,8 +22,10 @@ display:
   vmin: 77           # Color scale min in RAW mode.
   vmin_norm: -20     # Normalized mode: typical clean range -25..-15 dB.
   vmax_norm: 0       # Normalized mode peak.
+  velocity_vmin_mps: -0.70 # Default mode-1 signed-velocity scale min [m/s].
+  velocity_vmax_mps:  0.70 # Default mode-1 signed-velocity scale max [m/s].
   projection_mode:   cartesian # Options: polar_stretched, cartesian.
-  projection_interp: nearest  # Used only in cartesian mode: nearest, bilinear.
+  projection_interp: bilinear  # Used only in cartesian mode: nearest, bilinear.
   range_max:  3    # Hard limit shown on Y axis [m].
   crossrange_max: 2  # X extent [m]; use "auto" to derive it from angle FOV for the realtime heatmap.
   rangefft_db_min: 0
@@ -41,15 +43,19 @@ dsp:
   window_angle: hanning  # Options: none, rectangular, hanning, hamming, blackman.
   zero_after_range_fft_bins: 0 # If > 0, zeroes the first N range bins globally right after range FFT.
 
+  range_angle_moving:
+    relative_power_floor_db: -22.0 # More permissive for weak/slow movers like a person or a hand-moved thermos.
+    min_power_db: 0.0 # Absolute moving-power floor before a cell is visible.
+    min_dominance_ratio: 0.45 # Required dominant-Doppler power / total Doppler power for the cell.
+    velocity_dead_zone: 0.08 # Visual-only fraction of the mode-1 velocity scale kept black around zero.
+
   cfar_numba:
     enabled: true # Optional JIT for CA-CFAR only; OS-CFAR remains on the Python path.
     warmup_on_start: true # Compile/cache before the realtime loop to avoid a first-frame spike.
     self_check_on_start: true # Disable JIT automatically if Python/JIT equivalence fails.
 
   diagnostics:
-    log_cpu_runtime: true # Logs actual CPU affinity/SIMD/FFT/JIT runtime exposure for this DSP process.
-  
-  
+    log_cpu_runtime: false # Logs actual CPU affinity/SIMD/FFT/JIT runtime exposure for this DSP process.
   
   calibration:
     enabled: false
@@ -135,12 +141,12 @@ dsp:
       axes: [range_bin] # Applied before the moving branch Doppler FFT.
 
     slow_time:
-      enabled: false # Supported here only with mode: none, mean_subtraction, highpass.
+      enabled: true # Supported here only with mode: none, mean_subtraction, highpass.
       mode: mean_subtraction # Options: none, mean_subtraction, highpass. Doppler FFT is not supported here.
-      highpass_beta: 0.92
+      highpass_beta: 0.90
 
     background_subtraction:
-      enabled: true # Applied before the moving branch Doppler FFT, with its own background state.
+      enabled: false # Applied before the moving branch Doppler FFT, with its own background state.
       mode: frozen # Options: ema, running_mean, window_mean, frozen.
       alpha: 0.02
       init_frames: 40

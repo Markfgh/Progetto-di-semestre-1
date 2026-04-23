@@ -122,6 +122,7 @@ def test_dsp_releases_slot_only_after_copy(monkeypatch) -> None:
 
     def fake_process_buffer(raw_buffer, n_frames, *args, **kwargs):
         captured["raw_buffer"] = np.array(raw_buffer[: expected_complex.size], copy=True)
+        captured["display_heatmap_mode"] = kwargs.get("display_heatmap_mode")
         stop_evt.set()
         cal_vector = np.asarray(kwargs.get("cal_vector", np.ones(dsp_cfg.virtual_ant, dtype=np.complex64)), dtype=np.complex64)
         return None, [], cal_vector
@@ -171,8 +172,10 @@ def test_dsp_releases_slot_only_after_copy(monkeypatch) -> None:
         stop_evt=stop_evt,
         cfg_dict={},
         dsp_cfg=dsp_cfg,
+        heatmap_view_mode=mp.Value("i", 1),
     )
 
     assert free_slots.released == [0]
     np.testing.assert_array_equal(captured["raw_buffer"], expected_complex)
+    assert captured["display_heatmap_mode"] == "range_angle_moving"
 
