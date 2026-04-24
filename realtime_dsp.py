@@ -317,6 +317,7 @@ class RangeAngleMovingConfig:
     min_power_db: float = 6.0
     min_dominance_ratio: float = 0.65
     velocity_dead_zone: float = 0.08
+    min_opacity: float = 0.35
 
 
 @dataclass(frozen=True)
@@ -908,11 +909,23 @@ def range_angle_moving_from_yaml_dict(cfg: dict[str, Any]) -> RangeAngleMovingCo
         velocity_dead_zone = defaults.velocity_dead_zone
     velocity_dead_zone = min(0.99, max(0.0, float(velocity_dead_zone)))
 
+    min_opacity = _to_float(
+        block.get(
+            "min_opacity",
+            block.get("opacity_min", defaults.min_opacity),
+        ),
+        defaults.min_opacity,
+    )
+    if not np.isfinite(min_opacity):
+        min_opacity = defaults.min_opacity
+    min_opacity = min(1.0, max(0.0, float(min_opacity)))
+
     return RangeAngleMovingConfig(
         relative_power_floor_db=float(relative_power_floor_db),
         min_power_db=float(min_power_db),
         min_dominance_ratio=float(min_dominance_ratio),
         velocity_dead_zone=float(velocity_dead_zone),
+        min_opacity=float(min_opacity),
     )
 
 

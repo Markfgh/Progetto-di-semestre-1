@@ -546,6 +546,10 @@ FFT_WORKERS = max(1, min(FFT_WORKERS, LOGICAL_CPUS))
 CALIBRATION_CFG = calibration_from_yaml_dict(cfg, virtual_ant=int(VIRTUAL_ANT))
 RANGE_ANGLE_MOVING_CFG = range_angle_moving_from_yaml_dict(cfg)
 HEATMAP_VELOCITY_DEAD_ZONE = float(getattr(RANGE_ANGLE_MOVING_CFG, "velocity_dead_zone", 0.08))
+HEATMAP_VELOCITY_MIN_OPACITY = float(getattr(RANGE_ANGLE_MOVING_CFG, "min_opacity", 0.35))
+if not np.isfinite(HEATMAP_VELOCITY_MIN_OPACITY):
+    HEATMAP_VELOCITY_MIN_OPACITY = 0.35
+HEATMAP_VELOCITY_MIN_OPACITY = min(1.0, max(0.0, HEATMAP_VELOCITY_MIN_OPACITY))
 REALTIME_DSP_CFG = RealtimeDSPConfig(
     c=float(C),
     fs=float(FS),
@@ -1870,9 +1874,6 @@ def main():
 
     def _build_velocity_lut(size: int = 2048):
         x = np.linspace(0.0, 1.0, int(size), dtype=np.float32)
-        cyan = np.asarray([0.0, 225.0, 255.0], dtype=np.float32) / np.float32(255.0)
-        orange = np.asarray([255.0, 95.0, 0.0], dtype=np.float32) / np.float32(255.0)
-        center = np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
         signed = (x - np.float32(0.5)) * np.float32(2.0)
         dead_zone_value = float(HEATMAP_VELOCITY_DEAD_ZONE)
         if not np.isfinite(dead_zone_value):
@@ -1880,9 +1881,22 @@ def main():
         dead_zone = np.float32(min(0.99, max(0.0, dead_zone_value)))
         mag = (np.abs(signed) - dead_zone) / (np.float32(1.0) - dead_zone)
         np.clip(mag, 0.0, 1.0, out=mag)
-        mag = np.power(mag, np.float32(0.55), dtype=np.float32)
-        target = np.where(signed[:, None] < np.float32(0.0), cyan[None, :], orange[None, :])
-        rgb = center[None, :] + (target - center[None, :]) * mag[:, None]
+        mag = np.power(mag, np.float32(0.70), dtype=np.float32)
+
+        center = np.asarray([0.015, 0.015, 0.018], dtype=np.float32)
+        neg_mid = np.asarray([52.0, 92.0, 255.0], dtype=np.float32) / np.float32(255.0)
+        neg_hi = np.asarray([0.0, 235.0, 255.0], dtype=np.float32) / np.float32(255.0)
+        pos_mid = np.asarray([80.0, 230.0, 95.0], dtype=np.float32) / np.float32(255.0)
+        pos_hi = np.asarray([255.0, 190.0, 0.0], dtype=np.float32) / np.float32(255.0)
+
+        mid_mix = np.clip(mag / np.float32(0.55), 0.0, 1.0)
+        hi_mix = np.clip((mag - np.float32(0.55)) / np.float32(0.45), 0.0, 1.0)
+        neg_rgb = center[None, :] + (neg_mid[None, :] - center[None, :]) * mid_mix[:, None]
+        neg_rgb = neg_rgb + (neg_hi[None, :] - neg_rgb) * hi_mix[:, None]
+        pos_rgb = center[None, :] + (pos_mid[None, :] - center[None, :]) * mid_mix[:, None]
+        pos_rgb = pos_rgb + (pos_hi[None, :] - pos_rgb) * hi_mix[:, None]
+        rgb = np.where(signed[:, None] < np.float32(0.0), neg_rgb, pos_rgb)
+        rgb[mag <= np.float32(0.0), :] = center
         a = np.ones((int(size), 1), dtype=np.float32)
         return np.concatenate((rgb, a), axis=1).astype(np.float32, copy=False)
 
@@ -1896,7 +1910,7 @@ def main():
             dpg.add_colormap(
                 velocity_cmap_colors,
                 False,
-                label="Velocity Cyan-Black-Orange",
+                label="Velocity Blue-Black-Green",
                 tag=CMAP_VELOCITY_TAG,
             )
     except Exception:
@@ -3271,8 +3285,13 @@ def main():
                     alpha_display = gui_alpha_frame[::-1, :]
                     np.nan_to_num(alpha_display, copy=False, nan=0.0, posinf=1.0, neginf=0.0)
                     np.clip(alpha_display, 0.0, 1.0, out=alpha_display)
-                    rgba_frame[:, :, 3] = alpha_display
-                    rgba_frame[alpha_display <= np.float32(0.0), :3] = velocity_nodata_rgba[:3]
+                    valid_alpha = alpha_display > np.float32(0.0)
+                    alpha_out = rgba_frame[:, :, 3]
+                    alpha_out.fill(np.float32(0.0))
+                    min_opacity = np.float32(HEATMAP_VELOCITY_MIN_OPACITY)
+                    np.multiply(alpha_display, np.float32(1.0) - min_opacity, out=alpha_out, where=valid_alpha)
+                    alpha_out[valid_alpha] += min_opacity
+                    rgba_frame[~valid_alpha, :3] = velocity_nodata_rgba[:3]
                 tex_np[:] = rgba_frame.reshape(-1)
                 dpg.set_value(TEX_TAG, tex_buf)
 

@@ -48,6 +48,7 @@ dsp:
     min_power_db: 0.0 # Absolute moving-power floor before a cell is visible.
     min_dominance_ratio: 0.45 # Required dominant-Doppler power / total Doppler power for the cell.
     velocity_dead_zone: 0.08 # Visual-only fraction of the mode-1 velocity scale kept black around zero.
+    min_opacity: 0.0 # Minimum mode-1 opacity for valid cells; power still fades from this value to 1.0.
 
   cfar_numba:
     enabled: true # Optional JIT for CA-CFAR only; OS-CFAR remains on the Python path.
