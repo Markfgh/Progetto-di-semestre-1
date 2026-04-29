@@ -2114,10 +2114,11 @@ def main():
     def _fft_visible_range_from_view(rmax_m: float, view_full: bool):
         if view_full:
             max_r_bin = int(fft_plot_h)
+            max_r_m = float(max_r_bin) * float(dr_plot)
         else:
-            max_r_bin = int(rmax_m / dr_plot) if dr_plot > 1e-12 else int(fft_plot_h)
+            max_r_m = max(0.0, min(float(rmax_m), float(fft_plot_h) * float(dr_plot)))
+            max_r_bin = int(np.ceil(float(max_r_m) / float(dr_plot))) if dr_plot > 1e-12 else int(fft_plot_h)
             max_r_bin = max(1, min(max_r_bin, int(fft_plot_h)))
-        max_r_m = float(max_r_bin) * float(dr_plot)
         return max_r_bin, max_r_m
 
     def _set_fft_x_ticks(max_r_m: float):
@@ -2146,6 +2147,22 @@ def main():
             x0 = max(0.0, float(view_max_m) - eps)
             x1 = float(view_max_m)
         return float(x0), float(x1), float(view_max_m)
+
+    def _auto_expand_fft_x_window_for_rmax_growth(
+        *,
+        prev_rmax_m: float,
+        new_rmax_m: float,
+        fft_xmax_m: float,
+        view_full: bool,
+    ) -> float:
+        if view_full or float(new_rmax_m) <= float(prev_rmax_m):
+            return float(fft_xmax_m)
+        _, prev_view_max_m = _fft_visible_range_from_view(prev_rmax_m, view_full)
+        _, new_view_max_m = _fft_visible_range_from_view(new_rmax_m, view_full)
+        eps = max(float(dr_plot), 1e-3)
+        if abs(float(fft_xmax_m) - float(prev_view_max_m)) <= eps:
+            return float(new_view_max_m)
+        return float(fft_xmax_m)
 
     def _base_fft_scale_for_mode(mode_db: bool):
         if mode_db:
@@ -2201,11 +2218,6 @@ def main():
             dpg.set_value(IN_RMAX, rmax_cl)
         if xmax_cl != xmax:
             dpg.set_value(IN_XMAX, xmax_cl)
-        fft_xmin_cl, fft_xmax_cl, _ = _clamp_fft_x_window(fft_xmin, fft_xmax, rmax_cl, fft_view_full)
-        if fft_xmin_cl != fft_xmin and dpg.does_item_exist(IN_FFT_XMIN):
-            dpg.set_value(IN_FFT_XMIN, fft_xmin_cl)
-        if fft_xmax_cl != fft_xmax and dpg.does_item_exist(IN_FFT_XMAX):
-            dpg.set_value(IN_FFT_XMAX, fft_xmax_cl)
         fft_eps = 1.0
         if fft_vmax <= fft_vmin:
             fft_vmax = fft_vmin + fft_eps
@@ -2214,6 +2226,17 @@ def main():
 
         prev_rmax = float(ui_pending.get("rmax", rmax_cl))
         prev_xmax = float(ui_pending.get("xmax", xmax_cl))
+        fft_xmax = _auto_expand_fft_x_window_for_rmax_growth(
+            prev_rmax_m=prev_rmax,
+            new_rmax_m=rmax_cl,
+            fft_xmax_m=fft_xmax,
+            view_full=fft_view_full,
+        )
+        fft_xmin_cl, fft_xmax_cl, _ = _clamp_fft_x_window(fft_xmin, fft_xmax, rmax_cl, fft_view_full)
+        if fft_xmin_cl != fft_xmin and dpg.does_item_exist(IN_FFT_XMIN):
+            dpg.set_value(IN_FFT_XMIN, fft_xmin_cl)
+        if fft_xmax_cl != fft_xmax and dpg.does_item_exist(IN_FFT_XMAX):
+            dpg.set_value(IN_FFT_XMAX, fft_xmax_cl)
         ui_pending["vmin"] = vmin
         ui_pending["vmax"] = vmax
         ui_pending["rmax"] = rmax_cl
@@ -3145,7 +3168,6 @@ def main():
     gui_tracks_stop_xy_view = np.frombuffer(gui_tracks_stop_xy_dbuf, dtype=np.float32, count=track_max_shared * 2)
     tracks_out: list[dict[str, float | int | bool]] = []
     proc_frame = np.full((proc_tex_h, proc_tex_w), off_vmin, dtype=np.float32)
-    range_axis_m = np.arange(fft_plot_h, dtype=np.float32) * np.float32(dr_plot)
     x_range_cache = {}
     jet_lut = _build_jet_lut(2048)
     velocity_lut = _build_velocity_lut(2048)
@@ -3595,11 +3617,15 @@ def main():
 
                 if (now - fft_plot_last_t) >= fft_plot_period_s:
                     fft_plot_last_t = now
-                    max_r_bin, _ = _fft_visible_range_from_view(vis_rmax, vis_fft_view_full)
-                    x_range_m = x_range_cache.get(max_r_bin)
+                    max_r_bin, max_r_m = _fft_visible_range_from_view(vis_rmax, vis_fft_view_full)
+                    x_cache_key = (int(max_r_bin), round(float(max_r_m), 6))
+                    x_range_m = x_range_cache.get(x_cache_key)
                     if x_range_m is None:
-                        x_range_m = range_axis_m[:max_r_bin].tolist()
-                        x_range_cache[max_r_bin] = x_range_m
+                        if max_r_bin <= 1:
+                            x_range_m = [0.0]
+                        else:
+                            x_range_m = np.linspace(0.0, float(max_r_m), int(max_r_bin), dtype=np.float32).tolist()
+                        x_range_cache[x_cache_key] = x_range_m
                     fft_slice = rangefft_frame[:, :max_r_bin]
                     if vis_fft_mode_db:
                         fft_plot_vals = fft_slice

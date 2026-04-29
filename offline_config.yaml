@@ -7,7 +7,7 @@ scan:
   x_start: 1
   x_end: 1
   x_step: 1
-  x_pitch_m: 0.007792 # 10mm pitch 
+  x_pitch_m: 0.007792 # 7.7792mm pitch 
 
 bp:
   mode: mimo_sar # opzioni: sar_only | mimo_sar
@@ -22,18 +22,3 @@ bp:
   use_virtual_antennas: true # deprecato/ignorato in mimo_sar: la geometria fisica TX/RX resta attiva
   coherent_sum: true
 
-
-  # Con d = 1.948 mm, i valori pratici diventano:
-  #
-  # 1 * d = 1.948 mm
-  # 2 * d = 3.896 mm
-  # 4 * d = 7.792 mm
-  # 8 * d = 15.584 mm
-  #
-  # Il più interessante per te è questo:
-  #
-  # scan.x_pitch_m = 0.015584 m → massima estensione dell’apertura senza buchi tra il blocco di 8 antenne di una posizione e quello della posizione successiva.
-  #
-  # scan.x_pitch_m = 0.007792 m → 50% di overlap, più robusto e più “pulito” se la geometria virtuale reale non è perfettamente quella uniforme del modello.
-  #
-  # scan.x_pitch_m = 0.003896 m → super-campionamento dell’apertura, molto conservativo ma più lento e con tanta ridondanza.
