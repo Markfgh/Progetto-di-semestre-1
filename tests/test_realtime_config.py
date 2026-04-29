@@ -226,3 +226,100 @@ def test_window_shapes_and_identity_windows_are_stable() -> None:
     np.testing.assert_array_equal(w_range, np.ones_like(w_range))
     assert np.all(np.isfinite(w_doppler))
     assert np.all(np.isfinite(w_angle))
+
+
+def test_display_zoom_parser_and_viewport_clamps_are_stable() -> None:
+    cfg = {
+        "radar": {"c": 3.0e8, "fs": 2.0e6, "slope": 30.0e12},
+        "fft": {"nfft_range": 64, "nfft_angle": 128},
+        "display": {"range_max": 4.0},
+        "display_zoom": {
+            "enabled": "true",
+            "output_width": -10,
+            "output_height": "bad",
+            "max_zoom_nfft_range": 16,
+            "max_zoom_nfft_angle": 32,
+            "max_update_hz": -5.0,
+            "dsp_budget_ms": "nan",
+            "fallback_mode": "cached_frame",
+        },
+    }
+
+    zoom_cfg = realtime_dsp.display_zoom_from_yaml_dict(cfg)
+    assert zoom_cfg.enabled
+    assert zoom_cfg.output_width == 1
+    assert zoom_cfg.output_height > 0
+    assert zoom_cfg.max_zoom_nfft_range == 64
+    assert zoom_cfg.max_zoom_nfft_angle == 128
+    assert zoom_cfg.max_update_hz == 15.0
+    assert zoom_cfg.dsp_budget_ms == 6.0
+    assert zoom_cfg.fallback_mode == "cached_frame"
+
+    home = realtime_dsp.build_display_viewport(
+        x_min_m=-2.0,
+        x_max_m=2.0,
+        y_min_m=0.0,
+        y_max_m=4.0,
+        dr_m=0.1,
+        seq=0,
+    )
+    clamped = realtime_dsp.clamp_display_viewport(
+        x_min_m=-9.0,
+        x_max_m=0.2,
+        y_min_m=-1.0,
+        y_max_m=6.5,
+        home_viewport=home,
+        output_width=128,
+        output_height=64,
+        dr_m=0.1,
+        seq=3,
+    )
+
+    assert clamped.x_min_m >= home.x_min_m
+    assert clamped.x_max_m <= home.x_max_m
+    assert clamped.y_min_m >= home.y_min_m
+    assert clamped.y_max_m <= home.y_max_m
+    assert clamped.seq == 3
+    assert clamped.zoom_level >= 1.0
+
+
+def test_display_zoom_method_warnings_are_explicit_for_unsupported_values() -> None:
+    warnings = realtime_dsp.display_zoom_method_warnings(
+        realtime_dsp.DisplayZoomConfig(
+            enabled=True,
+            realtime_method="fft_zoom",
+            offline_method="adaptive",
+        )
+    )
+
+    assert any("display_zoom.realtime_method='fft_zoom'" in warning for warning in warnings)
+    assert any("display_zoom.offline_method='adaptive'" in warning for warning in warnings)
+    assert realtime_dsp.display_zoom_method_warnings(realtime_dsp.DisplayZoomConfig()) == []
+
+
+def test_display_viewport_clamp_expands_to_cover_requested_roi() -> None:
+    home = realtime_dsp.build_display_viewport(
+        x_min_m=-2.0,
+        x_max_m=2.0,
+        y_min_m=0.0,
+        y_max_m=3.0,
+        dr_m=0.09763672265546891,
+        seq=0,
+    )
+
+    clamped = realtime_dsp.clamp_display_viewport(
+        x_min_m=-0.2,
+        x_max_m=0.2,
+        y_min_m=0.0,
+        y_max_m=0.5,
+        home_viewport=home,
+        output_width=256,
+        output_height=128,
+        dr_m=0.09763672265546891,
+        seq=1,
+    )
+
+    assert clamped.x_min_m <= -0.2
+    assert clamped.x_max_m >= 0.2
+    assert clamped.y_min_m <= 0.0
+    assert clamped.y_max_m >= 0.5

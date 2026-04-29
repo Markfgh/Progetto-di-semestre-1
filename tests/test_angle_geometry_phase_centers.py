@@ -422,3 +422,40 @@ def test_cartesian_projection_places_peak_at_expected_xy() -> None:
     peak_rows, peak_cols = np.where(view >= np.float32(max_value))
     distances = np.hypot(x_axis[peak_cols] - np.float32(expected_x), y_axis[peak_rows] - np.float32(expected_y))
     assert float(np.min(distances)) <= max(float(x_axis[1] - x_axis[0]), float(y_axis[1] - y_axis[0])) + 0.06
+
+
+def test_projection_lut_accepts_explicit_zoomed_extents() -> None:
+    angle_axis = np.asarray([-30.0, 0.0, 30.0], dtype=np.float32)
+    lut = realtime_dsp.build_display_projection_lut(
+        gui_h=5,
+        gui_w=7,
+        x_max_m=0.6,
+        y_max_m=2.0,
+        dr_m=0.1,
+        angle_axis_deg=angle_axis,
+        projection_mode="cartesian",
+        projection_interp="nearest",
+        x_min_m=-0.2,
+        y_min_m=1.0,
+    )
+    np.testing.assert_allclose(lut["x_axis_m"][0], np.float32(-0.2 + (0.8 / 7.0) * 0.5), atol=1e-6)
+    np.testing.assert_allclose(lut["y_axis_m"][0], np.float32(1.0 + (1.0 / 5.0) * 0.5), atol=1e-6)
+
+    heatmap = np.ones((32, 3), dtype=np.float32)
+    view = realtime_dsp.project_heatmap_for_display(
+        heatmap,
+        angle_axis_deg=angle_axis,
+        dr_m=0.1,
+        gui_h=5,
+        gui_w=7,
+        y_max_m=2.0,
+        x_max_m=0.6,
+        projection_mode="cartesian",
+        projection_interp="nearest",
+        x_min_m=-0.2,
+        y_min_m=1.0,
+        precomputed_lut=lut,
+    )
+
+    assert view.shape == (5, 7)
+    assert np.all(np.isfinite(view))

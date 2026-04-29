@@ -14,7 +14,7 @@ capture:
 
 fft:
   nfft_range: 256 # Typical: 256 or 512. Higher = finer range bins, more CPU.
-  nfft_angle: 128 # Typical: 128/256/512. Higher = finer angular grid, more CPU.
+  nfft_angle: 256 # Typical: 128/256/512. Higher = finer angular grid, more CPU.
   workers: 8      # FFT worker threads.
 
 display:
@@ -33,6 +33,18 @@ display:
   rangefft_lin_min: 0
   rangefft_lin_max: 15e7
   normalize_skip_range_bins: 0 # Normalized display: ignore the first N range bins when choosing the frame peak.
+
+display_zoom:
+  enabled: true
+  output_width: 256
+  output_height: 256
+  realtime_method: auto
+  offline_method: viewport_grid
+  max_zoom_nfft_range: 256
+  max_zoom_nfft_angle: 256
+  max_update_hz: 22.0
+  dsp_budget_ms: 8.0 
+  fallback_mode: baseline_projection #
 
 processing:
   range_max_m: 12.5 # Physical processing/detection limit [m]. If missing, falls back to display.range_max.

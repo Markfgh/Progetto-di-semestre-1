@@ -372,10 +372,18 @@ from offline_processing import OfflineBPRuntime
 from mmwave_studio_bridge import DCA1000Config, MmwaveStudioBridge, MmwaveStudioError, RadarConnectionConfig
 from shutdown_utils import cleanup_processes, close_queues
 from realtime_dsp import (
+    AppliedViewportMeta,
+    DisplayViewport,
     RealtimeDSPConfig,
+    applied_viewport_meta_from_viewport,
     build_angle_axis_deg,
+    build_display_viewport,
     calibration_from_yaml_dict,
+    clamp_display_viewport,
     display_projection_from_yaml_dict,
+    display_viewport_signature,
+    display_zoom_method_warnings,
+    display_zoom_from_yaml_dict,
     dsp_worker,
     range_angle_moving_from_yaml_dict,
     resolve_processing_range_max_m,
@@ -423,6 +431,9 @@ RMAX_HARD_MAX = float(cfg["display"]["range_max"])
 RANGE_MAX_DISPLAY = float(cfg["display"]["range_max"])
 RANGE_MAX_PROCESSING = float(resolve_processing_range_max_m(cfg))
 display_projection_cfg = display_projection_from_yaml_dict(cfg)
+display_zoom_cfg = display_zoom_from_yaml_dict(cfg)
+for warn_msg in display_zoom_method_warnings(display_zoom_cfg):
+    print(f"[DISPLAY WARN] {warn_msg}")
 HEATMAP_CROSSRANGE_MAX_DISPLAY = float(
     resolve_display_crossrange_max_m(
         RANGE_MAX_DISPLAY,
@@ -572,6 +583,7 @@ REALTIME_DSP_CFG = RealtimeDSPConfig(
     zero_after_range_fft_bins=max(0, int(cfg.get("dsp", {}).get("zero_after_range_fft_bins", 0))),
     calibration=CALIBRATION_CFG,
     range_angle_moving=RANGE_ANGLE_MOVING_CFG,
+    display_zoom=display_zoom_cfg,
 )
 
 # --- PROCESS PRIORITY ---
@@ -1380,16 +1392,53 @@ def main():
     cap_saved = _track_mp_ref(Value("i", 0))    # frames saved for current position
 
     dr_shared = C * FS / (2.0 * SLOPE * NFFT_RANGE)
-    gui_h = int(np.floor(RANGE_MAX_DISPLAY / dr_shared))
-    gui_h = max(1, min(gui_h, NFFT_RANGE // 2))
+    gui_h = max(1, int(display_zoom_cfg.output_height))
     fft_plot_h = max(1, int(NFFT_RANGE))
-    gui_w = int(NFFT_ANGLE)
+    gui_w = max(1, int(display_zoom_cfg.output_width))
     gui_dbuf = _track_mp_ref(RawArray("f", 2 * gui_h * gui_w))
     gui_alpha_dbuf = _track_mp_ref(RawArray("f", 2 * gui_h * gui_w))
     gui_prof_dbuf = _track_mp_ref(RawArray("f", 2 * RANGE_PROFILE_COUNT * fft_plot_h))
     gui_latest_idx = _track_mp_ref(Value("i", -1))
     gui_latest_seq = _track_mp_ref(Value("Q", 0))
     gui_lock = _track_mp_ref(mp.Lock())
+    rt_home_viewport = build_display_viewport(
+        x_min_m=-float(HEATMAP_CROSSRANGE_MAX_DISPLAY),
+        x_max_m=float(HEATMAP_CROSSRANGE_MAX_DISPLAY),
+        y_min_m=0.0,
+        y_max_m=float(RANGE_MAX_DISPLAY),
+        dr_m=float(dr_shared),
+        seq=0,
+    )
+    rt_home_viewport_shared = _track_mp_ref(RawArray("d", 4))
+    rt_home_viewport_lock = _track_mp_ref(mp.Lock())
+    rt_requested_viewport = _track_mp_ref(RawArray("d", 4))
+    rt_requested_viewport_seq = _track_mp_ref(Value("Q", 0))
+    rt_requested_viewport_lock = _track_mp_ref(mp.Lock())
+    rt_applied_viewport = _track_mp_ref(RawArray("d", 9))
+    rt_applied_viewport_seq = _track_mp_ref(Value("Q", 0))
+    rt_applied_viewport_frame_seq = _track_mp_ref(Value("Q", 0))
+    rt_applied_viewport_fallback = _track_mp_ref(Value("b", 0))
+    rt_applied_viewport_lock = _track_mp_ref(mp.Lock())
+    with rt_home_viewport_lock:
+        rt_home_viewport_shared[0] = float(rt_home_viewport.x_min_m)
+        rt_home_viewport_shared[1] = float(rt_home_viewport.x_max_m)
+        rt_home_viewport_shared[2] = float(rt_home_viewport.y_min_m)
+        rt_home_viewport_shared[3] = float(rt_home_viewport.y_max_m)
+    with rt_requested_viewport_lock:
+        rt_requested_viewport[0] = float(rt_home_viewport.x_min_m)
+        rt_requested_viewport[1] = float(rt_home_viewport.x_max_m)
+        rt_requested_viewport[2] = float(rt_home_viewport.y_min_m)
+        rt_requested_viewport[3] = float(rt_home_viewport.y_max_m)
+    with rt_applied_viewport_lock:
+        rt_applied_viewport[0] = float(rt_home_viewport.x_min_m)
+        rt_applied_viewport[1] = float(rt_home_viewport.x_max_m)
+        rt_applied_viewport[2] = float(rt_home_viewport.y_min_m)
+        rt_applied_viewport[3] = float(rt_home_viewport.y_max_m)
+        rt_applied_viewport[4] = float(rt_home_viewport.range_min_bin_f)
+        rt_applied_viewport[5] = float(rt_home_viewport.range_max_bin_f)
+        rt_applied_viewport[6] = float(rt_home_viewport.angle_min_deg)
+        rt_applied_viewport[7] = float(rt_home_viewport.angle_max_deg)
+        rt_applied_viewport[8] = float(rt_home_viewport.zoom_level)
     track_cfg = cfg.get("tracking", {}) or {}
     track_max_shared = max(1, int(track_cfg.get("max_tracks", 30)))
     gui_tracks_xy_dbuf = _track_mp_ref(RawArray("f", track_max_shared * 4))   # x, y, vx, vy
@@ -1540,6 +1589,16 @@ def main():
             REALTIME_DSP_CFG,
             heatmap_view_mode,
             gui_alpha_dbuf,
+            rt_requested_viewport,
+            rt_requested_viewport_seq,
+            rt_requested_viewport_lock,
+            rt_applied_viewport,
+            rt_applied_viewport_seq,
+            rt_applied_viewport_frame_seq,
+            rt_applied_viewport_fallback,
+            rt_applied_viewport_lock,
+            rt_home_viewport_shared,
+            rt_home_viewport_lock,
         ),
     )
     _track_process(p_dsp)
@@ -1629,7 +1688,7 @@ def main():
     vis_fft_mode_db = True
     vis_fft_view_full = False
     vis_fft_xmin = 0.0
-    vis_fft_xmax = float(gui_h) * float(dr_plot)
+    vis_fft_xmax = float(min(int(fft_plot_h), max(1, int(np.ceil(float(RANGE_MAX_DISPLAY) / max(float(dr_plot), 1e-9)))))) * float(dr_plot)
     vis_fft_vmin = float(RANGEFFT_DB_MIN)
     vis_fft_vmax = float(RANGEFFT_DB_MAX)
     if vis_fft_vmax <= vis_fft_vmin:
@@ -1651,6 +1710,7 @@ def main():
         "fft_mode_db": bool(fft_mode_db),
         "fft_view_full": bool(fft_view_full),
         "heatmap_mode": int(vis_heatmap_mode),
+        "reset_view": True,
     }
 
     # 2) DearPyGui Init
@@ -1823,6 +1883,28 @@ def main():
         off_vmax = off_vmin + 1.0
     off_rmax = float(RANGE_MAX_DISPLAY)
     off_xmax = float(CROSSRANGE_MAX_DISPLAY)
+    rt_home_viewport_current = rt_home_viewport
+    rt_requested_viewport_current = rt_home_viewport
+    rt_applied_meta_current = applied_viewport_meta_from_viewport(
+        rt_home_viewport,
+        fallback_used=False,
+        frame_seq=0,
+    )
+    off_home_viewport_current = build_display_viewport(
+        x_min_m=-float(off_xmax),
+        x_max_m=float(off_xmax),
+        y_min_m=0.0,
+        y_max_m=float(off_rmax),
+        dr_m=float(dr_plot),
+        seq=0,
+    )
+    off_requested_viewport_current = off_home_viewport_current
+    off_applied_meta_current = applied_viewport_meta_from_viewport(
+        off_home_viewport_current,
+        fallback_used=False,
+        frame_seq=0,
+    )
+    rt_applied_seq_local = 0
 
     guide_angle_deg = 20.0
     guide_slope = float(np.tan(np.deg2rad(np.float32(guide_angle_deg))))
@@ -1831,6 +1913,104 @@ def main():
         y_top = max(0.0, float(y_max_m))
         x_top = float(angle_sign) * guide_slope * y_top
         return [[0.0, x_top], [0.0, y_top]]
+
+    def _configure_image_bounds(series_tag: str, meta: AppliedViewportMeta | DisplayViewport) -> None:
+        if not dpg.does_item_exist(series_tag):
+            return
+        dpg.configure_item(
+            series_tag,
+            bounds_min=(float(meta.x_min_m), float(meta.y_min_m)),
+            bounds_max=(float(meta.x_max_m), float(meta.y_max_m)),
+        )
+
+    def _write_realtime_requested_viewport(viewport: DisplayViewport) -> None:
+        with rt_requested_viewport_lock:
+            rt_requested_viewport[0] = float(viewport.x_min_m)
+            rt_requested_viewport[1] = float(viewport.x_max_m)
+            rt_requested_viewport[2] = float(viewport.y_min_m)
+            rt_requested_viewport[3] = float(viewport.y_max_m)
+        with rt_requested_viewport_seq.get_lock():
+            rt_requested_viewport_seq.value = int(viewport.seq)
+
+    def _write_realtime_home_viewport(viewport: DisplayViewport) -> None:
+        with rt_home_viewport_lock:
+            rt_home_viewport_shared[0] = float(viewport.x_min_m)
+            rt_home_viewport_shared[1] = float(viewport.x_max_m)
+            rt_home_viewport_shared[2] = float(viewport.y_min_m)
+            rt_home_viewport_shared[3] = float(viewport.y_max_m)
+
+    def _read_realtime_applied_meta() -> AppliedViewportMeta:
+        with rt_applied_viewport_lock:
+            arr = np.asarray(rt_applied_viewport[:], dtype=np.float64)
+        try:
+            seq_val = int(rt_applied_viewport_seq.value)
+        except Exception:
+            seq_val = 0
+        try:
+            frame_seq_val = int(rt_applied_viewport_frame_seq.value)
+        except Exception:
+            frame_seq_val = 0
+        try:
+            fallback_used = bool(rt_applied_viewport_fallback.value)
+        except Exception:
+            fallback_used = False
+        return AppliedViewportMeta(
+            x_min_m=float(arr[0]),
+            x_max_m=float(arr[1]),
+            y_min_m=float(arr[2]),
+            y_max_m=float(arr[3]),
+            range_min_bin_f=float(arr[4]),
+            range_max_bin_f=float(arr[5]),
+            angle_min_deg=float(arr[6]),
+            angle_max_deg=float(arr[7]),
+            zoom_level=float(arr[8]),
+            seq=int(seq_val),
+            fallback_used=bool(fallback_used),
+            frame_seq=int(frame_seq_val),
+        )
+
+    def _try_get_axis_limits(x_axis_tag: str, y_axis_tag: str) -> tuple[float, float, float, float] | None:
+        if not dpg.does_item_exist(x_axis_tag) or not dpg.does_item_exist(y_axis_tag):
+            return None
+        try:
+            x_limits = dpg.get_axis_limits(x_axis_tag)
+            y_limits = dpg.get_axis_limits(y_axis_tag)
+        except Exception:
+            return None
+        if x_limits is None or y_limits is None:
+            return None
+        try:
+            x0, x1 = float(x_limits[0]), float(x_limits[1])
+            y0, y1 = float(y_limits[0]), float(y_limits[1])
+        except Exception:
+            return None
+        if not (np.isfinite(x0) and np.isfinite(x1) and np.isfinite(y0) and np.isfinite(y1)):
+            return None
+        return (x0, x1, y0, y1)
+
+    def _poll_requested_viewport(
+        *,
+        x_axis_tag: str,
+        y_axis_tag: str,
+        home_viewport: DisplayViewport,
+        current_viewport: DisplayViewport,
+    ) -> DisplayViewport:
+        limits = _try_get_axis_limits(x_axis_tag, y_axis_tag)
+        if limits is None:
+            return current_viewport
+        x0, x1, y0, y1 = limits
+        return clamp_display_viewport(
+            x_min_m=float(x0),
+            x_max_m=float(x1),
+            y_min_m=float(y0),
+            y_max_m=float(y1),
+            home_viewport=home_viewport,
+            output_width=int(gui_w),
+            output_height=int(gui_h),
+            dr_m=float(dr_plot),
+            seq=int(current_viewport.seq) + 1,
+        )
+
     off_ui_dirty = False
     off_ui_dirty_t = 0.0
     off_ui_pending = {
@@ -1842,6 +2022,7 @@ def main():
         "rmax": float(off_rmax),
         "xmax": float(off_xmax),
         "norm_enabled": bool(off_norm_enabled),
+        "reset_view": True,
     }
     off_status_text = "Offline runtime non disponibile" if offline_runtime is None else "Offline ready"
     if offline_error:
@@ -1934,8 +2115,8 @@ def main():
         if view_full:
             max_r_bin = int(fft_plot_h)
         else:
-            max_r_bin = int(rmax_m / dr_plot) if dr_plot > 1e-12 else gui_h
-            max_r_bin = max(1, min(max_r_bin, gui_h))
+            max_r_bin = int(rmax_m / dr_plot) if dr_plot > 1e-12 else int(fft_plot_h)
+            max_r_bin = max(1, min(max_r_bin, int(fft_plot_h)))
         max_r_m = float(max_r_bin) * float(dr_plot)
         return max_r_bin, max_r_m
 
@@ -2031,6 +2212,8 @@ def main():
             if dpg.does_item_exist(IN_FFT_VMAX):
                 dpg.set_value(IN_FFT_VMAX, fft_vmax)
 
+        prev_rmax = float(ui_pending.get("rmax", rmax_cl))
+        prev_xmax = float(ui_pending.get("xmax", xmax_cl))
         ui_pending["vmin"] = vmin
         ui_pending["vmax"] = vmax
         ui_pending["rmax"] = rmax_cl
@@ -2042,6 +2225,11 @@ def main():
         ui_pending["fft_mode_db"] = bool(fft_mode_db)
         ui_pending["fft_view_full"] = bool(fft_view_full)
         ui_pending["heatmap_mode"] = int(heatmap_mode_now)
+        ui_pending["reset_view"] = bool(
+            ui_pending.get("reset_view", False)
+            or abs(float(prev_rmax) - float(rmax_cl)) > 1e-6
+            or abs(float(prev_xmax) - float(xmax_cl)) > 1e-6
+        )
 
         ui_dirty = True
 
@@ -2281,19 +2469,16 @@ def main():
                 if dpg.does_item_exist(ann_tag):
                     dpg.configure_item(ann_tag, show=False)
 
-    def _apply_heatmap_plot_geometry(mode: int, rmax: float, xmax: float):
-        if dpg.does_item_exist(IMG_SERIES_TAG):
-            dpg.configure_item(
-                IMG_SERIES_TAG,
-                bounds_min=(-float(HEATMAP_CROSSRANGE_MAX_DISPLAY), 0.0),
-                bounds_max=(+float(HEATMAP_CROSSRANGE_MAX_DISPLAY), float(RANGE_MAX_DISPLAY)),
-            )
+    def _apply_heatmap_plot_geometry(mode: int, rmax: float, xmax: float, *, reset_limits: bool = False):
+        _configure_image_bounds(IMG_SERIES_TAG, rt_applied_meta_current)
         if dpg.does_item_exist(XAXIS_TAG):
             dpg.configure_item(XAXIS_TAG, label="X (m)")
-            dpg.set_axis_limits(XAXIS_TAG, -float(xmax), +float(xmax))
+            if reset_limits:
+                dpg.set_axis_limits(XAXIS_TAG, -float(xmax), +float(xmax))
         if dpg.does_item_exist(YAXIS_TAG):
             dpg.configure_item(YAXIS_TAG, label="Y (m)")
-            dpg.set_axis_limits(YAXIS_TAG, 0.0, float(rmax))
+            if reset_limits:
+                dpg.set_axis_limits(YAXIS_TAG, 0.0, float(rmax))
         _set_realtime_xy_overlays_visible(True)
 
     def _apply_heatmap_mode_controls(mode: int):
@@ -2365,6 +2550,7 @@ def main():
         if dpg.does_item_exist(IN_VMAX):
             dpg.set_value(IN_VMAX, base_vmax)
         _apply_heatmap_mode_controls(mode)
+        ui_pending["reset_view"] = True
         _apply_params()
 
     def _toggle_fft_mode(sender=None, app_data=None):
@@ -2468,6 +2654,8 @@ def main():
         if x_end_cl != x_end:
             dpg.set_value(PROC_IN_XEND, x_end_cl)
 
+        prev_off_rmax = float(off_ui_pending.get("rmax", rmax_cl))
+        prev_off_xmax = float(off_ui_pending.get("xmax", xmax_cl))
         off_ui_pending["vmin"] = float(vmin)
         off_ui_pending["vmax"] = float(vmax)
         off_ui_pending["rmax"] = float(rmax_cl)
@@ -2475,6 +2663,11 @@ def main():
         off_ui_pending["x_start"] = int(x_start_cl)
         off_ui_pending["x_end"] = int(x_end_cl)
         off_ui_pending["motion_mode"] = str(motion_mode)
+        off_ui_pending["reset_view"] = bool(
+            off_ui_pending.get("reset_view", False)
+            or abs(float(prev_off_rmax) - float(rmax_cl)) > 1e-6
+            or abs(float(prev_off_xmax) - float(xmax_cl)) > 1e-6
+        )
         off_status_text = (
             f"Pending update | x={x_start_cl}:{x_end_cl} | motion={motion_mode} | "
             f"v={vmin:.1f}:{vmax:.1f}"
@@ -2603,8 +2796,8 @@ def main():
                         # bounds in metri fissi (full FOV): zoom/crop gestiti dagli assi
                         dpg.add_image_series(
                             TEX_TAG,
-                            bounds_min=(-float(HEATMAP_CROSSRANGE_MAX_DISPLAY), 0.0),
-                            bounds_max=(+float(HEATMAP_CROSSRANGE_MAX_DISPLAY), float(RANGE_MAX_DISPLAY)),
+                            bounds_min=(float(rt_applied_meta_current.x_min_m), float(rt_applied_meta_current.y_min_m)),
+                            bounds_max=(float(rt_applied_meta_current.x_max_m), float(rt_applied_meta_current.y_max_m)),
                             tag=IMG_SERIES_TAG,
                             parent=YAXIS_TAG,
                         )
@@ -2880,8 +3073,8 @@ def main():
                         dpg.add_plot_axis(dpg.mvYAxis, label="Y (m)", tag=PROC_YAXIS_TAG)
                         dpg.add_image_series(
                             PROC_TEX_TAG,
-                            bounds_min=(-float(CROSSRANGE_MAX_DISPLAY), 0.0),
-                            bounds_max=(+float(CROSSRANGE_MAX_DISPLAY), float(RANGE_MAX_DISPLAY)),
+                            bounds_min=(float(off_applied_meta_current.x_min_m), float(off_applied_meta_current.y_min_m)),
+                            bounds_max=(float(off_applied_meta_current.x_max_m), float(off_applied_meta_current.y_max_m)),
                             tag=PROC_IMG_SERIES_TAG,
                             parent=PROC_YAXIS_TAG,
                         )
@@ -2902,7 +3095,7 @@ def main():
 
     _update_heatmap_scale_input_labels(vis_heatmap_mode)
     _apply_heatmap_mode_controls(vis_heatmap_mode)
-    _apply_heatmap_plot_geometry(vis_heatmap_mode, vis_rmax, vis_xmax)
+    _apply_heatmap_plot_geometry(vis_heatmap_mode, vis_rmax, vis_xmax, reset_limits=True)
     _update_fft_scale_input_labels(fft_mode_db)
     # Applicazione parametri DOPO creazione items
     _apply_params()
@@ -2978,7 +3171,10 @@ def main():
 
 
             # --- UI apply (throttled, non-blocking) ---
-            if ui_dirty and (now - ui_dirty_t) >= 0.08:  # ~12.5 Hz, cambia 0.05..0.15 come vuoi
+            if ui_dirty and (
+                bool(ui_pending.get("reset_view", False))
+                or (now - ui_dirty_t) >= 0.08
+            ):  # reset immediato; altrimenti throttle ~12.5 Hz
                 ui_dirty = False
                 ui_dirty_t = now
 
@@ -2988,12 +3184,13 @@ def main():
                 rmax = max(0.0, min(ui_pending["rmax"], RMAX_HARD_MAX))
                 xmax = max(0.0, min(ui_pending["xmax"], HEATMAP_XMAX_HARD_MAX))
                 fft_xmin = float(ui_pending.get("fft_xmin", 0.0))
-                fft_xmax = float(ui_pending.get("fft_xmax", float(gui_h) * float(dr_plot)))
+                fft_xmax = float(ui_pending.get("fft_xmax", float(fft_plot_h) * float(dr_plot)))
                 fft_vmin = float(ui_pending["fft_vmin"])
                 fft_vmax = float(ui_pending["fft_vmax"])
                 fft_mode_db = bool(ui_pending["fft_mode_db"])
                 fft_view_full = bool(ui_pending.get("fft_view_full", False))
                 heatmap_mode_now = 1 if int(ui_pending.get("heatmap_mode", 0)) == 1 else 0
+                reset_realtime_view = bool(ui_pending.get("reset_view", False))
                 vmin, vmax = _sanitize_heatmap_scale_inputs(heatmap_mode_now, float(vmin), float(vmax))
                 fft_xmin, fft_xmax, _ = _clamp_fft_x_window(fft_xmin, fft_xmax, rmax, fft_view_full)
                 fft_eps = 1.0
@@ -3012,7 +3209,32 @@ def main():
                 vis_fft_vmin = fft_vmin
                 vis_fft_vmax = fft_vmax
 
-                _apply_heatmap_plot_geometry(vis_heatmap_mode, vis_rmax, vis_xmax)
+                rt_home_viewport_current = build_display_viewport(
+                    x_min_m=-float(vis_xmax),
+                    x_max_m=float(vis_xmax),
+                    y_min_m=0.0,
+                    y_max_m=float(vis_rmax),
+                    dr_m=float(dr_plot),
+                    seq=int(rt_requested_viewport_current.seq),
+                )
+                _write_realtime_home_viewport(rt_home_viewport_current)
+                if reset_realtime_view:
+                    rt_requested_viewport_current = rt_home_viewport_current
+                    _write_realtime_requested_viewport(rt_requested_viewport_current)
+                    # Aggiorna subito i bounds del plot alla home/requested view
+                    # mentre aspettiamo il prossimo frame applicato dal DSP.
+                    rt_applied_meta_current = applied_viewport_meta_from_viewport(
+                        rt_requested_viewport_current,
+                        fallback_used=bool(rt_applied_meta_current.fallback_used),
+                        frame_seq=int(rt_applied_meta_current.frame_seq),
+                    )
+                _apply_heatmap_plot_geometry(
+                    vis_heatmap_mode,
+                    vis_rmax,
+                    vis_xmax,
+                    reset_limits=bool(reset_realtime_view),
+                )
+                ui_pending["reset_view"] = False
                 if vis_heatmap_mode == 0 and dpg.does_item_exist(GUIDE_NEG20_TAG):
                     guide_neg_x, guide_y = _guide_line_points(-1.0, vis_rmax)
                     dpg.set_value(GUIDE_NEG20_TAG, [guide_neg_x, guide_y])
@@ -3054,8 +3276,21 @@ def main():
                     dpg.set_axis_limits(RANGEFFT_XAXIS_TAG, float(vis_fft_xmin), float(vis_fft_xmax))
                     _set_fft_x_ticks_window(vis_fft_xmin, vis_fft_xmax)
 
+            polled_rt_viewport = _poll_requested_viewport(
+                x_axis_tag=XAXIS_TAG,
+                y_axis_tag=YAXIS_TAG,
+                home_viewport=rt_home_viewport_current,
+                current_viewport=rt_requested_viewport_current,
+            )
+            if display_viewport_signature(polled_rt_viewport) != display_viewport_signature(rt_requested_viewport_current):
+                rt_requested_viewport_current = polled_rt_viewport
+                _write_realtime_requested_viewport(rt_requested_viewport_current)
+
             # --- OFFLINE UI apply (throttled) ---
-            if off_ui_dirty and (now - off_ui_dirty_t) >= 0.08:
+            if off_ui_dirty and (
+                bool(off_ui_pending.get("reset_view", False))
+                or (now - off_ui_dirty_t) >= 0.08
+            ):
                 off_ui_dirty = False
                 off_ui_dirty_t = now
                 off_vmin = float(off_ui_pending["vmin"])
@@ -3063,6 +3298,7 @@ def main():
                 off_rmax = max(0.0, min(float(off_ui_pending["rmax"]), RMAX_HARD_MAX))
                 off_xmax = max(0.0, min(float(off_ui_pending["xmax"]), XMAX_HARD_MAX))
                 off_norm_enabled = bool(off_ui_pending.get("norm_enabled", True))
+                reset_offline_view = bool(off_ui_pending.get("reset_view", False))
                 if off_vmax <= off_vmin:
                     off_vmax = off_vmin + 1.0
                     if dpg.does_item_exist(PROC_IN_VMAX):
@@ -3073,6 +3309,21 @@ def main():
                 off_ui_pending["rmax"] = float(off_rmax)
                 off_ui_pending["xmax"] = float(off_xmax)
                 off_ui_pending["norm_enabled"] = bool(off_norm_enabled)
+                off_home_viewport_current = build_display_viewport(
+                    x_min_m=-float(off_xmax),
+                    x_max_m=float(off_xmax),
+                    y_min_m=0.0,
+                    y_max_m=float(off_rmax),
+                    dr_m=float(dr_plot),
+                    seq=int(off_requested_viewport_current.seq),
+                )
+                if reset_offline_view:
+                    off_requested_viewport_current = off_home_viewport_current
+                    off_applied_meta_current = applied_viewport_meta_from_viewport(
+                        off_requested_viewport_current,
+                        fallback_used=bool(off_applied_meta_current.fallback_used),
+                        frame_seq=int(off_applied_meta_current.frame_seq),
+                    )
 
                 if dpg.does_item_exist(PROC_IN_RMAX):
                     dpg.set_value(PROC_IN_RMAX, off_rmax)
@@ -3080,9 +3331,11 @@ def main():
                     dpg.set_value(PROC_IN_XMAX, off_xmax)
                 if dpg.does_item_exist(PROC_BTN_NORM):
                     dpg.configure_item(PROC_BTN_NORM, label=_norm_toggle_label(off_norm_enabled))
-                if dpg.does_item_exist(PROC_XAXIS_TAG) and dpg.does_item_exist(PROC_YAXIS_TAG):
+                if reset_offline_view and dpg.does_item_exist(PROC_XAXIS_TAG) and dpg.does_item_exist(PROC_YAXIS_TAG):
                     dpg.set_axis_limits(PROC_XAXIS_TAG, -float(off_xmax), +float(off_xmax))
                     dpg.set_axis_limits(PROC_YAXIS_TAG, 0.0, float(off_rmax))
+                    _configure_image_bounds(PROC_IMG_SERIES_TAG, off_applied_meta_current)
+                off_ui_pending["reset_view"] = False
                 if dpg.does_item_exist(PROC_CMAP_SCALE_TAG):
                     dpg.configure_item(
                         PROC_CMAP_SCALE_TAG,
@@ -3097,9 +3350,31 @@ def main():
                             x_start=int(off_ui_pending["x_start"]),
                             x_end=int(off_ui_pending["x_end"]),
                             motion_mode=str(off_ui_pending["motion_mode"]),
+                            viewport=off_requested_viewport_current,
                         )
                     except Exception as e:
                         off_status_text = f"ERR update: {e}"
+                        if dpg.does_item_exist(PROC_TXT_STATUS):
+                            dpg.set_value(PROC_TXT_STATUS, off_status_text)
+
+            if offline_runtime is not None:
+                polled_off_viewport = _poll_requested_viewport(
+                    x_axis_tag=PROC_XAXIS_TAG,
+                    y_axis_tag=PROC_YAXIS_TAG,
+                    home_viewport=off_home_viewport_current,
+                    current_viewport=off_requested_viewport_current,
+                )
+                if display_viewport_signature(polled_off_viewport) != display_viewport_signature(off_requested_viewport_current):
+                    off_requested_viewport_current = polled_off_viewport
+                    try:
+                        offline_runtime.update_params(
+                            x_start=int(off_ui_pending["x_start"]),
+                            x_end=int(off_ui_pending["x_end"]),
+                            motion_mode=str(off_ui_pending["motion_mode"]),
+                            viewport=off_requested_viewport_current,
+                        )
+                    except Exception as e:
+                        off_status_text = f"ERR viewport: {e}"
                         if dpg.does_item_exist(PROC_TXT_STATUS):
                             dpg.set_value(PROC_TXT_STATUS, off_status_text)
 
@@ -3109,13 +3384,32 @@ def main():
                 if off_frame is not None:
                     frame_db, info = off_frame
                     proc_frame[:, :] = frame_db
+                    try:
+                        off_applied_meta_current = AppliedViewportMeta(
+                            x_min_m=float(info.get("applied_viewport_x_min_m", off_applied_meta_current.x_min_m)),
+                            x_max_m=float(info.get("applied_viewport_x_max_m", off_applied_meta_current.x_max_m)),
+                            y_min_m=float(info.get("applied_viewport_y_min_m", off_applied_meta_current.y_min_m)),
+                            y_max_m=float(info.get("applied_viewport_y_max_m", off_applied_meta_current.y_max_m)),
+                            range_min_bin_f=float(info.get("applied_viewport_range_min_bin_f", off_applied_meta_current.range_min_bin_f)),
+                            range_max_bin_f=float(info.get("applied_viewport_range_max_bin_f", off_applied_meta_current.range_max_bin_f)),
+                            angle_min_deg=float(info.get("applied_viewport_angle_min_deg", off_applied_meta_current.angle_min_deg)),
+                            angle_max_deg=float(info.get("applied_viewport_angle_max_deg", off_applied_meta_current.angle_max_deg)),
+                            zoom_level=float(info.get("applied_viewport_zoom_level", off_applied_meta_current.zoom_level)),
+                            seq=int(info.get("applied_viewport_seq", off_applied_meta_current.seq)),
+                            fallback_used=bool(info.get("fallback_used", False)),
+                            frame_seq=int(info.get("frame_seq", off_applied_meta_current.frame_seq)),
+                        )
+                        _configure_image_bounds(PROC_IMG_SERIES_TAG, off_applied_meta_current)
+                    except Exception:
+                        pass
                     off_status_text = (
                         f"x={info.get('x_start')}:{info.get('x_end')} | "
                         f"motion={info.get('motion_mode')} | "
                         f"dop={info.get('doppler_bins_used', 'n/a')} | "
                         f"geom={info.get('geometry_source', 'n/a')} | "
                         f"pos={info.get('n_pos_used', 'n/a')} | "
-                        f"BP={float(info.get('elapsed_ms', 0.0)):.1f} ms"
+                        f"BP={float(info.get('elapsed_ms', 0.0)):.1f} ms | "
+                        f"zoom={'fallback' if bool(info.get('fallback_used', False)) else 'ok'}"
                     )
                     if dpg.does_item_exist(PROC_TXT_STATUS):
                         dpg.set_value(PROC_TXT_STATUS, off_status_text)
@@ -3236,6 +3530,10 @@ def main():
             # 2. GUI TEXTURE UPDATE (double-buffer latest-wins)
             seq_now = int(gui_latest_seq.value)
             if seq_now != gui_last_seq:
+                rt_applied_meta_current = _read_realtime_applied_meta()
+                if int(rt_applied_meta_current.seq) != int(rt_applied_seq_local):
+                    _configure_image_bounds(IMG_SERIES_TAG, rt_applied_meta_current)
+                    rt_applied_seq_local = int(rt_applied_meta_current.seq)
                 with gui_lock:
                     seq_locked = int(gui_latest_seq.value)
                     idx = int(gui_latest_idx.value)

@@ -43,6 +43,7 @@ HeatmapSpatialFilterMode = Literal["none", "gaussian_3x3"]
 DisplayProjectionMode = Literal["polar_stretched", "cartesian"]
 DisplayProjectionInterp = Literal["nearest", "bilinear"]
 DisplayHeatmapMode = Literal["power_xy", "range_angle_moving"]
+DisplayZoomFallbackMode = Literal["baseline_projection", "cached_frame"]
 SlowTimeMode = Literal["none", "mean_subtraction", "highpass", "doppler_fft"]
 DetectionThresholdMode = Literal["relative", "absolute", "ca_cfar", "os_cfar"]
 DetectionSource = Literal["static", "moving", "fused"]
@@ -53,8 +54,12 @@ _VALID_HEATMAP_SPATIAL_FILTER_MODES = {"none", "gaussian_3x3"}
 _VALID_DISPLAY_PROJECTION_MODES = {"polar_stretched", "cartesian"}
 _VALID_DISPLAY_PROJECTION_INTERPS = {"nearest", "bilinear"}
 _VALID_DISPLAY_HEATMAP_MODES = {"power_xy", "range_angle_moving"}
+_VALID_DISPLAY_ZOOM_FALLBACK_MODES = {"baseline_projection", "cached_frame"}
+_VALID_DISPLAY_ZOOM_REALTIME_METHODS = {"auto"}
+_VALID_DISPLAY_ZOOM_OFFLINE_METHODS = {"viewport_grid"}
 _VALID_SLOW_TIME_MODES = {"none", "mean_subtraction", "highpass", "doppler_fft"}
 _VALID_THRESHOLD_MODES = {"relative", "absolute", "ca_cfar", "os_cfar"}
+_DISPLAY_ZOOM_OVER_BUDGET_RETRY_S = 0.25
 _GAUSSIAN_3X3_KERNEL = (
     np.array(
         [[1.0, 2.0, 1.0], [2.0, 4.0, 2.0], [1.0, 2.0, 1.0]],
@@ -228,6 +233,71 @@ class DisplayProjectionConfig:
 
 
 @dataclass(frozen=True)
+class DisplayZoomConfig:
+    enabled: bool = False
+    output_width: int = 128
+    output_height: int = 128
+    realtime_method: str = "auto"
+    offline_method: str = "viewport_grid"
+    max_zoom_nfft_range: int = 0
+    max_zoom_nfft_angle: int = 0
+    max_update_hz: float = 15.0
+    dsp_budget_ms: float = 6.0
+    fallback_mode: DisplayZoomFallbackMode = "baseline_projection"
+
+
+@dataclass(frozen=True)
+class DisplayViewport:
+    x_min_m: float
+    x_max_m: float
+    y_min_m: float
+    y_max_m: float
+    range_min_bin_f: float
+    range_max_bin_f: float
+    angle_min_deg: float
+    angle_max_deg: float
+    doppler_min_mps: float | None = None
+    doppler_max_mps: float | None = None
+    zoom_level: float = 1.0
+    seq: int = 0
+
+
+@dataclass(frozen=True)
+class AppliedViewportMeta:
+    x_min_m: float
+    x_max_m: float
+    y_min_m: float
+    y_max_m: float
+    range_min_bin_f: float
+    range_max_bin_f: float
+    angle_min_deg: float
+    angle_max_deg: float
+    doppler_min_mps: float | None = None
+    doppler_max_mps: float | None = None
+    zoom_level: float = 1.0
+    seq: int = 0
+    fallback_used: bool = False
+    frame_seq: int = 0
+
+
+@dataclass
+class DisplayZoomRuntime:
+    home_viewport: DisplayViewport
+    lut_cache: dict[tuple[Any, ...], dict[str, Any]] = field(default_factory=dict)
+    steering_cache: dict[tuple[Any, ...], tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
+    display_bg_state: BackgroundSubtractionState = field(default_factory=BackgroundSubtractionState)
+    moving_bg_state: BackgroundSubtractionState = field(default_factory=BackgroundSubtractionState)
+    last_view_db: np.ndarray | None = None
+    last_view_alpha: np.ndarray | None = None
+    last_fill_value: float = -120.0
+    last_applied_meta: AppliedViewportMeta | None = None
+    last_viewport_signature: tuple[Any, ...] | None = None
+    last_compute_ms: float = 0.0
+    last_compute_t_s: float = 0.0
+    last_mode: str = "power_xy"
+
+
+@dataclass(frozen=True)
 class SlowTimeConfig:
     enabled: bool = False
     mode: SlowTimeMode = "none"
@@ -345,6 +415,7 @@ class RealtimeDSPConfig:
     calibration: CalibrationConfig = CalibrationConfig()
     velocity_xy: VelocityXYConfig = field(default_factory=VelocityXYConfig)
     range_angle_moving: RangeAngleMovingConfig = field(default_factory=RangeAngleMovingConfig)
+    display_zoom: DisplayZoomConfig = field(default_factory=DisplayZoomConfig)
 
 
 @dataclass(frozen=True)
@@ -562,6 +633,65 @@ def display_projection_from_yaml_dict(cfg: dict[str, Any]) -> DisplayProjectionC
         projection_interp=interp,
         crossrange_max_m=crossrange_max_m,
         crossrange_auto=bool(crossrange_auto),
+    )
+
+
+def display_zoom_from_yaml_dict(cfg: dict[str, Any]) -> DisplayZoomConfig:
+    block = cfg.get("display_zoom", {}) or {}
+    fft_cfg = cfg.get("fft", {}) or {}
+    display_cfg = cfg.get("display", {}) or {}
+    radar_cfg = cfg.get("radar", {}) or {}
+
+    base_nfft_range = max(1, _to_int(fft_cfg.get("nfft_range", 128), 128))
+    base_nfft_angle = max(1, _to_int(fft_cfg.get("nfft_angle", 128), 128))
+    range_max_display = _to_float(display_cfg.get("range_max_m", display_cfg.get("range_max", 3.0)), 3.0)
+    if not np.isfinite(range_max_display) or range_max_display <= 0.0:
+        range_max_display = 3.0
+    c_m_s = _to_float(radar_cfg.get("c", 3.0e8), 3.0e8)
+    fs_hz = _to_float(radar_cfg.get("fs", 10.0e6), 10.0e6)
+    slope_hz_s = _to_float(radar_cfg.get("slope", 60.0e12), 60.0e12)
+    if not np.isfinite(c_m_s) or c_m_s <= 0.0 or not np.isfinite(fs_hz) or fs_hz <= 0.0 or not np.isfinite(slope_hz_s) or slope_hz_s <= 0.0:
+        dr_m = float(range_max_display / max(1, base_nfft_range // 2))
+    else:
+        dr_m = float(c_m_s * fs_hz / (2.0 * slope_hz_s * base_nfft_range))
+    if not np.isfinite(dr_m) or dr_m <= 0.0:
+        dr_m = float(range_max_display / max(1, base_nfft_range // 2))
+
+    default_height = max(1, min(base_nfft_range // 2, int(np.floor(float(range_max_display) / float(max(dr_m, 1e-9))))))
+    default_width = max(1, base_nfft_angle)
+
+    output_width = max(1, _to_int(block.get("output_width", default_width), default_width))
+    output_height = max(1, _to_int(block.get("output_height", default_height), default_height))
+
+    realtime_method = str(block.get("realtime_method", "auto") or "auto").strip().lower() or "auto"
+    offline_method = str(block.get("offline_method", "viewport_grid") or "viewport_grid").strip().lower() or "viewport_grid"
+
+    max_zoom_nfft_range = max(base_nfft_range, _to_int(block.get("max_zoom_nfft_range", base_nfft_range), base_nfft_range))
+    max_zoom_nfft_angle = max(base_nfft_angle, _to_int(block.get("max_zoom_nfft_angle", base_nfft_angle), base_nfft_angle))
+
+    max_update_hz = _to_float(block.get("max_update_hz", 15.0), 15.0)
+    if not np.isfinite(max_update_hz) or max_update_hz < 0.0:
+        max_update_hz = 15.0
+    dsp_budget_ms = _to_float(block.get("dsp_budget_ms", 6.0), 6.0)
+    if not np.isfinite(dsp_budget_ms) or dsp_budget_ms < 0.0:
+        dsp_budget_ms = 6.0
+
+    fallback_mode_raw = str(block.get("fallback_mode", "baseline_projection") or "baseline_projection").strip().lower()
+    fallback_mode: DisplayZoomFallbackMode = "baseline_projection"
+    if fallback_mode_raw in _VALID_DISPLAY_ZOOM_FALLBACK_MODES and fallback_mode_raw == "cached_frame":
+        fallback_mode = "cached_frame"
+
+    return DisplayZoomConfig(
+        enabled=_to_bool(block.get("enabled", False), False),
+        output_width=int(output_width),
+        output_height=int(output_height),
+        realtime_method=str(realtime_method),
+        offline_method=str(offline_method),
+        max_zoom_nfft_range=int(max_zoom_nfft_range),
+        max_zoom_nfft_angle=int(max_zoom_nfft_angle),
+        max_update_hz=float(max_update_hz),
+        dsp_budget_ms=float(dsp_budget_ms),
+        fallback_mode=fallback_mode,
     )
 
 
@@ -1206,6 +1336,268 @@ def resolve_display_crossrange_max_m(
     if sin_abs.size <= 0:
         return max(0.0, float(y_max_m))
     return max(0.0, float(y_max_m) * float(np.max(sin_abs)))
+
+
+def display_viewport_signature(viewport: DisplayViewport | AppliedViewportMeta | None) -> tuple[Any, ...] | None:
+    if viewport is None:
+        return None
+    doppler_min = None if viewport.doppler_min_mps is None else round(float(viewport.doppler_min_mps), 6)
+    doppler_max = None if viewport.doppler_max_mps is None else round(float(viewport.doppler_max_mps), 6)
+    return (
+        round(float(viewport.x_min_m), 6),
+        round(float(viewport.x_max_m), 6),
+        round(float(viewport.y_min_m), 6),
+        round(float(viewport.y_max_m), 6),
+        round(float(viewport.range_min_bin_f), 6),
+        round(float(viewport.range_max_bin_f), 6),
+        round(float(viewport.angle_min_deg), 6),
+        round(float(viewport.angle_max_deg), 6),
+        doppler_min,
+        doppler_max,
+    )
+
+
+def display_zoom_method_warnings(display_zoom_cfg: DisplayZoomConfig) -> list[str]:
+    warnings: list[str] = []
+    realtime_method = str(display_zoom_cfg.realtime_method or "auto").strip().lower() or "auto"
+    offline_method = str(display_zoom_cfg.offline_method or "viewport_grid").strip().lower() or "viewport_grid"
+    if realtime_method not in _VALID_DISPLAY_ZOOM_REALTIME_METHODS:
+        warnings.append(
+            f"display_zoom.realtime_method='{realtime_method}' is not implemented; using the realtime 'auto' strategy."
+        )
+    if offline_method not in _VALID_DISPLAY_ZOOM_OFFLINE_METHODS:
+        warnings.append(
+            f"display_zoom.offline_method='{offline_method}' is not implemented; using the offline 'viewport_grid' strategy."
+        )
+    return warnings
+
+
+def build_display_viewport(
+    *,
+    x_min_m: float,
+    x_max_m: float,
+    y_min_m: float,
+    y_max_m: float,
+    dr_m: float,
+    seq: int = 0,
+    home_viewport: DisplayViewport | None = None,
+    doppler_min_mps: float | None = None,
+    doppler_max_mps: float | None = None,
+) -> DisplayViewport:
+    x0 = float(min(x_min_m, x_max_m))
+    x1 = float(max(x_min_m, x_max_m))
+    y0 = max(0.0, float(min(y_min_m, y_max_m)))
+    y1 = max(y0, float(max(y_min_m, y_max_m)))
+    dr_f = float(dr_m)
+    if not np.isfinite(dr_f) or dr_f <= 0.0:
+        span_y = max(y1 - y0, 1e-3)
+        dr_f = span_y / 128.0
+
+    x_near = 0.0 if x0 <= 0.0 <= x1 else min(abs(x0), abs(x1))
+    range_min_m = float(np.hypot(x_near, y0))
+    corner_ranges = np.asarray(
+        [
+            np.hypot(x0, y0),
+            np.hypot(x0, y1),
+            np.hypot(x1, y0),
+            np.hypot(x1, y1),
+        ],
+        dtype=np.float64,
+    )
+    finite_corner_ranges = corner_ranges[np.isfinite(corner_ranges)]
+    range_max_m = float(np.max(finite_corner_ranges)) if finite_corner_ranges.size > 0 else range_min_m
+
+    y_angle_near = max(y0, dr_f * 0.5, 1e-6)
+    y_angle_far = max(y1, y_angle_near)
+    angle_samples = np.asarray(
+        [
+            np.rad2deg(np.arctan2(x0, y_angle_near)),
+            np.rad2deg(np.arctan2(x0, y_angle_far)),
+            np.rad2deg(np.arctan2(x1, y_angle_near)),
+            np.rad2deg(np.arctan2(x1, y_angle_far)),
+        ],
+        dtype=np.float64,
+    )
+    finite_angles = angle_samples[np.isfinite(angle_samples)]
+    if finite_angles.size <= 0:
+        angle_min_deg = 0.0
+        angle_max_deg = 0.0
+    else:
+        angle_min_deg = float(np.min(finite_angles))
+        angle_max_deg = float(np.max(finite_angles))
+    if angle_max_deg < angle_min_deg:
+        angle_min_deg, angle_max_deg = angle_max_deg, angle_min_deg
+
+    zoom_level = 1.0
+    if home_viewport is not None:
+        home_w = max(1e-6, float(home_viewport.x_max_m - home_viewport.x_min_m))
+        home_h = max(1e-6, float(home_viewport.y_max_m - home_viewport.y_min_m))
+        cur_w = max(1e-6, float(x1 - x0))
+        cur_h = max(1e-6, float(y1 - y0))
+        zoom_level = max(float(home_w / cur_w), float(home_h / cur_h), 1.0)
+
+    return DisplayViewport(
+        x_min_m=float(x0),
+        x_max_m=float(x1),
+        y_min_m=float(y0),
+        y_max_m=float(y1),
+        range_min_bin_f=float(range_min_m / dr_f),
+        range_max_bin_f=float(range_max_m / dr_f),
+        angle_min_deg=float(angle_min_deg),
+        angle_max_deg=float(angle_max_deg),
+        doppler_min_mps=None if doppler_min_mps is None else float(doppler_min_mps),
+        doppler_max_mps=None if doppler_max_mps is None else float(doppler_max_mps),
+        zoom_level=float(zoom_level),
+        seq=int(seq),
+    )
+
+
+def clamp_display_viewport(
+    *,
+    x_min_m: float,
+    x_max_m: float,
+    y_min_m: float,
+    y_max_m: float,
+    home_viewport: DisplayViewport,
+    output_width: int,
+    output_height: int,
+    dr_m: float,
+    seq: int = 0,
+    doppler_min_mps: float | None = None,
+    doppler_max_mps: float | None = None,
+) -> DisplayViewport:
+    home_x0 = float(home_viewport.x_min_m)
+    home_x1 = float(home_viewport.x_max_m)
+    home_y0 = float(home_viewport.y_min_m)
+    home_y1 = float(home_viewport.y_max_m)
+    home_w = max(1e-6, home_x1 - home_x0)
+    home_h = max(1e-6, home_y1 - home_y0)
+    x_step = max(home_w / float(max(1, int(output_width))), 1e-6)
+    y_step = max(home_h / float(max(1, int(output_height))), max(float(dr_m), 1e-6))
+
+    x0 = max(home_x0, min(home_x1, float(min(x_min_m, x_max_m))))
+    x1 = max(home_x0, min(home_x1, float(max(x_min_m, x_max_m))))
+    y0 = max(home_y0, min(home_y1, float(min(y_min_m, y_max_m))))
+    y1 = max(home_y0, min(home_y1, float(max(y_min_m, y_max_m))))
+
+    if x1 <= x0:
+        x1 = min(home_x1, x0 + x_step)
+    if y1 <= y0:
+        y1 = min(home_y1, y0 + y_step)
+
+    def _quantize_floor(value: float, origin: float, step: float) -> float:
+        return float(origin + math.floor((value - origin) / step) * step)
+
+    def _quantize_ceil(value: float, origin: float, step: float) -> float:
+        return float(origin + math.ceil((value - origin) / step) * step)
+
+    # Quantize outward so the applied viewport always covers the user's
+    # requested ROI instead of shrinking it and clipping the display edges.
+    x0 = _quantize_floor(x0, home_x0, x_step)
+    x1 = _quantize_ceil(x1, home_x0, x_step)
+    y0 = _quantize_floor(y0, home_y0, y_step)
+    y1 = _quantize_ceil(y1, home_y0, y_step)
+
+    x0 = max(home_x0, min(home_x1, x0))
+    x1 = max(home_x0, min(home_x1, x1))
+    y0 = max(home_y0, min(home_y1, y0))
+    y1 = max(home_y0, min(home_y1, y1))
+    if x1 <= x0:
+        if x0 >= home_x1:
+            x0 = max(home_x0, home_x1 - x_step)
+            x1 = home_x1
+        else:
+            x1 = min(home_x1, x0 + x_step)
+    if y1 <= y0:
+        if y0 >= home_y1:
+            y0 = max(home_y0, home_y1 - y_step)
+            y1 = home_y1
+        else:
+            y1 = min(home_y1, y0 + y_step)
+
+    return build_display_viewport(
+        x_min_m=float(x0),
+        x_max_m=float(x1),
+        y_min_m=float(y0),
+        y_max_m=float(y1),
+        dr_m=float(dr_m),
+        seq=int(seq),
+        home_viewport=home_viewport,
+        doppler_min_mps=doppler_min_mps,
+        doppler_max_mps=doppler_max_mps,
+    )
+
+
+def applied_viewport_meta_from_viewport(
+    viewport: DisplayViewport,
+    *,
+    fallback_used: bool,
+    frame_seq: int,
+) -> AppliedViewportMeta:
+    return AppliedViewportMeta(
+        x_min_m=float(viewport.x_min_m),
+        x_max_m=float(viewport.x_max_m),
+        y_min_m=float(viewport.y_min_m),
+        y_max_m=float(viewport.y_max_m),
+        range_min_bin_f=float(viewport.range_min_bin_f),
+        range_max_bin_f=float(viewport.range_max_bin_f),
+        angle_min_deg=float(viewport.angle_min_deg),
+        angle_max_deg=float(viewport.angle_max_deg),
+        doppler_min_mps=None if viewport.doppler_min_mps is None else float(viewport.doppler_min_mps),
+        doppler_max_mps=None if viewport.doppler_max_mps is None else float(viewport.doppler_max_mps),
+        zoom_level=float(viewport.zoom_level),
+        seq=int(viewport.seq),
+        fallback_used=bool(fallback_used),
+        frame_seq=int(frame_seq),
+    )
+
+
+def update_display_zoom_runtime_home_viewport(
+    runtime: DisplayZoomRuntime,
+    home_viewport: DisplayViewport,
+) -> bool:
+    prev_sig = display_viewport_signature(runtime.home_viewport)
+    next_sig = display_viewport_signature(home_viewport)
+    runtime.home_viewport = home_viewport
+    if prev_sig == next_sig:
+        return False
+    runtime.last_view_db = None
+    runtime.last_view_alpha = None
+    runtime.last_applied_meta = None
+    runtime.last_viewport_signature = None
+    runtime.last_compute_ms = 0.0
+    runtime.last_compute_t_s = 0.0
+    runtime.last_mode = "power_xy"
+    return True
+
+
+def should_recompute_display_zoom(
+    runtime: DisplayZoomRuntime | None,
+    *,
+    active_viewport_sig: tuple[Any, ...] | None,
+    display_mode: str,
+    display_zoom_cfg: DisplayZoomConfig,
+    now_s: float | None = None,
+) -> bool:
+    if runtime is None:
+        return False
+    min_interval_s = 0.0
+    if float(display_zoom_cfg.max_update_hz) > 0.0:
+        min_interval_s = 1.0 / float(display_zoom_cfg.max_update_hz)
+    same_view = runtime.last_viewport_signature == active_viewport_sig
+    same_mode = str(runtime.last_mode) == str(display_mode)
+    if not same_view or not same_mode:
+        return True
+    retry_interval_s = float(min_interval_s)
+    if (
+        float(display_zoom_cfg.dsp_budget_ms) > 0.0
+        and float(runtime.last_compute_ms) > float(display_zoom_cfg.dsp_budget_ms)
+    ):
+        retry_interval_s = max(retry_interval_s, _DISPLAY_ZOOM_OVER_BUDGET_RETRY_S)
+    if retry_interval_s <= 0.0:
+        return True
+    now_value = time.perf_counter() if now_s is None else float(now_s)
+    return (now_value - float(runtime.last_compute_t_s)) >= retry_interval_s
 
 
 def _threshold_mode_from_value(value: Any, default: DetectionThresholdMode = "relative") -> DetectionThresholdMode:
@@ -2008,23 +2400,32 @@ def build_display_projection_lut(
     angle_axis_deg: np.ndarray,
     projection_mode: str,
     projection_interp: str,
+    *,
+    x_min_m: float | None = None,
+    y_min_m: float | None = None,
 ) -> dict[str, Any]:
     gui_h = max(0, int(gui_h))
     gui_w = max(0, int(gui_w))
     mode = _normalize_display_projection_mode(projection_mode)
     interp = _normalize_display_projection_interp(projection_interp)
     angle_axis = np.asarray(angle_axis_deg, dtype=np.float32).reshape(-1)
+    x_min_v = float(-float(x_max_m) if x_min_m is None else x_min_m)
+    x_max_v = float(x_max_m)
+    y_min_v = float(0.0 if y_min_m is None else y_min_m)
+    y_max_v = float(y_max_m)
 
     lut: dict[str, Any] = {
         "projection_mode": mode,
         "projection_interp": interp,
         "output_shape": (gui_h, gui_w),
+        "x_min_m": float(x_min_v),
         "x_max_m": float(x_max_m),
+        "y_min_m": float(y_min_v),
         "y_max_m": float(y_max_m),
         "dr_m": float(dr_m),
         "angle_count": int(angle_axis.size),
-        "x_axis_m": _build_display_axis(-float(x_max_m), +float(x_max_m), gui_w),
-        "y_axis_m": _build_display_axis(0.0, float(y_max_m), gui_h),
+        "x_axis_m": _build_display_axis(float(x_min_v), float(x_max_v), gui_w),
+        "y_axis_m": _build_display_axis(float(y_min_v), float(y_max_v), gui_h),
     }
     if mode != "cartesian" or gui_h <= 0 or gui_w <= 0 or not np.isfinite(dr_m) or float(dr_m) <= 0.0:
         return lut
@@ -2102,6 +2503,9 @@ def project_heatmap_for_display(
     out: np.ndarray | None = None, # array opzionale di output preallocato con shape (gui_h, gui_w) e dtype float32; se fornito e compatibile, verrà usato per evitare l'allocazione interna di un nuovo array
     fill_value: float = 0.0, # valore di potenza lineare da usare per i pixel dell'output che non corrispondono a nessun bin valido del heatmap; di default 0.0 per visualizzare come nero, ma può essere impostato a un valore più alto per evidenziare le aree fuori range/angolo
     precomputed_lut: dict[str, Any] | None = None, # lookup table opzionale precomputata per la proiezione, ottenibile con build_display_projection_lut; se fornita e compatibile, verrà usata per evitare il calcolo interno della LUT e velocizzare la proiezione soprattutto in caso di proiezioni complesse o output di grandi dimensioni
+    *,
+    x_min_m: float | None = None,
+    y_min_m: float | None = None,
 ) -> np.ndarray:
     # round to int and sanitize inputs
     gui_h = max(0, int(gui_h)) 
@@ -2145,13 +2549,17 @@ def project_heatmap_for_display(
 
     # Rebuild the projection LUT whenever the cached one does not match the current display geometry.
     lut = precomputed_lut
+    x_min_v = float(-float(x_max_m) if x_min_m is None else x_min_m)
+    y_min_v = float(0.0 if y_min_m is None else y_min_m)
     if (
         lut is None
         or tuple(lut.get("output_shape", ())) != (gui_h, gui_w)
         or str(lut.get("projection_mode", "")) != mode
         or str(lut.get("projection_interp", "")) != interp
         or int(lut.get("angle_count", -1)) != eff_cols
+        or not np.isclose(float(lut.get("x_min_m", np.nan)), float(x_min_v))
         or not np.isclose(float(lut.get("x_max_m", np.nan)), float(x_max_m))
+        or not np.isclose(float(lut.get("y_min_m", np.nan)), float(y_min_v))
         or not np.isclose(float(lut.get("y_max_m", np.nan)), float(y_max_m))
         or not np.isclose(float(lut.get("dr_m", np.nan)), float(dr_m))
     ):
@@ -2164,6 +2572,8 @@ def project_heatmap_for_display(
             angle_axis_deg=angle_axis[:eff_cols],
             projection_mode=mode,
             projection_interp=interp,
+            x_min_m=x_min_v,
+            y_min_m=y_min_v,
         )
 
     #Abort if the LUT provides no valid angle coverage for the current output grid.
@@ -2209,10 +2619,16 @@ def project_heatmap_for_display(
         return dst
 
     max_range_idx = float(src_rows - 1)
+    # Bilinear interpolation is centered on discrete range bins, so the
+    # supported physical extent includes half a bin beyond the first/last
+    # sample. At the borders we fall back to one-sided interpolation by
+    # clipping r0/r1 below, instead of marking the final half-bin as empty.
+    min_range_support = np.float32(-0.5)
+    max_range_support = np.float32(max_range_idx + 0.5)
     valid = (
         valid_theta
-        & (range_pos >= 0.0)
-        & (range_pos <= max_range_idx)
+        & (range_pos >= min_range_support)
+        & (range_pos <= max_range_support)
         & (angle_low_src >= 0)
         & (angle_low_src < eff_cols)
         & (angle_high_src >= 0)
@@ -2263,6 +2679,120 @@ def project_heatmap_for_display(
     if np.any(supported):
         dst_flat[valid_idx[supported]] = (weighted[supported] / weight_sum[supported]).astype(np.float32, copy=False)
     return dst
+
+
+def _quantize_zoom_nfft(base_nfft: int, max_nfft: int, scale: float) -> int:
+    base = max(1, int(base_nfft))
+    limit = max(base, int(max_nfft))
+    target = max(float(base), float(base) * max(1.0, float(scale)))
+    nfft = base
+    while float(nfft) < target and nfft < limit:
+        nfft <<= 1
+    return int(min(max(base, nfft), limit))
+
+
+def _viewport_angle_roi_indices(
+    angle_axis_deg: np.ndarray,
+    viewport: DisplayViewport,
+) -> np.ndarray:
+    axis = np.asarray(angle_axis_deg, dtype=np.float32).reshape(-1)
+    if axis.size <= 0:
+        return np.empty((0,), dtype=np.int32)
+    valid = np.isfinite(axis)
+    if not np.any(valid):
+        return np.empty((0,), dtype=np.int32)
+    finite_axis = axis[valid]
+    if finite_axis.size <= 0:
+        return np.empty((0,), dtype=np.int32)
+    if finite_axis.size <= 2:
+        return np.flatnonzero(valid).astype(np.int32, copy=False)
+    step = float(np.nanmedian(np.abs(np.diff(finite_axis.astype(np.float64, copy=False)))))
+    if not np.isfinite(step) or step <= 0.0:
+        step = 0.5
+    margin = max(step * 2.0, 0.5)
+    roi = valid & (axis >= np.float32(float(viewport.angle_min_deg) - margin)) & (axis <= np.float32(float(viewport.angle_max_deg) + margin))
+    idx = np.flatnonzero(roi)
+    if idx.size <= 0:
+        idx = np.flatnonzero(valid)
+    if idx.size <= 0:
+        return np.empty((0,), dtype=np.int32)
+    start = max(0, int(idx[0]) - 1)
+    stop = min(int(axis.size), int(idx[-1]) + 2)
+    return np.arange(start, stop, dtype=np.int32)
+
+
+def _display_zoom_cache_key_for_geometry(
+    geometry: VirtualArrayGeometry,
+    nfft_angle: int,
+) -> tuple[Any, ...]:
+    phase_centers = np.asarray(geometry.phase_centers_lambda, dtype=np.float32).reshape(-1)
+    return (
+        int(nfft_angle),
+        bytes(phase_centers.tobytes()),
+        None if geometry.uniform_spacing_lambda is None else round(float(geometry.uniform_spacing_lambda), 8),
+        round(float(getattr(geometry, "angle_axis_sign", 1.0)), 8),
+        round(float(getattr(geometry, "angle_u_to_sin_scale", 2.0)), 8),
+    )
+
+
+def _get_cached_angle_axis_and_steering(
+    runtime: DisplayZoomRuntime,
+    *,
+    geometry: VirtualArrayGeometry,
+    virtual_ant: int,
+    nfft_angle: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    cache_key = _display_zoom_cache_key_for_geometry(geometry, nfft_angle)
+    cached = runtime.steering_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    angle_axis = build_angle_axis_deg(int(nfft_angle), geometry=geometry)
+    steering = build_angle_steering_matrix(int(virtual_ant), int(nfft_angle), geometry=geometry)
+    runtime.steering_cache[cache_key] = (angle_axis, steering)
+    return angle_axis, steering
+
+
+def _get_cached_projection_lut(
+    runtime: DisplayZoomRuntime,
+    *,
+    gui_h: int,
+    gui_w: int,
+    viewport: DisplayViewport,
+    dr_m: float,
+    angle_axis_deg: np.ndarray,
+    projection_mode: str,
+    projection_interp: str,
+) -> dict[str, Any]:
+    angle_axis = np.asarray(angle_axis_deg, dtype=np.float32).reshape(-1)
+    cache_key = (
+        int(gui_h),
+        int(gui_w),
+        round(float(viewport.x_min_m), 6),
+        round(float(viewport.x_max_m), 6),
+        round(float(viewport.y_min_m), 6),
+        round(float(viewport.y_max_m), 6),
+        round(float(dr_m), 9),
+        int(angle_axis.size),
+        str(_normalize_display_projection_mode(projection_mode)),
+        str(_normalize_display_projection_interp(projection_interp)),
+    )
+    cached = runtime.lut_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    lut = build_display_projection_lut(
+        gui_h=int(gui_h),
+        gui_w=int(gui_w),
+        x_max_m=float(viewport.x_max_m),
+        y_max_m=float(viewport.y_max_m),
+        dr_m=float(dr_m),
+        angle_axis_deg=angle_axis,
+        projection_mode=projection_mode,
+        projection_interp=projection_interp,
+        x_min_m=float(viewport.x_min_m),
+        y_min_m=float(viewport.y_min_m),
+    )
+    runtime.lut_cache[cache_key] = lut
+    return lut
 
 
 def _resolve_chirp_period_s(cfg: dict[str, Any]) -> float | None:
@@ -4171,10 +4701,51 @@ def process_buffer(
     debug_top_peaks_angle_max_deg: float | None = None,
     display_heatmap_mode: str = "power_xy",
     gui_heat_alpha_views: tuple[np.ndarray, np.ndarray] | None = None,
+    display_viewport: DisplayViewport | None = None,
+    display_zoom_cfg: DisplayZoomConfig | None = None,
+    display_zoom_runtime: DisplayZoomRuntime | None = None,
+    frame_seq: int = 0,
 ) -> tuple[np.ndarray | None, list[Detection], np.ndarray]:
     try:
         cal_vector_out = np.asarray(cal_vector, dtype=np.complex64).reshape(-1)
         display_mode = _normalize_display_heatmap_mode(display_heatmap_mode)
+        display_zoom_cfg_eff = display_zoom_cfg or getattr(dsp_cfg, "display_zoom", DisplayZoomConfig())
+        home_viewport = (
+            display_zoom_runtime.home_viewport
+            if display_zoom_runtime is not None
+            else build_display_viewport(
+                x_min_m=-float(display_x_max_m),
+                x_max_m=float(display_x_max_m),
+                y_min_m=0.0,
+                y_max_m=float(display_y_max_m),
+                dr_m=float(dsp_cfg.c * dsp_cfg.fs / (2.0 * dsp_cfg.slope * dsp_cfg.nfft_range)),
+                seq=0,
+            )
+        )
+        active_viewport = display_viewport or home_viewport
+        active_viewport_sig = display_viewport_signature(active_viewport)
+        home_viewport_sig = display_viewport_signature(home_viewport)
+        zoom_active = bool(
+            display_zoom_cfg_eff.enabled
+            and active_viewport_sig is not None
+            and active_viewport_sig != home_viewport_sig
+            and float(active_viewport.zoom_level) > 1.0001
+        )
+        if (
+            display_zoom_runtime is not None
+            and display_mode != "range_angle_moving"
+            and display_zoom_runtime.last_viewport_signature is not None
+            and display_zoom_runtime.last_viewport_signature != active_viewport_sig
+        ):
+            heatmap_ema = None
+        home_width_m = max(1e-6, float(home_viewport.x_max_m - home_viewport.x_min_m))
+        home_height_m = max(1e-6, float(home_viewport.y_max_m - home_viewport.y_min_m))
+        cur_width_m = max(1e-6, float(active_viewport.x_max_m - active_viewport.x_min_m))
+        cur_height_m = max(1e-6, float(active_viewport.y_max_m - active_viewport.y_min_m))
+        zoom_width_scale = float(home_width_m / cur_width_m)
+        zoom_height_scale = float(home_height_m / cur_height_m)
+        zoom_range_nfft = int(dsp_cfg.nfft_range)
+        zoom_angle_nfft = int(dsp_cfg.nfft_angle)
 
         # Raw complex stream -> Reshape -> radar tensor [frame, loop, tx, sample, rx].
         data = raw_buffer.reshape(n_frames,dsp_cfg.chirps // dsp_cfg.tx,dsp_cfg.tx,dsp_cfg.samples,dsp_cfg.rx,)
@@ -4186,6 +4757,21 @@ def process_buffer(
         if apply_range_window:
             data *= w_range
 
+        zoom_range_fft_input: np.ndarray | None = None
+        if zoom_active:
+            zoom_range_nfft = _quantize_zoom_nfft(
+                int(dsp_cfg.nfft_range),
+                int(display_zoom_cfg_eff.max_zoom_nfft_range),
+                zoom_height_scale,
+            )
+            zoom_angle_nfft = _quantize_zoom_nfft(
+                int(dsp_cfg.nfft_angle),
+                int(display_zoom_cfg_eff.max_zoom_nfft_angle),
+                zoom_width_scale,
+            )
+            if zoom_range_nfft > int(dsp_cfg.nfft_range):
+                zoom_range_fft_input = np.array(data, dtype=np.complex64, copy=True)
+
         # Range FFT with optional zero-padding and in-place computation to save memory.
         range_fft_common = fft.fft(data,n=dsp_cfg.nfft_range,axis=3,workers=dsp_cfg.fft_workers,overwrite_x=True,)
         zero_after_range_fft_bins = int(getattr(dsp_cfg, "zero_after_range_fft_bins", 0))
@@ -4195,6 +4781,7 @@ def process_buffer(
 
         # Range bin to physical range conversion factor (meters per bin).
         range_bin_m = dsp_cfg.c * dsp_cfg.fs / (2.0 * dsp_cfg.slope * dsp_cfg.nfft_range)
+        zoom_range_bin_m = dsp_cfg.c * dsp_cfg.fs / (2.0 * dsp_cfg.slope * zoom_range_nfft)
 
         if pending_calibration:
             calibration_max_bin = max(1, min(max(int(processing_max_bin), int(display_max_bin)), dsp_cfg.nfft_range // 2))
@@ -4392,11 +4979,115 @@ def process_buffer(
                 profiles_out[:copy_rows, :fft_profile_bins] = profiles_db_va[:copy_rows, :].astype(np.float32, copy=False)
 
         publish_fill_value = np.float32(-120.0)
+        fallback_used = False
         view_alpha: np.ndarray | None = None
+        viewport_range_max_m = max(0.0, float(active_viewport.range_max_bin_f) * float(range_bin_m))
+
+        def _viewport_max_bin_for(dr_local: float, available_bins: int) -> int:
+            available = max(1, int(available_bins))
+            if not np.isfinite(dr_local) or float(dr_local) <= 0.0:
+                return max(
+                    1,
+                    min(
+                        int(math.ceil(float(active_viewport.range_max_bin_f))),
+                        available,
+                    ),
+                )
+            return max(
+                1,
+                min(
+                    int(math.ceil(float(viewport_range_max_m) / float(dr_local))),
+                    available,
+                ),
+            )
+
+        active_display_max_bin = _viewport_max_bin_for(range_bin_m, int(range_fft_display.shape[3]))
+
+        def _projection_lut_for(
+            angle_axis_local: np.ndarray,
+            dr_local: float,
+            projection_mode_local: str,
+        ) -> dict[str, Any] | None:
+            if display_zoom_runtime is not None:
+                return _get_cached_projection_lut(
+                    display_zoom_runtime,
+                    gui_h=gui_h,
+                    gui_w=gui_w,
+                    viewport=active_viewport,
+                    dr_m=dr_local,
+                    angle_axis_deg=angle_axis_local,
+                    projection_mode=projection_mode_local,
+                    projection_interp=display_projection_cfg.projection_interp,
+                )
+            if (
+                projection_mode_local == display_projection_cfg.projection_mode
+                and display_viewport_signature(active_viewport) == home_viewport_sig
+            ):
+                return display_projection_lut
+            return build_display_projection_lut(
+                gui_h=gui_h,
+                gui_w=gui_w,
+                x_max_m=float(active_viewport.x_max_m),
+                y_max_m=float(active_viewport.y_max_m),
+                dr_m=float(dr_local),
+                angle_axis_deg=angle_axis_local,
+                projection_mode=projection_mode_local,
+                projection_interp=display_projection_cfg.projection_interp,
+                x_min_m=float(active_viewport.x_min_m),
+                y_min_m=float(active_viewport.y_min_m),
+            )
+
+        def _project_view(
+            src: np.ndarray,
+            *,
+            angle_axis_local: np.ndarray,
+            dr_local: float,
+            projection_mode_local: str,
+            out_buf: np.ndarray | None,
+            fill_value_local: float,
+        ) -> np.ndarray:
+            return project_heatmap_for_display(
+                src,
+                angle_axis_deg=angle_axis_local,
+                dr_m=dr_local,
+                gui_h=gui_h,
+                gui_w=gui_w,
+                y_max_m=float(active_viewport.y_max_m),
+                x_max_m=float(active_viewport.x_max_m),
+                projection_mode=projection_mode_local,
+                projection_interp=display_projection_cfg.projection_interp,
+                out=out_buf,
+                fill_value=float(fill_value_local),
+                precomputed_lut=_projection_lut_for(angle_axis_local, dr_local, projection_mode_local),
+                x_min_m=float(active_viewport.x_min_m),
+                y_min_m=float(active_viewport.y_min_m),
+            )
+
+        zoom_can_improve = bool(
+            zoom_active
+            and (
+                int(zoom_range_nfft) > int(dsp_cfg.nfft_range)
+                or int(zoom_angle_nfft) > int(dsp_cfg.nfft_angle)
+            )
+        )
+        zoom_should_recompute = False
+        if zoom_can_improve:
+            zoom_should_recompute = should_recompute_display_zoom(
+                display_zoom_runtime,
+                active_viewport_sig=active_viewport_sig,
+                display_mode=display_mode,
+                display_zoom_cfg=display_zoom_cfg_eff,
+                now_s=time.perf_counter(),
+            )
+
         if display_mode == "range_angle_moving":
+            moving_display_max_bin = max(
+                1,
+                min(active_display_max_bin, max(1, int(range_fft_detection_moving.shape[3]))),
+            )
             velocity_ra, alpha_ra = compute_range_angle_moving_velocity_map(
                 range_fft_detection_moving,
-                max_bin=display_max_bin,
+                max_bin=moving_display_max_bin,
                 dsp_cfg=dsp_cfg,
                 w_doppler=w_doppler,
                 w_angle=w_angle,
@@ -4413,7 +5104,7 @@ def process_buffer(
                 doppler_work_buf=(
                     None
                     if doppler_work_buf is None
-                    else doppler_work_buf[:n_frames, : int(range_fft_detection_moving.shape[1]), :, :display_max_bin, :]
+                    else doppler_work_buf[:n_frames, : int(range_fft_detection_moving.shape[1]), :, :moving_display_max_bin, :]
                 ),
                 virtual_array_work_buf=(
                     None
@@ -4421,7 +5112,7 @@ def process_buffer(
                     else virtual_array_work_buf[
                         :n_frames,
                         : int(range_fft_detection_moving.shape[1]),
-                        :display_max_bin,
+                        :moving_display_max_bin,
                         :,
                         :,
                     ]
@@ -4432,42 +5123,136 @@ def process_buffer(
                     else virtual_array_flat_work_buf[
                         :n_frames,
                         : int(range_fft_detection_moving.shape[1]),
-                        :display_max_bin,
+                        :moving_display_max_bin,
                         :,
                     ]
                 ),
             )
             velocity_ra_for_projection = velocity_ra.astype(np.float32, copy=True)
             velocity_ra_for_projection[alpha_ra <= np.float32(0.0)] = np.float32(np.nan)
-            view_display = project_heatmap_for_display(
+            view_display = _project_view(
                 velocity_ra_for_projection,
-                angle_axis_deg=angle_axis_deg,
-                dr_m=range_bin_m,
-                gui_h=gui_h,
-                gui_w=gui_w,
-                y_max_m=display_y_max_m,
-                x_max_m=display_x_max_m,
-                projection_mode="cartesian",
-                projection_interp=display_projection_cfg.projection_interp,
-                out=heatmap_db_work_buf,
-                fill_value=0.0,
-                precomputed_lut=display_projection_lut,
+                angle_axis_local=angle_axis_deg,
+                dr_local=range_bin_m,
+                projection_mode_local="cartesian",
+                out_buf=heatmap_db_work_buf,
+                fill_value_local=0.0,
             )
-            view_alpha = project_heatmap_for_display(
+            view_alpha = _project_view(
                 alpha_ra,
-                angle_axis_deg=angle_axis_deg,
-                dr_m=range_bin_m,
-                gui_h=gui_h,
-                gui_w=gui_w,
-                y_max_m=display_y_max_m,
-                x_max_m=display_x_max_m,
-                projection_mode="cartesian",
-                projection_interp=display_projection_cfg.projection_interp,
-                out=None,
-                fill_value=0.0,
-                precomputed_lut=display_projection_lut,
+                angle_axis_local=angle_axis_deg,
+                dr_local=range_bin_m,
+                projection_mode_local="cartesian",
+                out_buf=None,
+                fill_value_local=0.0,
             )
             publish_fill_value = np.float32(0.0)
+
+            if zoom_can_improve and not zoom_should_recompute:
+                fallback_used = True
+                if (
+                    display_zoom_cfg_eff.fallback_mode == "cached_frame"
+                    and display_zoom_runtime is not None
+                    and display_zoom_runtime.last_view_db is not None
+                    and display_zoom_runtime.last_viewport_signature == active_viewport_sig
+                    and str(display_zoom_runtime.last_mode) == str(display_mode)
+                    and display_zoom_runtime.last_view_db.shape == view_display.shape
+                ):
+                    np.copyto(view_display, display_zoom_runtime.last_view_db, casting="unsafe")
+                    if view_alpha is not None and display_zoom_runtime.last_view_alpha is not None and display_zoom_runtime.last_view_alpha.shape == view_alpha.shape:
+                        np.copyto(view_alpha, display_zoom_runtime.last_view_alpha, casting="unsafe")
+            elif zoom_should_recompute and display_zoom_runtime is not None:
+                zoom_t0 = time.perf_counter()
+                try:
+                    if zoom_range_fft_input is not None:
+                        zoom_range_fft_common = fft.fft(
+                            zoom_range_fft_input,
+                            n=int(zoom_range_nfft),
+                            axis=3,
+                            workers=dsp_cfg.fft_workers,
+                            overwrite_x=True,
+                        )
+                        if zero_after_range_fft_bins > 0:
+                            zero_bins = min(zero_after_range_fft_bins, int(zoom_range_fft_common.shape[3]))
+                            zoom_range_fft_common[:, :, :, :zero_bins, :] = np.complex64(0.0)
+                        zoom_range_fft_detection_in = (
+                            zoom_range_fft_common.copy()
+                            if _branch_needs_copy(detection_moving_pre_doppler_filters)
+                            else zoom_range_fft_common
+                        )
+                        zoom_range_fft_detection = apply_post_range_fft_filters(
+                            zoom_range_fft_detection_in,
+                            detection_moving_pre_doppler_filters,
+                            bg_state=display_zoom_runtime.moving_bg_state,
+                            fft_workers=dsp_cfg.fft_workers,
+                            apply_loop_average_after_background=False,
+                        )
+                    else:
+                        zoom_range_fft_detection = range_fft_detection_moving
+
+                    zoom_angle_axis_full, zoom_steering_full = _get_cached_angle_axis_and_steering(
+                        display_zoom_runtime,
+                        geometry=virtual_array_geometry,
+                        virtual_ant=int(dsp_cfg.virtual_ant),
+                        nfft_angle=int(zoom_angle_nfft),
+                    )
+                    roi_idx = _viewport_angle_roi_indices(zoom_angle_axis_full, active_viewport)
+                    if roi_idx.size > 0 and roi_idx.size < int(zoom_angle_axis_full.size):
+                        zoom_angle_axis = zoom_angle_axis_full[roi_idx].astype(np.float32, copy=False)
+                        zoom_steering = zoom_steering_full[:, roi_idx].astype(np.complex64, copy=False)
+                        zoom_dsp_cfg = replace(dsp_cfg, nfft_angle=int(zoom_angle_axis.size))
+                    else:
+                        zoom_angle_axis = zoom_angle_axis_full
+                        zoom_steering = zoom_steering_full
+                        zoom_dsp_cfg = replace(dsp_cfg, nfft_angle=int(zoom_angle_nfft))
+                    zoom_dsp_cfg = replace(zoom_dsp_cfg, nfft_range=int(zoom_range_nfft))
+
+                    zoom_display_max_bin = max(
+                        1,
+                        _viewport_max_bin_for(zoom_range_bin_m, int(zoom_range_fft_detection.shape[3])),
+                    )
+                    velocity_zoom, alpha_zoom = compute_range_angle_moving_velocity_map(
+                        zoom_range_fft_detection,
+                        max_bin=zoom_display_max_bin,
+                        dsp_cfg=zoom_dsp_cfg,
+                        w_doppler=w_doppler,
+                        w_angle=w_angle,
+                        apply_doppler_window=apply_doppler_window,
+                        apply_angle_window=apply_angle_window,
+                        doppler_fft_shift=bool(detection_moving_cfg.doppler_fft_shift),
+                        doppler_axis_mps=doppler_axis_mps,
+                        tdm_mimo_compensation_table=tdm_mimo_compensation_table,
+                        virtual_array_geometry=virtual_array_geometry,
+                        angle_steering=zoom_steering,
+                        angle_axis_deg=zoom_angle_axis,
+                        calibration_enabled=calibration_enabled,
+                        cal_vector=cal_vector_out,
+                        doppler_work_buf=None,
+                        virtual_array_work_buf=None,
+                        virtual_array_flat_work_buf=None,
+                    )
+                    velocity_zoom_for_projection = velocity_zoom.astype(np.float32, copy=True)
+                    velocity_zoom_for_projection[alpha_zoom <= np.float32(0.0)] = np.float32(np.nan)
+                    view_display = _project_view(
+                        velocity_zoom_for_projection,
+                        angle_axis_local=zoom_angle_axis,
+                        dr_local=zoom_range_bin_m,
+                        projection_mode_local="cartesian",
+                        out_buf=heatmap_db_work_buf,
+                        fill_value_local=0.0,
+                    )
+                    view_alpha = _project_view(
+                        alpha_zoom,
+                        angle_axis_local=zoom_angle_axis,
+                        dr_local=zoom_range_bin_m,
+                        projection_mode_local="cartesian",
+                        out_buf=None,
+                        fill_value_local=0.0,
+                    )
+                    display_zoom_runtime.last_compute_ms = float((time.perf_counter() - zoom_t0) * 1000.0)
+                    display_zoom_runtime.last_compute_t_s = time.perf_counter()
+                except Exception:
+                    fallback_used = True
             if view_display.size > 0 and dsp_cfg.debug_stats:
                 try:
                     valid_alpha = view_alpha > np.float32(0.0) if view_alpha is not None else np.ones(view_display.shape, dtype=bool)
@@ -4487,9 +5272,10 @@ def process_buffer(
         else:
             # Build the virtual array after trimming range bins to limit memory traffic.
             # [frame, loop, range_bin, virtual_ant]
+            debug_angle_axis = angle_axis_deg
             virtual_array = _build_virtual_array_from_range_fft(
                 range_fft_display,
-                max_bin=display_max_bin,
+                max_bin=active_display_max_bin,
                 dsp_cfg=dsp_cfg,
                 geometry=virtual_array_geometry,
                 work_buf=(
@@ -4498,7 +5284,7 @@ def process_buffer(
                     else virtual_array_work_buf[
                         :n_frames,
                         : int(range_fft_display.shape[1]),
-                        :display_max_bin,
+                        :active_display_max_bin,
                         :,
                         :,
                     ]
@@ -4509,7 +5295,7 @@ def process_buffer(
                     else virtual_array_flat_work_buf[
                         :n_frames,
                         : int(range_fft_display.shape[1]),
-                        :display_max_bin,
+                        :active_display_max_bin,
                         :,
                     ]
                 ),
@@ -4523,46 +5309,160 @@ def process_buffer(
             heatmap = compute_angle_heatmap(
                 virtual_array,
                 angle_cfg=angle_processing,
-                dsp_cfg=dsp_cfg,
+                dsp_cfg=replace(dsp_cfg, nfft_angle=int(dsp_cfg.nfft_angle)),
                 angle_steering=angle_steering,
                 geometry=virtual_array_geometry,
                 ant_spacing=virtual_array_geometry.uniform_spacing_lambda,
             )
 
-            if not heatmap_ema_cfg.enabled: #bypass
+            if not heatmap_ema_cfg.enabled:
                 heatmap_ema = heatmap
-            elif heatmap_ema is None: #initialize
+            elif heatmap_ema is None:
                 heatmap_ema = heatmap
-            else: # update
+            else:
                 heatmap_ema *= (1.0 - heatmap_ema_cfg.alpha)
                 heatmap_ema += (heatmap_ema_cfg.alpha * heatmap)
             heatmap_ema = apply_heatmap_spatial_filter(heatmap_ema, heatmap_spatial_filter_cfg)
 
-            # Display path only: project the linear polar heatmap onto the GUI grid, then convert to dB.
-            view_display = project_heatmap_for_display(
+            view_display = _project_view(
                 heatmap_ema,
-                angle_axis_deg=angle_axis_deg,
-                dr_m=range_bin_m,
-                gui_h=gui_h,
-                gui_w=gui_w,
-                y_max_m=display_y_max_m,
-                x_max_m=display_x_max_m,
-                projection_mode=display_projection_cfg.projection_mode,
-                projection_interp=display_projection_cfg.projection_interp,
-                out=heatmap_db_work_buf,
-                fill_value=0.0,
-                precomputed_lut=display_projection_lut,
+                angle_axis_local=angle_axis_deg,
+                dr_local=range_bin_m,
+                projection_mode_local=display_projection_cfg.projection_mode,
+                out_buf=heatmap_db_work_buf,
+                fill_value_local=0.0,
             )
             np.add(view_display, np.float32(1e-12), out=view_display)
             np.log10(view_display, out=view_display)
             view_display *= np.float32(10.0)
 
+            if zoom_can_improve and not zoom_should_recompute:
+                fallback_used = True
+                if (
+                    display_zoom_cfg_eff.fallback_mode == "cached_frame"
+                    and display_zoom_runtime is not None
+                    and display_zoom_runtime.last_view_db is not None
+                    and display_zoom_runtime.last_viewport_signature == active_viewport_sig
+                    and str(display_zoom_runtime.last_mode) == str(display_mode)
+                    and display_zoom_runtime.last_view_db.shape == view_display.shape
+                ):
+                    np.copyto(view_display, display_zoom_runtime.last_view_db, casting="unsafe")
+            elif zoom_should_recompute and display_zoom_runtime is not None:
+                zoom_t0 = time.perf_counter()
+                try:
+                    if zoom_range_fft_input is not None:
+                        zoom_range_fft_common = fft.fft(
+                            zoom_range_fft_input,
+                            n=int(zoom_range_nfft),
+                            axis=3,
+                            workers=dsp_cfg.fft_workers,
+                            overwrite_x=True,
+                        )
+                        if zero_after_range_fft_bins > 0:
+                            zero_bins = min(zero_after_range_fft_bins, int(zoom_range_fft_common.shape[3]))
+                            zoom_range_fft_common[:, :, :, :zero_bins, :] = np.complex64(0.0)
+                        zoom_range_fft_display_in = (
+                            zoom_range_fft_common.copy()
+                            if _branch_needs_copy(display_post_range_fft_filters)
+                            else zoom_range_fft_common
+                        )
+                        zoom_range_fft_display = apply_post_range_fft_filters(
+                            zoom_range_fft_display_in,
+                            display_post_range_fft_filters,
+                            bg_state=display_zoom_runtime.display_bg_state,
+                            fft_workers=dsp_cfg.fft_workers,
+                            apply_loop_average_after_background=apply_display_loop_average_after_background,
+                        )
+                    else:
+                        zoom_range_fft_display = range_fft_display
+
+                    zoom_dsp_cfg = replace(dsp_cfg, nfft_range=int(zoom_range_nfft), nfft_angle=int(zoom_angle_nfft))
+                    zoom_display_max_bin = max(
+                        1,
+                        _viewport_max_bin_for(zoom_range_bin_m, int(zoom_range_fft_display.shape[3])),
+                    )
+                    zoom_virtual_array = _build_virtual_array_from_range_fft(
+                        zoom_range_fft_display,
+                        max_bin=zoom_display_max_bin,
+                        dsp_cfg=zoom_dsp_cfg,
+                        geometry=virtual_array_geometry,
+                        work_buf=None,
+                        flat_work_buf=None,
+                    )
+                    if calibration_enabled:
+                        _apply_calibration_vector(zoom_virtual_array, cal_vector_out)
+                    if apply_angle_window:
+                        zoom_virtual_array *= w_angle
+
+                    if angle_processing.mode == "fft":
+                        zoom_angle_axis, zoom_steering = _get_cached_angle_axis_and_steering(
+                            display_zoom_runtime,
+                            geometry=virtual_array_geometry,
+                            virtual_ant=int(dsp_cfg.virtual_ant),
+                            nfft_angle=int(zoom_angle_nfft),
+                        )
+                        zoom_heatmap = compute_angle_heatmap(
+                            zoom_virtual_array,
+                            angle_cfg=angle_processing,
+                            dsp_cfg=zoom_dsp_cfg,
+                            angle_steering=zoom_steering,
+                            geometry=virtual_array_geometry,
+                            ant_spacing=virtual_array_geometry.uniform_spacing_lambda,
+                        )
+                    else:
+                        zoom_angle_axis_full, zoom_steering_full = _get_cached_angle_axis_and_steering(
+                            display_zoom_runtime,
+                            geometry=virtual_array_geometry,
+                            virtual_ant=int(dsp_cfg.virtual_ant),
+                            nfft_angle=int(zoom_angle_nfft),
+                        )
+                        roi_idx = _viewport_angle_roi_indices(zoom_angle_axis_full, active_viewport)
+                        if roi_idx.size > 0 and roi_idx.size < int(zoom_angle_axis_full.size):
+                            zoom_angle_axis = zoom_angle_axis_full[roi_idx].astype(np.float32, copy=False)
+                            zoom_steering = zoom_steering_full[:, roi_idx].astype(np.complex64, copy=False)
+                        else:
+                            zoom_angle_axis = zoom_angle_axis_full
+                            zoom_steering = zoom_steering_full
+                        zoom_heatmap = compute_angle_heatmap(
+                            zoom_virtual_array,
+                            angle_cfg=angle_processing,
+                            dsp_cfg=replace(zoom_dsp_cfg, nfft_angle=int(zoom_angle_axis.size)),
+                            angle_steering=zoom_steering,
+                            geometry=virtual_array_geometry,
+                            ant_spacing=virtual_array_geometry.uniform_spacing_lambda,
+                        )
+                    debug_angle_axis = zoom_angle_axis
+
+                    if not heatmap_ema_cfg.enabled:
+                        heatmap_ema = zoom_heatmap
+                    elif heatmap_ema is None:
+                        heatmap_ema = zoom_heatmap
+                    else:
+                        heatmap_ema *= (1.0 - heatmap_ema_cfg.alpha)
+                        heatmap_ema += (heatmap_ema_cfg.alpha * zoom_heatmap)
+                    heatmap_ema = apply_heatmap_spatial_filter(heatmap_ema, heatmap_spatial_filter_cfg)
+                    view_display = _project_view(
+                        heatmap_ema,
+                        angle_axis_local=zoom_angle_axis,
+                        dr_local=zoom_range_bin_m,
+                        projection_mode_local=display_projection_cfg.projection_mode,
+                        out_buf=heatmap_db_work_buf,
+                        fill_value_local=0.0,
+                    )
+                    np.add(view_display, np.float32(1e-12), out=view_display)
+                    np.log10(view_display, out=view_display)
+                    view_display *= np.float32(10.0)
+                    display_zoom_runtime.last_compute_ms = float((time.perf_counter() - zoom_t0) * 1000.0)
+                    display_zoom_runtime.last_compute_t_s = time.perf_counter()
+                except Exception:
+                    fallback_used = True
+
             if debug_print_top_peaks:
                 print(
                     _format_debug_top_peaks_range_angle(
                         heatmap_ema,
-                        angle_axis_deg=angle_axis_deg,
-                        range_bin_m=range_bin_m,
+                        angle_axis_deg=debug_angle_axis,
+                        range_bin_m=(zoom_range_bin_m if debug_angle_axis is not angle_axis_deg else range_bin_m),
                         top_k=debug_top_peaks_count,
                         range_min_m=debug_top_peaks_range_min_m,
                         range_max_m=debug_top_peaks_range_max_m,
@@ -4573,8 +5473,8 @@ def process_buffer(
                 print(
                     _format_debug_top_peaks_xy(
                         view_display,
-                        x_max_m=display_x_max_m,
-                        y_max_m=display_y_max_m,
+                        x_max_m=float(active_viewport.x_max_m),
+                        y_max_m=float(active_viewport.y_max_m),
                         top_k=debug_top_peaks_count,
                         range_min_m=debug_top_peaks_range_min_m,
                         range_max_m=debug_top_peaks_range_max_m,
@@ -4607,6 +5507,21 @@ def process_buffer(
                         pass
                 if normalize_to_peak:
                     view_display -= raw_max if norm_ref_db is None else float(norm_ref_db)
+
+        if display_zoom_runtime is not None:
+            display_zoom_runtime.last_viewport_signature = active_viewport_sig
+            display_zoom_runtime.last_mode = str(display_mode)
+            display_zoom_runtime.last_fill_value = float(publish_fill_value)
+            display_zoom_runtime.last_applied_meta = applied_viewport_meta_from_viewport(
+                active_viewport,
+                fallback_used=bool(fallback_used),
+                frame_seq=int(frame_seq),
+            )
+            display_zoom_runtime.last_view_db = np.array(view_display, dtype=np.float32, copy=True)
+            if view_alpha is None:
+                display_zoom_runtime.last_view_alpha = None
+            else:
+                display_zoom_runtime.last_view_alpha = np.array(view_alpha, dtype=np.float32, copy=True)
 
         # Latest-wins publish to the GUI double buffer.
         with gui_lock:
@@ -4683,6 +5598,16 @@ def dsp_worker(
     dsp_cfg: RealtimeDSPConfig,
     heatmap_view_mode: Synchronized | None = None,
     gui_alpha_dbuf=None,
+    display_viewport_request=None,
+    display_viewport_request_seq: Synchronized | None = None,
+    display_viewport_request_lock=None,
+    display_viewport_applied=None,
+    display_viewport_applied_seq: Synchronized | None = None,
+    display_viewport_applied_frame_seq: Synchronized | None = None,
+    display_viewport_applied_fallback: Synchronized | None = None,
+    display_viewport_applied_lock=None,
+    display_home_viewport=None,
+    display_home_viewport_lock=None,
 ) -> None:
     dsp_block = cfg_dict.get("dsp", {}) or {}
     selection = selection_from_yaml_dict(cfg_dict)
@@ -4707,6 +5632,7 @@ def dsp_worker(
     heatmap_ema_cfg = heatmap_ema_from_yaml_dict(cfg_dict)
     heatmap_spatial_filter_cfg = heatmap_spatial_filter_from_yaml_dict(cfg_dict)
     display_projection_cfg = display_projection_from_yaml_dict(cfg_dict)
+    display_zoom_cfg = display_zoom_from_yaml_dict(cfg_dict)
     detection_static_cfg = detection_static_from_yaml_dict(cfg_dict)
     detection_moving_cfg = detection_moving_from_yaml_dict(cfg_dict)
     fusion_cfg = fusion_from_yaml_dict(cfg_dict)
@@ -4743,6 +5669,7 @@ def dsp_worker(
         detection_static_filter_warnings
         + detection_moving_filter_warnings
         + display_filter_warnings
+        + display_zoom_method_warnings(display_zoom_cfg)
         + virtual_array_warnings
     ):
         print(f"[DSP WARN] {warn_msg}")
@@ -4771,15 +5698,51 @@ def dsp_worker(
         )
     display_y_max_m = float(dsp_cfg.range_max_display)
     display_x_max_m = resolve_display_crossrange_max_m(display_y_max_m, angle_axis_deg, display_projection_cfg)
+    dr = dsp_cfg.c * dsp_cfg.fs / (2.0 * dsp_cfg.slope * dsp_cfg.nfft_range)
+    home_viewport = build_display_viewport(
+        x_min_m=-float(display_x_max_m),
+        x_max_m=float(display_x_max_m),
+        y_min_m=0.0,
+        y_max_m=float(display_y_max_m),
+        dr_m=float(dr),
+        seq=0,
+    )
+
+    def _read_home_viewport(default_viewport: DisplayViewport) -> DisplayViewport:
+        if display_home_viewport is None:
+            return default_viewport
+        arr = None
+        try:
+            if display_home_viewport_lock is not None:
+                with display_home_viewport_lock:
+                    arr = np.asarray(display_home_viewport[:], dtype=np.float64)
+            else:
+                arr = np.asarray(display_home_viewport[:], dtype=np.float64)
+        except Exception:
+            return default_viewport
+        if arr is None or int(arr.size) < 4:
+            return default_viewport
+        return build_display_viewport(
+            x_min_m=float(arr[0]),
+            x_max_m=float(arr[1]),
+            y_min_m=float(arr[2]),
+            y_max_m=float(arr[3]),
+            dr_m=float(dr),
+            seq=int(default_viewport.seq),
+        )
+
+    home_viewport = _read_home_viewport(home_viewport)
     display_projection_lut = build_display_projection_lut(
         gui_h=gui_h,
         gui_w=gui_w,
         x_max_m=display_x_max_m,
         y_max_m=display_y_max_m,
-        dr_m=dsp_cfg.c * dsp_cfg.fs / (2.0 * dsp_cfg.slope * dsp_cfg.nfft_range),
+        dr_m=dr,
         angle_axis_deg=angle_axis_deg,
         projection_mode=display_projection_cfg.projection_mode,
         projection_interp=display_projection_cfg.projection_interp,
+        x_min_m=float(home_viewport.x_min_m),
+        y_min_m=float(home_viewport.y_min_m),
     )
     n_doppler = int(dsp_cfg.chirps // dsp_cfg.tx)
     doppler_axis_mps = build_doppler_axis_mps(
@@ -4794,13 +5757,12 @@ def dsp_worker(
         doppler_fft_shift=detection_moving_cfg.doppler_fft_shift,
     )
 
-    dr = dsp_cfg.c * dsp_cfg.fs / (2.0 * dsp_cfg.slope * dsp_cfg.nfft_range)
     processing_range_max_m = float(
         dsp_cfg.range_max_processing_m if dsp_cfg.range_max_processing_m > 0.0 else dsp_cfg.range_max_display
     )
     processing_max_bin = int(np.floor(processing_range_max_m / dr))
     processing_max_bin = max(1, min(processing_max_bin, dsp_cfg.nfft_range // 2))
-    display_max_bin = int(np.floor(display_y_max_m / dr))
+    display_max_bin = int(math.ceil(float(home_viewport.range_max_bin_f)))
     display_max_bin = max(1, min(display_max_bin, dsp_cfg.nfft_range // 2))
     max_virtual_array_bin = max(processing_max_bin, display_max_bin)
 
@@ -4843,6 +5805,7 @@ def dsp_worker(
     shm_view = memoryview(shm_frames).cast("B")
     n_slots = len(slot_state)
     heatmap_ema = None
+    display_zoom_runtime = DisplayZoomRuntime(home_viewport=home_viewport)
     calibration_enabled = bool(calibration_cfg.enabled)
     cal_vector = _build_complex_calibration_vector(calibration_cfg, int(dsp_cfg.virtual_ant))
     pending_calibration = False
@@ -4963,6 +5926,88 @@ def dsp_worker(
                 pending_calibration = True
                 print("[DSP CAL] boresight calibration requested; waiting for next processed batch.")
 
+    def _read_requested_viewport() -> DisplayViewport:
+        if display_viewport_request is None:
+            return home_viewport
+        arr = None
+        try:
+            if display_viewport_request_lock is not None:
+                with display_viewport_request_lock:
+                    arr = np.asarray(display_viewport_request[:], dtype=np.float64)
+            else:
+                arr = np.asarray(display_viewport_request[:], dtype=np.float64)
+        except Exception:
+            return home_viewport
+        if arr is None or int(arr.size) < 4:
+            return home_viewport
+        try:
+            seq_value = int(display_viewport_request_seq.value) if display_viewport_request_seq is not None else 0
+        except Exception:
+            seq_value = 0
+        return clamp_display_viewport(
+            x_min_m=float(arr[0]),
+            x_max_m=float(arr[1]),
+            y_min_m=float(arr[2]),
+            y_max_m=float(arr[3]),
+            home_viewport=home_viewport,
+            output_width=int(gui_w),
+            output_height=int(gui_h),
+            dr_m=float(dr),
+            seq=int(seq_value),
+        )
+
+    def _sync_home_viewport() -> None:
+        nonlocal home_viewport, display_max_bin
+        next_home_viewport = _read_home_viewport(home_viewport)
+        if display_zoom_runtime is not None:
+            changed = update_display_zoom_runtime_home_viewport(display_zoom_runtime, next_home_viewport)
+        else:
+            changed = display_viewport_signature(next_home_viewport) != display_viewport_signature(home_viewport)
+        home_viewport = next_home_viewport
+        if changed:
+            display_max_bin = int(math.ceil(float(home_viewport.range_max_bin_f)))
+            display_max_bin = max(1, min(display_max_bin, dsp_cfg.nfft_range // 2))
+
+    def _write_applied_viewport(meta: AppliedViewportMeta | None) -> None:
+        if meta is None or display_viewport_applied is None:
+            return
+        values = [
+            float(meta.x_min_m),
+            float(meta.x_max_m),
+            float(meta.y_min_m),
+            float(meta.y_max_m),
+            float(meta.range_min_bin_f),
+            float(meta.range_max_bin_f),
+            float(meta.angle_min_deg),
+            float(meta.angle_max_deg),
+            float(meta.zoom_level),
+        ]
+        try:
+            if display_viewport_applied_lock is not None:
+                with display_viewport_applied_lock:
+                    for idx_val, value in enumerate(values):
+                        display_viewport_applied[idx_val] = float(value)
+            else:
+                for idx_val, value in enumerate(values):
+                    display_viewport_applied[idx_val] = float(value)
+        except Exception:
+            return
+        try:
+            if display_viewport_applied_seq is not None:
+                display_viewport_applied_seq.value = int(meta.seq)
+        except Exception:
+            pass
+        try:
+            if display_viewport_applied_frame_seq is not None:
+                display_viewport_applied_frame_seq.value = int(meta.frame_seq)
+        except Exception:
+            pass
+        try:
+            if display_viewport_applied_fallback is not None:
+                display_viewport_applied_fallback.value = 1 if bool(meta.fallback_used) else 0
+        except Exception:
+            pass
+
     while True:
         _poll_dsp_commands()
         if stop_evt.is_set():
@@ -5060,6 +6105,8 @@ def dsp_worker(
         display_heatmap_mode = "range_angle_moving" if int(heatmap_mode_value) == 1 else "power_xy"
         if display_heatmap_mode == "range_angle_moving":
             normalize_to_peak = False
+        _sync_home_viewport()
+        requested_viewport = _read_requested_viewport()
         apply_display_loop_average_after_background = bool(
             display_post_range_fft_filters.loop_average_after_background.enabled
         )
@@ -5151,7 +6198,12 @@ def dsp_worker(
             debug_top_peaks_angle_max_deg,
             display_heatmap_mode=display_heatmap_mode,
             gui_heat_alpha_views=gui_heat_alpha_views,
+            display_viewport=requested_viewport,
+            display_zoom_cfg=display_zoom_cfg,
+            display_zoom_runtime=display_zoom_runtime,
+            frame_seq=(int(proc_seqs[-1]) if proc_seqs else 0),
         )
+        _write_applied_viewport(display_zoom_runtime.last_applied_meta)
         if requested_calibration:
             pending_calibration = False
         if tracker is not None and tracking_runtime_enabled:

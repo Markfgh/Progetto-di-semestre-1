@@ -17,6 +17,12 @@ import numpy as np
 import scipy.fft as fft
 import yaml
 
+from realtime_dsp import (
+    DisplayViewport,
+    build_display_viewport,
+    clamp_display_viewport,
+    display_viewport_signature,
+)
 from offline_dsp import (
     AvgMode,
     BpMode,
@@ -543,6 +549,68 @@ def _queue_put_latest(q: Queue, msg: dict[str, Any]) -> None:
         pass
 
 
+def _viewport_status_fields(viewport: DisplayViewport, *, fallback_used: bool) -> dict[str, Any]:
+    return {
+        "applied_viewport_x_min_m": float(viewport.x_min_m),
+        "applied_viewport_x_max_m": float(viewport.x_max_m),
+        "applied_viewport_y_min_m": float(viewport.y_min_m),
+        "applied_viewport_y_max_m": float(viewport.y_max_m),
+        "applied_viewport_range_min_bin_f": float(viewport.range_min_bin_f),
+        "applied_viewport_range_max_bin_f": float(viewport.range_max_bin_f),
+        "applied_viewport_angle_min_deg": float(viewport.angle_min_deg),
+        "applied_viewport_angle_max_deg": float(viewport.angle_max_deg),
+        "applied_viewport_zoom_level": float(viewport.zoom_level),
+        "applied_viewport_seq": int(viewport.seq),
+        "fallback_used": bool(fallback_used),
+    }
+
+
+def _viewport_to_cmd_payload(viewport: DisplayViewport | None) -> dict[str, Any] | None:
+    if viewport is None:
+        return None
+    return {
+        "x_min_m": float(viewport.x_min_m),
+        "x_max_m": float(viewport.x_max_m),
+        "y_min_m": float(viewport.y_min_m),
+        "y_max_m": float(viewport.y_max_m),
+        "seq": int(viewport.seq),
+    }
+
+
+def _viewport_from_cmd_payload(
+    payload: Any,
+    *,
+    home_viewport: DisplayViewport,
+    output_width: int,
+    output_height: int,
+    dr_m: float,
+) -> DisplayViewport | None:
+    if payload is None:
+        return None
+    block = payload if isinstance(payload, dict) else {}
+    if not block:
+        return None
+    try:
+        x_min_m = float(block.get("x_min_m"))
+        x_max_m = float(block.get("x_max_m"))
+        y_min_m = float(block.get("y_min_m"))
+        y_max_m = float(block.get("y_max_m"))
+    except Exception:
+        return None
+    seq = int(block.get("seq", 0))
+    return clamp_display_viewport(
+        x_min_m=float(x_min_m),
+        x_max_m=float(x_max_m),
+        y_min_m=float(y_min_m),
+        y_max_m=float(y_max_m),
+        home_viewport=home_viewport,
+        output_width=int(output_width),
+        output_height=int(output_height),
+        dr_m=float(dr_m),
+        seq=int(seq),
+    )
+
+
 def _read_x_pitch_m(offline_config_path: str | Path) -> float:
     cfg = _load_yaml_file(Path(offline_config_path))
     scan_cfg = cfg.get("scan", {}) or {}
@@ -1059,20 +1127,16 @@ def _offline_dsp_worker(
         dr_m = float(c_m_s) * float(fs_hz) / (2.0 * float(slope_hz_s) * float(nfft_range))
         max_bin = int(np.floor(float(range_max_m) / dr_m))
         max_bin = max(1, min(max_bin, int(n_bins_total)))
-
-        x_axis = np.linspace(
-            -float(crossrange_max_m),
-            +float(crossrange_max_m),
-            int(gui_w),
-            dtype=np.float32,
+        home_viewport = build_display_viewport(
+            x_min_m=-float(crossrange_max_m),
+            x_max_m=float(crossrange_max_m),
+            y_min_m=0.0,
+            y_max_m=float(range_max_m),
+            dr_m=float(dr_m),
+            seq=0,
         )
-        y_axis = np.linspace(
-            0.0,
-            float(range_max_m),
-            int(gui_h),
-            dtype=np.float32,
-        )
-        x_grid, y_grid = np.meshgrid(x_axis, y_axis)
+        requested_viewport = home_viewport
+        applied_viewport = home_viewport
 
         pos_f = positions.astype(np.float32, copy=False)
         pos_center = float(np.mean(pos_f)) if pos_f.size > 0 else 0.0
@@ -1111,6 +1175,7 @@ def _offline_dsp_worker(
                 "virtual_antennas": int(n_ant_used),
                 "geometry_source": str(geometry_source),
                 "doppler_bins_used": 1 if motion_mode == "static_zero_doppler" else max(1, int(range_fft_data.shape[2])),
+                **_viewport_status_fields(applied_viewport, fallback_used=False),
             },
         )
 
@@ -1120,6 +1185,8 @@ def _offline_dsp_worker(
         prepared_cache = None
         bp_plan_cache_key = None
         bp_plan_cache = None
+        grid_cache_key = None
+        grid_cache = None
 
         while not stop_evt.is_set():
             got_cmd = False
@@ -1161,6 +1228,16 @@ def _offline_dsp_worker(
                     avg_mode, avg_mode_warning = _resolve_effective_avg_mode(avg_mode_requested, bp_mode=bp_mode)
                     if avg_mode_warning:
                         print(avg_mode_warning)
+                viewport_new = _viewport_from_cmd_payload(
+                    cmd.get("viewport"),
+                    home_viewport=home_viewport,
+                    output_width=int(gui_w),
+                    output_height=int(gui_h),
+                    dr_m=float(dr_m),
+                )
+                if viewport_new is not None:
+                    requested_viewport = viewport_new
+                    applied_viewport = viewport_new
                 motion_mode = motion_mode_requested
                 dirty = True
 
@@ -1172,9 +1249,30 @@ def _offline_dsp_worker(
                 int(x_end),
                 str(avg_mode) if bp_mode == "sar_only" else str(motion_mode),
                 bool(coherent_sum),
+                display_viewport_signature(applied_viewport),
             )
             if dirty or job_key != last_job_key or got_cmd:
                 t0 = time.perf_counter()
+
+                grid_key = display_viewport_signature(applied_viewport)
+                if grid_cache_key == grid_key and grid_cache is not None:
+                    x_grid, y_grid = grid_cache
+                else:
+                    x_axis = np.linspace(
+                        float(applied_viewport.x_min_m),
+                        float(applied_viewport.x_max_m),
+                        int(gui_w),
+                        dtype=np.float32,
+                    )
+                    y_axis = np.linspace(
+                        float(applied_viewport.y_min_m),
+                        float(applied_viewport.y_max_m),
+                        int(gui_h),
+                        dtype=np.float32,
+                    )
+                    x_grid, y_grid = np.meshgrid(x_axis, y_axis)
+                    grid_cache_key = grid_key
+                    grid_cache = (x_grid, y_grid)
 
                 sel_mask = (positions >= int(x_start)) & (positions <= int(x_end))
                 if not np.any(sel_mask):
@@ -1219,6 +1317,7 @@ def _offline_dsp_worker(
                         float(dr_m),
                         float(fc_hz),
                         float(c_m_s),
+                        display_viewport_signature(applied_viewport),
                     )
                     if bp_plan_cache_key == bp_plan_key and bp_plan_cache is not None:
                         bp_plan = bp_plan_cache
@@ -1304,6 +1403,7 @@ def _offline_dsp_worker(
                         "geometry_source": str(geometry_source),
                         "doppler_bins_used": int(doppler_bins_used),
                         "elapsed_ms": float((t1 - t0) * 1000.0),
+                        **_viewport_status_fields(applied_viewport, fallback_used=False),
                     },
                 )
 
@@ -1582,6 +1682,7 @@ class OfflineBPRuntime:
         x_end: int | None = None,
         motion_mode: str | None = None,
         avg_mode: str | None = None,
+        viewport: DisplayViewport | None = None,
     ) -> None:
         if not self._started or self._cmd_q is None:
             return
@@ -1591,6 +1692,7 @@ class OfflineBPRuntime:
             "x_end": x_end,
             "motion_mode": None if motion_mode is None else _motion_mode_normalize(motion_mode),
             "avg_mode": None if avg_mode is None else _avg_mode_normalize(avg_mode),
+            "viewport": _viewport_to_cmd_payload(viewport),
         }
         self._put_latest_cmd(cmd)
 

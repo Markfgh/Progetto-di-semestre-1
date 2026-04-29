@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import multiprocessing as mp
 import threading
 
@@ -80,6 +81,12 @@ def _run_display_process(
     display_post_range_fft_filters: realtime_dsp.PostRangeFftFilterConfig | None = None,
     display_projection_cfg: realtime_dsp.DisplayProjectionConfig | None = None,
     range_angle_moving_cfg: realtime_dsp.RangeAngleMovingConfig | None = None,
+    gui_h: int = 32,
+    gui_w: int | None = None,
+    angle_processing: realtime_dsp.AngleProcessingConfig | None = None,
+    display_viewport: realtime_dsp.DisplayViewport | None = None,
+    display_zoom_cfg: realtime_dsp.DisplayZoomConfig | None = None,
+    display_zoom_runtime: realtime_dsp.DisplayZoomRuntime | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray, np.ndarray, np.ndarray]:
     samples = 32
     loops = 8
@@ -97,8 +104,8 @@ def _run_display_process(
     geometry = _geometry()
     angle_axis = realtime_dsp.build_angle_axis_deg(dsp_cfg.nfft_angle, geometry=geometry)
     steering = realtime_dsp.build_angle_steering_matrix(dsp_cfg.virtual_ant, dsp_cfg.nfft_angle, geometry=geometry)
-    gui_h = 32
-    gui_w = dsp_cfg.nfft_angle if display_heatmap_mode in {"range_angle_moving", "velocity_xy"} else 65
+    if gui_w is None:
+        gui_w = dsp_cfg.nfft_angle if display_heatmap_mode in {"range_angle_moving", "velocity_xy"} else 65
     gui_heat_views = (
         np.full(gui_h * gui_w, -120.0, dtype=np.float32),
         np.full(gui_h * gui_w, -120.0, dtype=np.float32),
@@ -117,6 +124,12 @@ def _run_display_process(
     process_kwargs = {}
     if display_heatmap_mode is not None:
         process_kwargs["display_heatmap_mode"] = display_heatmap_mode
+    if display_viewport is not None:
+        process_kwargs["display_viewport"] = display_viewport
+    if display_zoom_cfg is not None:
+        process_kwargs["display_zoom_cfg"] = display_zoom_cfg
+    if display_zoom_runtime is not None:
+        process_kwargs["display_zoom_runtime"] = display_zoom_runtime
 
     heatmap_ema, _, _ = realtime_dsp.process_buffer(
         _raw_target(
@@ -140,7 +153,7 @@ def _run_display_process(
         display_post_range_fft_filters or realtime_dsp.PostRangeFftFilterConfig(),
         False,
         False,
-        realtime_dsp.AngleProcessingConfig(mode="mvdr"),
+        angle_processing or realtime_dsp.AngleProcessingConfig(mode="mvdr"),
         realtime_dsp.HeatmapEMAConfig(enabled=False),
         realtime_dsp.HeatmapSpatialFilterConfig(enabled=False),
         display_projection_cfg or realtime_dsp.DisplayProjectionConfig(projection_mode="cartesian", projection_interp="nearest"),
@@ -192,6 +205,37 @@ def _run_display_process(
         gui_heat_alpha_views[1].reshape(gui_h, gui_w),
         doppler_axis,
     )
+
+
+def _build_home_and_zoom_viewports(
+    *,
+    dsp_cfg: realtime_dsp.RealtimeDSPConfig,
+    gui_h: int,
+    gui_w: int,
+    x_max_m: float = 1.5,
+    y_max_m: float = 2.0,
+) -> tuple[realtime_dsp.DisplayViewport, realtime_dsp.DisplayViewport]:
+    dr_m = dsp_cfg.c * dsp_cfg.fs / (2.0 * dsp_cfg.slope * dsp_cfg.nfft_range)
+    home_viewport = realtime_dsp.build_display_viewport(
+        x_min_m=-x_max_m,
+        x_max_m=x_max_m,
+        y_min_m=0.0,
+        y_max_m=y_max_m,
+        dr_m=dr_m,
+        seq=0,
+    )
+    zoom_viewport = realtime_dsp.clamp_display_viewport(
+        x_min_m=-0.45,
+        x_max_m=0.45,
+        y_min_m=0.70,
+        y_max_m=1.35,
+        home_viewport=home_viewport,
+        output_width=gui_w,
+        output_height=gui_h,
+        dr_m=dr_m,
+        seq=1,
+    )
+    return home_viewport, zoom_viewport
 
 
 def test_process_buffer_synthetic_static_target_outputs_detection_and_finite_views() -> None:
@@ -295,7 +339,8 @@ def test_process_buffer_synthetic_static_target_outputs_detection_and_finite_vie
     )
 
     assert heatmap_ema is not None
-    assert heatmap_ema.shape == (20, dsp_cfg.nfft_angle)
+    home_viewport, _ = _build_home_and_zoom_viewports(dsp_cfg=dsp_cfg, gui_h=gui_h, gui_w=gui_w)
+    assert heatmap_ema.shape == (int(math.ceil(float(home_viewport.range_max_bin_f))), dsp_cfg.nfft_angle)
     assert len(detections) == 1
     det = detections[0]
     assert abs(det.range_bin - range_bin) <= 1
@@ -337,6 +382,341 @@ def test_process_buffer_power_xy_default_matches_explicit_power_mode() -> None:
     assert heatmap_explicit is not None
     np.testing.assert_allclose(heatmap_default, heatmap_explicit, rtol=0.0, atol=0.0)
     np.testing.assert_allclose(view_default, view_explicit, rtol=0.0, atol=0.0)
+
+
+def test_power_xy_zoom_keeps_fixed_texture_size_and_tracks_applied_viewport() -> None:
+    gui_h = 48
+    gui_w = 96
+    dsp_cfg = _dsp_cfg()
+    home_viewport, zoom_viewport = _build_home_and_zoom_viewports(dsp_cfg=dsp_cfg, gui_h=gui_h, gui_w=gui_w)
+    zoom_cfg = realtime_dsp.DisplayZoomConfig(
+        enabled=True,
+        output_width=gui_w,
+        output_height=gui_h,
+        max_zoom_nfft_range=dsp_cfg.nfft_range * 4,
+        max_zoom_nfft_angle=dsp_cfg.nfft_angle * 2,
+        max_update_hz=0.0,
+        dsp_budget_ms=1000.0,
+        fallback_mode="baseline_projection",
+    )
+    full_runtime = realtime_dsp.DisplayZoomRuntime(home_viewport=home_viewport)
+    zoom_runtime = realtime_dsp.DisplayZoomRuntime(home_viewport=home_viewport)
+
+    full_heatmap, full_view, _, _ = _run_display_process(
+        gui_h=gui_h,
+        gui_w=gui_w,
+        display_viewport=home_viewport,
+        display_zoom_cfg=zoom_cfg,
+        display_zoom_runtime=full_runtime,
+    )
+    zoom_heatmap, zoom_view, _, _ = _run_display_process(
+        gui_h=gui_h,
+        gui_w=gui_w,
+        display_viewport=zoom_viewport,
+        display_zoom_cfg=zoom_cfg,
+        display_zoom_runtime=zoom_runtime,
+    )
+
+    assert full_heatmap is not None
+    assert zoom_heatmap is not None
+    assert full_view.shape == (gui_h, gui_w)
+    assert zoom_view.shape == (gui_h, gui_w)
+    assert full_runtime.last_applied_meta is not None
+    assert zoom_runtime.last_applied_meta is not None
+    assert realtime_dsp.display_viewport_signature(full_runtime.last_applied_meta) == realtime_dsp.display_viewport_signature(home_viewport)
+    assert realtime_dsp.display_viewport_signature(zoom_runtime.last_applied_meta) == realtime_dsp.display_viewport_signature(zoom_viewport)
+    assert not zoom_runtime.last_applied_meta.fallback_used
+    assert zoom_runtime.last_compute_t_s > 0.0
+    assert zoom_heatmap.shape[0] > full_heatmap.shape[0]
+    assert not np.allclose(full_view, zoom_view)
+
+
+def test_display_zoom_over_budget_retries_periodically() -> None:
+    gui_h = 48
+    gui_w = 96
+    dsp_cfg = _dsp_cfg()
+    home_viewport, zoom_viewport = _build_home_and_zoom_viewports(dsp_cfg=dsp_cfg, gui_h=gui_h, gui_w=gui_w)
+    zoom_cfg = realtime_dsp.DisplayZoomConfig(
+        enabled=True,
+        output_width=gui_w,
+        output_height=gui_h,
+        max_update_hz=15.0,
+        dsp_budget_ms=6.0,
+    )
+    runtime = realtime_dsp.DisplayZoomRuntime(home_viewport=home_viewport)
+    runtime.last_viewport_signature = realtime_dsp.display_viewport_signature(zoom_viewport)
+    runtime.last_mode = "power_xy"
+    runtime.last_compute_ms = 9.5
+    runtime.last_compute_t_s = 10.0
+
+    assert not realtime_dsp.should_recompute_display_zoom(
+        runtime,
+        active_viewport_sig=realtime_dsp.display_viewport_signature(zoom_viewport),
+        display_mode="power_xy",
+        display_zoom_cfg=zoom_cfg,
+        now_s=10.10,
+    )
+    assert realtime_dsp.should_recompute_display_zoom(
+        runtime,
+        active_viewport_sig=realtime_dsp.display_viewport_signature(zoom_viewport),
+        display_mode="power_xy",
+        display_zoom_cfg=zoom_cfg,
+        now_s=10.30,
+    )
+    assert realtime_dsp.should_recompute_display_zoom(
+        runtime,
+        active_viewport_sig=realtime_dsp.display_viewport_signature(home_viewport),
+        display_mode="power_xy",
+        display_zoom_cfg=zoom_cfg,
+        now_s=10.10,
+    )
+
+
+def test_display_zoom_runtime_home_viewport_update_resets_stale_state() -> None:
+    dsp_cfg = _dsp_cfg()
+    gui_h = 48
+    gui_w = 96
+    dr_m = dsp_cfg.c * dsp_cfg.fs / (2.0 * dsp_cfg.slope * dsp_cfg.nfft_range)
+    old_home, _ = _build_home_and_zoom_viewports(dsp_cfg=dsp_cfg, gui_h=gui_h, gui_w=gui_w)
+    new_home = realtime_dsp.build_display_viewport(
+        x_min_m=-0.75,
+        x_max_m=0.75,
+        y_min_m=0.0,
+        y_max_m=1.2,
+        dr_m=dr_m,
+        seq=3,
+    )
+    runtime = realtime_dsp.DisplayZoomRuntime(home_viewport=old_home)
+    runtime.last_view_db = np.ones((gui_h, gui_w), dtype=np.float32)
+    runtime.last_view_alpha = np.ones((gui_h, gui_w), dtype=np.float32)
+    runtime.last_applied_meta = realtime_dsp.applied_viewport_meta_from_viewport(
+        old_home,
+        fallback_used=True,
+        frame_seq=17,
+    )
+    runtime.last_viewport_signature = realtime_dsp.display_viewport_signature(old_home)
+    runtime.last_compute_ms = 11.0
+    runtime.last_compute_t_s = 42.0
+    runtime.last_mode = "range_angle_moving"
+
+    changed = realtime_dsp.update_display_zoom_runtime_home_viewport(runtime, new_home)
+
+    assert changed
+    assert realtime_dsp.display_viewport_signature(runtime.home_viewport) == realtime_dsp.display_viewport_signature(new_home)
+    assert runtime.last_view_db is None
+    assert runtime.last_view_alpha is None
+    assert runtime.last_applied_meta is None
+    assert runtime.last_viewport_signature is None
+    assert runtime.last_compute_ms == 0.0
+    assert runtime.last_compute_t_s == 0.0
+    assert runtime.last_mode == "power_xy"
+
+
+def test_requested_viewport_matching_updated_home_disables_zoom() -> None:
+    gui_h = 48
+    gui_w = 96
+    dsp_cfg = _dsp_cfg()
+    dr_m = dsp_cfg.c * dsp_cfg.fs / (2.0 * dsp_cfg.slope * dsp_cfg.nfft_range)
+    old_home, _ = _build_home_and_zoom_viewports(dsp_cfg=dsp_cfg, gui_h=gui_h, gui_w=gui_w)
+    new_home = realtime_dsp.build_display_viewport(
+        x_min_m=-0.75,
+        x_max_m=0.75,
+        y_min_m=0.0,
+        y_max_m=1.2,
+        dr_m=dr_m,
+        seq=5,
+    )
+    stale_requested = realtime_dsp.clamp_display_viewport(
+        x_min_m=new_home.x_min_m,
+        x_max_m=new_home.x_max_m,
+        y_min_m=new_home.y_min_m,
+        y_max_m=new_home.y_max_m,
+        home_viewport=old_home,
+        output_width=gui_w,
+        output_height=gui_h,
+        dr_m=dr_m,
+        seq=5,
+    )
+    assert stale_requested.zoom_level > 1.0
+
+    runtime = realtime_dsp.DisplayZoomRuntime(home_viewport=old_home)
+    realtime_dsp.update_display_zoom_runtime_home_viewport(runtime, new_home)
+    requested_home = realtime_dsp.clamp_display_viewport(
+        x_min_m=new_home.x_min_m,
+        x_max_m=new_home.x_max_m,
+        y_min_m=new_home.y_min_m,
+        y_max_m=new_home.y_max_m,
+        home_viewport=runtime.home_viewport,
+        output_width=gui_w,
+        output_height=gui_h,
+        dr_m=dr_m,
+        seq=5,
+    )
+    zoom_cfg = realtime_dsp.DisplayZoomConfig(
+        enabled=True,
+        output_width=gui_w,
+        output_height=gui_h,
+        max_zoom_nfft_range=dsp_cfg.nfft_range * 4,
+        max_zoom_nfft_angle=dsp_cfg.nfft_angle * 2,
+        max_update_hz=0.0,
+        dsp_budget_ms=1000.0,
+        fallback_mode="baseline_projection",
+    )
+
+    _, view_display, _, _ = _run_display_process(
+        gui_h=gui_h,
+        gui_w=gui_w,
+        display_viewport=requested_home,
+        display_zoom_cfg=zoom_cfg,
+        display_zoom_runtime=runtime,
+    )
+
+    assert requested_home.zoom_level == 1.0
+    assert runtime.last_compute_t_s == 0.0
+    assert runtime.last_applied_meta is not None
+    assert not runtime.last_applied_meta.fallback_used
+    assert runtime.last_applied_meta.zoom_level == 1.0
+    assert realtime_dsp.display_viewport_signature(runtime.home_viewport) == realtime_dsp.display_viewport_signature(new_home)
+    assert realtime_dsp.display_viewport_signature(runtime.last_applied_meta) == realtime_dsp.display_viewport_signature(requested_home)
+    assert view_display.shape == (gui_h, gui_w)
+
+
+def test_process_buffer_zoom_args_leave_tracking_detections_unchanged() -> None:
+    samples = 32
+    loops = 4
+    n_frames = 1
+    range_bin = 9
+    angle_deg = 25.0
+    gui_h = 48
+    gui_w = 96
+    dsp_cfg = _dsp_cfg(samples=samples, loops=loops)
+    geometry = _geometry()
+    angle_axis = realtime_dsp.build_angle_axis_deg(dsp_cfg.nfft_angle, geometry=geometry)
+    steering = realtime_dsp.build_angle_steering_matrix(dsp_cfg.virtual_ant, dsp_cfg.nfft_angle, geometry=geometry)
+    home_viewport, zoom_viewport = _build_home_and_zoom_viewports(dsp_cfg=dsp_cfg, gui_h=gui_h, gui_w=gui_w)
+    zoom_cfg = realtime_dsp.DisplayZoomConfig(
+        enabled=True,
+        output_width=gui_w,
+        output_height=gui_h,
+        max_zoom_nfft_range=dsp_cfg.nfft_range * 4,
+        max_zoom_nfft_angle=dsp_cfg.nfft_angle * 2,
+        max_update_hz=0.0,
+        dsp_budget_ms=1000.0,
+        fallback_mode="baseline_projection",
+    )
+
+    sample_phase = np.exp(1j * 2.0 * np.pi * range_bin * np.arange(samples, dtype=np.float32) / samples)
+    snapshot = _snapshot(angle_deg).reshape(2, 4)
+    raw = (
+        sample_phase.reshape(1, 1, 1, samples, 1)
+        * snapshot.reshape(1, 1, 2, 1, 4)
+        * np.complex64(30.0 + 0.0j)
+    )
+    raw = np.tile(raw, (n_frames, loops, 1, 1, 1)).astype(np.complex64, copy=False).reshape(-1)
+
+    def _run_detection(
+        *,
+        display_viewport: realtime_dsp.DisplayViewport,
+        display_zoom_cfg: realtime_dsp.DisplayZoomConfig,
+        display_zoom_runtime: realtime_dsp.DisplayZoomRuntime,
+    ) -> tuple[np.ndarray | None, list[realtime_dsp.Detection], np.ndarray]:
+        gui_heat_views = (
+            np.full(gui_h * gui_w, -120.0, dtype=np.float32),
+            np.full(gui_h * gui_w, -120.0, dtype=np.float32),
+        )
+        gui_profile_views = (
+            np.full(dsp_cfg.range_profile_count * samples, -120.0, dtype=np.float32),
+            np.full(dsp_cfg.range_profile_count * samples, -120.0, dtype=np.float32),
+        )
+        profiles_out = np.empty((dsp_cfg.range_profile_count, samples), dtype=np.float32)
+        return realtime_dsp.process_buffer(
+            raw,
+            n_frames,
+            np.ones((1, 1, 1, samples, 1), dtype=np.float32),
+            np.ones((1, loops, 1, 1, 1), dtype=np.float32),
+            np.ones((1, 1, 1, dsp_cfg.virtual_ant), dtype=np.float32),
+            False,
+            False,
+            False,
+            realtime_dsp.MeanSelection(enabled=False),
+            realtime_dsp.PostRangeFftFilterConfig(),
+            realtime_dsp.PostRangeFftFilterConfig(),
+            realtime_dsp.PostRangeFftFilterConfig(),
+            False,
+            False,
+            realtime_dsp.AngleProcessingConfig(mode="bartlett"),
+            realtime_dsp.HeatmapEMAConfig(enabled=False),
+            realtime_dsp.HeatmapSpatialFilterConfig(enabled=False),
+            realtime_dsp.DisplayProjectionConfig(projection_mode="cartesian", projection_interp="nearest"),
+            geometry,
+            steering,
+            angle_axis,
+            None,
+            2.0,
+            1.5,
+            None,
+            None,
+            realtime_dsp.DetectionConfigStatic(
+                enabled=True,
+                threshold_mode="relative",
+                threshold_db=-6.0,
+                localmax_range_bins=1,
+                localmax_angle_bins=3,
+                min_power_db=-120.0,
+                max_detections=1,
+            ),
+            realtime_dsp.DetectionConfigMoving(enabled=False),
+            realtime_dsp.FusionConfig(enabled=True),
+            realtime_dsp.BackgroundSubtractionState(),
+            realtime_dsp.BackgroundSubtractionState(),
+            realtime_dsp.BackgroundSubtractionState(),
+            None,
+            False,
+            np.ones(dsp_cfg.virtual_ant, dtype=np.complex64),
+            False,
+            None,
+            None,
+            None,
+            None,
+            None,
+            gui_h,
+            gui_w,
+            gui_heat_views,
+            gui_profile_views,
+            mp.Value("i", 0),
+            mp.Value("i", 0),
+            threading.Lock(),
+            True,
+            profiles_out,
+            mp.Value("d", 0.0),
+            mp.Value("d", 0.0),
+            mp.Value("d", 0.0),
+            mp.Value("d", 0.0),
+            dsp_cfg,
+            20,
+            20,
+            display_viewport=display_viewport,
+            display_zoom_cfg=display_zoom_cfg,
+            display_zoom_runtime=display_zoom_runtime,
+        )
+
+    _, detections_base, cal_base = _run_detection(
+        display_viewport=home_viewport,
+        display_zoom_cfg=realtime_dsp.DisplayZoomConfig(
+            enabled=False,
+            output_width=gui_w,
+            output_height=gui_h,
+        ),
+        display_zoom_runtime=realtime_dsp.DisplayZoomRuntime(home_viewport=home_viewport),
+    )
+    _, detections_zoom, cal_zoom = _run_detection(
+        display_viewport=zoom_viewport,
+        display_zoom_cfg=zoom_cfg,
+        display_zoom_runtime=realtime_dsp.DisplayZoomRuntime(home_viewport=home_viewport),
+    )
+
+    assert detections_base == detections_zoom
+    np.testing.assert_allclose(cal_base, cal_zoom, rtol=0.0, atol=0.0)
 
 
 def test_range_angle_moving_ignores_normalize_to_peak() -> None:
@@ -443,3 +823,29 @@ def test_cartesian_projection_bilinear_is_nan_aware() -> None:
 
     assert supported[0, 0] == np.float32(2.0)
     assert np.isnan(unsupported[0, 0])
+
+
+def test_cartesian_projection_bilinear_keeps_last_half_range_bin_supported() -> None:
+    angle_axis = np.asarray([0.0], dtype=np.float32)
+    heatmap = np.asarray(
+        [
+            [1.0],
+            [7.0],
+        ],
+        dtype=np.float32,
+    )
+    projected = realtime_dsp.project_heatmap_for_display(
+        heatmap,
+        angle_axis_deg=angle_axis,
+        dr_m=1.0,
+        gui_h=1,
+        gui_w=1,
+        y_max_m=1.5,
+        x_max_m=0.0,
+        projection_mode="cartesian",
+        projection_interp="bilinear",
+        fill_value=float("nan"),
+        y_min_m=1.0,
+    )
+
+    assert projected[0, 0] == np.float32(7.0)
