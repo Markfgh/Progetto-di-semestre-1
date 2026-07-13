@@ -1710,6 +1710,12 @@ def main():
     doppler_single_bin = False
     angle_selected_bin = 0
     doppler_selected_bin = 0
+    vis_angle_diag_vmin = -50.0
+    vis_angle_diag_vmax = 0.0
+    vis_doppler_diag_vmin = -50.0
+    vis_doppler_diag_vmax = 0.0
+    angle_diag_norm_to_peak = True
+    doppler_diag_norm_to_peak = True
     angle_axis_diag = build_angle_axis_deg(ANGLEFFT_BINS)
     angle_axis_finite = angle_axis_diag[np.isfinite(angle_axis_diag)]
     if angle_axis_finite.size > 0:
@@ -1838,6 +1844,7 @@ def main():
     ANGLEFFT_PROFILE_YAXIS_TAG = "anglefft_profile_yaxis"
     ANGLEFFT_IMG_SERIES_TAG = "anglefft_img_series"
     ANGLEFFT_PROFILE_LINE_TAG = "anglefft_profile_line"
+    ANGLEFFT_CMAP_SCALE_TAG = "anglefft_cmap_scale"
     DOPPLERFFT_HEAT_PLOT_TAG = "dopplerfft_heat_plot"
     DOPPLERFFT_PROFILE_PLOT_TAG = "dopplerfft_profile_plot"
     DOPPLERFFT_XAXIS_TAG = "dopplerfft_xaxis"
@@ -1846,10 +1853,17 @@ def main():
     DOPPLERFFT_PROFILE_YAXIS_TAG = "dopplerfft_profile_yaxis"
     DOPPLERFFT_IMG_SERIES_TAG = "dopplerfft_img_series"
     DOPPLERFFT_PROFILE_LINE_TAG = "dopplerfft_profile_line"
+    DOPPLERFFT_CMAP_SCALE_TAG = "dopplerfft_cmap_scale"
     CHK_ANGLE_SINGLE_BIN = "chk_angle_single_bin"
     CHK_DOPPLER_SINGLE_BIN = "chk_doppler_single_bin"
+    CHK_ANGLE_NORM = "chk_angle_norm"
+    CHK_DOPPLER_NORM = "chk_doppler_norm"
     IN_ANGLE_BIN = "in_angle_bin"
     IN_DOPPLER_BIN = "in_doppler_bin"
+    IN_ANGLE_VMIN = "in_angle_vmin"
+    IN_ANGLE_VMAX = "in_angle_vmax"
+    IN_DOPPLER_VMIN = "in_doppler_vmin"
+    IN_DOPPLER_VMAX = "in_doppler_vmax"
     RANGEFFT_LINE_COLORS = [
         (0, 255, 255, 255),    # Ciano
         (255, 255, 0, 255),    # Giallo
@@ -2710,6 +2724,56 @@ def main():
         if dpg.does_item_exist(DOPPLERFFT_PROFILE_PLOT_TAG):
             dpg.configure_item(DOPPLERFFT_PROFILE_PLOT_TAG, show=doppler_single_bin)
 
+    def _read_diag_scale(vmin_tag: str, vmax_tag: str, default_vmin: float, default_vmax: float) -> tuple[float, float]:
+        try:
+            vmin = float(dpg.get_value(vmin_tag)) if dpg.does_item_exist(vmin_tag) else float(default_vmin)
+            vmax = float(dpg.get_value(vmax_tag)) if dpg.does_item_exist(vmax_tag) else float(default_vmax)
+        except (TypeError, ValueError):
+            return float(default_vmin), float(default_vmax)
+        if not np.isfinite(vmin):
+            vmin = float(default_vmin)
+        if not np.isfinite(vmax):
+            vmax = float(default_vmax)
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+        return float(vmin), float(vmax)
+
+    def _diag_norm_enabled(tag: str, default_value: bool) -> bool:
+        try:
+            return bool(dpg.get_value(tag)) if dpg.does_item_exist(tag) else bool(default_value)
+        except Exception:
+            return bool(default_value)
+
+    def _update_diag_colormap_scale(tag: str, vmin: float, vmax: float) -> None:
+        if dpg.does_item_exist(tag):
+            dpg.configure_item(tag, min_scale=float(vmin), max_scale=float(vmax), format=CMAP_NUM_FMT)
+
+    def _normalize_diag_map_to_lut(
+        src_db: np.ndarray,
+        out_norm: np.ndarray,
+        *,
+        vmin: float,
+        vmax: float,
+        norm_to_peak: bool,
+    ) -> float:
+        peak = 0.0
+        if bool(norm_to_peak) and src_db.size > 0:
+            finite_src = src_db[np.isfinite(src_db)]
+            peak = float(np.max(finite_src)) if finite_src.size > 0 else 0.0
+            if peak <= -119.0:
+                peak = 0.0
+            np.subtract(src_db, peak, out=out_norm)
+        else:
+            out_norm[:, :] = src_db
+        denom_local = float(vmax - vmin)
+        if denom_local < 1e-6:
+            denom_local = 1e-6
+        np.subtract(out_norm, float(vmin), out=out_norm)
+        out_norm *= float(1.0 / denom_local)
+        np.clip(out_norm, 0.0, 1.0, out=out_norm)
+        np.nan_to_num(out_norm, copy=False, nan=0.0, posinf=1.0, neginf=0.0)
+        return float(peak)
+
     def _base_off_vscale_for_mode(enabled: bool):
         if enabled:
             vmin = float(VMIN_NORM)
@@ -3310,102 +3374,182 @@ def main():
                                 )
 
                             with dpg.tab(label="Angle"):
-                                dpg.add_checkbox(
-                                    label="Single range bin",
-                                    tag=CHK_ANGLE_SINGLE_BIN,
-                                    default_value=False,
-                                    callback=_on_angle_single_bin,
-                                )
-                                dpg.add_input_int(
-                                    label="Range bin",
-                                    tag=IN_ANGLE_BIN,
-                                    default_value=0,
-                                    min_value=0,
-                                    max_value=max(0, int(fft_plot_h) - 1),
-                                    min_clamped=True,
-                                    max_clamped=True,
-                                    width=180,
-                                )
-                                with dpg.plot(
-                                    tag=ANGLEFFT_HEAT_PLOT_TAG,
-                                    label="Range-Angle FFT",
-                                    width=-1,
-                                    height=500,
-                                    no_menus=True,
-                                ):
-                                    dpg.add_plot_axis(dpg.mvXAxis, label="Angle (deg)", tag=ANGLEFFT_XAXIS_TAG)
-                                    dpg.add_plot_axis(dpg.mvYAxis, label="Range (m)", tag=ANGLEFFT_YAXIS_TAG)
-                                    dpg.add_image_series(
-                                        ANGLEFFT_TEX_TAG,
-                                        bounds_min=(float(angle_axis_min), 0.0),
-                                        bounds_max=(float(angle_axis_max), float(fft_plot_h) * float(dr_plot)),
-                                        tag=ANGLEFFT_IMG_SERIES_TAG,
-                                        parent=ANGLEFFT_YAXIS_TAG,
+                                with dpg.table(header_row=False, policy=dpg.mvTable_SizingStretchProp):
+                                    dpg.add_table_column(init_width_or_weight=1.0, width_stretch=True)
+                                    dpg.add_table_column(init_width_or_weight=70, width_fixed=True)
+                                    with dpg.table_row():
+                                        with dpg.table_cell():
+                                            with dpg.plot(
+                                                tag=ANGLEFFT_HEAT_PLOT_TAG,
+                                                label="Range-Angle FFT",
+                                                width=-1,
+                                                height=500,
+                                                no_menus=True,
+                                            ):
+                                                dpg.add_plot_axis(dpg.mvXAxis, label="Angle (deg)", tag=ANGLEFFT_XAXIS_TAG)
+                                                dpg.add_plot_axis(dpg.mvYAxis, label="Range (m)", tag=ANGLEFFT_YAXIS_TAG)
+                                                dpg.add_image_series(
+                                                    ANGLEFFT_TEX_TAG,
+                                                    bounds_min=(float(angle_axis_min), 0.0),
+                                                    bounds_max=(float(angle_axis_max), float(fft_plot_h) * float(dr_plot)),
+                                                    tag=ANGLEFFT_IMG_SERIES_TAG,
+                                                    parent=ANGLEFFT_YAXIS_TAG,
+                                                )
+                                            with dpg.plot(
+                                                tag=ANGLEFFT_PROFILE_PLOT_TAG,
+                                                label="Angle FFT @ range bin",
+                                                width=-1,
+                                                height=500,
+                                                no_menus=True,
+                                                show=False,
+                                            ):
+                                                dpg.add_plot_axis(dpg.mvXAxis, label="Angle (deg)", tag=ANGLEFFT_PROFILE_XAXIS_TAG)
+                                                dpg.add_plot_axis(dpg.mvYAxis, label="dB", tag=ANGLEFFT_PROFILE_YAXIS_TAG)
+                                                dpg.add_line_series([], [], label="Angle", tag=ANGLEFFT_PROFILE_LINE_TAG, parent=ANGLEFFT_PROFILE_YAXIS_TAG)
+                                        with dpg.table_cell():
+                                            dpg.add_colormap_scale(
+                                                tag=ANGLEFFT_CMAP_SCALE_TAG,
+                                                min_scale=float(vis_angle_diag_vmin),
+                                                max_scale=float(vis_angle_diag_vmax),
+                                                format=CMAP_NUM_FMT,
+                                                width=-1,
+                                                height=500,
+                                                colormap=dpg.mvPlotColormap_Jet,
+                                            )
+                                with dpg.group():
+                                    dpg.add_checkbox(
+                                        label="Single range bin",
+                                        tag=CHK_ANGLE_SINGLE_BIN,
+                                        default_value=False,
+                                        callback=_on_angle_single_bin,
                                     )
-                                with dpg.plot(
-                                    tag=ANGLEFFT_PROFILE_PLOT_TAG,
-                                    label="Angle FFT @ range bin",
-                                    width=-1,
-                                    height=500,
-                                    no_menus=True,
-                                    show=False,
-                                ):
-                                    dpg.add_plot_axis(dpg.mvXAxis, label="Angle (deg)", tag=ANGLEFFT_PROFILE_XAXIS_TAG)
-                                    dpg.add_plot_axis(dpg.mvYAxis, label="dB", tag=ANGLEFFT_PROFILE_YAXIS_TAG)
-                                    dpg.add_line_series([], [], label="Angle", tag=ANGLEFFT_PROFILE_LINE_TAG, parent=ANGLEFFT_PROFILE_YAXIS_TAG)
+                                    dpg.add_checkbox(
+                                        label="Norm to peak",
+                                        tag=CHK_ANGLE_NORM,
+                                        default_value=bool(angle_diag_norm_to_peak),
+                                    )
+                                with dpg.group():
+                                    dpg.add_input_int(
+                                        label="Range bin",
+                                        tag=IN_ANGLE_BIN,
+                                        default_value=0,
+                                        min_value=0,
+                                        max_value=max(0, int(fft_plot_h) - 1),
+                                        min_clamped=True,
+                                        max_clamped=True,
+                                        width=220,
+                                    )
+                                    dpg.add_input_double(
+                                        label="Vmin dB",
+                                        tag=IN_ANGLE_VMIN,
+                                        default_value=float(vis_angle_diag_vmin),
+                                        format="%.0f",
+                                        step=1.0,
+                                        step_fast=10.0,
+                                        width=220,
+                                    )
+                                    dpg.add_input_double(
+                                        label="Vmax dB",
+                                        tag=IN_ANGLE_VMAX,
+                                        default_value=float(vis_angle_diag_vmax),
+                                        format="%.0f",
+                                        step=1.0,
+                                        step_fast=10.0,
+                                        width=220,
+                                    )
                                 dpg.set_axis_limits(ANGLEFFT_XAXIS_TAG, float(angle_axis_min), float(angle_axis_max))
                                 dpg.set_axis_limits(ANGLEFFT_YAXIS_TAG, 0.0, float(vis_fft_xmax))
                                 dpg.set_axis_limits(ANGLEFFT_PROFILE_XAXIS_TAG, float(angle_axis_min), float(angle_axis_max))
-                                dpg.set_axis_limits(ANGLEFFT_PROFILE_YAXIS_TAG, float(vis_fft_vmin), float(vis_fft_vmax))
+                                dpg.set_axis_limits(ANGLEFFT_PROFILE_YAXIS_TAG, float(vis_angle_diag_vmin), float(vis_angle_diag_vmax))
 
                             with dpg.tab(label="Doppler"):
-                                dpg.add_checkbox(
-                                    label="Single range bin",
-                                    tag=CHK_DOPPLER_SINGLE_BIN,
-                                    default_value=False,
-                                    callback=_on_doppler_single_bin,
-                                )
-                                dpg.add_input_int(
-                                    label="Range bin",
-                                    tag=IN_DOPPLER_BIN,
-                                    default_value=0,
-                                    min_value=0,
-                                    max_value=max(0, int(fft_plot_h) - 1),
-                                    min_clamped=True,
-                                    max_clamped=True,
-                                    width=180,
-                                )
-                                with dpg.plot(
-                                    tag=DOPPLERFFT_HEAT_PLOT_TAG,
-                                    label="Range-Doppler FFT",
-                                    width=-1,
-                                    height=500,
-                                    no_menus=True,
-                                ):
-                                    dpg.add_plot_axis(dpg.mvXAxis, label="Doppler (m/s)", tag=DOPPLERFFT_XAXIS_TAG)
-                                    dpg.add_plot_axis(dpg.mvYAxis, label="Range (m)", tag=DOPPLERFFT_YAXIS_TAG)
-                                    dpg.add_image_series(
-                                        DOPPLERFFT_TEX_TAG,
-                                        bounds_min=(float(doppler_axis_min), 0.0),
-                                        bounds_max=(float(doppler_axis_max), float(fft_plot_h) * float(dr_plot)),
-                                        tag=DOPPLERFFT_IMG_SERIES_TAG,
-                                        parent=DOPPLERFFT_YAXIS_TAG,
+                                with dpg.table(header_row=False, policy=dpg.mvTable_SizingStretchProp):
+                                    dpg.add_table_column(init_width_or_weight=1.0, width_stretch=True)
+                                    dpg.add_table_column(init_width_or_weight=70, width_fixed=True)
+                                    with dpg.table_row():
+                                        with dpg.table_cell():
+                                            with dpg.plot(
+                                                tag=DOPPLERFFT_HEAT_PLOT_TAG,
+                                                label="Range-Doppler FFT",
+                                                width=-1,
+                                                height=500,
+                                                no_menus=True,
+                                            ):
+                                                dpg.add_plot_axis(dpg.mvXAxis, label="Doppler (m/s)", tag=DOPPLERFFT_XAXIS_TAG)
+                                                dpg.add_plot_axis(dpg.mvYAxis, label="Range (m)", tag=DOPPLERFFT_YAXIS_TAG)
+                                                dpg.add_image_series(
+                                                    DOPPLERFFT_TEX_TAG,
+                                                    bounds_min=(float(doppler_axis_min), 0.0),
+                                                    bounds_max=(float(doppler_axis_max), float(fft_plot_h) * float(dr_plot)),
+                                                    tag=DOPPLERFFT_IMG_SERIES_TAG,
+                                                    parent=DOPPLERFFT_YAXIS_TAG,
+                                                )
+                                            with dpg.plot(
+                                                tag=DOPPLERFFT_PROFILE_PLOT_TAG,
+                                                label="Doppler FFT @ range bin",
+                                                width=-1,
+                                                height=500,
+                                                no_menus=True,
+                                                show=False,
+                                            ):
+                                                dpg.add_plot_axis(dpg.mvXAxis, label="Doppler (m/s)", tag=DOPPLERFFT_PROFILE_XAXIS_TAG)
+                                                dpg.add_plot_axis(dpg.mvYAxis, label="dB", tag=DOPPLERFFT_PROFILE_YAXIS_TAG)
+                                                dpg.add_line_series([], [], label="Doppler", tag=DOPPLERFFT_PROFILE_LINE_TAG, parent=DOPPLERFFT_PROFILE_YAXIS_TAG)
+                                        with dpg.table_cell():
+                                            dpg.add_colormap_scale(
+                                                tag=DOPPLERFFT_CMAP_SCALE_TAG,
+                                                min_scale=float(vis_doppler_diag_vmin),
+                                                max_scale=float(vis_doppler_diag_vmax),
+                                                format=CMAP_NUM_FMT,
+                                                width=-1,
+                                                height=500,
+                                                colormap=dpg.mvPlotColormap_Jet,
+                                            )
+                                with dpg.group():
+                                    dpg.add_checkbox(
+                                        label="Single range bin",
+                                        tag=CHK_DOPPLER_SINGLE_BIN,
+                                        default_value=False,
+                                        callback=_on_doppler_single_bin,
                                     )
-                                with dpg.plot(
-                                    tag=DOPPLERFFT_PROFILE_PLOT_TAG,
-                                    label="Doppler FFT @ range bin",
-                                    width=-1,
-                                    height=500,
-                                    no_menus=True,
-                                    show=False,
-                                ):
-                                    dpg.add_plot_axis(dpg.mvXAxis, label="Doppler (m/s)", tag=DOPPLERFFT_PROFILE_XAXIS_TAG)
-                                    dpg.add_plot_axis(dpg.mvYAxis, label="dB", tag=DOPPLERFFT_PROFILE_YAXIS_TAG)
-                                    dpg.add_line_series([], [], label="Doppler", tag=DOPPLERFFT_PROFILE_LINE_TAG, parent=DOPPLERFFT_PROFILE_YAXIS_TAG)
+                                    dpg.add_checkbox(
+                                        label="Norm to peak",
+                                        tag=CHK_DOPPLER_NORM,
+                                        default_value=bool(doppler_diag_norm_to_peak),
+                                    )
+                                with dpg.group():
+                                    dpg.add_input_int(
+                                        label="Range bin",
+                                        tag=IN_DOPPLER_BIN,
+                                        default_value=0,
+                                        min_value=0,
+                                        max_value=max(0, int(fft_plot_h) - 1),
+                                        min_clamped=True,
+                                        max_clamped=True,
+                                        width=220,
+                                    )
+                                    dpg.add_input_double(
+                                        label="Vmin dB",
+                                        tag=IN_DOPPLER_VMIN,
+                                        default_value=float(vis_doppler_diag_vmin),
+                                        format="%.0f",
+                                        step=1.0,
+                                        step_fast=10.0,
+                                        width=220,
+                                    )
+                                    dpg.add_input_double(
+                                        label="Vmax dB",
+                                        tag=IN_DOPPLER_VMAX,
+                                        default_value=float(vis_doppler_diag_vmax),
+                                        format="%.0f",
+                                        step=1.0,
+                                        step_fast=10.0,
+                                        width=220,
+                                    )
                                 dpg.set_axis_limits(DOPPLERFFT_XAXIS_TAG, float(doppler_axis_min), float(doppler_axis_max))
                                 dpg.set_axis_limits(DOPPLERFFT_YAXIS_TAG, 0.0, float(vis_fft_xmax))
                                 dpg.set_axis_limits(DOPPLERFFT_PROFILE_XAXIS_TAG, float(doppler_axis_min), float(doppler_axis_max))
-                                dpg.set_axis_limits(DOPPLERFFT_PROFILE_YAXIS_TAG, float(vis_fft_vmin), float(vis_fft_vmax))
+                                dpg.set_axis_limits(DOPPLERFFT_PROFILE_YAXIS_TAG, float(vis_doppler_diag_vmin), float(vis_doppler_diag_vmax))
 
         with dpg.table(header_row=False, resizable=True, policy=dpg.mvTable_SizingFixedFit, parent=TAB_PROCESSED_TAG):
             dpg.add_table_column(init_width_or_weight=340, width_fixed=True)
@@ -3746,9 +3890,13 @@ def main():
                 if dpg.does_item_exist(DOPPLERFFT_YAXIS_TAG):
                     dpg.set_axis_limits(DOPPLERFFT_YAXIS_TAG, 0.0, float(vis_fft_xmax))
                 if dpg.does_item_exist(ANGLEFFT_PROFILE_YAXIS_TAG):
-                    dpg.set_axis_limits(ANGLEFFT_PROFILE_YAXIS_TAG, float(vis_fft_vmin), float(vis_fft_vmax))
+                    angle_vmin_now, angle_vmax_now = _read_diag_scale(IN_ANGLE_VMIN, IN_ANGLE_VMAX, vis_angle_diag_vmin, vis_angle_diag_vmax)
+                    dpg.set_axis_limits(ANGLEFFT_PROFILE_YAXIS_TAG, float(angle_vmin_now), float(angle_vmax_now))
+                    _update_diag_colormap_scale(ANGLEFFT_CMAP_SCALE_TAG, angle_vmin_now, angle_vmax_now)
                 if dpg.does_item_exist(DOPPLERFFT_PROFILE_YAXIS_TAG):
-                    dpg.set_axis_limits(DOPPLERFFT_PROFILE_YAXIS_TAG, float(vis_fft_vmin), float(vis_fft_vmax))
+                    doppler_vmin_now, doppler_vmax_now = _read_diag_scale(IN_DOPPLER_VMIN, IN_DOPPLER_VMAX, vis_doppler_diag_vmin, vis_doppler_diag_vmax)
+                    dpg.set_axis_limits(DOPPLERFFT_PROFILE_YAXIS_TAG, float(doppler_vmin_now), float(doppler_vmax_now))
+                    _update_diag_colormap_scale(DOPPLERFFT_CMAP_SCALE_TAG, doppler_vmin_now, doppler_vmax_now)
 
             polled_rt_viewport = _poll_requested_viewport(
                 x_axis_tag=XAXIS_TAG,
@@ -4107,14 +4255,30 @@ def main():
                         if dpg.does_item_exist(line_tag):
                             y_vals = fft_plot_vals[ant_i, :].tolist()
                             dpg.set_value(line_tag, [x_range_m, y_vals])
-                    diag_denom = float(vis_fft_vmax - vis_fft_vmin)
-                    if diag_denom < 1e-6:
-                        diag_denom = 1e-6
+                    vis_angle_diag_vmin, vis_angle_diag_vmax = _read_diag_scale(
+                        IN_ANGLE_VMIN,
+                        IN_ANGLE_VMAX,
+                        vis_angle_diag_vmin,
+                        vis_angle_diag_vmax,
+                    )
+                    vis_doppler_diag_vmin, vis_doppler_diag_vmax = _read_diag_scale(
+                        IN_DOPPLER_VMIN,
+                        IN_DOPPLER_VMAX,
+                        vis_doppler_diag_vmin,
+                        vis_doppler_diag_vmax,
+                    )
+                    angle_diag_norm_to_peak = _diag_norm_enabled(CHK_ANGLE_NORM, angle_diag_norm_to_peak)
+                    doppler_diag_norm_to_peak = _diag_norm_enabled(CHK_DOPPLER_NORM, doppler_diag_norm_to_peak)
+                    _update_diag_colormap_scale(ANGLEFFT_CMAP_SCALE_TAG, vis_angle_diag_vmin, vis_angle_diag_vmax)
+                    _update_diag_colormap_scale(DOPPLERFFT_CMAP_SCALE_TAG, vis_doppler_diag_vmin, vis_doppler_diag_vmax)
 
-                    np.subtract(anglefft_frame, float(vis_fft_vmin), out=angle_diag_norm_frame)
-                    angle_diag_norm_frame *= float(1.0 / diag_denom)
-                    np.clip(angle_diag_norm_frame, 0.0, 1.0, out=angle_diag_norm_frame)
-                    np.nan_to_num(angle_diag_norm_frame, copy=False, nan=0.0, posinf=1.0, neginf=0.0)
+                    angle_peak_db = _normalize_diag_map_to_lut(
+                        anglefft_frame,
+                        angle_diag_norm_frame,
+                        vmin=vis_angle_diag_vmin,
+                        vmax=vis_angle_diag_vmax,
+                        norm_to_peak=angle_diag_norm_to_peak,
+                    )
                     np.multiply(angle_diag_norm_frame, lut_last, out=angle_diag_norm_frame)
                     np.rint(angle_diag_norm_frame, out=angle_diag_norm_frame)
                     angle_diag_lut_idx[:, :] = angle_diag_norm_frame
@@ -4123,10 +4287,13 @@ def main():
                     if dpg.does_item_exist(ANGLEFFT_TEX_TAG):
                         dpg.set_value(ANGLEFFT_TEX_TAG, angle_diag_tex_buf)
 
-                    np.subtract(dopplerfft_frame, float(vis_fft_vmin), out=doppler_diag_norm_frame)
-                    doppler_diag_norm_frame *= float(1.0 / diag_denom)
-                    np.clip(doppler_diag_norm_frame, 0.0, 1.0, out=doppler_diag_norm_frame)
-                    np.nan_to_num(doppler_diag_norm_frame, copy=False, nan=0.0, posinf=1.0, neginf=0.0)
+                    doppler_peak_db = _normalize_diag_map_to_lut(
+                        dopplerfft_frame,
+                        doppler_diag_norm_frame,
+                        vmin=vis_doppler_diag_vmin,
+                        vmax=vis_doppler_diag_vmax,
+                        norm_to_peak=doppler_diag_norm_to_peak,
+                    )
                     np.multiply(doppler_diag_norm_frame, lut_last, out=doppler_diag_norm_frame)
                     np.rint(doppler_diag_norm_frame, out=doppler_diag_norm_frame)
                     doppler_diag_lut_idx[:, :] = doppler_diag_norm_frame
@@ -4140,9 +4307,9 @@ def main():
                     if dpg.does_item_exist(DOPPLERFFT_YAXIS_TAG):
                         dpg.set_axis_limits(DOPPLERFFT_YAXIS_TAG, 0.0, float(max_r_m))
                     if dpg.does_item_exist(ANGLEFFT_PROFILE_YAXIS_TAG):
-                        dpg.set_axis_limits(ANGLEFFT_PROFILE_YAXIS_TAG, float(vis_fft_vmin), float(vis_fft_vmax))
+                        dpg.set_axis_limits(ANGLEFFT_PROFILE_YAXIS_TAG, float(vis_angle_diag_vmin), float(vis_angle_diag_vmax))
                     if dpg.does_item_exist(DOPPLERFFT_PROFILE_YAXIS_TAG):
-                        dpg.set_axis_limits(DOPPLERFFT_PROFILE_YAXIS_TAG, float(vis_fft_vmin), float(vis_fft_vmax))
+                        dpg.set_axis_limits(DOPPLERFFT_PROFILE_YAXIS_TAG, float(vis_doppler_diag_vmin), float(vis_doppler_diag_vmax))
 
                     try:
                         angle_selected_bin = int(dpg.get_value(IN_ANGLE_BIN)) if dpg.does_item_exist(IN_ANGLE_BIN) else int(angle_selected_bin)
@@ -4161,9 +4328,15 @@ def main():
 
                     if angle_single_bin and dpg.does_item_exist(ANGLEFFT_PROFILE_LINE_TAG):
                         angle_x_vals = np.nan_to_num(angle_axis_diag, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False).tolist()
-                        dpg.set_value(ANGLEFFT_PROFILE_LINE_TAG, [angle_x_vals, anglefft_frame[int(angle_selected_bin), :].tolist()])
+                        angle_y_vals = anglefft_frame[int(angle_selected_bin), :]
+                        if angle_diag_norm_to_peak:
+                            angle_y_vals = angle_y_vals - np.float32(angle_peak_db)
+                        dpg.set_value(ANGLEFFT_PROFILE_LINE_TAG, [angle_x_vals, angle_y_vals.astype(np.float32, copy=False).tolist()])
                     if doppler_single_bin and dpg.does_item_exist(DOPPLERFFT_PROFILE_LINE_TAG):
-                        dpg.set_value(DOPPLERFFT_PROFILE_LINE_TAG, [doppler_axis_diag.astype(np.float32, copy=False).tolist(), dopplerfft_frame[int(doppler_selected_bin), :].tolist()])
+                        doppler_y_vals = dopplerfft_frame[int(doppler_selected_bin), :]
+                        if doppler_diag_norm_to_peak:
+                            doppler_y_vals = doppler_y_vals - np.float32(doppler_peak_db)
+                        dpg.set_value(DOPPLERFFT_PROFILE_LINE_TAG, [doppler_axis_diag.astype(np.float32, copy=False).tolist(), doppler_y_vals.astype(np.float32, copy=False).tolist()])
                 if DEBUG_STATS:
                     img_updates += 1
 
