@@ -9,11 +9,11 @@ import numpy as np
 
 AvgMode = Literal["none", "loop", "frame", "both"]
 BpMode = Literal["sar_only", "mimo_sar"]
-MotionMode = Literal["static_zero_doppler", "all_doppler_incoherent"]
+MotionMode = Literal["static_zero_doppler"]
 
 _AVG_MODES = {"none", "loop", "frame", "both"}
 _BP_MODES = {"sar_only", "mimo_sar"}
-_MOTION_MODES = {"static_zero_doppler", "all_doppler_incoherent"}
+_MOTION_MODES = {"static_zero_doppler"}
 
 
 @dataclass(frozen=True)
@@ -38,6 +38,14 @@ class MimoBackProjectionPlan:
     entries: tuple[MimoBackProjectionPlanEntry, ...]
 
 
+@dataclass(frozen=True)
+class SyntheticApertureData:
+    snapshot_cube: np.ndarray
+    x_position_m: np.ndarray
+    x_phase_center_m: np.ndarray
+    x_element_m: np.ndarray
+
+
 def avg_mode_normalize(mode: str | None) -> AvgMode:
     mode_s = str(mode or "both").strip().lower()
     if mode_s not in _AVG_MODES:
@@ -55,7 +63,10 @@ def bp_mode_normalize(mode: str | None) -> BpMode:
 def motion_mode_normalize(mode: str | None) -> MotionMode:
     mode_s = str(mode or "static_zero_doppler").strip().lower()
     if mode_s not in _MOTION_MODES:
-        return "static_zero_doppler"
+        raise ValueError(
+            "motion_mode non valido per mimo_sar: "
+            f"{mode!r}. Valore supportato: 'static_zero_doppler'."
+        )
     return mode_s  # type: ignore[return-value]
 
 
@@ -431,6 +442,12 @@ def prepare_mimo_snapshots(
     motion_mode: MotionMode,
     window_doppler: np.ndarray | None = None,
 ) -> np.ndarray:
+    """Prepare offline MIMO-SAR snapshots for a static scene using zero Doppler.
+
+    Pipeline:
+    range FFT -> Doppler FFT sui loop -> compensazione TDM-MIMO ->
+    selezione Doppler zero -> output [pos, frame, ant, bin].
+    """
     raw = np.asarray(raw_range_fft, dtype=np.complex64)
     if raw.ndim != 6:
         raise ValueError(f"raw_range_fft shape non valido: {raw.shape!r}")
@@ -442,7 +459,7 @@ def prepare_mimo_snapshots(
     if int(n_tx_eff) != n_tx_i:
         raise ValueError(f"raw_range_fft asse tx={n_tx_eff}, atteso n_tx={n_tx_i}")
 
-    motion_mode_eff = motion_mode_normalize(motion_mode)
+    motion_mode_normalize(motion_mode)
     win = _build_doppler_window(window_doppler, int(n_loops))
     t0 = time.perf_counter()
 
@@ -453,32 +470,103 @@ def prepare_mimo_snapshots(
     doppler_cube = np.fft.fftshift(doppler_cube, axes=2).astype(np.complex64, copy=False)
     doppler_cube = _apply_tdm_post_fft_compensation(doppler_cube, n_tx_i)
 
-    if motion_mode_eff == "static_zero_doppler":
-        zero_idx = int(n_loops // 2)
-        out = doppler_cube[:, :, zero_idx, :, :, :].reshape(
-            int(n_pos),
-            int(n_frames),
-            int(n_tx_i * n_rx),
-            int(n_bins),
-        )
-        print("[OFFLINE INFO] prepare_mimo_snapshots motion_mode=static_zero_doppler doppler_bins_used=1")
-        return out.astype(np.complex64, copy=False)
-
-    out = doppler_cube.reshape(
+    zero_idx = int(n_loops // 2)
+    out = doppler_cube[:, :, zero_idx, :, :, :].reshape(
         int(n_pos),
         int(n_frames),
-        int(n_loops),
         int(n_tx_i * n_rx),
         int(n_bins),
     ).astype(np.complex64, copy=False)
     prep_ms = np.float32((time.perf_counter() - t0) * 1000.0)
-    est_bp_snapshots = int(n_frames) * int(n_loops)
+    est_bp_snapshots = int(n_frames)
     print(
         "[OFFLINE INFO] prepare_mimo_snapshots "
-        f"motion_mode=all_doppler_incoherent doppler_bins_used={int(n_loops)} "
+        "motion_mode=static_zero_doppler doppler_bins_used=1 "
         f"prep_ms={float(prep_ms):.1f} est_bp_snapshots={est_bp_snapshots}"
     )
     return out
+
+
+def prepare_synthetic_aperture_data(
+    zero_doppler_snapshots: np.ndarray,
+    *,
+    selected_positions: np.ndarray,
+    x_pitch_m: float,
+    x_tx_ant_m: np.ndarray,
+    x_rx_ant_m: np.ndarray,
+) -> SyntheticApertureData:
+    """Flatten selected SAR positions and MIMO phase centers into one aperture.
+
+    Input zero_doppler_snapshots shape: [pos, frame, ant, range_bin]
+    Output snapshot_cube shape: [frame, 1, range_bin, synthetic_ant]
+    """
+    snapshots = np.asarray(zero_doppler_snapshots, dtype=np.complex64)
+    if snapshots.ndim != 4:
+        raise ValueError(
+            "zero_doppler_snapshots shape non valido per synthetic aperture: "
+            f"{snapshots.shape!r}; atteso [pos, frame, ant, bin]."
+        )
+
+    n_pos, n_frames, n_ant, n_bins = snapshots.shape
+    pos_values = np.asarray(selected_positions, dtype=np.float32).reshape(-1)
+    x_tx = np.asarray(x_tx_ant_m, dtype=np.float32).reshape(-1)
+    x_rx = np.asarray(x_rx_ant_m, dtype=np.float32).reshape(-1)
+    if pos_values.size != int(n_pos):
+        raise ValueError(
+            f"selected_positions size={pos_values.size} != aperture positions={int(n_pos)}"
+        )
+    if x_tx.size != int(n_ant) or x_rx.size != int(n_ant):
+        raise ValueError(
+            f"x_tx_ant_m/x_rx_ant_m size non coerente con asse antenna: "
+            f"{x_tx.size}/{x_rx.size} vs {int(n_ant)}"
+        )
+    pitch = float(x_pitch_m)
+    if not np.isfinite(pitch) or pitch <= 0.0:
+        raise ValueError(f"x_pitch_m non valido: {x_pitch_m!r}")
+
+    x_position_m = (pos_values * np.float32(pitch)).astype(np.float32, copy=False)
+    x_phase_center_m = (
+        np.float32(0.5) * (x_tx + x_rx).astype(np.float32, copy=False)
+    ).astype(np.float32, copy=False)
+    x_element_m = (
+        x_position_m[:, None] + x_phase_center_m[None, :]
+    ).astype(np.float32, copy=False)
+    flattened = np.transpose(snapshots, (1, 3, 0, 2)).reshape(
+        int(n_frames),
+        int(n_bins),
+        int(n_pos * n_ant),
+    )
+    snapshot_cube = flattened[:, None, :, :].astype(np.complex64, copy=False)
+    return SyntheticApertureData(
+        snapshot_cube=snapshot_cube,
+        x_position_m=x_position_m.astype(np.float32, copy=False),
+        x_phase_center_m=x_phase_center_m.astype(np.float32, copy=False),
+        x_element_m=x_element_m.reshape(-1).astype(np.float32, copy=False),
+    )
+
+
+def synthetic_aperture_uniform_spacing_lambda(
+    x_element_m: np.ndarray,
+    *,
+    wavelength_m: float,
+    atol: float = 1e-6,
+) -> float | None:
+    phase_centers_lambda = (
+        np.asarray(x_element_m, dtype=np.float32).reshape(-1) / np.float32(float(wavelength_m))
+    ).astype(np.float32, copy=False)
+    if phase_centers_lambda.size <= 1:
+        return 0.0
+    diffs = np.diff(phase_centers_lambda.astype(np.float64, copy=False))
+    if diffs.size <= 0:
+        return 0.0
+    ref = float(diffs[0])
+    if not np.isfinite(ref) or abs(ref) <= float(atol):
+        return None
+    if not np.all(np.isfinite(diffs)):
+        return None
+    if not np.allclose(diffs, ref, rtol=0.0, atol=float(atol)):
+        return None
+    return float(ref)
 
 
 def back_projection_image(
@@ -724,56 +812,30 @@ def back_projection_image_mimo(
     coherent_sum: bool = True,
     bp_plan: MimoBackProjectionPlan | None = None,
 ) -> np.ndarray:
-    motion_mode_eff = motion_mode_normalize(motion_mode)
-    total_power = np.zeros_like(x_grid, dtype=np.float32)
-
-    if motion_mode_eff == "static_zero_doppler":
-        if range_fft_sel.ndim != 4:
-            raise ValueError(
-                f"range_fft_sel shape non valido per motion_mode=static_zero_doppler: {range_fft_sel.shape!r}"
-            )
-        n_frames = int(range_fft_sel.shape[1])
-        for frame_i in range(n_frames):
-            total_power += back_projection_power_mimo_snapshot(
-                range_fft_sel[:, frame_i, :, :],
-                x_pos_m,
-                x_tx_ant_m,
-                x_rx_ant_m,
-                x_grid,
-                y_grid,
-                dr_m=dr_m,
-                fc_hz=fc_hz,
-                c_m_s=c_m_s,
-                max_bin=max_bin,
-                phase_sign=phase_sign,
-                chunk_size=chunk_size,
-                coherent_sum=coherent_sum,
-                bp_plan=bp_plan,
-            )
-        return power_image_to_db(total_power)
-
-    if range_fft_sel.ndim != 5:
+    motion_mode_normalize(motion_mode)
+    if range_fft_sel.ndim != 4:
         raise ValueError(
-            f"range_fft_sel shape non valido per motion_mode=all_doppler_incoherent: {range_fft_sel.shape!r}"
+            "range_fft_sel shape non valido per mimo_sar static_zero_doppler: "
+            f"{range_fft_sel.shape!r}; atteso [pos, frame, ant, bin]."
         )
+
+    total_power = np.zeros_like(x_grid, dtype=np.float32)
     n_frames = int(range_fft_sel.shape[1])
-    n_doppler = int(range_fft_sel.shape[2])
     for frame_i in range(n_frames):
-        for doppler_i in range(n_doppler):
-            total_power += back_projection_power_mimo_snapshot(
-                range_fft_sel[:, frame_i, doppler_i, :, :],
-                x_pos_m,
-                x_tx_ant_m,
-                x_rx_ant_m,
-                x_grid,
-                y_grid,
-                dr_m=dr_m,
-                fc_hz=fc_hz,
-                c_m_s=c_m_s,
-                max_bin=max_bin,
-                phase_sign=phase_sign,
-                chunk_size=chunk_size,
-                coherent_sum=coherent_sum,
-                bp_plan=bp_plan,
-            )
+        total_power += back_projection_power_mimo_snapshot(
+            range_fft_sel[:, frame_i, :, :],
+            x_pos_m,
+            x_tx_ant_m,
+            x_rx_ant_m,
+            x_grid,
+            y_grid,
+            dr_m=dr_m,
+            fc_hz=fc_hz,
+            c_m_s=c_m_s,
+            max_bin=max_bin,
+            phase_sign=phase_sign,
+            chunk_size=chunk_size,
+            coherent_sum=coherent_sum,
+            bp_plan=bp_plan,
+        )
     return power_image_to_db(total_power)

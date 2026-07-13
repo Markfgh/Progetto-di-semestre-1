@@ -1648,7 +1648,7 @@ def main():
         print(
             f"[OFFLINE] ready pos={offline_info.get('pos_min')}..{offline_info.get('pos_max')} "
             f"default={offline_info.get('x_start')}..{offline_info.get('x_end')} "
-            f"motion={offline_info.get('motion_mode')}"
+            f"alg={offline_info.get('algorithm')} motion={offline_info.get('motion_mode')}"
         )
     except Exception as exc:
         offline_error = str(exc)
@@ -3426,6 +3426,7 @@ def main():
                         pass
                     off_status_text = (
                         f"x={info.get('x_start')}:{info.get('x_end')} | "
+                        f"alg={info.get('algorithm', 'backprojection')} | "
                         f"motion={info.get('motion_mode')} | "
                         f"dop={info.get('doppler_bins_used', 'n/a')} | "
                         f"geom={info.get('geometry_source', 'n/a')} | "

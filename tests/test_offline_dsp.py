@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from offline_dsp import (
     _interp_cubic_complex,
@@ -9,6 +10,8 @@ from offline_dsp import (
     back_projection_power_mimo_snapshot,
     back_projection_image_mimo,
     build_mimo_geometry,
+    motion_mode_normalize,
+    prepare_synthetic_aperture_data,
     prepare_mimo_snapshots,
 )
 
@@ -237,6 +240,70 @@ def test_mimo_bp_plan_matches_direct_path() -> None:
     np.testing.assert_allclose(planned, direct, atol=1e-5, rtol=1e-5)
 
 
+def test_motion_mode_normalize_accepts_static_zero_doppler() -> None:
+    assert motion_mode_normalize("static_zero_doppler") == "static_zero_doppler"
+
+
+def test_motion_mode_normalize_rejects_legacy_all_doppler_incoherent() -> None:
+    with pytest.raises(ValueError, match="static_zero_doppler"):
+        motion_mode_normalize("all_doppler_incoherent")
+
+
+def test_prepare_mimo_snapshots_returns_4d_and_uses_all_virtual_antennas() -> None:
+    n_pos, n_frames, n_loops, n_tx, n_rx, n_bins = 2, 3, 8, 2, 4, 16
+    raw = np.zeros((n_pos, n_frames, n_loops, n_tx, n_rx, n_bins), dtype=np.complex64)
+
+    prepared = prepare_mimo_snapshots(raw, n_tx=n_tx, motion_mode="static_zero_doppler")
+
+    assert prepared.shape == (n_pos, n_frames, n_tx * n_rx, n_bins)
+
+
+def test_prepare_synthetic_aperture_data_flattens_selected_positions_and_antennas() -> None:
+    zero_doppler = np.arange(4 * 2 * 8 * 3, dtype=np.float32).reshape(4, 2, 8, 3).astype(np.complex64)
+    selected_positions = np.asarray([0, 2, 5, 9], dtype=np.int32)
+    x_tx_ant_m, x_rx_ant_m = build_mimo_geometry(2, 4, fc_hz=77e9, c_m_s=3e8)
+
+    synthetic = prepare_synthetic_aperture_data(
+        zero_doppler,
+        selected_positions=selected_positions,
+        x_pitch_m=0.1,
+        x_tx_ant_m=x_tx_ant_m,
+        x_rx_ant_m=x_rx_ant_m,
+    )
+
+    expected_cube = np.transpose(zero_doppler, (1, 3, 0, 2)).reshape(2, 1, 3, 32)
+    expected_phase_centers = (np.float32(0.5) * (x_tx_ant_m + x_rx_ant_m)).astype(np.float32, copy=False)
+    expected_positions_m = selected_positions.astype(np.float32) * np.float32(0.1)
+    expected_x = (expected_positions_m[:, None] + expected_phase_centers[None, :]).reshape(-1)
+
+    assert synthetic.snapshot_cube.shape == (2, 1, 3, 32)
+    np.testing.assert_allclose(synthetic.snapshot_cube, expected_cube, atol=1e-6, rtol=0.0)
+    np.testing.assert_allclose(synthetic.x_position_m, expected_positions_m, atol=1e-6, rtol=0.0)
+    np.testing.assert_allclose(synthetic.x_element_m, expected_x, atol=1e-6, rtol=0.0)
+
+
+def test_prepare_synthetic_aperture_data_preserves_noncontiguous_physical_spacing() -> None:
+    zero_doppler = np.zeros((2, 1, 8, 2), dtype=np.complex64)
+    selected_positions = np.asarray([1, 4], dtype=np.int32)
+    x_tx_ant_m, x_rx_ant_m = build_mimo_geometry(2, 4, fc_hz=77e9, c_m_s=3e8)
+
+    synthetic = prepare_synthetic_aperture_data(
+        zero_doppler,
+        selected_positions=selected_positions,
+        x_pitch_m=0.05,
+        x_tx_ant_m=x_tx_ant_m,
+        x_rx_ant_m=x_rx_ant_m,
+    )
+
+    x_by_pos = synthetic.x_element_m.reshape(2, 8)
+    np.testing.assert_allclose(
+        x_by_pos[1, 0] - x_by_pos[0, 0],
+        np.float32(0.15),
+        atol=1e-6,
+        rtol=0.0,
+    )
+
+
 def test_tdm_compensation_static_target_survives_zero_bin() -> None:
     n_pos, n_frames, n_loops, n_tx, n_rx, n_bins, target_bin = 1, 1, 32, 2, 4, 64, 18
 
@@ -244,31 +311,11 @@ def test_tdm_compensation_static_target_survives_zero_bin() -> None:
     raw[:, :, :, :, :, target_bin] = np.complex64(1.0 + 0.0j)
 
     zero_bin = prepare_mimo_snapshots(raw, n_tx=n_tx, motion_mode="static_zero_doppler")
-    all_bins = prepare_mimo_snapshots(raw, n_tx=n_tx, motion_mode="all_doppler_incoherent")
+    assert zero_bin.shape == (n_pos, n_frames, n_tx * n_rx, n_bins)
 
-    zero_energy = float(np.sum(np.abs(zero_bin[:, :, :, target_bin]) ** 2))
-    total_energy = float(np.sum(np.abs(all_bins[:, :, :, :, target_bin]) ** 2))
-    assert zero_energy / max(total_energy, 1e-12) >= 0.85
-
-
-def test_tdm_static_target_does_not_split_to_nyquist() -> None:
-    n_pos, n_frames, n_loops, n_tx, n_rx, n_bins, target_bin = 1, 1, 32, 2, 4, 64, 18
-
-    raw = np.zeros((n_pos, n_frames, n_loops, n_tx, n_rx, n_bins), dtype=np.complex64)
-    raw[:, :, :, :, :, target_bin] = np.complex64(1.0 + 0.0j)
-
-    all_bins = prepare_mimo_snapshots(raw, n_tx=n_tx, motion_mode="all_doppler_incoherent")
-    doppler_energy = np.sum(
-        np.abs(all_bins[:, :, :, :, target_bin]) ** np.float32(2.0),
-        axis=(0, 1, 3),
-        dtype=np.float32,
-    )
-
-    zero_idx = int(n_loops // 2)
-    nyquist_idx = 0
-    total_energy = float(np.sum(doppler_energy, dtype=np.float32))
-    assert float(doppler_energy[zero_idx]) / max(total_energy, 1e-12) >= 0.99
-    assert float(doppler_energy[nyquist_idx]) / max(total_energy, 1e-12) <= 1e-6
+    zero_energy = float(np.sum(np.abs(zero_bin[:, :, :, target_bin]) ** 2, dtype=np.float32))
+    expected_energy = float((n_tx * n_rx) * (n_loops**2))
+    assert zero_energy >= 0.99 * expected_energy
 
 
 def test_tdm_compensation_moving_target_attenuated_in_zero_bin() -> None:
@@ -287,19 +334,36 @@ def test_tdm_compensation_moving_target_attenuated_in_zero_bin() -> None:
         raw[:, :, :, tx_i, :, target_bin] = phase.reshape(1, 1, n_loops, 1)
 
     zero_bin = prepare_mimo_snapshots(raw, n_tx=n_tx, motion_mode="static_zero_doppler")
-    all_bins = prepare_mimo_snapshots(raw, n_tx=n_tx, motion_mode="all_doppler_incoherent")
 
-    zero_energy = float(np.sum(np.abs(zero_bin[:, :, :, target_bin]) ** 2))
-    doppler_energy = np.sum(np.abs(all_bins[:, :, :, :, target_bin]) ** np.float32(2.0), axis=(0, 1, 3), dtype=np.float32)
-    expected_idx = int(n_loops // 2 + target_doppler_bin)
-    correct_doppler_energy = float(np.max(doppler_energy))
-    assert int(np.argmax(doppler_energy)) == expected_idx
+    zero_energy = float(np.sum(np.abs(zero_bin[:, :, :, target_bin]) ** np.float32(2.0), dtype=np.float32))
+    expected_peak_energy = float((n_tx * n_rx) * (n_loops**2))
     zero_db = 10.0 * np.log10(max(zero_energy, 1e-12))
-    correct_db = 10.0 * np.log10(max(correct_doppler_energy, 1e-12))
+    correct_db = 10.0 * np.log10(max(expected_peak_energy, 1e-12))
     assert zero_db <= correct_db - 15.0
 
-    total_doppler = float(np.sum(doppler_energy))
-    assert correct_doppler_energy / max(total_doppler, 1e-12) >= 0.99
+
+def test_back_projection_image_mimo_rejects_5d_input() -> None:
+    range_fft_sel = np.zeros((2, 1, 3, 8, 16), dtype=np.complex64)
+    x_pos_m = np.asarray([-0.01, 0.01], dtype=np.float32)
+    x_tx_ant_m = np.zeros(8, dtype=np.float32)
+    x_rx_ant_m = np.zeros(8, dtype=np.float32)
+    x_grid = np.zeros((4, 4), dtype=np.float32)
+    y_grid = np.ones((4, 4), dtype=np.float32)
+
+    with pytest.raises(ValueError, match="atteso \\[pos, frame, ant, bin\\]"):
+        back_projection_image_mimo(
+            range_fft_sel,
+            x_pos_m,
+            x_tx_ant_m,
+            x_rx_ant_m,
+            x_grid,
+            y_grid,
+            dr_m=0.05,
+            fc_hz=77e9,
+            c_m_s=3e8,
+            max_bin=16,
+            motion_mode="static_zero_doppler",
+        )
 
 
 def test_cubic_vs_linear_interpolation() -> None:

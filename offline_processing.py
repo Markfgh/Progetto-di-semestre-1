@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import re
 import json
@@ -18,10 +18,30 @@ import scipy.fft as fft
 import yaml
 
 from realtime_dsp import (
+    AngleProcessingConfig,
+    BackgroundSubtractionConfig,
+    BackgroundSubtractionState,
     DisplayViewport,
+    DisplayProjectionConfig,
+    PostRangeFftFilterConfig,
+    RealtimeDSPConfig,
+    VirtualArrayGeometry,
+    angle_processing_from_yaml_dict,
+    apply_background_subtraction,
+    apply_slow_time_filter,
     build_display_viewport,
+    build_angle_axis_deg,
+    build_angle_steering_matrix,
+    build_display_projection_lut,
+    compute_angle_heatmap,
     clamp_display_viewport,
+    display_post_range_fft_filters_from_yaml_dict,
     display_viewport_signature,
+    display_projection_from_yaml_dict,
+    project_heatmap_for_display,
+    sanitize_display_post_range_fft_filters,
+    subtract_selected_mean,
+    window_type_normalize,
 )
 from offline_dsp import (
     AvgMode,
@@ -35,8 +55,11 @@ from offline_dsp import (
     build_mimo_geometry as _build_mimo_geometry,
     motion_mode_normalize as _motion_mode_normalize,
     phase_sign_normalize as _phase_sign_normalize,
+    power_image_to_db as _power_image_to_db,
     prepare_mimo_snapshots as _prepare_mimo_snapshots,
+    prepare_synthetic_aperture_data as _prepare_synthetic_aperture_data,
     reduce_avg_mode as _reduce_avg_mode,
+    synthetic_aperture_uniform_spacing_lambda as _synthetic_aperture_uniform_spacing_lambda,
 )
 from shutdown_utils import cleanup_processes, close_queues
 
@@ -44,6 +67,7 @@ _CAPTURE_FILE_RE = re.compile(r"^capture_pos(-?\d+)\.bin$")
 _CAPTURE_HEADER_MAGIC = b"RTPBIN1\x00"
 _CAPTURE_HEADER_PREFIX_LEN = len(_CAPTURE_HEADER_MAGIC) + 4
 _CAPTURE_HEADER_MAX_LEN = 256 * 1024
+_RECONSTRUCTION_ALGORITHMS = {"backprojection", "synthetic_range_angle"}
 
 
 @dataclass(frozen=True)
@@ -118,6 +142,20 @@ class SARData:
     chirps: int
     rx: int
     tx: int
+
+
+@dataclass(frozen=True)
+class OfflineSyntheticRangeAngleConfig:
+    use_realtime_filters: bool
+    window_range: str
+    window_doppler: str
+    window_angle: str
+    zero_after_range_fft_bins: int
+    post_range_fft_filters: PostRangeFftFilterConfig
+    angle_processing: AngleProcessingConfig
+    nfft_angle: int
+    projection: DisplayProjectionConfig
+    filter_warnings: tuple[str, ...] = ()
 
 
 class SARReader:
@@ -513,6 +551,16 @@ def _pick(*values):
     return None
 
 
+def _reconstruction_algorithm_normalize(value: Any) -> str:
+    algorithm = str(value or "backprojection").strip().lower()
+    if algorithm not in _RECONSTRUCTION_ALGORITHMS:
+        raise ValueError(
+            "reconstruction.algorithm non valido: "
+            f"{value!r}. Valori supportati: 'backprojection', 'synthetic_range_angle'."
+        )
+    return algorithm
+
+
 def _to_int(field_name: str, value) -> int:
     if value is None:
         raise ValueError(f"{field_name} mancante")
@@ -644,9 +692,6 @@ def _read_default_motion_mode(offline_config_path: str | Path) -> MotionMode:
     raw_motion = bp_cfg.get("motion_mode", None)
     if raw_motion is not None:
         return _motion_mode_normalize(str(raw_motion))
-    if bp_cfg.get("avg_mode", None) is not None:
-        motion_mode, _ = _motion_mode_from_legacy_avg_mode(bp_cfg.get("avg_mode"))
-        return motion_mode
     return "static_zero_doppler"
 
 
@@ -659,6 +704,41 @@ def _read_fft_workers(fallback_capture_cfg: str | Path) -> int:
     except (TypeError, ValueError):
         workers = 1
     return max(1, workers)
+
+
+def _build_window_1d(window_type: str, size: int) -> np.ndarray:
+    window = str(window_type).strip().lower()
+    size_i = max(1, int(size))
+    if window in {"none", "rectangular"}:
+        return np.ones(size_i, dtype=np.float32)
+    if window == "hanning":
+        return np.hanning(size_i).astype(np.float32, copy=False)
+    if window == "hamming":
+        return np.hamming(size_i).astype(np.float32, copy=False)
+    if window == "blackman":
+        return np.blackman(size_i).astype(np.float32, copy=False)
+    raise ValueError(f"window type non valido: {window_type!r}")
+
+
+def _offline_sar_range_angle_filters_enabled(cfg: OfflineSyntheticRangeAngleConfig) -> tuple[str, ...]:
+    enabled: list[str] = []
+    if cfg.use_realtime_filters:
+        enabled.append("range_window")
+        if int(cfg.zero_after_range_fft_bins) > 0:
+            enabled.append("zero_after_range_fft_bins")
+        if cfg.post_range_fft_filters.mean_after_range_fft.enabled:
+            enabled.append("mean_after_range_fft")
+        if cfg.post_range_fft_filters.slow_time.enabled and cfg.post_range_fft_filters.slow_time.mode != "none":
+            enabled.append(f"slow_time:{cfg.post_range_fft_filters.slow_time.mode}")
+        if cfg.post_range_fft_filters.background_subtraction.enabled:
+            enabled.append(f"background:{cfg.post_range_fft_filters.background_subtraction.mode}")
+        if cfg.post_range_fft_filters.loop_average_after_background.enabled:
+            enabled.append("loop_average_after_background")
+        if str(cfg.window_doppler) not in {"none", "rectangular"}:
+            enabled.append("window_doppler")
+        if str(cfg.window_angle) not in {"none", "rectangular"}:
+            enabled.append("window_angle")
+    return tuple(enabled)
 
 
 def _to_bool(field_name: str, value: Any) -> bool:
@@ -744,15 +824,6 @@ def _resolve_bp_offsets_m(
     return (offsets_lambda * np.float32(float(wavelength_m))).astype(np.float32, copy=False)
 
 
-def _motion_mode_from_legacy_avg_mode(avg_mode_raw: Any) -> tuple[MotionMode, str]:
-    legacy = _avg_mode_normalize(None if avg_mode_raw is None else str(avg_mode_raw))
-    motion_mode: MotionMode = "all_doppler_incoherent" if legacy == "none" else "static_zero_doppler"
-    return (
-        motion_mode,
-        f"[OFFLINE WARN] bp.avg_mode={legacy} e' deprecato in mimo_sar; using motion_mode={motion_mode}.",
-    )
-
-
 def _append_deprecated_mimo_geometry_warnings(
     *,
     warnings: list[str],
@@ -775,13 +846,133 @@ def _append_deprecated_mimo_geometry_warnings(
             )
 
 
+def _read_offline_sar_range_angle_cfg(
+    cfg: dict[str, Any],
+    fallback_cfg: dict[str, Any],
+) -> OfflineSyntheticRangeAngleConfig:
+    branch = cfg.get("offline_sar_range_angle", {}) or {}
+    fallback_dsp = fallback_cfg.get("dsp", {}) or {}
+    fallback_display_filters = fallback_dsp.get("display_filters", {}) or {}
+    fallback_display = fallback_cfg.get("display", {}) or {}
+
+    use_realtime_filters = bool(branch.get("use_realtime_filters", True))
+    window_range = window_type_normalize(
+        _pick(branch.get("window_range"), fallback_dsp.get("window_range"), "blackman"),
+        "blackman",
+    )
+    window_doppler = window_type_normalize(
+        _pick(branch.get("window_doppler"), fallback_dsp.get("window_doppler"), "hanning"),
+        "hanning",
+    )
+    window_angle = window_type_normalize(
+        _pick(branch.get("window_angle"), fallback_dsp.get("window_angle"), "hanning"),
+        "hanning",
+    )
+    zero_after_raw = _pick(
+        branch.get("zero_after_range_fft_bins"),
+        fallback_dsp.get("zero_after_range_fft_bins"),
+        0,
+    )
+    try:
+        zero_after_range_fft_bins = int(zero_after_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"offline_config: offline_sar_range_angle.zero_after_range_fft_bins non valido: {zero_after_raw!r}"
+        ) from exc
+    zero_after_range_fft_bins = max(0, zero_after_range_fft_bins)
+
+    filters_cfg = display_post_range_fft_filters_from_yaml_dict(
+        {
+            "dsp": {
+                "display_filters": {
+                    "mean_after_range_fft": _pick(
+                        branch.get("mean_after_range_fft"),
+                        fallback_display_filters.get("mean_after_range_fft"),
+                        fallback_dsp.get("mean_after_range_fft", {}),
+                    )
+                    or {},
+                    "slow_time": _pick(
+                        branch.get("slow_time"),
+                        fallback_display_filters.get("slow_time"),
+                        fallback_dsp.get("slow_time", {}),
+                    )
+                    or {},
+                    "background_subtraction": _pick(
+                        branch.get("background_subtraction"),
+                        fallback_display_filters.get("background_subtraction"),
+                        fallback_dsp.get("background_subtraction", {}),
+                    )
+                    or {},
+                    "loop_average_after_background": _pick(
+                        branch.get("loop_average_after_background"),
+                        fallback_display_filters.get("loop_average_after_background"),
+                        fallback_dsp.get("loop_average_after_background", {}),
+                    )
+                    or {},
+                }
+            }
+        }
+    )
+    filters_cfg, filter_warnings = sanitize_display_post_range_fft_filters(filters_cfg)
+    if filters_cfg.slow_time.enabled and filters_cfg.slow_time.mode == "doppler_fft":
+        filter_warnings.append(
+            "offline_sar_range_angle.slow_time.mode=doppler_fft conflicts with the dedicated zero-Doppler "
+            "TDM-MIMO reconstruction step; forcing slow_time off."
+        )
+        filters_cfg = replace(
+            filters_cfg,
+            slow_time=replace(filters_cfg.slow_time, enabled=False, mode="none", doppler_zero_notch=False),
+        )
+
+    angle_processing = angle_processing_from_yaml_dict(
+        {
+            "dsp": {
+                "angle_processing": _pick(
+                    branch.get("angle_processing"),
+                    fallback_dsp.get("angle_processing", {}),
+                )
+                or {}
+            }
+        }
+    )
+    nfft_angle_raw = _pick((fallback_cfg.get("fft", {}) or {}).get("nfft_angle"), 256)
+    try:
+        nfft_angle = max(1, int(nfft_angle_raw))
+    except (TypeError, ValueError):
+        nfft_angle = 256
+    projection = display_projection_from_yaml_dict(
+        {
+            "display": {
+                **fallback_display,
+                **(cfg.get("display", {}) or {}),
+            }
+        }
+    )
+    return OfflineSyntheticRangeAngleConfig(
+        use_realtime_filters=bool(use_realtime_filters),
+        window_range=str(window_range),
+        window_doppler=str(window_doppler),
+        window_angle=str(window_angle),
+        zero_after_range_fft_bins=int(zero_after_range_fft_bins),
+        post_range_fft_filters=filters_cfg,
+        angle_processing=angle_processing,
+        nfft_angle=int(nfft_angle),
+        projection=projection,
+        filter_warnings=tuple(str(w) for w in filter_warnings),
+    )
+
+
 def _read_bp_runtime_cfg(offline_config_path: str | Path, fallback_capture_cfg: str | Path) -> dict[str, Any]:
     cfg = _load_yaml_file(Path(offline_config_path))
     fallback_cfg = _load_yaml_file(Path(fallback_capture_cfg))
+    reconstruction_cfg = cfg.get("reconstruction", {}) or {}
     bp_cfg = cfg.get("bp", {}) or {}
     warnings: list[str] = []
+    algorithm = _reconstruction_algorithm_normalize(_pick(reconstruction_cfg.get("algorithm"), "backprojection"))
 
     mode: BpMode = _bp_mode_normalize(_pick(bp_cfg.get("mode"), "sar_only"))
+    if algorithm == "synthetic_range_angle" and mode != "mimo_sar":
+        raise ValueError("reconstruction.algorithm=synthetic_range_angle richiede bp.mode=mimo_sar")
     if mode == "mimo_sar":
         _append_deprecated_mimo_geometry_warnings(
             warnings=warnings,
@@ -793,50 +984,16 @@ def _read_bp_runtime_cfg(offline_config_path: str | Path, fallback_capture_cfg: 
             source_label="capture_config",
             cfg=fallback_cfg,
         )
-    avg_mode: AvgMode = _avg_mode_normalize(_pick(bp_cfg.get("avg_mode"), "both"))
-    motion_mode_raw = bp_cfg.get("motion_mode", None)
-    if motion_mode_raw is None and bp_cfg.get("avg_mode", None) is not None and mode == "mimo_sar":
-        motion_mode, warning = _motion_mode_from_legacy_avg_mode(bp_cfg.get("avg_mode"))
-        warnings.append(str(warning))
-    else:
-        motion_mode = _motion_mode_normalize(_pick(motion_mode_raw, "static_zero_doppler"))
-    use_virtual_antennas = True
-    if bp_cfg.get("use_virtual_antennas", None) is not None:
-        try:
-            use_virtual_antennas = _to_bool(
-                "offline_config: bp.use_virtual_antennas",
-                bp_cfg.get("use_virtual_antennas"),
-            )
-        except ValueError:
-            warnings.append(
-                "[OFFLINE WARN] bp.use_virtual_antennas is deprecated/ignored in mimo_sar."
-            )
-            use_virtual_antennas = True
-    if mode == "mimo_sar" and not bool(use_virtual_antennas):
-        warnings.append(
-            "[OFFLINE WARN] bp.use_virtual_antennas=false is deprecated/ignored in mimo_sar; "
-            "physical TX/RX bistatic geometry remains enabled."
-        )
-        use_virtual_antennas = True
     coherent_sum = _to_bool(
         "offline_config: bp.coherent_sum",
         _pick(bp_cfg.get("coherent_sum"), True),
     )
-
-    raw_pitch = _pick(bp_cfg.get("virtual_ant_pitch_m"), 0.00195)
-    virtual_ant_pitch_m = 0.00195
-    try:
-        virtual_ant_pitch_m = float(raw_pitch)
-    except (TypeError, ValueError):
-        warnings.append(
-            f"[OFFLINE WARN] bp.virtual_ant_pitch_m={raw_pitch!r} is deprecated/ignored in mimo_sar."
-        )
-        virtual_ant_pitch_m = 0.00195
-    if mode == "mimo_sar" and bp_cfg.get("virtual_ant_pitch_m", None) is not None:
-        warnings.append(
-            "[OFFLINE WARN] bp.virtual_ant_pitch_m is deprecated/ignored in mimo_sar; "
-            "phase centers are derived from 0.5 * (x_tx + x_rx)."
-        )
+    avg_mode: AvgMode | None = None
+    motion_mode: MotionMode = "static_zero_doppler"
+    if mode == "mimo_sar":
+        motion_mode = _motion_mode_normalize(_pick(bp_cfg.get("motion_mode"), "static_zero_doppler"))
+    else:
+        avg_mode = _avg_mode_normalize(_pick(bp_cfg.get("avg_mode"), "both"))
 
     wavelength_m = _resolve_wavelength_m(fallback_cfg)
     tx_offsets_m = _resolve_bp_offsets_m(
@@ -852,17 +1009,19 @@ def _read_bp_runtime_cfg(offline_config_path: str | Path, fallback_capture_cfg: 
         wavelength_m=float(wavelength_m),
     )
 
-    return {
+    runtime_cfg = {
         "mode": mode,
-        "avg_mode": avg_mode,
         "motion_mode": motion_mode,
-        "use_virtual_antennas": bool(use_virtual_antennas),
         "coherent_sum": bool(coherent_sum),
-        "virtual_ant_pitch_m": float(virtual_ant_pitch_m),
         "tx_offsets_m": None if tx_offsets_m is None else tx_offsets_m.astype(np.float32, copy=False),
         "rx_offsets_m": None if rx_offsets_m is None else rx_offsets_m.astype(np.float32, copy=False),
         "warnings": warnings,
     }
+    if avg_mode is not None:
+        runtime_cfg["avg_mode"] = avg_mode
+    runtime_cfg["algorithm"] = str(algorithm)
+    runtime_cfg["range_angle"] = _read_offline_sar_range_angle_cfg(cfg, fallback_cfg)
+    return runtime_cfg
 
 
 def _resolve_effective_avg_mode(
@@ -912,6 +1071,319 @@ def _resolve_offline_mimo_geometry(
     }
 
 
+def _apply_offline_sar_range_angle_pre_filters(
+    raw_mimo: np.ndarray,
+    *,
+    filters_cfg: PostRangeFftFilterConfig,
+    fft_workers: int,
+) -> np.ndarray:
+    if raw_mimo.ndim != 6:
+        raise ValueError(f"raw_mimo shape non valido per pre-filters: {raw_mimo.shape!r}")
+    if (
+        (not filters_cfg.mean_after_range_fft.enabled or not filters_cfg.mean_after_range_fft.axes)
+        and (not filters_cfg.slow_time.enabled or filters_cfg.slow_time.mode == "none")
+    ):
+        return np.asarray(raw_mimo, dtype=np.complex64, copy=False)
+
+    out = np.array(raw_mimo, dtype=np.complex64, copy=True)
+    n_pos = int(out.shape[0])
+    for pos_i in range(n_pos):
+        # Reuse the realtime helper axis convention: [frame, loop, tx, range_bin, rx].
+        view = np.transpose(out[pos_i], (0, 1, 2, 4, 3)).astype(np.complex64, copy=False)
+        view = apply_slow_time_filter(view, filters_cfg.slow_time, fft_workers=int(fft_workers))
+        view = subtract_selected_mean(view, filters_cfg.mean_after_range_fft)
+        out[pos_i] = np.transpose(view, (0, 1, 2, 4, 3)).astype(np.complex64, copy=False)
+    return out.astype(np.complex64, copy=False)
+
+
+def _apply_offline_sar_range_angle_background(
+    snapshot_cube: np.ndarray,
+    *,
+    bg_cfg: BackgroundSubtractionConfig,
+) -> np.ndarray:
+    cube = np.asarray(snapshot_cube, dtype=np.complex64)
+    if not bg_cfg.enabled or cube.ndim != 4 or int(cube.shape[0]) <= 0:
+        return cube
+
+    if str(bg_cfg.mode) != "frozen":
+        state = BackgroundSubtractionState()
+        return apply_background_subtraction(np.array(cube, dtype=np.complex64, copy=True), bg_cfg, state)
+
+    warmup = min(max(1, int(bg_cfg.init_frames)), int(cube.shape[0]))
+    model = cube[:warmup].mean(axis=0, dtype=np.complex64).astype(np.complex64, copy=False)
+    if int(cube.shape[0]) <= warmup:
+        return np.empty((0,) + tuple(int(v) for v in cube.shape[1:]), dtype=np.complex64)
+
+    state = BackgroundSubtractionState(model=np.array(model, dtype=np.complex64, copy=True))
+    return apply_background_subtraction(
+        np.array(cube[warmup:], dtype=np.complex64, copy=True),
+        bg_cfg,
+        state,
+    )
+
+
+def _build_synthetic_virtual_array_geometry(
+    x_element_m: np.ndarray,
+    *,
+    wavelength_m: float,
+) -> tuple[VirtualArrayGeometry, bool]:
+    x_element = np.asarray(x_element_m, dtype=np.float32).reshape(-1)
+    if x_element.size <= 0:
+        raise ValueError("x_element_m vuoto per synthetic aperture")
+    wavelength = float(wavelength_m)
+    if not np.isfinite(wavelength) or wavelength <= 0.0:
+        raise ValueError(f"wavelength_m non valida: {wavelength_m!r}")
+
+    phase_centers_lambda = (x_element / np.float32(wavelength)).astype(np.float32, copy=False)
+    diffs = np.diff(phase_centers_lambda.astype(np.float64, copy=False))
+    finite_diffs = np.abs(diffs[np.isfinite(diffs)])
+    base_spacing = float(np.min(finite_diffs)) if finite_diffs.size > 0 else 0.25
+    if not np.isfinite(base_spacing) or base_spacing <= 1e-8:
+        base_spacing = 0.25
+    uniform_spacing = _synthetic_aperture_uniform_spacing_lambda(
+        x_element,
+        wavelength_m=float(wavelength),
+    )
+    fft_uniform = uniform_spacing is not None
+    geometry = VirtualArrayGeometry(
+        order_flat=np.arange(int(phase_centers_lambda.size), dtype=np.int32),
+        phase_centers_lambda=phase_centers_lambda.astype(np.float32, copy=False),
+        identity_order=True,
+        uniform_half_lambda=bool(
+            fft_uniform and np.isclose(abs(float(uniform_spacing)), 0.5, rtol=0.0, atol=1e-6)
+        ),
+        # Keep the actual element coordinates for steering and use the finest observed spacing
+        # to define the steering/u grid even when the aperture is sparse.
+        uniform_spacing_lambda=float(abs(float(uniform_spacing))) if fft_uniform else float(base_spacing),
+        angle_axis_sign=1.0,
+        angle_u_to_sin_scale=2.0,
+    )
+    return geometry, bool(fft_uniform)
+
+
+def _resolve_synthetic_angle_processing(
+    angle_cfg: AngleProcessingConfig,
+    *,
+    fft_uniform: bool,
+) -> tuple[AngleProcessingConfig, str | None]:
+    if angle_cfg.mode != "fft" or fft_uniform:
+        return angle_cfg, None
+    warning = (
+        "[OFFLINE WARN] synthetic_range_angle requested angle_processing.mode=fft on a non-uniform synthetic "
+        "aperture; falling back to bartlett."
+    )
+    return replace(angle_cfg, mode="bartlett"), warning
+
+
+def _build_synthetic_angle_dsp_cfg(
+    *,
+    c_m_s: float,
+    fs_hz: float,
+    slope_hz_s: float,
+    nfft_range: int,
+    nfft_angle: int,
+    range_max_m: float,
+    synthetic_ant: int,
+    fft_workers: int,
+    frames_like: int,
+) -> RealtimeDSPConfig:
+    return RealtimeDSPConfig(
+        c=float(c_m_s),
+        fs=float(fs_hz),
+        slope=float(slope_hz_s),
+        samples=1,
+        chirps=1,
+        rx=max(1, int(synthetic_ant)),
+        tx=1,
+        x_frames=max(1, int(frames_like)),
+        bytes_per_frame=max(1, int(synthetic_ant) * 8),
+        nfft_range=max(1, int(nfft_range)),
+        nfft_angle=max(1, int(nfft_angle)),
+        range_max_display=float(range_max_m),
+        range_profile_count=max(1, int(nfft_range)),
+        virtual_ant=max(1, int(synthetic_ant)),
+        fft_workers=max(1, int(fft_workers)),
+        debug_stats=False,
+    )
+
+
+def _compute_synthetic_range_angle_image(
+    range_fft_sel: np.ndarray,
+    *,
+    selected_positions: np.ndarray,
+    x_pitch_m: float,
+    tx_i: int,
+    rx_i: int,
+    x_tx_ant_m: np.ndarray,
+    x_rx_ant_m: np.ndarray,
+    range_angle_cfg: OfflineSyntheticRangeAngleConfig,
+    c_m_s: float,
+    fs_hz: float,
+    slope_hz_s: float,
+    fc_hz: float,
+    fft_workers: int,
+    nfft_range: int,
+    gui_h: int,
+    gui_w: int,
+    viewport: DisplayViewport,
+    projection_lut: dict[str, Any] | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    if range_fft_sel.ndim != 5:
+        raise ValueError(
+            "range_fft_sel shape non valido per synthetic_range_angle: "
+            f"{range_fft_sel.shape!r}; atteso [pos, frame, loop, ant, bin]."
+        )
+
+    n_pos_sel, n_frames_sel, n_loops_sel, n_ant_sel, n_bins_sel = range_fft_sel.shape
+    if x_tx_ant_m.size != int(n_ant_sel) or x_rx_ant_m.size != int(n_ant_sel):
+        raise ValueError("x_tx_ant_m/x_rx_ant_m size != asse antenna synthetic_range_angle")
+    if int(n_ant_sel) <= 0 or int(n_bins_sel) <= 0:
+        return np.zeros((int(gui_h), int(gui_w)), dtype=np.float32), {
+            "synthetic_antennas": 0,
+            "angle_mode_requested": str(range_angle_cfg.angle_processing.mode),
+            "angle_mode": str(range_angle_cfg.angle_processing.mode),
+            "fft_uniform_geometry": False,
+            "enabled_filters": _offline_sar_range_angle_filters_enabled(range_angle_cfg),
+        }
+    if int(tx_i) <= 0 or int(rx_i) <= 0 or int(tx_i) * int(rx_i) != int(n_ant_sel):
+        raise ValueError(
+            f"tx/rx non coerente con asse antenna synthetic_range_angle: tx={tx_i}, rx={rx_i}, ant={n_ant_sel}"
+        )
+
+    raw_mimo = range_fft_sel.reshape(
+        int(n_pos_sel),
+        int(n_frames_sel),
+        int(n_loops_sel),
+        int(tx_i),
+        int(rx_i),
+        int(n_bins_sel),
+    ).astype(np.complex64, copy=False)
+    if range_angle_cfg.use_realtime_filters:
+        filtered_mimo = _apply_offline_sar_range_angle_pre_filters(
+            raw_mimo,
+            filters_cfg=range_angle_cfg.post_range_fft_filters,
+            fft_workers=int(fft_workers),
+        )
+        doppler_window = _build_window_1d(str(range_angle_cfg.window_doppler), int(n_loops_sel))
+    else:
+        filtered_mimo = raw_mimo
+        doppler_window = None
+
+    zero_doppler = _prepare_mimo_snapshots(
+        filtered_mimo,
+        n_tx=int(tx_i),
+        motion_mode="static_zero_doppler",
+        window_doppler=doppler_window,
+    )
+    synthetic = _prepare_synthetic_aperture_data(
+        zero_doppler,
+        selected_positions=np.asarray(selected_positions, dtype=np.int32).reshape(-1),
+        x_pitch_m=float(x_pitch_m),
+        x_tx_ant_m=x_tx_ant_m,
+        x_rx_ant_m=x_rx_ant_m,
+    )
+    geometry, fft_uniform = _build_synthetic_virtual_array_geometry(
+        synthetic.x_element_m,
+        wavelength_m=float(c_m_s) / float(fc_hz),
+    )
+    angle_cfg_eff, angle_warning = _resolve_synthetic_angle_processing(
+        range_angle_cfg.angle_processing,
+        fft_uniform=fft_uniform,
+    )
+    if angle_warning:
+        print(angle_warning)
+
+    synthetic_cube = np.array(synthetic.snapshot_cube, dtype=np.complex64, copy=True)
+    if range_angle_cfg.use_realtime_filters:
+        synthetic_cube = _apply_offline_sar_range_angle_background(
+            synthetic_cube,
+            bg_cfg=range_angle_cfg.post_range_fft_filters.background_subtraction,
+        )
+        if range_angle_cfg.post_range_fft_filters.loop_average_after_background.enabled and synthetic_cube.ndim == 4:
+            synthetic_cube = synthetic_cube.mean(axis=1, keepdims=True, dtype=np.complex64)
+        if synthetic_cube.size > 0:
+            w_angle = _build_window_1d(str(range_angle_cfg.window_angle), int(synthetic_cube.shape[-1]))
+            synthetic_cube *= w_angle.reshape(1, 1, 1, int(synthetic_cube.shape[-1])).astype(
+                np.complex64,
+                copy=False,
+            )
+
+    synthetic_ant = int(synthetic.x_element_m.size)
+    dsp_cfg = _build_synthetic_angle_dsp_cfg(
+        c_m_s=float(c_m_s),
+        fs_hz=float(fs_hz),
+        slope_hz_s=float(slope_hz_s),
+        nfft_range=int(nfft_range),
+        nfft_angle=int(range_angle_cfg.nfft_angle),
+        range_max_m=float(viewport.y_max_m),
+        synthetic_ant=int(synthetic_ant),
+        fft_workers=int(fft_workers),
+        frames_like=int(max(1, synthetic_cube.shape[0] if synthetic_cube.ndim == 4 else 1)),
+    )
+    angle_axis = build_angle_axis_deg(int(range_angle_cfg.nfft_angle), geometry=geometry)
+    angle_steering = build_angle_steering_matrix(
+        int(synthetic_ant),
+        int(range_angle_cfg.nfft_angle),
+        geometry=geometry,
+    )
+
+    if synthetic_cube.ndim != 4 or int(synthetic_cube.shape[0]) <= 0:
+        heatmap_lin = np.zeros((int(n_bins_sel), int(range_angle_cfg.nfft_angle)), dtype=np.float32)
+    else:
+        heatmap_lin = compute_angle_heatmap(
+            synthetic_cube,
+            angle_cfg=angle_cfg_eff,
+            dsp_cfg=dsp_cfg,
+            angle_steering=angle_steering,
+            geometry=geometry,
+            ant_spacing=None,
+        ).astype(np.float32, copy=False)
+        if heatmap_lin.ndim != 2:
+            heatmap_lin = np.zeros((int(n_bins_sel), int(range_angle_cfg.nfft_angle)), dtype=np.float32)
+
+    projection_mode = "cartesian"
+    projection_interp = str(range_angle_cfg.projection.projection_interp)
+    lut = projection_lut
+    if lut is None:
+        lut = build_display_projection_lut(
+            gui_h=int(gui_h),
+            gui_w=int(gui_w),
+            x_max_m=float(viewport.x_max_m),
+            y_max_m=float(viewport.y_max_m),
+            dr_m=float(c_m_s) * float(fs_hz) / (2.0 * float(slope_hz_s) * float(nfft_range)),
+            angle_axis_deg=angle_axis,
+            projection_mode=projection_mode,
+            projection_interp=projection_interp,
+            x_min_m=float(viewport.x_min_m),
+            y_min_m=float(viewport.y_min_m),
+        )
+    projected_lin = project_heatmap_for_display(
+        heatmap_lin,
+        angle_axis_deg=angle_axis,
+        dr_m=float(c_m_s) * float(fs_hz) / (2.0 * float(slope_hz_s) * float(nfft_range)),
+        gui_h=int(gui_h),
+        gui_w=int(gui_w),
+        y_max_m=float(viewport.y_max_m),
+        x_max_m=float(viewport.x_max_m),
+        projection_mode=projection_mode,
+        projection_interp=projection_interp,
+        precomputed_lut=lut,
+        x_min_m=float(viewport.x_min_m),
+        y_min_m=float(viewport.y_min_m),
+    )
+    img_db = _power_image_to_db(projected_lin)
+    meta = {
+        "synthetic_antennas": int(synthetic_ant),
+        "angle_mode_requested": str(range_angle_cfg.angle_processing.mode),
+        "angle_mode": str(angle_cfg_eff.mode),
+        "fft_uniform_geometry": bool(fft_uniform),
+        "enabled_filters": _offline_sar_range_angle_filters_enabled(range_angle_cfg),
+        "selected_positions": tuple(int(v) for v in np.asarray(selected_positions, dtype=np.int32).reshape(-1).tolist()),
+        "projection_lut": lut,
+    }
+    return img_db.astype(np.float32, copy=False), meta
+
+
 # ---------------------------------------------------------------------
 # Offline Multiprocess Pipeline
 # - reader process: load + range-FFT prep
@@ -931,7 +1403,9 @@ def _offline_reader_worker(
         reader = SARReader(offline_config_path=offline_config_path, fallback_capture_cfg=fallback_capture_cfg)
         bp_runtime_cfg = _read_bp_runtime_cfg(offline_config_path, fallback_capture_cfg)
         fft_workers = _read_fft_workers(fallback_capture_cfg)
+        algorithm = str(bp_runtime_cfg.get("algorithm", "backprojection"))
         bp_mode: BpMode = bp_runtime_cfg["mode"]
+        range_angle_cfg: OfflineSyntheticRangeAngleConfig = bp_runtime_cfg["range_angle"]
         data = reader.load(keep_raw=False)
 
         mimo_geometry = None
@@ -949,15 +1423,25 @@ def _offline_reader_worker(
 
         for warning in bp_runtime_cfg.get("warnings", []):
             print(str(warning))
+        for warning in range_angle_cfg.filter_warnings:
+            print(f"[OFFLINE WARN] {warning}")
 
         if bp_mode == "mimo_sar":
             # MIMO-SAR: preserva asse antenna [pos, frame, loop, ant, sample].
             sig = data.iq_cube
+            if algorithm == "synthetic_range_angle" and range_angle_cfg.use_realtime_filters:
+                sig = np.array(sig, dtype=np.complex64, copy=True)
+                w_range = _build_window_1d(str(range_angle_cfg.window_range), int(data.samples))
+                sig *= w_range.reshape(1, 1, 1, 1, int(data.samples)).astype(np.complex64, copy=False)
             range_fft = fft.fft(sig, n=int(nfft_range), axis=-1, workers=fft_workers).astype(np.complex64, copy=False)
         else:
             # Legacy SAR-only: media preliminare sulle antenne virtuali.
             sig = data.iq_cube.mean(axis=3, dtype=np.complex64)  # [pos, frame, loop, sample]
             range_fft = fft.fft(sig, n=int(nfft_range), axis=-1, workers=fft_workers).astype(np.complex64, copy=False)
+        if algorithm == "synthetic_range_angle" and range_angle_cfg.use_realtime_filters:
+            zero_bins = min(int(range_angle_cfg.zero_after_range_fft_bins), int(range_fft.shape[-1]))
+            if zero_bins > 0:
+                range_fft[..., :zero_bins] = np.complex64(0.0)
         range_fft = np.ascontiguousarray(range_fft, dtype=np.complex64)
         shm_range_fft = shared_memory.SharedMemory(create=True, size=int(range_fft.nbytes))
         shm_arr = np.ndarray(range_fft.shape, dtype=np.complex64, buffer=shm_range_fft.buf)
@@ -971,11 +1455,11 @@ def _offline_reader_worker(
             "positions": data.positions.astype(np.int32, copy=False),
             "x_start_cfg": int(reader.config.x_start),
             "x_end_cfg": int(reader.config.x_end),
+            "algorithm": str(algorithm),
             "bp_mode": str(bp_mode),
             "bp_motion_mode": str(bp_runtime_cfg["motion_mode"]),
-            "bp_virtual_ant_pitch_m": float(bp_runtime_cfg["virtual_ant_pitch_m"]),
-            "bp_use_virtual_antennas": bool(bp_runtime_cfg["use_virtual_antennas"]),
             "bp_coherent_sum": bool(bp_runtime_cfg["coherent_sum"]),
+            "range_angle_cfg": range_angle_cfg,
             "tx": int(data.tx),
             "rx": int(data.rx),
         }
@@ -991,8 +1475,13 @@ def _offline_reader_worker(
                 "type": "reader_ready",
                 "positions": int(data.positions.size),
                 "frames_per_pos": int(data.n_frames_per_position),
+                "algorithm": str(algorithm),
                 "bp_mode": str(bp_mode),
                 "motion_mode": str(bp_runtime_cfg["motion_mode"]),
+                "range_angle_enabled_filters": _offline_sar_range_angle_filters_enabled(range_angle_cfg),
+                "range_angle_use_realtime_filters": bool(range_angle_cfg.use_realtime_filters),
+                "range_angle_angle_mode": str(range_angle_cfg.angle_processing.mode),
+                "range_angle_nfft_angle": int(range_angle_cfg.nfft_angle),
                 "geometry_source": None if mimo_geometry is None else str(mimo_geometry["geometry_source"]),
             },
         )
@@ -1089,9 +1578,26 @@ def _offline_dsp_worker(
 
         range_fft_data, shm_range_fft = _range_fft_from_init_msg(init_msg)
         positions = np.asarray(init_msg["positions"], dtype=np.int32)
+        algorithm = _reconstruction_algorithm_normalize(_pick(init_msg.get("algorithm"), "backprojection"))
         bp_mode: BpMode = _bp_mode_normalize(_pick(init_msg.get("bp_mode"), "sar_only"))
         if ("bp_mode" not in init_msg) and range_fft_data.ndim == 5:
             bp_mode = "mimo_sar"
+        range_angle_cfg_raw = init_msg.get("range_angle_cfg")
+        if isinstance(range_angle_cfg_raw, OfflineSyntheticRangeAngleConfig):
+            range_angle_cfg = range_angle_cfg_raw
+        else:
+            range_angle_cfg = OfflineSyntheticRangeAngleConfig(
+                use_realtime_filters=False,
+                window_range="blackman",
+                window_doppler="hanning",
+                window_angle="hanning",
+                zero_after_range_fft_bins=0,
+                post_range_fft_filters=PostRangeFftFilterConfig(),
+                angle_processing=AngleProcessingConfig(),
+                nfft_angle=256,
+                projection=DisplayProjectionConfig(),
+                filter_warnings=(),
+            )
         if range_fft_data.ndim not in (4, 5):
             raise ValueError(f"range_fft shape non valido: {range_fft_data.shape!r}")
         if bp_mode == "sar_only" and range_fft_data.ndim != 4:
@@ -1100,6 +1606,8 @@ def _offline_dsp_worker(
             raise ValueError(f"range_fft shape non coerente con bp.mode=mimo_sar: {range_fft_data.shape!r}")
         if positions.ndim != 1 or positions.size != range_fft_data.shape[0]:
             raise ValueError("positions non coerente con range_fft")
+        if algorithm == "synthetic_range_angle" and bp_mode != "mimo_sar":
+            raise ValueError("synthetic_range_angle richiede range_fft MIMO-SAR a 5 dimensioni")
 
         coherent_sum = _to_bool(
             "init_msg: bp_coherent_sum",
@@ -1135,7 +1643,6 @@ def _offline_dsp_worker(
             dr_m=float(dr_m),
             seq=0,
         )
-        requested_viewport = home_viewport
         applied_viewport = home_viewport
 
         pos_f = positions.astype(np.float32, copy=False)
@@ -1160,6 +1667,7 @@ def _offline_dsp_worker(
             status_q,
             {
                 "type": "ready",
+                "algorithm": str(algorithm),
                 "pos_min": pos_min,
                 "pos_max": pos_max,
                 "x_start": x_start,
@@ -1174,9 +1682,18 @@ def _offline_dsp_worker(
                 "bp_mode": str(bp_mode),
                 "virtual_antennas": int(n_ant_used),
                 "geometry_source": str(geometry_source),
-                "doppler_bins_used": 1 if motion_mode == "static_zero_doppler" else max(1, int(range_fft_data.shape[2])),
+                "doppler_bins_used": 1,
+                "range_angle_use_realtime_filters": bool(range_angle_cfg.use_realtime_filters),
+                "range_angle_enabled_filters": _offline_sar_range_angle_filters_enabled(range_angle_cfg),
+                "range_angle_angle_mode_requested": str(range_angle_cfg.angle_processing.mode),
+                "range_angle_nfft_angle": int(range_angle_cfg.nfft_angle),
                 **_viewport_status_fields(applied_viewport, fallback_used=False),
             },
+        )
+        print(
+            f"[OFFLINE INFO] algorithm={algorithm} bp_mode={bp_mode} "
+            f"default_positions={x_start}:{x_end} angle_mode={range_angle_cfg.angle_processing.mode} "
+            f"filters={_offline_sar_range_angle_filters_enabled(range_angle_cfg)}"
         )
 
         last_job_key = None
@@ -1187,6 +1704,8 @@ def _offline_dsp_worker(
         bp_plan_cache = None
         grid_cache_key = None
         grid_cache = None
+        synthetic_projection_lut_cache_key = None
+        synthetic_projection_lut_cache = None
 
         while not stop_evt.is_set():
             got_cmd = False
@@ -1219,9 +1738,6 @@ def _offline_dsp_worker(
                 avg_mode_new = cmd.get("avg_mode", None)
                 if motion_mode_new is not None:
                     motion_mode_requested = _motion_mode_normalize(str(motion_mode_new))
-                elif avg_mode_new is not None and bp_mode == "mimo_sar":
-                    motion_mode_requested, warning = _motion_mode_from_legacy_avg_mode(avg_mode_new)
-                    print(str(warning))
                 avg_mode_new = cmd.get("avg_mode", None)
                 if avg_mode_new is not None and bp_mode == "sar_only":
                     avg_mode_requested = _avg_mode_normalize(str(avg_mode_new))
@@ -1236,7 +1752,6 @@ def _offline_dsp_worker(
                     dr_m=float(dr_m),
                 )
                 if viewport_new is not None:
-                    requested_viewport = viewport_new
                     applied_viewport = viewport_new
                 motion_mode = motion_mode_requested
                 dirty = True
@@ -1245,6 +1760,7 @@ def _offline_dsp_worker(
                 break
 
             job_key = (
+                str(algorithm),
                 int(x_start),
                 int(x_end),
                 str(avg_mode) if bp_mode == "sar_only" else str(motion_mode),
@@ -1253,76 +1769,144 @@ def _offline_dsp_worker(
             )
             if dirty or job_key != last_job_key or got_cmd:
                 t0 = time.perf_counter()
-
-                grid_key = display_viewport_signature(applied_viewport)
-                if grid_cache_key == grid_key and grid_cache is not None:
-                    x_grid, y_grid = grid_cache
-                else:
-                    x_axis = np.linspace(
-                        float(applied_viewport.x_min_m),
-                        float(applied_viewport.x_max_m),
-                        int(gui_w),
-                        dtype=np.float32,
-                    )
-                    y_axis = np.linspace(
-                        float(applied_viewport.y_min_m),
-                        float(applied_viewport.y_max_m),
-                        int(gui_h),
-                        dtype=np.float32,
-                    )
-                    x_grid, y_grid = np.meshgrid(x_axis, y_axis)
-                    grid_cache_key = grid_key
-                    grid_cache = (x_grid, y_grid)
-
                 sel_mask = (positions >= int(x_start)) & (positions <= int(x_end))
                 if not np.any(sel_mask):
                     sel_mask[:] = True
                 sel_idx = np.where(sel_mask)[0]
-                x_pos_m_sel = x_pos_m_full[sel_idx]
-                if bp_mode == "mimo_sar":
+                sel_key = tuple(int(v) for v in sel_idx.tolist())
+                frame_meta: dict[str, Any] = {}
+                if algorithm == "synthetic_range_angle":
+                    selected_positions = positions[sel_idx].astype(np.int32, copy=False)
                     range_fft_sel = range_fft_data[sel_idx, :, :, :, :max_bin]
-                    n_pos_sel, n_frames_sel, n_loops_sel, n_ant_sel, n_bins_sel = range_fft_sel.shape
+                    n_pos_sel, _n_frames_sel, _n_loops_sel, n_ant_sel, _n_bins_sel = range_fft_sel.shape
                     if int(n_ant_sel) != int(tx_i) * int(rx_i):
                         raise ValueError(
-                            f"asse antenna mimo={n_ant_sel} non coerente con tx/rx={tx_i}/{rx_i}"
+                            f"asse antenna synthetic={n_ant_sel} non coerente con tx/rx={tx_i}/{rx_i}"
                         )
-                    sel_key = tuple(int(v) for v in sel_idx.tolist())
-                    prepared_key = (sel_key, str(motion_mode), int(max_bin), int(tx_i), int(rx_i))
-                    if prepared_cache_key == prepared_key and prepared_cache is not None:
-                        prepared = prepared_cache
-                    else:
-                        raw_mimo = range_fft_sel.reshape(
-                            int(n_pos_sel),
-                            int(n_frames_sel),
-                            int(n_loops_sel),
-                            int(tx_i),
-                            int(rx_i),
-                            int(n_bins_sel),
-                        ).astype(np.complex64, copy=False)
-                        prepared = _prepare_mimo_snapshots(
-                            raw_mimo,
-                            n_tx=int(tx_i),
-                            motion_mode=motion_mode,
-                            window_doppler=None,
-                        )
-                        prepared_cache_key = prepared_key
-                        prepared_cache = prepared
-
-                    bp_plan_key = (
+                    synthetic_projection_lut_key = (
+                        str(algorithm),
                         sel_key,
-                        int(gui_h),
-                        int(gui_w),
-                        int(max_bin),
-                        int(phase_sign_i),
-                        float(dr_m),
-                        float(fc_hz),
-                        float(c_m_s),
+                        int(range_angle_cfg.nfft_angle),
+                        str(range_angle_cfg.projection.projection_interp),
                         display_viewport_signature(applied_viewport),
                     )
-                    if bp_plan_cache_key == bp_plan_key and bp_plan_cache is not None:
-                        bp_plan = bp_plan_cache
+                    if (
+                        synthetic_projection_lut_cache_key == synthetic_projection_lut_key
+                        and synthetic_projection_lut_cache is not None
+                    ):
+                        projection_lut = synthetic_projection_lut_cache
                     else:
-                        bp_plan = _build_mimo_back_projection_plan(
+                        projection_lut = None
+                    img_db, frame_meta = _compute_synthetic_range_angle_image(
+                        range_fft_sel,
+                        selected_positions=selected_positions,
+                        x_pitch_m=float(x_pitch_m),
+                        tx_i=int(tx_i),
+                        rx_i=int(rx_i),
+                        x_tx_ant_m=x_tx_ant_m,
+                        x_rx_ant_m=x_rx_ant_m,
+                        range_angle_cfg=range_angle_cfg,
+                        c_m_s=float(c_m_s),
+                        fs_hz=float(fs_hz),
+                        slope_hz_s=float(slope_hz_s),
+                        fc_hz=float(fc_hz),
+                        fft_workers=int(fft_workers),
+                        nfft_range=int(nfft_range),
+                        gui_h=int(gui_h),
+                        gui_w=int(gui_w),
+                        viewport=applied_viewport,
+                        projection_lut=projection_lut,
+                    )
+                    synthetic_projection_lut_cache = frame_meta.pop("projection_lut", None)
+                    synthetic_projection_lut_cache_key = synthetic_projection_lut_key
+                    doppler_bins_used = 1
+                else:
+                    grid_key = display_viewport_signature(applied_viewport)
+                    if grid_cache_key == grid_key and grid_cache is not None:
+                        x_grid, y_grid = grid_cache
+                    else:
+                        x_axis = np.linspace(
+                            float(applied_viewport.x_min_m),
+                            float(applied_viewport.x_max_m),
+                            int(gui_w),
+                            dtype=np.float32,
+                        )
+                        y_axis = np.linspace(
+                            float(applied_viewport.y_min_m),
+                            float(applied_viewport.y_max_m),
+                            int(gui_h),
+                            dtype=np.float32,
+                        )
+                        x_grid, y_grid = np.meshgrid(x_axis, y_axis)
+                        grid_cache_key = grid_key
+                        grid_cache = (x_grid, y_grid)
+
+                    x_pos_m_sel = x_pos_m_full[sel_idx]
+                    if bp_mode == "mimo_sar":
+                        range_fft_sel = range_fft_data[sel_idx, :, :, :, :max_bin]
+                        n_pos_sel, n_frames_sel, n_loops_sel, n_ant_sel, n_bins_sel = range_fft_sel.shape
+                        if int(n_ant_sel) != int(tx_i) * int(rx_i):
+                            raise ValueError(
+                                f"asse antenna mimo={n_ant_sel} non coerente con tx/rx={tx_i}/{rx_i}"
+                            )
+                        prepared_key = (
+                            sel_key,
+                            str(motion_mode),
+                            int(max_bin),
+                            int(tx_i),
+                            int(rx_i),
+                        )
+                        if prepared_cache_key == prepared_key and prepared_cache is not None:
+                            prepared = prepared_cache
+                        else:
+                            raw_mimo = range_fft_sel.reshape(
+                                int(n_pos_sel),
+                                int(n_frames_sel),
+                                int(n_loops_sel),
+                                int(tx_i),
+                                int(rx_i),
+                                int(n_bins_sel),
+                            ).astype(np.complex64, copy=False)
+                            prepared = _prepare_mimo_snapshots(
+                                raw_mimo,
+                                n_tx=int(tx_i),
+                                motion_mode=motion_mode,
+                                window_doppler=None,
+                            )
+                            prepared_cache_key = prepared_key
+                            prepared_cache = prepared
+
+                        bp_plan_key = (
+                            sel_key,
+                            int(gui_h),
+                            int(gui_w),
+                            int(max_bin),
+                            int(phase_sign_i),
+                            float(dr_m),
+                            float(fc_hz),
+                            float(c_m_s),
+                            display_viewport_signature(applied_viewport),
+                        )
+                        if bp_plan_cache_key == bp_plan_key and bp_plan_cache is not None:
+                            bp_plan = bp_plan_cache
+                        else:
+                            bp_plan = _build_mimo_back_projection_plan(
+                                x_pos_m_sel,
+                                x_tx_ant_m,
+                                x_rx_ant_m,
+                                x_grid,
+                                y_grid,
+                                dr_m=dr_m,
+                                fc_hz=fc_hz,
+                                c_m_s=c_m_s,
+                                max_bin=max_bin,
+                                phase_sign=phase_sign_i,
+                            )
+                            bp_plan_cache_key = bp_plan_key
+                            bp_plan_cache = bp_plan
+
+                        img_db = _back_projection_image_mimo(
+                            prepared,
                             x_pos_m_sel,
                             x_tx_ant_m,
                             x_rx_ant_m,
@@ -1332,47 +1916,31 @@ def _offline_dsp_worker(
                             fc_hz=fc_hz,
                             c_m_s=c_m_s,
                             max_bin=max_bin,
+                            motion_mode=motion_mode,
                             phase_sign=phase_sign_i,
+                            chunk_size=16384,
+                            coherent_sum=bool(coherent_sum),
+                            bp_plan=bp_plan,
                         )
-                        bp_plan_cache_key = bp_plan_key
-                        bp_plan_cache = bp_plan
-
-                    img_db = _back_projection_image_mimo(
-                        prepared,
-                        x_pos_m_sel,
-                        x_tx_ant_m,
-                        x_rx_ant_m,
-                        x_grid,
-                        y_grid,
-                        dr_m=dr_m,
-                        fc_hz=fc_hz,
-                        c_m_s=c_m_s,
-                        max_bin=max_bin,
-                        motion_mode=motion_mode,
-                        phase_sign=phase_sign_i,
-                        chunk_size=16384,
-                        coherent_sum=bool(coherent_sum),
-                        bp_plan=bp_plan,
-                    )
-                    doppler_bins_used = 1 if motion_mode == "static_zero_doppler" else int(prepared.shape[2])
-                else:
-                    range_fft_sel = range_fft_data[sel_idx, :, :, :max_bin]
-                    reduced = _reduce_avg_mode(range_fft_sel, avg_mode)
-                    if reduced.ndim != 3:
-                        raise ValueError(f"reduce_avg_mode sar_only shape non valido: {reduced.shape!r}")
-                    img_db = _back_projection_image(
-                        reduced,
-                        x_pos_m_sel,
-                        x_grid,
-                        y_grid,
-                        dr_m=dr_m,
-                        fc_hz=fc_hz,
-                        c_m_s=c_m_s,
-                        max_bin=max_bin,
-                        phase_sign=phase_sign_i,
-                        chunk_size=16384,
-                    )
-                    doppler_bins_used = 1
+                        doppler_bins_used = 1
+                    else:
+                        range_fft_sel = range_fft_data[sel_idx, :, :, :max_bin]
+                        reduced = _reduce_avg_mode(range_fft_sel, avg_mode)
+                        if reduced.ndim != 3:
+                            raise ValueError(f"reduce_avg_mode sar_only shape non valido: {reduced.shape!r}")
+                        img_db = _back_projection_image(
+                            reduced,
+                            x_pos_m_sel,
+                            x_grid,
+                            y_grid,
+                            dr_m=dr_m,
+                            fc_hz=fc_hz,
+                            c_m_s=c_m_s,
+                            max_bin=max_bin,
+                            phase_sign=phase_sign_i,
+                            chunk_size=16384,
+                        )
+                        doppler_bins_used = 1
 
                 with gui_lock:
                     prev_idx = int(gui_latest_idx.value)
@@ -1389,10 +1957,18 @@ def _offline_dsp_worker(
                     gui_latest_seq.value = int(gui_latest_seq.value) + 1
 
                 t1 = time.perf_counter()
+                print(
+                    f"[OFFLINE INFO] frame algorithm={algorithm} positions={sel_key} "
+                    f"synthetic_ant={frame_meta.get('synthetic_antennas', n_ant_used)} "
+                    f"angle_mode={frame_meta.get('angle_mode', range_angle_cfg.angle_processing.mode)} "
+                    f"filters={frame_meta.get('enabled_filters', _offline_sar_range_angle_filters_enabled(range_angle_cfg))} "
+                    f"fft_uniform={frame_meta.get('fft_uniform_geometry', 'n/a')}"
+                )
                 _queue_put_latest(
                     status_q,
                     {
                         "type": "frame",
+                        "algorithm": str(algorithm),
                         "x_start": int(x_start),
                         "x_end": int(x_end),
                         "avg_mode": str(avg_mode),
@@ -1402,6 +1978,16 @@ def _offline_dsp_worker(
                         "bp_mode": str(bp_mode),
                         "geometry_source": str(geometry_source),
                         "doppler_bins_used": int(doppler_bins_used),
+                        "synthetic_antennas": int(frame_meta.get("synthetic_antennas", 0)),
+                        "angle_mode_requested": str(
+                            frame_meta.get("angle_mode_requested", range_angle_cfg.angle_processing.mode)
+                        ),
+                        "angle_mode": str(frame_meta.get("angle_mode", range_angle_cfg.angle_processing.mode)),
+                        "fft_uniform_geometry": bool(frame_meta.get("fft_uniform_geometry", False)),
+                        "range_angle_enabled_filters": frame_meta.get(
+                            "enabled_filters",
+                            _offline_sar_range_angle_filters_enabled(range_angle_cfg),
+                        ),
                         "elapsed_ms": float((t1 - t0) * 1000.0),
                         **_viewport_status_fields(applied_viewport, fallback_used=False),
                     },
@@ -1466,6 +2052,13 @@ class OfflineBPRuntime:
         self.crossrange_max_m = float(crossrange_max_m)
         self.image_h = int(image_h)
         self.image_w = int(image_w)
+        offline_cfg_dict = _load_yaml_file(Path(self.offline_config_path))
+        fallback_cfg_dict = _load_yaml_file(Path(self.fallback_capture_cfg))
+        reconstruction_cfg = offline_cfg_dict.get("reconstruction", {}) or {}
+        self.reconstruction_algorithm = _reconstruction_algorithm_normalize(
+            _pick(reconstruction_cfg.get("algorithm"), "backprojection")
+        )
+        self.range_angle_cfg = _read_offline_sar_range_angle_cfg(offline_cfg_dict, fallback_cfg_dict)
         self.fft_workers = int(_read_fft_workers(self.fallback_capture_cfg))
         self.x_pitch_m = float(x_pitch_m) if x_pitch_m is not None else _read_x_pitch_m(self.offline_config_path)
         self.default_avg_mode = _avg_mode_normalize(
