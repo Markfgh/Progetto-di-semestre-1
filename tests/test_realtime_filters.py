@@ -77,6 +77,19 @@ def test_background_subtraction_clamp_positive_only_preserves_negative_residual_
     np.testing.assert_allclose(out, 0.0 + 0.0j, atol=1e-6)
 
 
+def test_disabled_background_subtraction_ignores_existing_model() -> None:
+    state = realtime_dsp.BackgroundSubtractionState(
+        model=np.full((1, 1, 2, 1), 10.0 + 0.0j, dtype=np.complex64)
+    )
+    cfg = realtime_dsp.BackgroundSubtractionConfig(enabled=False, mode="frozen", init_frames=1)
+    data = np.full((1, 1, 1, 2, 1), 3.0 + 0.0j, dtype=np.complex64)
+
+    out = realtime_dsp.apply_background_subtraction(data, cfg, state)
+
+    assert out is data
+    np.testing.assert_allclose(out, data)
+
+
 def test_post_range_filters_can_loop_average_after_background() -> None:
     data = np.ones((2, 4, 1, 3, 1), dtype=np.complex64)
     data[:, 2:, :, :, :] = 3.0 + 0.0j

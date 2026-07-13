@@ -238,6 +238,118 @@ def _build_home_and_zoom_viewports(
     return home_viewport, zoom_viewport
 
 
+def test_process_buffer_publishes_angle_and_doppler_diagnostics():
+    samples = 32
+    loops = 8
+    n_frames = 1
+    range_bin = 9
+    dsp_cfg = _dsp_cfg(samples=samples, loops=loops)
+    geometry = _geometry()
+    angle_axis = realtime_dsp.build_angle_axis_deg(dsp_cfg.nfft_angle, geometry=geometry)
+    steering = realtime_dsp.build_angle_steering_matrix(dsp_cfg.virtual_ant, dsp_cfg.nfft_angle, geometry=geometry)
+    gui_h = 16
+    gui_w = 32
+    angle_diag = np.full((samples, dsp_cfg.nfft_angle), -120.0, dtype=np.float32)
+    doppler_diag = np.full((samples, loops), -120.0, dtype=np.float32)
+    gui_angle_diag_views = (
+        np.full(angle_diag.size, -120.0, dtype=np.float32),
+        np.full(angle_diag.size, -120.0, dtype=np.float32),
+    )
+    gui_doppler_diag_views = (
+        np.full(doppler_diag.size, -120.0, dtype=np.float32),
+        np.full(doppler_diag.size, -120.0, dtype=np.float32),
+    )
+    gui_heat_views = (
+        np.full(gui_h * gui_w, -120.0, dtype=np.float32),
+        np.full(gui_h * gui_w, -120.0, dtype=np.float32),
+    )
+    gui_profile_views = (
+        np.full(dsp_cfg.range_profile_count * samples, -120.0, dtype=np.float32),
+        np.full(dsp_cfg.range_profile_count * samples, -120.0, dtype=np.float32),
+    )
+    gui_latest_idx = mp.Value("i", 0)
+    gui_latest_seq = mp.Value("i", 0)
+
+    realtime_dsp.process_buffer(
+        _raw_target(
+            samples=samples,
+            loops=loops,
+            range_bin=range_bin,
+            angle_deg=15.0,
+            doppler_bin=1,
+            amplitude=30.0,
+        ),
+        n_frames,
+        np.ones((1, 1, 1, samples, 1), dtype=np.float32),
+        np.ones((1, loops, 1, 1, 1), dtype=np.float32),
+        np.ones((1, 1, 1, dsp_cfg.virtual_ant), dtype=np.float32),
+        False,
+        False,
+        False,
+        realtime_dsp.MeanSelection(enabled=False),
+        realtime_dsp.PostRangeFftFilterConfig(),
+        realtime_dsp.PostRangeFftFilterConfig(),
+        realtime_dsp.PostRangeFftFilterConfig(),
+        False,
+        False,
+        realtime_dsp.AngleProcessingConfig(mode="fft"),
+        realtime_dsp.HeatmapEMAConfig(enabled=False),
+        realtime_dsp.HeatmapSpatialFilterConfig(enabled=False),
+        realtime_dsp.DisplayProjectionConfig(projection_mode="cartesian", projection_interp="nearest"),
+        geometry,
+        steering,
+        angle_axis,
+        None,
+        2.0,
+        1.5,
+        (np.fft.fftshift(np.fft.fftfreq(loops, d=1.0)) * 4.0).astype(np.float32),
+        realtime_dsp.build_tdm_mimo_doppler_compensation_table(loops, dsp_cfg.tx, doppler_fft_shift=True),
+        realtime_dsp.DetectionConfigStatic(enabled=False),
+        realtime_dsp.DetectionConfigMoving(enabled=False, doppler_fft_shift=True),
+        realtime_dsp.FusionConfig(enabled=True),
+        realtime_dsp.BackgroundSubtractionState(),
+        realtime_dsp.BackgroundSubtractionState(),
+        realtime_dsp.BackgroundSubtractionState(),
+        None,
+        False,
+        np.ones(dsp_cfg.virtual_ant, dtype=np.complex64),
+        False,
+        np.empty((n_frames, loops, 20, dsp_cfg.tx, dsp_cfg.rx), dtype=np.complex64),
+        np.empty((n_frames, loops, 20, dsp_cfg.virtual_ant), dtype=np.complex64),
+        np.empty((n_frames, loops, dsp_cfg.tx, 20, dsp_cfg.rx), dtype=np.complex64),
+        np.empty((dsp_cfg.tx, samples, dsp_cfg.rx), dtype=np.float32),
+        np.empty((gui_h, gui_w), dtype=np.float32),
+        gui_h,
+        gui_w,
+        gui_heat_views,
+        gui_profile_views,
+        gui_latest_idx,
+        gui_latest_seq,
+        threading.Lock(),
+        True,
+        np.empty((dsp_cfg.range_profile_count, samples), dtype=np.float32),
+        mp.Value("d", 0.0),
+        mp.Value("d", 0.0),
+        mp.Value("d", 0.0),
+        mp.Value("d", 0.0),
+        dsp_cfg,
+        20,
+        20,
+        gui_angle_diag_views=gui_angle_diag_views,
+        gui_doppler_diag_views=gui_doppler_diag_views,
+        angle_diag_out_buf=angle_diag,
+        doppler_diag_out_buf=doppler_diag,
+    )
+
+    published_idx = int(gui_latest_idx.value)
+    published_angle = gui_angle_diag_views[published_idx].reshape(angle_diag.shape)
+    published_doppler = gui_doppler_diag_views[published_idx].reshape(doppler_diag.shape)
+    assert np.isfinite(published_angle).all()
+    assert np.isfinite(published_doppler).all()
+    assert float(np.max(published_angle[range_bin])) > -120.0
+    assert float(np.max(published_doppler[range_bin])) > -120.0
+
+
 def test_process_buffer_synthetic_static_target_outputs_detection_and_finite_views() -> None:
     samples = 32
     loops = 4

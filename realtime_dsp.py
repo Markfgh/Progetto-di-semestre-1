@@ -1073,6 +1073,16 @@ def _to_bool(value: Any, default: bool = False) -> bool:
     return bool(value)
 
 
+def _deep_merge_dict(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    out = dict(base)
+    for key, value in (patch or {}).items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge_dict(out.get(key, {}) or {}, value)
+        else:
+            out[key] = value
+    return out
+
+
 def _to_optional_float(value: Any) -> float | None:
     if value is None:
         return None
@@ -4705,6 +4715,10 @@ def process_buffer(
     display_zoom_cfg: DisplayZoomConfig | None = None,
     display_zoom_runtime: DisplayZoomRuntime | None = None,
     frame_seq: int = 0,
+    gui_angle_diag_views: tuple[np.ndarray, np.ndarray] | None = None,
+    gui_doppler_diag_views: tuple[np.ndarray, np.ndarray] | None = None,
+    angle_diag_out_buf: np.ndarray | None = None,
+    doppler_diag_out_buf: np.ndarray | None = None,
 ) -> tuple[np.ndarray | None, list[Detection], np.ndarray]:
     try:
         cal_vector_out = np.asarray(cal_vector, dtype=np.complex64).reshape(-1)
@@ -5002,6 +5016,98 @@ def process_buffer(
             )
 
         active_display_max_bin = _viewport_max_bin_for(range_bin_m, int(range_fft_display.shape[3]))
+
+        if angle_diag_out_buf is not None:
+            angle_diag_out_buf.fill(np.float32(-120.0))
+            diag_range_bins = min(
+                int(active_display_max_bin),
+                int(angle_diag_out_buf.shape[0]),
+                int(range_fft_display.shape[3]),
+            )
+            if diag_range_bins > 0:
+                diag_virtual_array = _build_virtual_array_from_range_fft(
+                    range_fft_display,
+                    max_bin=diag_range_bins,
+                    dsp_cfg=dsp_cfg,
+                    geometry=virtual_array_geometry,
+                    work_buf=(
+                        None
+                        if virtual_array_work_buf is None
+                        else virtual_array_work_buf[
+                            :n_frames,
+                            : int(range_fft_display.shape[1]),
+                            :diag_range_bins,
+                            :,
+                            :,
+                        ]
+                    ),
+                    flat_work_buf=(
+                        None
+                        if virtual_array_flat_work_buf is None
+                        else virtual_array_flat_work_buf[
+                            :n_frames,
+                            : int(range_fft_display.shape[1]),
+                            :diag_range_bins,
+                            :,
+                        ]
+                    ),
+                )
+                if calibration_enabled:
+                    _apply_calibration_vector(diag_virtual_array, cal_vector_out)
+                if apply_angle_window:
+                    diag_virtual_array *= w_angle
+                diag_angle_pow = compute_angle_heatmap(
+                    diag_virtual_array,
+                    angle_cfg=angle_processing,
+                    dsp_cfg=replace(dsp_cfg, nfft_angle=int(angle_diag_out_buf.shape[1])),
+                    angle_steering=angle_steering,
+                    geometry=virtual_array_geometry,
+                    ant_spacing=virtual_array_geometry.uniform_spacing_lambda,
+                )
+                diag_copy_rows = min(int(angle_diag_out_buf.shape[0]), int(diag_angle_pow.shape[0]))
+                diag_copy_cols = min(int(angle_diag_out_buf.shape[1]), int(diag_angle_pow.shape[1]))
+                if diag_copy_rows > 0 and diag_copy_cols > 0:
+                    diag_angle_db = diag_angle_pow[:diag_copy_rows, :diag_copy_cols].astype(np.float32, copy=False)
+                    np.add(diag_angle_db, np.float32(1e-12), out=diag_angle_db)
+                    np.log10(diag_angle_db, out=diag_angle_db)
+                    diag_angle_db *= np.float32(10.0)
+                    angle_diag_out_buf[:diag_copy_rows, :diag_copy_cols] = diag_angle_db
+
+        if doppler_diag_out_buf is not None:
+            doppler_diag_out_buf.fill(np.float32(-120.0))
+            diag_range_bins = min(
+                int(active_display_max_bin),
+                int(doppler_diag_out_buf.shape[0]),
+                int(range_fft_detection_moving.shape[3]),
+            )
+            if diag_range_bins > 0:
+                _, diag_range_doppler = compute_range_doppler(
+                    range_fft_detection_moving,
+                    max_bin=diag_range_bins,
+                    dsp_cfg=dsp_cfg,
+                    moving_cfg=detection_moving_cfg,
+                    w_doppler=w_doppler,
+                    apply_doppler_window=apply_doppler_window,
+                    doppler_work_buf=(
+                        None
+                        if doppler_work_buf is None
+                        else doppler_work_buf[
+                            :n_frames,
+                            : int(range_fft_detection_moving.shape[1]),
+                            :,
+                            :diag_range_bins,
+                            :,
+                        ]
+                    ),
+                )
+                diag_copy_rows = min(int(doppler_diag_out_buf.shape[0]), int(diag_range_doppler.shape[0]))
+                diag_copy_cols = min(int(doppler_diag_out_buf.shape[1]), int(diag_range_doppler.shape[1]))
+                if diag_copy_rows > 0 and diag_copy_cols > 0:
+                    diag_doppler_db = diag_range_doppler[:diag_copy_rows, :diag_copy_cols].astype(np.float32, copy=False)
+                    np.add(diag_doppler_db, np.float32(1e-12), out=diag_doppler_db)
+                    np.log10(diag_doppler_db, out=diag_doppler_db)
+                    diag_doppler_db *= np.float32(10.0)
+                    doppler_diag_out_buf[:diag_copy_rows, :diag_copy_cols] = diag_doppler_db
 
         def _projection_lut_for(
             angle_axis_local: np.ndarray,
@@ -5551,6 +5657,20 @@ def process_buffer(
             n_prof = min(dst_prof.size, prof_flat.size)
             if n_prof > 0:
                 dst_prof[:n_prof] = prof_flat[:n_prof]
+            if gui_angle_diag_views is not None and angle_diag_out_buf is not None:
+                dst_angle = gui_angle_diag_views[next_idx]
+                dst_angle.fill(-120.0)
+                angle_flat = angle_diag_out_buf.reshape(-1)
+                n_angle = min(dst_angle.size, angle_flat.size)
+                if n_angle > 0:
+                    dst_angle[:n_angle] = angle_flat[:n_angle]
+            if gui_doppler_diag_views is not None and doppler_diag_out_buf is not None:
+                dst_doppler = gui_doppler_diag_views[next_idx]
+                dst_doppler.fill(-120.0)
+                doppler_flat = doppler_diag_out_buf.reshape(-1)
+                n_doppler_diag = min(dst_doppler.size, doppler_flat.size)
+                if n_doppler_diag > 0:
+                    dst_doppler[:n_doppler_diag] = doppler_flat[:n_doppler_diag]
             gui_latest_idx.value = next_idx
             gui_latest_seq.value = int(gui_latest_seq.value) + 1
         return heatmap_ema, tracking_detections, cal_vector_out
@@ -5608,6 +5728,10 @@ def dsp_worker(
     display_viewport_applied_lock=None,
     display_home_viewport=None,
     display_home_viewport_lock=None,
+    gui_angle_diag_dbuf=None,
+    gui_doppler_diag_dbuf=None,
+    angle_diag_w: int = 0,
+    doppler_diag_w: int = 0,
 ) -> None:
     dsp_block = cfg_dict.get("dsp", {}) or {}
     selection = selection_from_yaml_dict(cfg_dict)
@@ -5771,6 +5895,16 @@ def dsp_worker(
 
     complex_data = np.zeros(total_samples_needed, dtype=np.complex64)
     profiles_out_buf = np.empty((dsp_cfg.range_profile_count, int(fft_plot_h)), dtype=np.float32)
+    angle_diag_out_buf = (
+        np.empty((int(fft_plot_h), max(1, int(angle_diag_w))), dtype=np.float32)
+        if gui_angle_diag_dbuf is not None and int(angle_diag_w) > 0
+        else None
+    )
+    doppler_diag_out_buf = (
+        np.empty((int(fft_plot_h), max(1, int(doppler_diag_w))), dtype=np.float32)
+        if gui_doppler_diag_dbuf is not None and int(doppler_diag_w) > 0
+        else None
+    )
     virtual_array_work_buf = np.empty(
         (dsp_cfg.x_frames, n_doppler, max_virtual_array_bin, dsp_cfg.tx, dsp_cfg.rx),
         dtype=np.complex64,
@@ -5801,6 +5935,20 @@ def dsp_worker(
         np.frombuffer(gui_prof_dbuf, dtype=np.float32, count=gui_prof_size, offset=0),
         np.frombuffer(gui_prof_dbuf, dtype=np.float32, count=gui_prof_size, offset=gui_prof_size * 4),
     )
+    gui_angle_diag_views: tuple[np.ndarray, np.ndarray] | None = None
+    if gui_angle_diag_dbuf is not None and int(angle_diag_w) > 0:
+        gui_angle_diag_size = int(fft_plot_h) * max(1, int(angle_diag_w))
+        gui_angle_diag_views = (
+            np.frombuffer(gui_angle_diag_dbuf, dtype=np.float32, count=gui_angle_diag_size, offset=0),
+            np.frombuffer(gui_angle_diag_dbuf, dtype=np.float32, count=gui_angle_diag_size, offset=gui_angle_diag_size * 4),
+        )
+    gui_doppler_diag_views: tuple[np.ndarray, np.ndarray] | None = None
+    if gui_doppler_diag_dbuf is not None and int(doppler_diag_w) > 0:
+        gui_doppler_diag_size = int(fft_plot_h) * max(1, int(doppler_diag_w))
+        gui_doppler_diag_views = (
+            np.frombuffer(gui_doppler_diag_dbuf, dtype=np.float32, count=gui_doppler_diag_size, offset=0),
+            np.frombuffer(gui_doppler_diag_dbuf, dtype=np.float32, count=gui_doppler_diag_size, offset=gui_doppler_diag_size * 4),
+        )
 
     shm_view = memoryview(shm_frames).cast("B")
     n_slots = len(slot_state)
@@ -5912,6 +6060,153 @@ def dsp_worker(
             except Exception:
                 pass
 
+    def _reset_runtime_processing_state(*, reset_tracker: bool) -> None:
+        nonlocal detection_static_bg_state, detection_moving_bg_state, display_bg_state
+        nonlocal heatmap_ema, tracker, tracker_time_s, last_tracker_seq
+        nonlocal warned_display_loop_average_after_doppler, warned_detection_loop_average_after_doppler
+
+        detection_static_bg_state = BackgroundSubtractionState()
+        detection_moving_bg_state = BackgroundSubtractionState()
+        display_bg_state = BackgroundSubtractionState()
+        heatmap_ema = None
+        warned_display_loop_average_after_doppler = False
+        warned_detection_loop_average_after_doppler = False
+        if display_zoom_runtime is not None:
+            display_zoom_runtime.display_bg_state = BackgroundSubtractionState()
+            display_zoom_runtime.moving_bg_state = BackgroundSubtractionState()
+            display_zoom_runtime.last_view_db = None
+            display_zoom_runtime.last_view_alpha = None
+            display_zoom_runtime.last_viewport_signature = None
+            display_zoom_runtime.last_applied_meta = None
+            display_zoom_runtime.last_mode = "power_xy"
+        if reset_tracker:
+            tracker = (
+                MultiObjectTracker(tracking_cfg=tracking_cfg, tracker_cfg=tracker_cfg)
+                if tracking_runtime_enabled
+                else None
+            )
+            tracker_time_s = None
+            last_tracker_seq = None
+
+    def _apply_runtime_config_patch(cfg_patch: dict[str, Any], *, reset_runtime_state: bool = False) -> None:
+        nonlocal cfg_dict, dsp_cfg
+        nonlocal selection, window_range, window_doppler, window_angle
+        nonlocal apply_range_window, apply_doppler_window, apply_angle_window
+        nonlocal mean_before_range_fft
+        nonlocal detection_static_post_range_fft_filters, detection_moving_pre_doppler_filters
+        nonlocal display_post_range_fft_filters, angle_processing
+        nonlocal heatmap_ema_cfg, heatmap_spatial_filter_cfg, heatmap_ema
+        nonlocal detection_static_cfg, detection_moving_cfg, fusion_cfg
+        nonlocal tracking_cfg, tracker_cfg, tracking_runtime_enabled, tracker
+        nonlocal tracker_nominal_frame_dt_s, tracker_time_s, last_tracker_seq
+        nonlocal detection_static_bg_state, detection_moving_bg_state, display_bg_state
+        nonlocal warned_display_loop_average_after_doppler, warned_detection_loop_average_after_doppler
+
+        if not isinstance(cfg_patch, dict) or not cfg_patch:
+            return
+
+        next_cfg_dict = _deep_merge_dict(cfg_dict, cfg_patch)
+        next_selection = selection_from_yaml_dict(next_cfg_dict)
+        next_mean_before_range_fft, _ = mean_selections_from_yaml_dict(next_cfg_dict)
+        next_detection_static_filters = detection_static_post_range_fft_filters_from_yaml_dict(next_cfg_dict)
+        next_detection_static_filters, detection_static_filter_warnings = sanitize_detection_static_post_range_fft_filters(
+            next_detection_static_filters
+        )
+        next_detection_moving_filters = detection_moving_pre_doppler_filters_from_yaml_dict(next_cfg_dict)
+        next_detection_moving_filters, detection_moving_filter_warnings = sanitize_detection_moving_pre_doppler_filters(
+            next_detection_moving_filters
+        )
+        next_display_filters = display_post_range_fft_filters_from_yaml_dict(next_cfg_dict)
+        next_display_filters, display_filter_warnings = sanitize_display_post_range_fft_filters(next_display_filters)
+        next_angle_processing = angle_processing_from_yaml_dict(next_cfg_dict)
+        next_heatmap_ema_cfg = heatmap_ema_from_yaml_dict(next_cfg_dict)
+        next_heatmap_spatial_filter_cfg = heatmap_spatial_filter_from_yaml_dict(next_cfg_dict)
+        next_detection_static_cfg = detection_static_from_yaml_dict(next_cfg_dict)
+        next_detection_moving_cfg = detection_moving_from_yaml_dict(next_cfg_dict)
+        next_fusion_cfg = fusion_from_yaml_dict(next_cfg_dict)
+        next_tracking_cfg = tracking_from_yaml_dict(next_cfg_dict)
+        next_tracker_cfg = tracker_from_yaml_dict(next_cfg_dict)
+        next_range_angle_moving_cfg = range_angle_moving_from_yaml_dict(next_cfg_dict)
+        next_zero_after = max(0, _to_int((next_cfg_dict.get("dsp", {}) or {}).get("zero_after_range_fft_bins", 0), 0))
+
+        if next_selection != selection:
+            window_range, window_doppler, window_angle = build_windows(
+                next_selection,
+                samples=dsp_cfg.samples,
+                n_loops=dsp_cfg.chirps // dsp_cfg.tx,
+                virtual_ant=dsp_cfg.virtual_ant,
+            )
+            apply_range_window = not _window_is_identity(next_selection.window_range)
+            apply_doppler_window = not _window_is_identity(next_selection.window_doppler)
+            apply_angle_window = not _window_is_identity(next_selection.window_angle)
+
+        if next_detection_static_filters != detection_static_post_range_fft_filters:
+            detection_static_bg_state = BackgroundSubtractionState()
+            warned_detection_loop_average_after_doppler = False
+        if next_detection_moving_filters != detection_moving_pre_doppler_filters:
+            detection_moving_bg_state = BackgroundSubtractionState()
+            if display_zoom_runtime is not None:
+                display_zoom_runtime.moving_bg_state = BackgroundSubtractionState()
+        if next_display_filters != display_post_range_fft_filters:
+            display_bg_state = BackgroundSubtractionState()
+            if display_zoom_runtime is not None:
+                display_zoom_runtime.display_bg_state = BackgroundSubtractionState()
+            warned_display_loop_average_after_doppler = False
+        if next_heatmap_ema_cfg != heatmap_ema_cfg:
+            heatmap_ema = None
+
+        next_tracking_runtime_enabled = bool(getattr(next_tracking_cfg, "enabled", False))
+        if next_tracking_runtime_enabled and int(dsp_cfg.x_frames) > 1:
+            print(
+                f"[TRACK WARN] runtime tracking disabled because capture.x_frames={int(dsp_cfg.x_frames)}. "
+                "Current tracker expects x_frames=1."
+            )
+            next_tracking_runtime_enabled = False
+        if (
+            next_tracking_runtime_enabled != tracking_runtime_enabled
+            or next_tracking_cfg != tracking_cfg
+            or next_tracker_cfg != tracker_cfg
+        ):
+            tracker = (
+                MultiObjectTracker(tracking_cfg=next_tracking_cfg, tracker_cfg=next_tracker_cfg)
+                if next_tracking_runtime_enabled
+                else None
+            )
+            tracker_time_s = None
+            last_tracker_seq = None
+
+        for warn_msg in detection_static_filter_warnings + detection_moving_filter_warnings + display_filter_warnings:
+            print(f"[DSP WARN] runtime config: {warn_msg}")
+
+        cfg_dict = next_cfg_dict
+        selection = next_selection
+        mean_before_range_fft = next_mean_before_range_fft
+        detection_static_post_range_fft_filters = next_detection_static_filters
+        detection_moving_pre_doppler_filters = next_detection_moving_filters
+        display_post_range_fft_filters = next_display_filters
+        angle_processing = next_angle_processing
+        heatmap_ema_cfg = next_heatmap_ema_cfg
+        heatmap_spatial_filter_cfg = next_heatmap_spatial_filter_cfg
+        detection_static_cfg = next_detection_static_cfg
+        detection_moving_cfg = next_detection_moving_cfg
+        fusion_cfg = next_fusion_cfg
+        tracking_cfg = next_tracking_cfg
+        tracker_cfg = next_tracker_cfg
+        tracking_runtime_enabled = next_tracking_runtime_enabled
+        tracker_nominal_frame_dt_s = resolve_nominal_frame_period_s(cfg_dict, dsp_cfg, tracking_cfg)
+        dsp_cfg = replace(
+            dsp_cfg,
+            zero_after_range_fft_bins=int(next_zero_after),
+            range_angle_moving=next_range_angle_moving_cfg,
+        )
+        if display_zoom_runtime is not None:
+            display_zoom_runtime.last_view_db = None
+            display_zoom_runtime.last_view_alpha = None
+            display_zoom_runtime.last_viewport_signature = None
+        if reset_runtime_state:
+            _reset_runtime_processing_state(reset_tracker=True)
+        print("[DSP CFG] runtime config updated from GUI.")
+
     def _poll_dsp_commands() -> None:
         nonlocal pending_calibration
         while True:
@@ -5925,6 +6220,18 @@ def dsp_worker(
             if cmd_type == "calibrate_boresight":
                 pending_calibration = True
                 print("[DSP CAL] boresight calibration requested; waiting for next processed batch.")
+            elif cmd_type == "update_runtime_config":
+                cfg_patch = cmd.get("cfg_patch", cmd.get("patch", {}))
+                try:
+                    _apply_runtime_config_patch(
+                        cfg_patch,
+                        reset_runtime_state=bool(cmd.get("reset_runtime_state", False)),
+                    )
+                except Exception as e:
+                    print(f"[DSP CFG WARN] runtime config update failed: {e}")
+            elif cmd_type == "reset_runtime_state":
+                _reset_runtime_processing_state(reset_tracker=True)
+                print("[DSP CFG] runtime processing state reset from GUI.")
 
     def _read_requested_viewport() -> DisplayViewport:
         if display_viewport_request is None:
@@ -6202,6 +6509,10 @@ def dsp_worker(
             display_zoom_cfg=display_zoom_cfg,
             display_zoom_runtime=display_zoom_runtime,
             frame_seq=(int(proc_seqs[-1]) if proc_seqs else 0),
+            gui_angle_diag_views=gui_angle_diag_views,
+            gui_doppler_diag_views=gui_doppler_diag_views,
+            angle_diag_out_buf=angle_diag_out_buf,
+            doppler_diag_out_buf=doppler_diag_out_buf,
         )
         _write_applied_viewport(display_zoom_runtime.last_applied_meta)
         if requested_calibration:

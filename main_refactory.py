@@ -377,6 +377,7 @@ from realtime_dsp import (
     RealtimeDSPConfig,
     applied_viewport_meta_from_viewport,
     build_angle_axis_deg,
+    build_doppler_axis_mps,
     build_display_viewport,
     calibration_from_yaml_dict,
     clamp_display_viewport,
@@ -469,6 +470,8 @@ except (TypeError, ValueError):
 RANGE_PROFILE_COUNT = max(1, min(int(RANGE_PROFILE_COUNT), int(VIRTUAL_ANT)))
 RANGEFFT_PLOT_COUNT = int(TX)
 RANGEFFT_LINES_PER_PLOT = int(RX)
+ANGLEFFT_BINS = max(1, int(NFFT_ANGLE))
+DOPPLERFFT_BINS = max(1, int(CHIRPS // max(1, TX)))
 
 
 def _fallback_heatmap_velocity_scale_mps() -> tuple[float, float]:
@@ -1398,6 +1401,8 @@ def main():
     gui_dbuf = _track_mp_ref(RawArray("f", 2 * gui_h * gui_w))
     gui_alpha_dbuf = _track_mp_ref(RawArray("f", 2 * gui_h * gui_w))
     gui_prof_dbuf = _track_mp_ref(RawArray("f", 2 * RANGE_PROFILE_COUNT * fft_plot_h))
+    gui_angle_diag_dbuf = _track_mp_ref(RawArray("f", 2 * fft_plot_h * ANGLEFFT_BINS))
+    gui_doppler_diag_dbuf = _track_mp_ref(RawArray("f", 2 * fft_plot_h * DOPPLERFFT_BINS))
     gui_latest_idx = _track_mp_ref(Value("i", -1))
     gui_latest_seq = _track_mp_ref(Value("Q", 0))
     gui_lock = _track_mp_ref(mp.Lock())
@@ -1600,6 +1605,12 @@ def main():
             rt_home_viewport_shared,
             rt_home_viewport_lock,
         ),
+        kwargs={
+            "gui_angle_diag_dbuf": gui_angle_diag_dbuf,
+            "gui_doppler_diag_dbuf": gui_doppler_diag_dbuf,
+            "angle_diag_w": int(ANGLEFFT_BINS),
+            "doppler_diag_w": int(DOPPLERFFT_BINS),
+        },
     )
     _track_process(p_dsp)
 
@@ -1695,6 +1706,30 @@ def main():
         vis_fft_vmax = vis_fft_vmin + 1.0
     fft_mode_db = bool(vis_fft_mode_db)
     fft_view_full = bool(vis_fft_view_full)
+    angle_single_bin = False
+    doppler_single_bin = False
+    angle_selected_bin = 0
+    doppler_selected_bin = 0
+    angle_axis_diag = build_angle_axis_deg(ANGLEFFT_BINS)
+    angle_axis_finite = angle_axis_diag[np.isfinite(angle_axis_diag)]
+    if angle_axis_finite.size > 0:
+        angle_axis_min = float(np.min(angle_axis_finite))
+        angle_axis_max = float(np.max(angle_axis_finite))
+    else:
+        angle_axis_min = float(-ANGLEFFT_BINS // 2)
+        angle_axis_max = float(ANGLEFFT_BINS // 2)
+    doppler_axis_diag = build_doppler_axis_mps(
+        cfg,
+        REALTIME_DSP_CFG,
+        DOPPLERFFT_BINS,
+        doppler_fft_shift=bool((cfg.get("detection_moving", {}) or {}).get("doppler_fft_shift", True)),
+    )
+    if doppler_axis_diag is None or int(np.asarray(doppler_axis_diag).size) != int(DOPPLERFFT_BINS):
+        doppler_axis_diag = np.linspace(-1.0, 1.0, int(DOPPLERFFT_BINS), dtype=np.float32)
+    else:
+        doppler_axis_diag = np.asarray(doppler_axis_diag, dtype=np.float32)
+    doppler_axis_min = float(np.min(doppler_axis_diag)) if doppler_axis_diag.size > 0 else -1.0
+    doppler_axis_max = float(np.max(doppler_axis_diag)) if doppler_axis_diag.size > 0 else 1.0
 
     ui_dirty = True
     ui_dirty_t = 0.0
@@ -1732,11 +1767,13 @@ def main():
     TAG_MAIN_TABBAR = "main_tabbar"
     TAB_REALTIME_TAG = "tab_tempo_reale"
     TAB_PROCESSED_TAG = "tab_dati_processati"
+    TAB_TUNING_TAG = "tab_tuning_dsp"
     TAG_SIDEBAR     = "sidebar_col"
     TAG_CBAR_COL    = "cbar_col"
     TAG_RANGEFFT_COL = "rangefft_col"
 
     TXT_STATS_TAG = "txt_stats"
+    TXT_TUNING_STATUS_TAG = "txt_tuning_status"
     IN_VMIN, IN_VMAX = "in_vmin", "in_vmax"
     IN_RMAX, IN_XMAX = "in_rmax", "in_xmax"
     IN_FFT_XMIN, IN_FFT_XMAX = "in_fft_xmin", "in_fft_xmax"
@@ -1790,6 +1827,29 @@ def main():
     RANGEFFT_XAXIS_TAG = "rangefft_xaxis"
     RANGEFFT_YAXIS_TAG = "rangefft_yaxis"
     RANGEFFT_LINE_TAGS = [f"rangefft_line_ant{ant_i}" for ant_i in range(RANGE_PROFILE_COUNT)]
+    FFT_DIAG_TABBAR_TAG = "fft_diag_tabbar"
+    ANGLEFFT_TEX_TAG = "anglefft_tex"
+    DOPPLERFFT_TEX_TAG = "dopplerfft_tex"
+    ANGLEFFT_HEAT_PLOT_TAG = "anglefft_heat_plot"
+    ANGLEFFT_PROFILE_PLOT_TAG = "anglefft_profile_plot"
+    ANGLEFFT_XAXIS_TAG = "anglefft_xaxis"
+    ANGLEFFT_YAXIS_TAG = "anglefft_yaxis"
+    ANGLEFFT_PROFILE_XAXIS_TAG = "anglefft_profile_xaxis"
+    ANGLEFFT_PROFILE_YAXIS_TAG = "anglefft_profile_yaxis"
+    ANGLEFFT_IMG_SERIES_TAG = "anglefft_img_series"
+    ANGLEFFT_PROFILE_LINE_TAG = "anglefft_profile_line"
+    DOPPLERFFT_HEAT_PLOT_TAG = "dopplerfft_heat_plot"
+    DOPPLERFFT_PROFILE_PLOT_TAG = "dopplerfft_profile_plot"
+    DOPPLERFFT_XAXIS_TAG = "dopplerfft_xaxis"
+    DOPPLERFFT_YAXIS_TAG = "dopplerfft_yaxis"
+    DOPPLERFFT_PROFILE_XAXIS_TAG = "dopplerfft_profile_xaxis"
+    DOPPLERFFT_PROFILE_YAXIS_TAG = "dopplerfft_profile_yaxis"
+    DOPPLERFFT_IMG_SERIES_TAG = "dopplerfft_img_series"
+    DOPPLERFFT_PROFILE_LINE_TAG = "dopplerfft_profile_line"
+    CHK_ANGLE_SINGLE_BIN = "chk_angle_single_bin"
+    CHK_DOPPLER_SINGLE_BIN = "chk_doppler_single_bin"
+    IN_ANGLE_BIN = "in_angle_bin"
+    IN_DOPPLER_BIN = "in_doppler_bin"
     RANGEFFT_LINE_COLORS = [
         (0, 255, 255, 255),    # Ciano
         (255, 255, 0, 255),    # Giallo
@@ -1856,6 +1916,12 @@ def main():
     tex_w, tex_h = int(gui_w), int(gui_h)
     tex_buf = array("f", [0.0]) * (tex_w * tex_h * 4)
     tex_np = np.frombuffer(tex_buf, dtype=np.float32)
+    angle_diag_tex_w, angle_diag_tex_h = int(ANGLEFFT_BINS), int(fft_plot_h)
+    angle_diag_tex_buf = array("f", [0.0]) * (angle_diag_tex_w * angle_diag_tex_h * 4)
+    angle_diag_tex_np = np.frombuffer(angle_diag_tex_buf, dtype=np.float32)
+    doppler_diag_tex_w, doppler_diag_tex_h = int(DOPPLERFFT_BINS), int(fft_plot_h)
+    doppler_diag_tex_buf = array("f", [0.0]) * (doppler_diag_tex_w * doppler_diag_tex_h * 4)
+    doppler_diag_tex_np = np.frombuffer(doppler_diag_tex_buf, dtype=np.float32)
     proc_tex_w, proc_tex_h = int(gui_w), int(gui_h)
     proc_tex_buf = array("f", [0.0]) * (proc_tex_w * proc_tex_h * 4)
     proc_tex_np = np.frombuffer(proc_tex_buf, dtype=np.float32)
@@ -2034,6 +2100,18 @@ def main():
             height=tex_h,
             default_value=[0.0, 0.0, 0.0, 1.0] * tex_w * tex_h,
             tag=TEX_TAG,
+        )
+        dpg.add_dynamic_texture(
+            width=angle_diag_tex_w,
+            height=angle_diag_tex_h,
+            default_value=[0.0, 0.0, 0.0, 1.0] * angle_diag_tex_w * angle_diag_tex_h,
+            tag=ANGLEFFT_TEX_TAG,
+        )
+        dpg.add_dynamic_texture(
+            width=doppler_diag_tex_w,
+            height=doppler_diag_tex_h,
+            default_value=[0.0, 0.0, 0.0, 1.0] * doppler_diag_tex_w * doppler_diag_tex_h,
+            tag=DOPPLERFFT_TEX_TAG,
         )
         dpg.add_dynamic_texture(
             width=proc_tex_w,
@@ -2616,6 +2694,22 @@ def main():
         ui_pending["fft_view_full"] = bool(fft_view_full)
         ui_dirty = True
 
+    def _on_angle_single_bin(sender=None, app_data=None):
+        nonlocal angle_single_bin
+        angle_single_bin = bool(app_data)
+        if dpg.does_item_exist(ANGLEFFT_HEAT_PLOT_TAG):
+            dpg.configure_item(ANGLEFFT_HEAT_PLOT_TAG, show=not angle_single_bin)
+        if dpg.does_item_exist(ANGLEFFT_PROFILE_PLOT_TAG):
+            dpg.configure_item(ANGLEFFT_PROFILE_PLOT_TAG, show=angle_single_bin)
+
+    def _on_doppler_single_bin(sender=None, app_data=None):
+        nonlocal doppler_single_bin
+        doppler_single_bin = bool(app_data)
+        if dpg.does_item_exist(DOPPLERFFT_HEAT_PLOT_TAG):
+            dpg.configure_item(DOPPLERFFT_HEAT_PLOT_TAG, show=not doppler_single_bin)
+        if dpg.does_item_exist(DOPPLERFFT_PROFILE_PLOT_TAG):
+            dpg.configure_item(DOPPLERFFT_PROFILE_PLOT_TAG, show=doppler_single_bin)
+
     def _base_off_vscale_for_mode(enabled: bool):
         if enabled:
             vmin = float(VMIN_NORM)
@@ -2717,6 +2811,225 @@ def main():
         body = "".join(_format_stats_row(k, v) + "\n" for k, v in rows_s)
         return border + body + border
 
+    def _cfg_path_get(path: str, default=None):
+        node = cfg
+        for part in str(path).split("."):
+            if not isinstance(node, dict) or part not in node:
+                return default
+            node = node.get(part)
+        return node
+
+    def _tune_tag(path: str) -> str:
+        return "tune__" + str(path).replace(".", "__")
+
+    TUNING_THRESHOLD_MODES = ["relative", "absolute", "ca_cfar", "os_cfar"]
+    TUNING_WINDOWS = ["none", "rectangular", "hanning", "hamming", "blackman"]
+    TUNING_BG_MODES = ["ema", "running_mean", "window_mean", "frozen"]
+    TUNING_SLOW_TIME_MODES = ["none", "mean_subtraction", "highpass", "doppler_fft"]
+    TUNING_MOVING_SLOW_TIME_MODES = ["none", "mean_subtraction", "highpass"]
+    TUNING_ANGLE_MODES = ["fft", "bartlett", "mvdr"]
+    TUNING_AGGREGATION_MODES = ["frame_loop", "frame", "loop", "none"]
+    TUNING_SPATIAL_FILTER_MODES = ["none", "gaussian_3x3"]
+
+    TUNING_FIELD_SPECS = [
+        {"section": "DSP", "group": "Windows", "path": "dsp.window_range", "label": "Range", "kind": "combo", "items": TUNING_WINDOWS, "default": "hanning"},
+        {"section": "DSP", "group": "Windows", "path": "dsp.window_doppler", "label": "Doppler", "kind": "combo", "items": TUNING_WINDOWS, "default": "hanning"},
+        {"section": "DSP", "group": "Windows", "path": "dsp.window_angle", "label": "Angle", "kind": "combo", "items": TUNING_WINDOWS, "default": "hanning"},
+        {"section": "DSP", "group": "Range FFT", "path": "dsp.zero_after_range_fft_bins", "label": "Zero first bins", "kind": "int", "default": 0, "min": 0, "step": 1},
+        {"section": "DSP", "group": "Moving heatmap", "path": "dsp.range_angle_moving.relative_power_floor_db", "label": "Rel floor dB", "kind": "float", "default": -22.0, "step": 1.0},
+        {"section": "DSP", "group": "Moving heatmap", "path": "dsp.range_angle_moving.min_power_db", "label": "Min power dB", "kind": "float", "default": 0.0, "step": 1.0},
+        {"section": "DSP", "group": "Moving heatmap", "path": "dsp.range_angle_moving.min_dominance_ratio", "label": "Dominance", "kind": "float", "default": 0.45, "min": 0.0, "max": 1.0, "step": 0.05},
+        {"section": "DSP", "group": "Moving heatmap", "path": "dsp.range_angle_moving.velocity_dead_zone", "label": "Dead zone", "kind": "float", "default": 0.08, "min": 0.0, "max": 0.99, "step": 0.01},
+        {"section": "DSP", "group": "Moving heatmap", "path": "dsp.range_angle_moving.min_opacity", "label": "Min opacity", "kind": "float", "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05},
+        {"section": "DSP", "group": "Display BG", "path": "dsp.display_filters.background_subtraction.enabled", "label": "Enabled", "kind": "bool", "default": True},
+        {"section": "DSP", "group": "Display BG", "path": "dsp.display_filters.background_subtraction.mode", "label": "Mode", "kind": "combo", "items": TUNING_BG_MODES, "default": "frozen"},
+        {"section": "DSP", "group": "Display BG", "path": "dsp.display_filters.background_subtraction.alpha", "label": "Alpha", "kind": "float", "default": 0.02, "min": 0.0, "max": 1.0, "step": 0.01},
+        {"section": "DSP", "group": "Display BG", "path": "dsp.display_filters.background_subtraction.init_frames", "label": "Init frames", "kind": "int", "default": 40, "min": 0, "step": 1},
+        {"section": "DSP", "group": "Display BG", "path": "dsp.display_filters.background_subtraction.window_frames", "label": "Window frames", "kind": "int", "default": 40, "min": 1, "step": 1},
+        {"section": "DSP", "group": "Display BG", "path": "dsp.display_filters.background_subtraction.clamp_positive_only", "label": "Clamp positive", "kind": "bool", "default": True},
+        {"section": "DSP", "group": "Display slow time", "path": "dsp.display_filters.slow_time.enabled", "label": "Enabled", "kind": "bool", "default": False},
+        {"section": "DSP", "group": "Display slow time", "path": "dsp.display_filters.slow_time.mode", "label": "Mode", "kind": "combo", "items": TUNING_SLOW_TIME_MODES, "default": "mean_subtraction"},
+        {"section": "DSP", "group": "Display slow time", "path": "dsp.display_filters.slow_time.highpass_beta", "label": "Highpass beta", "kind": "float", "default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01},
+        {"section": "DSP", "group": "Display mean", "path": "dsp.display_filters.mean_after_range_fft.enabled", "label": "Mean after FFT", "kind": "bool", "default": False},
+        {"section": "DSP", "group": "Display mean", "path": "dsp.display_filters.loop_average_after_background.enabled", "label": "Loop avg after BG", "kind": "bool", "default": False},
+        {"section": "DSP", "group": "Angle", "path": "dsp.angle_processing.mode", "label": "Mode", "kind": "combo", "items": TUNING_ANGLE_MODES, "default": "bartlett"},
+        {"section": "DSP", "group": "Angle", "path": "dsp.angle_processing.mvdr_diagonal_loading", "label": "MVDR loading", "kind": "float", "default": 0.02, "min": 0.0, "step": 0.005},
+        {"section": "DSP", "group": "Angle", "path": "dsp.angle_processing.aggregation", "label": "Aggregation", "kind": "combo", "items": TUNING_AGGREGATION_MODES, "default": "frame_loop"},
+        {"section": "DSP", "group": "Heatmap EMA", "path": "dsp.heatmap_ema.enabled", "label": "Enabled", "kind": "bool", "default": False},
+        {"section": "DSP", "group": "Heatmap EMA", "path": "dsp.heatmap_ema.alpha", "label": "Alpha", "kind": "float", "default": 0.10, "min": 0.0, "max": 1.0, "step": 0.01},
+        {"section": "DSP", "group": "Spatial filter", "path": "dsp.heatmap_spatial_filter.enabled", "label": "Enabled", "kind": "bool", "default": False},
+        {"section": "DSP", "group": "Spatial filter", "path": "dsp.heatmap_spatial_filter.mode", "label": "Mode", "kind": "combo", "items": TUNING_SPATIAL_FILTER_MODES, "default": "none"},
+        {"section": "Tracking", "group": "Lifecycle", "path": "tracking.enabled", "label": "Enabled", "kind": "bool", "default": True},
+        {"section": "Tracking", "group": "Lifecycle", "path": "tracking.max_tracks", "label": "Max tracks", "kind": "int", "default": 8, "min": 1, "step": 1},
+        {"section": "Tracking", "group": "Lifecycle", "path": "tracking.min_hits_to_confirm", "label": "Min hits", "kind": "int", "default": 3, "min": 1, "step": 1},
+        {"section": "Tracking", "group": "Lifecycle", "path": "tracking.max_missed_tentative", "label": "Miss tentative", "kind": "int", "default": 3, "min": 0, "step": 1},
+        {"section": "Tracking", "group": "Lifecycle", "path": "tracking.max_missed_confirmed", "label": "Miss confirmed", "kind": "int", "default": 18, "min": 0, "step": 1},
+        {"section": "Tracking", "group": "Lifecycle", "path": "tracking.max_track_age", "label": "Max age", "kind": "int", "default": 0, "min": 0, "step": 1},
+        {"section": "Tracking", "group": "Association", "path": "tracking.gating_xy_m", "label": "Gate XY m", "kind": "float", "default": 1.0, "min": 0.0, "step": 0.05},
+        {"section": "Tracking", "group": "Association", "path": "tracking.gating_doppler_mps", "label": "Gate Doppler", "kind": "float", "default": 0.5, "min": 0.0, "step": 0.05},
+        {"section": "Tracking", "group": "Association", "path": "tracking.birth_min_separation_m", "label": "Birth separation", "kind": "float", "default": 0.35, "min": 0.0, "step": 0.05},
+        {"section": "Tracking", "group": "Association", "path": "tracking.use_doppler_in_cost", "label": "Use Doppler cost", "kind": "bool", "default": True},
+        {"section": "Tracking", "group": "Kalman", "path": "tracking.process_noise_pos", "label": "Noise pos", "kind": "float", "default": 0.3, "min": 0.0001, "step": 0.05},
+        {"section": "Tracking", "group": "Kalman", "path": "tracking.process_noise_vel", "label": "Noise vel", "kind": "float", "default": 0.25, "min": 0.0001, "step": 0.05},
+        {"section": "Tracking", "group": "Kalman", "path": "tracking.measurement_noise_xy", "label": "Meas noise XY", "kind": "float", "default": 0.10, "min": 0.0001, "step": 0.01},
+        {"section": "Tracking", "group": "Motion state", "path": "tracking.moving_speed_threshold_mps", "label": "Moving speed", "kind": "float", "default": 0.22, "min": 0.0, "step": 0.02},
+        {"section": "Tracking", "group": "Motion state", "path": "tracking.stopped_speed_threshold_mps", "label": "Stopped speed", "kind": "float", "default": 0.10, "min": 0.0, "step": 0.02},
+        {"section": "Tracking", "group": "Motion state", "path": "tracking.doppler_moving_threshold_mps", "label": "Doppler moving", "kind": "float", "default": 0.15, "min": 0.0, "step": 0.02},
+        {"section": "Tracking", "group": "Motion state", "path": "tracking.motion_confirm_frames_moving", "label": "Confirm moving", "kind": "int", "default": 2, "min": 1, "step": 1},
+        {"section": "Tracking", "group": "Motion state", "path": "tracking.motion_confirm_frames_stopped", "label": "Confirm stopped", "kind": "int", "default": 3, "min": 1, "step": 1},
+        {"section": "Tracking", "group": "Stopped memory", "path": "tracking.stopped_memory_s", "label": "Memory s", "kind": "float", "default": 5.0, "min": 0.0, "step": 0.5},
+        {"section": "Tracking", "group": "Stopped memory", "path": "tracking.stopped_resume_gate_m", "label": "Resume gate", "kind": "float", "default": 0.8, "min": 0.0, "step": 0.05},
+        {"section": "Tracking", "group": "Stopped memory", "path": "tracking.stop_position_alpha", "label": "Stop alpha", "kind": "float", "default": 0.35, "min": 0.0, "max": 1.0, "step": 0.05},
+        {"section": "Detection static", "group": "Core", "path": "detection_static.enabled", "label": "Enabled", "kind": "bool", "default": True},
+        {"section": "Detection static", "group": "Core", "path": "detection_static.threshold_mode", "label": "Mode", "kind": "combo", "items": TUNING_THRESHOLD_MODES, "default": "relative"},
+        {"section": "Detection static", "group": "Core", "path": "detection_static.threshold_db", "label": "Threshold dB", "kind": "float", "default": -10.0, "step": 1.0},
+        {"section": "Detection static", "group": "Core", "path": "detection_static.min_power_db", "label": "Min power dB", "kind": "float", "default": 6.0, "step": 1.0},
+        {"section": "Detection static", "group": "Core", "path": "detection_static.max_detections", "label": "Max detections", "kind": "int", "default": 12, "min": 1, "step": 1},
+        {"section": "Detection static", "group": "Local max", "path": "detection_static.localmax_range_bins", "label": "Range bins", "kind": "int", "default": 1, "min": 0, "step": 1},
+        {"section": "Detection static", "group": "Local max", "path": "detection_static.localmax_angle_bins", "label": "Angle bins", "kind": "int", "default": 1, "min": 0, "step": 1},
+        {"section": "Detection static", "group": "CFAR", "path": "detection_static.cfar_train_range_bins", "label": "Train range", "kind": "int", "default": 8, "min": 0, "step": 1},
+        {"section": "Detection static", "group": "CFAR", "path": "detection_static.cfar_guard_range_bins", "label": "Guard range", "kind": "int", "default": 2, "min": 0, "step": 1},
+        {"section": "Detection static", "group": "CFAR", "path": "detection_static.cfar_train_col_bins", "label": "Train angle", "kind": "int", "default": 8, "min": 0, "step": 1},
+        {"section": "Detection static", "group": "CFAR", "path": "detection_static.cfar_guard_col_bins", "label": "Guard angle", "kind": "int", "default": 2, "min": 0, "step": 1},
+        {"section": "Detection static", "group": "CFAR", "path": "detection_static.cfar_threshold_db", "label": "Offset dB", "kind": "float", "default": 10.0, "step": 1.0},
+        {"section": "Detection static", "group": "CFAR", "path": "detection_static.os_cfar_rank", "label": "OS rank", "kind": "int", "default": 0, "min": 0, "step": 1},
+        {"section": "Detection moving", "group": "Core", "path": "detection_moving.enabled", "label": "Enabled", "kind": "bool", "default": True},
+        {"section": "Detection moving", "group": "Core", "path": "detection_moving.threshold_mode", "label": "Mode", "kind": "combo", "items": TUNING_THRESHOLD_MODES, "default": "ca_cfar"},
+        {"section": "Detection moving", "group": "Core", "path": "detection_moving.threshold_db", "label": "Threshold dB", "kind": "float", "default": -7.0, "step": 1.0},
+        {"section": "Detection moving", "group": "Core", "path": "detection_moving.min_power_db", "label": "Min power dB", "kind": "float", "default": 6.0, "step": 1.0},
+        {"section": "Detection moving", "group": "Core", "path": "detection_moving.max_detections", "label": "Max detections", "kind": "int", "default": 12, "min": 1, "step": 1},
+        {"section": "Detection moving", "group": "Local max", "path": "detection_moving.localmax_range_bins", "label": "Range bins", "kind": "int", "default": 2, "min": 0, "step": 1},
+        {"section": "Detection moving", "group": "Local max", "path": "detection_moving.localmax_doppler_bins", "label": "Doppler bins", "kind": "int", "default": 2, "min": 0, "step": 1},
+        {"section": "Detection moving", "group": "Local max", "path": "detection_moving.zero_doppler_exclusion_bins", "label": "Zero excl bins", "kind": "int", "default": 1, "min": 0, "step": 1},
+        {"section": "Detection moving", "group": "CFAR", "path": "detection_moving.cfar_train_range_bins", "label": "Train range", "kind": "int", "default": 8, "min": 0, "step": 1},
+        {"section": "Detection moving", "group": "CFAR", "path": "detection_moving.cfar_guard_range_bins", "label": "Guard range", "kind": "int", "default": 2, "min": 0, "step": 1},
+        {"section": "Detection moving", "group": "CFAR", "path": "detection_moving.cfar_train_col_bins", "label": "Train doppler", "kind": "int", "default": 4, "min": 0, "step": 1},
+        {"section": "Detection moving", "group": "CFAR", "path": "detection_moving.cfar_guard_col_bins", "label": "Guard doppler", "kind": "int", "default": 1, "min": 0, "step": 1},
+        {"section": "Detection moving", "group": "CFAR", "path": "detection_moving.cfar_threshold_db", "label": "Offset dB", "kind": "float", "default": 10.0, "step": 1.0},
+        {"section": "Detection moving", "group": "CFAR", "path": "detection_moving.os_cfar_rank", "label": "OS rank", "kind": "int", "default": 0, "min": 0, "step": 1},
+        {"section": "Detection moving", "group": "Pre-Doppler filters", "path": "dsp.detection_moving_pre_doppler_filters.slow_time.enabled", "label": "Slow time", "kind": "bool", "default": True},
+        {"section": "Detection moving", "group": "Pre-Doppler filters", "path": "dsp.detection_moving_pre_doppler_filters.slow_time.mode", "label": "Slow mode", "kind": "combo", "items": TUNING_MOVING_SLOW_TIME_MODES, "default": "mean_subtraction"},
+        {"section": "Detection moving", "group": "Pre-Doppler filters", "path": "dsp.detection_moving_pre_doppler_filters.slow_time.highpass_beta", "label": "Highpass beta", "kind": "float", "default": 0.90, "min": 0.0, "max": 1.0, "step": 0.01},
+        {"section": "Fusion", "group": "Core", "path": "fusion.enabled", "label": "Enabled", "kind": "bool", "default": True},
+        {"section": "Fusion", "group": "Merge gates", "path": "fusion.merge_xy_m", "label": "Merge XY m", "kind": "float", "default": 0.50, "min": 0.0, "step": 0.05},
+        {"section": "Fusion", "group": "Merge gates", "path": "fusion.merge_range_m", "label": "Merge range m", "kind": "float", "default": 0.40, "min": 0.0, "step": 0.05},
+        {"section": "Fusion", "group": "Merge gates", "path": "fusion.merge_angle_deg", "label": "Merge angle deg", "kind": "float", "default": 8.0, "min": 0.0, "step": 0.5},
+        {"section": "Fusion", "group": "Policy", "path": "fusion.prefer_moving_when_doppler_valid", "label": "Prefer moving", "kind": "bool", "default": False},
+    ]
+
+    def _tune_set_patch_value(out: dict, path: str, value):
+        node = out
+        parts = str(path).split(".")
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = value
+
+    def _tune_value_from_widget(spec: dict):
+        value = dpg.get_value(_tune_tag(spec["path"]))
+        kind = str(spec.get("kind", "float"))
+        if kind == "bool":
+            return bool(value)
+        if kind == "int":
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                value = int(spec.get("default", 0))
+            if "min" in spec:
+                value = max(int(spec["min"]), value)
+            if "max" in spec:
+                value = min(int(spec["max"]), value)
+            return value
+        if kind == "float":
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                value = float(spec.get("default", 0.0))
+            if not np.isfinite(value):
+                value = float(spec.get("default", 0.0))
+            if "min" in spec:
+                value = max(float(spec["min"]), value)
+            if "max" in spec:
+                value = min(float(spec["max"]), value)
+            return float(value)
+        return str(value)
+
+    def _apply_tuning_params(sender=None, app_data=None):
+        patch = {}
+        for spec in TUNING_FIELD_SPECS:
+            tag = _tune_tag(spec["path"])
+            if not dpg.does_item_exist(tag):
+                continue
+            try:
+                _tune_set_patch_value(patch, spec["path"], _tune_value_from_widget(spec))
+            except Exception:
+                continue
+        try:
+            dsp_cmd_q.put_nowait({"type": "update_runtime_config", "cfg_patch": patch, "reset_runtime_state": True})
+            if dpg.does_item_exist(TXT_TUNING_STATUS_TAG):
+                dpg.set_value(TXT_TUNING_STATUS_TAG, "Runtime update + soft reset DSP inviati")
+        except Exception as e:
+            if dpg.does_item_exist(TXT_TUNING_STATUS_TAG):
+                dpg.set_value(TXT_TUNING_STATUS_TAG, f"ERR tuning: {e}")
+
+    def _add_tuning_widget(spec: dict, width: int = 260):
+        path = str(spec["path"])
+        tag = _tune_tag(path)
+        label = str(spec.get("label", path))
+        kind = str(spec.get("kind", "float"))
+        default = _cfg_path_get(path, spec.get("default"))
+        if kind == "bool":
+            dpg.add_checkbox(label=label, tag=tag, default_value=bool(default), callback=_apply_tuning_params)
+            return
+        if kind == "combo":
+            items = list(spec.get("items", []))
+            default_s = str(default)
+            if items and default_s not in items:
+                default_s = str(spec.get("default", items[0]))
+            dpg.add_combo(items, label=label, tag=tag, default_value=default_s, width=width, callback=_apply_tuning_params)
+            return
+        if kind == "int":
+            dpg.add_input_int(
+                label=label,
+                tag=tag,
+                default_value=int(default),
+                step=int(spec.get("step", 1)),
+                width=width,
+                min_value=int(spec["min"]) if "min" in spec else 0,
+                max_value=int(spec["max"]) if "max" in spec else 0,
+                min_clamped=("min" in spec),
+                max_clamped=("max" in spec),
+                callback=_apply_tuning_params,
+                on_enter=False,
+            )
+            return
+        dpg.add_input_float(
+            label=label,
+            tag=tag,
+            default_value=float(default),
+            step=float(spec.get("step", 0.1)),
+            width=width,
+            min_value=float(spec["min"]) if "min" in spec else 0.0,
+            max_value=float(spec["max"]) if "max" in spec else 0.0,
+            min_clamped=("min" in spec),
+            max_clamped=("max" in spec),
+            callback=_apply_tuning_params,
+            on_enter=False,
+        )
+
+    def _add_tuning_section(section: str, width: int = 260):
+        current_group = None
+        for spec in TUNING_FIELD_SPECS:
+            if spec.get("section") != section:
+                continue
+            group = str(spec.get("group", ""))
+            if group != current_group:
+                if current_group is not None:
+                    dpg.add_spacer(height=8)
+                dpg.add_text(group.upper(), color=(255, 200, 0))
+                dpg.add_separator()
+                current_group = group
+            _add_tuning_widget(spec, width=width)
+
     track_annotation_tags: list[str] = []
     supports_plot_annotation = bool(hasattr(dpg, "add_plot_annotation"))
 
@@ -2725,6 +3038,7 @@ def main():
         with dpg.tab_bar(tag=TAG_MAIN_TABBAR):
             dpg.add_tab(label="Tempo Reale", tag=TAB_REALTIME_TAG)
             dpg.add_tab(label="Dati Processati", tag=TAB_PROCESSED_TAG)
+            dpg.add_tab(label="Tuning DSP", tag=TAB_TUNING_TAG)
 
         with dpg.table(header_row=False, resizable=True, policy=dpg.mvTable_SizingFixedFit, parent=TAB_REALTIME_TAG):
 
@@ -2889,109 +3203,209 @@ def main():
                 # --- RANGE FFT PROFILES ---
                 with dpg.table_cell():
                     with dpg.child_window(tag=TAG_RANGEFFT_COL, width=-1, height=-1, border=True):
-                        dpg.add_text("RANGE FFT |TXxRX|", color=(255, 200, 0))
+                        dpg.add_text("FFT DIAGNOSTICS", color=(255, 200, 0))
                         dpg.add_separator()
-                        with dpg.plot(
-                            tag=RANGEFFT_PLOT_TAG,
-                            label=_fft_plot_title(vis_fft_view_full),
-                            width=-1,
-                            height=540,
-                            no_menus=True,
-                            no_box_select=True,
-                            no_mouse_pos=True,
-                        ):
-                            dpg.add_plot_axis(
-                                dpg.mvXAxis,
-                                label="Range (m)",
-                                tag=RANGEFFT_XAXIS_TAG,
-                                auto_fit=False,
-                                lock_min=True,
-                                lock_max=True,
-                            )
-                            dpg.add_plot_axis(
-                                dpg.mvYAxis,
-                                label=_fft_axis_label(vis_fft_mode_db),
-                                tag=RANGEFFT_YAXIS_TAG,
-                                auto_fit=False,
-                                lock_min=True,
-                                lock_max=True,
-                            )
-                            dpg.add_plot_legend(location=dpg.mvPlot_Location_SouthEast, outside=True, horizontal=True)
-                            for ant_i in range(RANGE_PROFILE_COUNT):
-                                line_tag = RANGEFFT_LINE_TAGS[ant_i]
-                                dpg.add_line_series(
-                                    [0.0],
-                                    [0.0],
-                                    label=f"A{ant_i + 1}",
-                                    tag=line_tag,
-                                    parent=RANGEFFT_YAXIS_TAG,
+                        with dpg.tab_bar(tag=FFT_DIAG_TABBAR_TAG):
+                            with dpg.tab(label="Range"):
+                                with dpg.plot(
+                                    tag=RANGEFFT_PLOT_TAG,
+                                    label=_fft_plot_title(vis_fft_view_full),
+                                    width=-1,
+                                    height=500,
+                                    no_menus=True,
+                                    no_box_select=True,
+                                    no_mouse_pos=True,
+                                ):
+                                    dpg.add_plot_axis(
+                                        dpg.mvXAxis,
+                                        label="Range (m)",
+                                        tag=RANGEFFT_XAXIS_TAG,
+                                        auto_fit=False,
+                                        lock_min=True,
+                                        lock_max=True,
+                                    )
+                                    dpg.add_plot_axis(
+                                        dpg.mvYAxis,
+                                        label=_fft_axis_label(vis_fft_mode_db),
+                                        tag=RANGEFFT_YAXIS_TAG,
+                                        auto_fit=False,
+                                        lock_min=True,
+                                        lock_max=True,
+                                    )
+                                    dpg.add_plot_legend(location=dpg.mvPlot_Location_SouthEast, outside=True, horizontal=True)
+                                    for ant_i in range(RANGE_PROFILE_COUNT):
+                                        line_tag = RANGEFFT_LINE_TAGS[ant_i]
+                                        dpg.add_line_series(
+                                            [0.0],
+                                            [0.0],
+                                            label=f"A{ant_i + 1}",
+                                            tag=line_tag,
+                                            parent=RANGEFFT_YAXIS_TAG,
+                                        )
+                                        if ant_i < len(rangefft_line_themes):
+                                            dpg.bind_item_theme(line_tag, rangefft_line_themes[ant_i])
+                                _, init_fft_rmax_m = _fft_visible_range_from_view(vis_rmax, vis_fft_view_full)
+                                vis_fft_xmin, vis_fft_xmax, _ = _clamp_fft_x_window(vis_fft_xmin, vis_fft_xmax, vis_rmax, vis_fft_view_full)
+                                dpg.set_axis_limits(RANGEFFT_XAXIS_TAG, float(vis_fft_xmin), float(vis_fft_xmax))
+                                _set_fft_x_ticks_window(vis_fft_xmin, vis_fft_xmax)
+                                dpg.set_axis_limits(RANGEFFT_YAXIS_TAG, float(vis_fft_vmin), float(vis_fft_vmax))
+                                dpg.add_separator()
+                                dpg.add_button(
+                                    label=_fft_view_label(fft_view_full),
+                                    tag=BTN_FFT_VIEW_TAG,
+                                    callback=_toggle_fft_view,
+                                    width=-1,
+                                    height=30,
                                 )
-                                if ant_i < len(rangefft_line_themes):
-                                    dpg.bind_item_theme(line_tag, rangefft_line_themes[ant_i])
-                        _, init_fft_rmax_m = _fft_visible_range_from_view(vis_rmax, vis_fft_view_full)
-                        vis_fft_xmin, vis_fft_xmax, _ = _clamp_fft_x_window(vis_fft_xmin, vis_fft_xmax, vis_rmax, vis_fft_view_full)
-                        dpg.set_axis_limits(RANGEFFT_XAXIS_TAG, float(vis_fft_xmin), float(vis_fft_xmax))
-                        _set_fft_x_ticks_window(vis_fft_xmin, vis_fft_xmax)
-                        dpg.set_axis_limits(RANGEFFT_YAXIS_TAG, float(vis_fft_vmin), float(vis_fft_vmax))
-                        dpg.add_separator()
-                        dpg.add_button(
-                            label=_fft_view_label(fft_view_full),
-                            tag=BTN_FFT_VIEW_TAG,
-                            callback=_toggle_fft_view,
-                            width=-1,
-                            height=30,
-                        )
-                        dpg.add_button(
-                            label=_fft_mode_label(fft_mode_db),
-                            tag=BTN_FFT_MODE_TAG,
-                            callback=_toggle_fft_mode,
-                            width=-1,
-                            height=30,
-                        )
-                        dpg.add_input_double(
-                            label="FFT Xmin (m)",
-                            tag=IN_FFT_XMIN,
-                            default_value=float(vis_fft_xmin),
-                            format="%.2f",
-                            step=0.5,
-                            step_fast=2.0,
-                            width=220,
-                            callback=_apply_params,
-                            on_enter=False,
-                        )
-                        dpg.add_input_double(
-                            label="FFT Xmax (m)",
-                            tag=IN_FFT_XMAX,
-                            default_value=float(vis_fft_xmax),
-                            format="%.2f",
-                            step=0.5,
-                            step_fast=2.0,
-                            width=220,
-                            callback=_apply_params,
-                            on_enter=False,
-                        )
-                        dpg.add_input_double(
-                            label="FFT Ymin (dB)",
-                            tag=IN_FFT_VMIN,
-                            default_value=float(vis_fft_vmin),
-                            format="%.0f",
-                            step=1.0,
-                            step_fast=10.0,
-                            width=220,
-                            callback=_apply_params,
-                            on_enter=False,
-                        )
-                        dpg.add_input_double(
-                            label="FFT Ymax (dB)",
-                            tag=IN_FFT_VMAX,
-                            default_value=float(vis_fft_vmax),
-                            format="%.0f",
-                            step=1.0,
-                            step_fast=10.0,
-                            width=220,
-                            callback=_apply_params,
-                            on_enter=False,
-                        )
+                                dpg.add_button(
+                                    label=_fft_mode_label(fft_mode_db),
+                                    tag=BTN_FFT_MODE_TAG,
+                                    callback=_toggle_fft_mode,
+                                    width=-1,
+                                    height=30,
+                                )
+                                dpg.add_input_double(
+                                    label="FFT Xmin (m)",
+                                    tag=IN_FFT_XMIN,
+                                    default_value=float(vis_fft_xmin),
+                                    format="%.2f",
+                                    step=0.5,
+                                    step_fast=2.0,
+                                    width=220,
+                                    callback=_apply_params,
+                                    on_enter=False,
+                                )
+                                dpg.add_input_double(
+                                    label="FFT Xmax (m)",
+                                    tag=IN_FFT_XMAX,
+                                    default_value=float(vis_fft_xmax),
+                                    format="%.2f",
+                                    step=0.5,
+                                    step_fast=2.0,
+                                    width=220,
+                                    callback=_apply_params,
+                                    on_enter=False,
+                                )
+                                dpg.add_input_double(
+                                    label="FFT Ymin (dB)",
+                                    tag=IN_FFT_VMIN,
+                                    default_value=float(vis_fft_vmin),
+                                    format="%.0f",
+                                    step=1.0,
+                                    step_fast=10.0,
+                                    width=220,
+                                    callback=_apply_params,
+                                    on_enter=False,
+                                )
+                                dpg.add_input_double(
+                                    label="FFT Ymax (dB)",
+                                    tag=IN_FFT_VMAX,
+                                    default_value=float(vis_fft_vmax),
+                                    format="%.0f",
+                                    step=1.0,
+                                    step_fast=10.0,
+                                    width=220,
+                                    callback=_apply_params,
+                                    on_enter=False,
+                                )
+
+                            with dpg.tab(label="Angle"):
+                                dpg.add_checkbox(
+                                    label="Single range bin",
+                                    tag=CHK_ANGLE_SINGLE_BIN,
+                                    default_value=False,
+                                    callback=_on_angle_single_bin,
+                                )
+                                dpg.add_input_int(
+                                    label="Range bin",
+                                    tag=IN_ANGLE_BIN,
+                                    default_value=0,
+                                    min_value=0,
+                                    max_value=max(0, int(fft_plot_h) - 1),
+                                    min_clamped=True,
+                                    max_clamped=True,
+                                    width=180,
+                                )
+                                with dpg.plot(
+                                    tag=ANGLEFFT_HEAT_PLOT_TAG,
+                                    label="Range-Angle FFT",
+                                    width=-1,
+                                    height=500,
+                                    no_menus=True,
+                                ):
+                                    dpg.add_plot_axis(dpg.mvXAxis, label="Angle (deg)", tag=ANGLEFFT_XAXIS_TAG)
+                                    dpg.add_plot_axis(dpg.mvYAxis, label="Range (m)", tag=ANGLEFFT_YAXIS_TAG)
+                                    dpg.add_image_series(
+                                        ANGLEFFT_TEX_TAG,
+                                        bounds_min=(float(angle_axis_min), 0.0),
+                                        bounds_max=(float(angle_axis_max), float(fft_plot_h) * float(dr_plot)),
+                                        tag=ANGLEFFT_IMG_SERIES_TAG,
+                                        parent=ANGLEFFT_YAXIS_TAG,
+                                    )
+                                with dpg.plot(
+                                    tag=ANGLEFFT_PROFILE_PLOT_TAG,
+                                    label="Angle FFT @ range bin",
+                                    width=-1,
+                                    height=500,
+                                    no_menus=True,
+                                    show=False,
+                                ):
+                                    dpg.add_plot_axis(dpg.mvXAxis, label="Angle (deg)", tag=ANGLEFFT_PROFILE_XAXIS_TAG)
+                                    dpg.add_plot_axis(dpg.mvYAxis, label="dB", tag=ANGLEFFT_PROFILE_YAXIS_TAG)
+                                    dpg.add_line_series([], [], label="Angle", tag=ANGLEFFT_PROFILE_LINE_TAG, parent=ANGLEFFT_PROFILE_YAXIS_TAG)
+                                dpg.set_axis_limits(ANGLEFFT_XAXIS_TAG, float(angle_axis_min), float(angle_axis_max))
+                                dpg.set_axis_limits(ANGLEFFT_YAXIS_TAG, 0.0, float(vis_fft_xmax))
+                                dpg.set_axis_limits(ANGLEFFT_PROFILE_XAXIS_TAG, float(angle_axis_min), float(angle_axis_max))
+                                dpg.set_axis_limits(ANGLEFFT_PROFILE_YAXIS_TAG, float(vis_fft_vmin), float(vis_fft_vmax))
+
+                            with dpg.tab(label="Doppler"):
+                                dpg.add_checkbox(
+                                    label="Single range bin",
+                                    tag=CHK_DOPPLER_SINGLE_BIN,
+                                    default_value=False,
+                                    callback=_on_doppler_single_bin,
+                                )
+                                dpg.add_input_int(
+                                    label="Range bin",
+                                    tag=IN_DOPPLER_BIN,
+                                    default_value=0,
+                                    min_value=0,
+                                    max_value=max(0, int(fft_plot_h) - 1),
+                                    min_clamped=True,
+                                    max_clamped=True,
+                                    width=180,
+                                )
+                                with dpg.plot(
+                                    tag=DOPPLERFFT_HEAT_PLOT_TAG,
+                                    label="Range-Doppler FFT",
+                                    width=-1,
+                                    height=500,
+                                    no_menus=True,
+                                ):
+                                    dpg.add_plot_axis(dpg.mvXAxis, label="Doppler (m/s)", tag=DOPPLERFFT_XAXIS_TAG)
+                                    dpg.add_plot_axis(dpg.mvYAxis, label="Range (m)", tag=DOPPLERFFT_YAXIS_TAG)
+                                    dpg.add_image_series(
+                                        DOPPLERFFT_TEX_TAG,
+                                        bounds_min=(float(doppler_axis_min), 0.0),
+                                        bounds_max=(float(doppler_axis_max), float(fft_plot_h) * float(dr_plot)),
+                                        tag=DOPPLERFFT_IMG_SERIES_TAG,
+                                        parent=DOPPLERFFT_YAXIS_TAG,
+                                    )
+                                with dpg.plot(
+                                    tag=DOPPLERFFT_PROFILE_PLOT_TAG,
+                                    label="Doppler FFT @ range bin",
+                                    width=-1,
+                                    height=500,
+                                    no_menus=True,
+                                    show=False,
+                                ):
+                                    dpg.add_plot_axis(dpg.mvXAxis, label="Doppler (m/s)", tag=DOPPLERFFT_PROFILE_XAXIS_TAG)
+                                    dpg.add_plot_axis(dpg.mvYAxis, label="dB", tag=DOPPLERFFT_PROFILE_YAXIS_TAG)
+                                    dpg.add_line_series([], [], label="Doppler", tag=DOPPLERFFT_PROFILE_LINE_TAG, parent=DOPPLERFFT_PROFILE_YAXIS_TAG)
+                                dpg.set_axis_limits(DOPPLERFFT_XAXIS_TAG, float(doppler_axis_min), float(doppler_axis_max))
+                                dpg.set_axis_limits(DOPPLERFFT_YAXIS_TAG, 0.0, float(vis_fft_xmax))
+                                dpg.set_axis_limits(DOPPLERFFT_PROFILE_XAXIS_TAG, float(doppler_axis_min), float(doppler_axis_max))
+                                dpg.set_axis_limits(DOPPLERFFT_PROFILE_YAXIS_TAG, float(vis_fft_vmin), float(vis_fft_vmax))
 
         with dpg.table(header_row=False, resizable=True, policy=dpg.mvTable_SizingFixedFit, parent=TAB_PROCESSED_TAG):
             dpg.add_table_column(init_width_or_weight=340, width_fixed=True)
@@ -3116,6 +3530,28 @@ def main():
                         if font_mono:
                             dpg.bind_item_font(PROC_CMAP_SCALE_TAG, font_mono)
 
+        with dpg.child_window(parent=TAB_TUNING_TAG, width=-1, height=-1, border=True):
+            dpg.add_text("RUNTIME TUNING", color=(255, 200, 0))
+            dpg.add_separator()
+            dpg.add_text("Pronto", tag=TXT_TUNING_STATUS_TAG, wrap=-1)
+            dpg.add_spacer(height=6)
+            with dpg.tab_bar(tag="tuning_subtabbar"):
+                with dpg.tab(label="DSP"):
+                    with dpg.child_window(width=-1, height=-1, border=False):
+                        _add_tuning_section("DSP", width=280)
+                with dpg.tab(label="Tracking"):
+                    with dpg.child_window(width=-1, height=-1, border=False):
+                        _add_tuning_section("Tracking", width=280)
+                with dpg.tab(label="Detection static"):
+                    with dpg.child_window(width=-1, height=-1, border=False):
+                        _add_tuning_section("Detection static", width=280)
+                with dpg.tab(label="Detection moving"):
+                    with dpg.child_window(width=-1, height=-1, border=False):
+                        _add_tuning_section("Detection moving", width=280)
+                with dpg.tab(label="Fusion"):
+                    with dpg.child_window(width=-1, height=-1, border=False):
+                        _add_tuning_section("Fusion", width=280)
+
     _update_heatmap_scale_input_labels(vis_heatmap_mode)
     _apply_heatmap_mode_controls(vis_heatmap_mode)
     _apply_heatmap_plot_geometry(vis_heatmap_mode, vis_rmax, vis_xmax, reset_limits=True)
@@ -3162,6 +3598,8 @@ def main():
     gui_frame = np.zeros((gui_h, gui_w), dtype=np.float32)
     gui_alpha_frame = np.zeros((gui_h, gui_w), dtype=np.float32)
     rangefft_frame = np.full((RANGE_PROFILE_COUNT, fft_plot_h), -120.0, dtype=np.float32)
+    anglefft_frame = np.full((fft_plot_h, ANGLEFFT_BINS), -120.0, dtype=np.float32)
+    dopplerfft_frame = np.full((fft_plot_h, DOPPLERFFT_BINS), -120.0, dtype=np.float32)
     gui_tracks_xy_view = np.frombuffer(gui_tracks_xy_dbuf, dtype=np.float32, count=track_max_shared * 4)
     gui_tracks_meta_view = np.frombuffer(gui_tracks_meta_dbuf, dtype=np.int32, count=track_max_shared * 4)
     gui_tracks_state_view = np.frombuffer(gui_tracks_state_dbuf, dtype=np.int32, count=track_max_shared * 2)
@@ -3176,6 +3614,12 @@ def main():
     lut_idx = np.empty((gui_h, gui_w), dtype=np.int32)
     rgba_frame = np.empty((gui_h, gui_w, 4), dtype=np.float32)
     fft_lin_frame = np.empty((RANGE_PROFILE_COUNT, fft_plot_h), dtype=np.float32)
+    angle_diag_norm_frame = np.empty((fft_plot_h, ANGLEFFT_BINS), dtype=np.float32)
+    angle_diag_lut_idx = np.empty((fft_plot_h, ANGLEFFT_BINS), dtype=np.int32)
+    angle_diag_rgba_frame = np.empty((fft_plot_h, ANGLEFFT_BINS, 4), dtype=np.float32)
+    doppler_diag_norm_frame = np.empty((fft_plot_h, DOPPLERFFT_BINS), dtype=np.float32)
+    doppler_diag_lut_idx = np.empty((fft_plot_h, DOPPLERFFT_BINS), dtype=np.int32)
+    doppler_diag_rgba_frame = np.empty((fft_plot_h, DOPPLERFFT_BINS, 4), dtype=np.float32)
     proc_norm_frame = np.empty((proc_tex_h, proc_tex_w), dtype=np.float32)
     proc_lut_idx = np.empty((proc_tex_h, proc_tex_w), dtype=np.int32)
     proc_rgba_frame = np.empty((proc_tex_h, proc_tex_w, 4), dtype=np.float32)
@@ -3297,6 +3741,14 @@ def main():
                 if dpg.does_item_exist(RANGEFFT_XAXIS_TAG):
                     dpg.set_axis_limits(RANGEFFT_XAXIS_TAG, float(vis_fft_xmin), float(vis_fft_xmax))
                     _set_fft_x_ticks_window(vis_fft_xmin, vis_fft_xmax)
+                if dpg.does_item_exist(ANGLEFFT_YAXIS_TAG):
+                    dpg.set_axis_limits(ANGLEFFT_YAXIS_TAG, 0.0, float(vis_fft_xmax))
+                if dpg.does_item_exist(DOPPLERFFT_YAXIS_TAG):
+                    dpg.set_axis_limits(DOPPLERFFT_YAXIS_TAG, 0.0, float(vis_fft_xmax))
+                if dpg.does_item_exist(ANGLEFFT_PROFILE_YAXIS_TAG):
+                    dpg.set_axis_limits(ANGLEFFT_PROFILE_YAXIS_TAG, float(vis_fft_vmin), float(vis_fft_vmax))
+                if dpg.does_item_exist(DOPPLERFFT_PROFILE_YAXIS_TAG):
+                    dpg.set_axis_limits(DOPPLERFFT_PROFILE_YAXIS_TAG, float(vis_fft_vmin), float(vis_fft_vmax))
 
             polled_rt_viewport = _poll_requested_viewport(
                 x_axis_tag=XAXIS_TAG,
@@ -3579,6 +4031,22 @@ def main():
                             offset=prof_base * 4,
                         )
                         rangefft_frame.reshape(-1)[:] = prof_flat
+                        angle_base = idx * fft_plot_h * ANGLEFFT_BINS
+                        angle_flat = np.frombuffer(
+                            gui_angle_diag_dbuf,
+                            dtype=np.float32,
+                            count=fft_plot_h * ANGLEFFT_BINS,
+                            offset=angle_base * 4,
+                        )
+                        anglefft_frame.reshape(-1)[:] = angle_flat
+                        doppler_base = idx * fft_plot_h * DOPPLERFFT_BINS
+                        doppler_flat = np.frombuffer(
+                            gui_doppler_diag_dbuf,
+                            dtype=np.float32,
+                            count=fft_plot_h * DOPPLERFFT_BINS,
+                            offset=doppler_base * 4,
+                        )
+                        dopplerfft_frame.reshape(-1)[:] = doppler_flat
                     gui_last_seq = seq_locked
 
                 denom = (vis_vmax - vis_vmin)
@@ -3639,6 +4107,63 @@ def main():
                         if dpg.does_item_exist(line_tag):
                             y_vals = fft_plot_vals[ant_i, :].tolist()
                             dpg.set_value(line_tag, [x_range_m, y_vals])
+                    diag_denom = float(vis_fft_vmax - vis_fft_vmin)
+                    if diag_denom < 1e-6:
+                        diag_denom = 1e-6
+
+                    np.subtract(anglefft_frame, float(vis_fft_vmin), out=angle_diag_norm_frame)
+                    angle_diag_norm_frame *= float(1.0 / diag_denom)
+                    np.clip(angle_diag_norm_frame, 0.0, 1.0, out=angle_diag_norm_frame)
+                    np.nan_to_num(angle_diag_norm_frame, copy=False, nan=0.0, posinf=1.0, neginf=0.0)
+                    np.multiply(angle_diag_norm_frame, lut_last, out=angle_diag_norm_frame)
+                    np.rint(angle_diag_norm_frame, out=angle_diag_norm_frame)
+                    angle_diag_lut_idx[:, :] = angle_diag_norm_frame
+                    np.take(jet_lut, angle_diag_lut_idx[::-1, :], axis=0, out=angle_diag_rgba_frame)
+                    angle_diag_tex_np[:] = angle_diag_rgba_frame.reshape(-1)
+                    if dpg.does_item_exist(ANGLEFFT_TEX_TAG):
+                        dpg.set_value(ANGLEFFT_TEX_TAG, angle_diag_tex_buf)
+
+                    np.subtract(dopplerfft_frame, float(vis_fft_vmin), out=doppler_diag_norm_frame)
+                    doppler_diag_norm_frame *= float(1.0 / diag_denom)
+                    np.clip(doppler_diag_norm_frame, 0.0, 1.0, out=doppler_diag_norm_frame)
+                    np.nan_to_num(doppler_diag_norm_frame, copy=False, nan=0.0, posinf=1.0, neginf=0.0)
+                    np.multiply(doppler_diag_norm_frame, lut_last, out=doppler_diag_norm_frame)
+                    np.rint(doppler_diag_norm_frame, out=doppler_diag_norm_frame)
+                    doppler_diag_lut_idx[:, :] = doppler_diag_norm_frame
+                    np.take(jet_lut, doppler_diag_lut_idx[::-1, :], axis=0, out=doppler_diag_rgba_frame)
+                    doppler_diag_tex_np[:] = doppler_diag_rgba_frame.reshape(-1)
+                    if dpg.does_item_exist(DOPPLERFFT_TEX_TAG):
+                        dpg.set_value(DOPPLERFFT_TEX_TAG, doppler_diag_tex_buf)
+
+                    if dpg.does_item_exist(ANGLEFFT_YAXIS_TAG):
+                        dpg.set_axis_limits(ANGLEFFT_YAXIS_TAG, 0.0, float(max_r_m))
+                    if dpg.does_item_exist(DOPPLERFFT_YAXIS_TAG):
+                        dpg.set_axis_limits(DOPPLERFFT_YAXIS_TAG, 0.0, float(max_r_m))
+                    if dpg.does_item_exist(ANGLEFFT_PROFILE_YAXIS_TAG):
+                        dpg.set_axis_limits(ANGLEFFT_PROFILE_YAXIS_TAG, float(vis_fft_vmin), float(vis_fft_vmax))
+                    if dpg.does_item_exist(DOPPLERFFT_PROFILE_YAXIS_TAG):
+                        dpg.set_axis_limits(DOPPLERFFT_PROFILE_YAXIS_TAG, float(vis_fft_vmin), float(vis_fft_vmax))
+
+                    try:
+                        angle_selected_bin = int(dpg.get_value(IN_ANGLE_BIN)) if dpg.does_item_exist(IN_ANGLE_BIN) else int(angle_selected_bin)
+                    except Exception:
+                        angle_selected_bin = 0
+                    angle_selected_bin = max(0, min(int(angle_selected_bin), int(max_r_bin) - 1, int(fft_plot_h) - 1))
+                    if dpg.does_item_exist(IN_ANGLE_BIN) and int(dpg.get_value(IN_ANGLE_BIN)) != int(angle_selected_bin):
+                        dpg.set_value(IN_ANGLE_BIN, int(angle_selected_bin))
+                    try:
+                        doppler_selected_bin = int(dpg.get_value(IN_DOPPLER_BIN)) if dpg.does_item_exist(IN_DOPPLER_BIN) else int(doppler_selected_bin)
+                    except Exception:
+                        doppler_selected_bin = 0
+                    doppler_selected_bin = max(0, min(int(doppler_selected_bin), int(max_r_bin) - 1, int(fft_plot_h) - 1))
+                    if dpg.does_item_exist(IN_DOPPLER_BIN) and int(dpg.get_value(IN_DOPPLER_BIN)) != int(doppler_selected_bin):
+                        dpg.set_value(IN_DOPPLER_BIN, int(doppler_selected_bin))
+
+                    if angle_single_bin and dpg.does_item_exist(ANGLEFFT_PROFILE_LINE_TAG):
+                        angle_x_vals = np.nan_to_num(angle_axis_diag, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False).tolist()
+                        dpg.set_value(ANGLEFFT_PROFILE_LINE_TAG, [angle_x_vals, anglefft_frame[int(angle_selected_bin), :].tolist()])
+                    if doppler_single_bin and dpg.does_item_exist(DOPPLERFFT_PROFILE_LINE_TAG):
+                        dpg.set_value(DOPPLERFFT_PROFILE_LINE_TAG, [doppler_axis_diag.astype(np.float32, copy=False).tolist(), dopplerfft_frame[int(doppler_selected_bin), :].tolist()])
                 if DEBUG_STATS:
                     img_updates += 1
 

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import numpy as np
 
 import realtime_dsp
@@ -24,6 +27,366 @@ def _dsp_cfg() -> realtime_dsp.RealtimeDSPConfig:
         fft_workers=1,
         debug_stats=False,
     )
+
+
+EXPECTED_TUNING_PATHS = {
+    "dsp.window_range",
+    "dsp.window_doppler",
+    "dsp.window_angle",
+    "dsp.zero_after_range_fft_bins",
+    "dsp.range_angle_moving.relative_power_floor_db",
+    "dsp.range_angle_moving.min_power_db",
+    "dsp.range_angle_moving.min_dominance_ratio",
+    "dsp.range_angle_moving.velocity_dead_zone",
+    "dsp.range_angle_moving.min_opacity",
+    "dsp.display_filters.background_subtraction.enabled",
+    "dsp.display_filters.background_subtraction.mode",
+    "dsp.display_filters.background_subtraction.alpha",
+    "dsp.display_filters.background_subtraction.init_frames",
+    "dsp.display_filters.background_subtraction.window_frames",
+    "dsp.display_filters.background_subtraction.clamp_positive_only",
+    "dsp.display_filters.slow_time.enabled",
+    "dsp.display_filters.slow_time.mode",
+    "dsp.display_filters.slow_time.highpass_beta",
+    "dsp.display_filters.mean_after_range_fft.enabled",
+    "dsp.display_filters.loop_average_after_background.enabled",
+    "dsp.angle_processing.mode",
+    "dsp.angle_processing.mvdr_diagonal_loading",
+    "dsp.angle_processing.aggregation",
+    "dsp.heatmap_ema.enabled",
+    "dsp.heatmap_ema.alpha",
+    "dsp.heatmap_spatial_filter.enabled",
+    "dsp.heatmap_spatial_filter.mode",
+    "tracking.enabled",
+    "tracking.max_tracks",
+    "tracking.min_hits_to_confirm",
+    "tracking.max_missed_tentative",
+    "tracking.max_missed_confirmed",
+    "tracking.max_track_age",
+    "tracking.gating_xy_m",
+    "tracking.gating_doppler_mps",
+    "tracking.birth_min_separation_m",
+    "tracking.use_doppler_in_cost",
+    "tracking.process_noise_pos",
+    "tracking.process_noise_vel",
+    "tracking.measurement_noise_xy",
+    "tracking.moving_speed_threshold_mps",
+    "tracking.stopped_speed_threshold_mps",
+    "tracking.doppler_moving_threshold_mps",
+    "tracking.motion_confirm_frames_moving",
+    "tracking.motion_confirm_frames_stopped",
+    "tracking.stopped_memory_s",
+    "tracking.stopped_resume_gate_m",
+    "tracking.stop_position_alpha",
+    "detection_static.enabled",
+    "detection_static.threshold_mode",
+    "detection_static.threshold_db",
+    "detection_static.min_power_db",
+    "detection_static.max_detections",
+    "detection_static.localmax_range_bins",
+    "detection_static.localmax_angle_bins",
+    "detection_static.cfar_train_range_bins",
+    "detection_static.cfar_guard_range_bins",
+    "detection_static.cfar_train_col_bins",
+    "detection_static.cfar_guard_col_bins",
+    "detection_static.cfar_threshold_db",
+    "detection_static.os_cfar_rank",
+    "detection_moving.enabled",
+    "detection_moving.threshold_mode",
+    "detection_moving.threshold_db",
+    "detection_moving.min_power_db",
+    "detection_moving.max_detections",
+    "detection_moving.localmax_range_bins",
+    "detection_moving.localmax_doppler_bins",
+    "detection_moving.zero_doppler_exclusion_bins",
+    "detection_moving.cfar_train_range_bins",
+    "detection_moving.cfar_guard_range_bins",
+    "detection_moving.cfar_train_col_bins",
+    "detection_moving.cfar_guard_col_bins",
+    "detection_moving.cfar_threshold_db",
+    "detection_moving.os_cfar_rank",
+    "dsp.detection_moving_pre_doppler_filters.slow_time.enabled",
+    "dsp.detection_moving_pre_doppler_filters.slow_time.mode",
+    "dsp.detection_moving_pre_doppler_filters.slow_time.highpass_beta",
+    "fusion.enabled",
+    "fusion.merge_xy_m",
+    "fusion.merge_range_m",
+    "fusion.merge_angle_deg",
+    "fusion.prefer_moving_when_doppler_valid",
+}
+
+
+def _extract_tuning_paths_from_gui_source() -> set[str]:
+    source = Path("main_refactory.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    paths: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key, value in zip(node.keys, node.values):
+            if isinstance(key, ast.Constant) and key.value == "path" and isinstance(value, ast.Constant):
+                paths.add(str(value.value))
+    return paths
+
+
+def test_tuning_gui_paths_are_applied_by_runtime_config_parsers() -> None:
+    assert _extract_tuning_paths_from_gui_source() == EXPECTED_TUNING_PATHS
+
+    cfg = {
+        "dsp": {
+            "window_range": "hamming",
+            "window_doppler": "blackman",
+            "window_angle": "rectangular",
+            "zero_after_range_fft_bins": 3,
+            "range_angle_moving": {
+                "relative_power_floor_db": -17.5,
+                "min_power_db": 4.25,
+                "min_dominance_ratio": 0.55,
+                "velocity_dead_zone": 0.12,
+                "min_opacity": 0.35,
+            },
+            "display_filters": {
+                "background_subtraction": {
+                    "enabled": False,
+                    "mode": "window_mean",
+                    "alpha": 0.33,
+                    "init_frames": 7,
+                    "window_frames": 9,
+                    "clamp_positive_only": True,
+                },
+                "slow_time": {
+                    "enabled": True,
+                    "mode": "highpass",
+                    "highpass_beta": 0.77,
+                },
+                "mean_after_range_fft": {"enabled": True},
+                "loop_average_after_background": {"enabled": True},
+            },
+            "angle_processing": {
+                "mode": "mvdr",
+                "mvdr_diagonal_loading": 0.04,
+                "aggregation": "loop",
+            },
+            "heatmap_ema": {"enabled": True, "alpha": 0.27},
+            "heatmap_spatial_filter": {"enabled": True, "mode": "gaussian_3x3"},
+            "detection_moving_pre_doppler_filters": {
+                "slow_time": {
+                    "enabled": True,
+                    "mode": "highpass",
+                    "highpass_beta": 0.66,
+                }
+            },
+        },
+        "tracking": {
+            "enabled": False,
+            "max_tracks": 6,
+            "min_hits_to_confirm": 4,
+            "max_missed_tentative": 5,
+            "max_missed_confirmed": 11,
+            "max_track_age": 13,
+            "gating_xy_m": 1.2,
+            "gating_doppler_mps": 0.45,
+            "birth_min_separation_m": 0.62,
+            "use_doppler_in_cost": False,
+            "process_noise_pos": 0.44,
+            "process_noise_vel": 0.88,
+            "measurement_noise_xy": 0.19,
+            "moving_speed_threshold_mps": 0.31,
+            "stopped_speed_threshold_mps": 0.09,
+            "doppler_moving_threshold_mps": 0.21,
+            "motion_confirm_frames_moving": 3,
+            "motion_confirm_frames_stopped": 5,
+            "stopped_memory_s": 7.5,
+            "stopped_resume_gate_m": 0.71,
+            "stop_position_alpha": 0.41,
+        },
+        "detection_static": {
+            "enabled": False,
+            "threshold_mode": "ca_cfar",
+            "threshold_db": -8.0,
+            "min_power_db": 3.0,
+            "max_detections": 7,
+            "localmax_range_bins": 2,
+            "localmax_angle_bins": 3,
+            "cfar_train_range_bins": 9,
+            "cfar_guard_range_bins": 4,
+            "cfar_train_col_bins": 10,
+            "cfar_guard_col_bins": 5,
+            "cfar_threshold_db": 11.0,
+            "os_cfar_rank": 6,
+        },
+        "detection_moving": {
+            "enabled": False,
+            "threshold_mode": "os_cfar",
+            "threshold_db": -6.0,
+            "min_power_db": 4.0,
+            "max_detections": 8,
+            "localmax_range_bins": 3,
+            "localmax_doppler_bins": 4,
+            "zero_doppler_exclusion_bins": 2,
+            "cfar_train_range_bins": 11,
+            "cfar_guard_range_bins": 5,
+            "cfar_train_col_bins": 6,
+            "cfar_guard_col_bins": 2,
+            "cfar_threshold_db": 12.5,
+            "os_cfar_rank": 7,
+        },
+        "fusion": {
+            "enabled": False,
+            "merge_xy_m": 0.61,
+            "merge_range_m": 0.42,
+            "merge_angle_deg": 9.5,
+            "prefer_moving_when_doppler_valid": True,
+        },
+    }
+
+    selection = realtime_dsp.selection_from_yaml_dict(cfg)
+    assert selection == realtime_dsp.DspSelection("hamming", "blackman", "rectangular")
+    assert int((cfg["dsp"] or {})["zero_after_range_fft_bins"]) == 3
+
+    range_angle = realtime_dsp.range_angle_moving_from_yaml_dict(cfg)
+    assert range_angle.relative_power_floor_db == -17.5
+    assert range_angle.min_power_db == 4.25
+    assert range_angle.min_dominance_ratio == 0.55
+    assert range_angle.velocity_dead_zone == 0.12
+    assert range_angle.min_opacity == 0.35
+
+    display_filters = realtime_dsp.display_post_range_fft_filters_from_yaml_dict(cfg)
+    assert not display_filters.background_subtraction.enabled
+    assert display_filters.background_subtraction.mode == "window_mean"
+    assert display_filters.background_subtraction.alpha == 0.33
+    assert display_filters.background_subtraction.init_frames == 7
+    assert display_filters.background_subtraction.window_frames == 9
+    assert display_filters.background_subtraction.clamp_positive_only
+    assert display_filters.slow_time.enabled
+    assert display_filters.slow_time.mode == "highpass"
+    assert display_filters.slow_time.highpass_beta == 0.77
+    assert display_filters.mean_after_range_fft.enabled
+    assert display_filters.loop_average_after_background.enabled
+
+    angle = realtime_dsp.angle_processing_from_yaml_dict(cfg)
+    assert angle.mode == "mvdr"
+    assert angle.mvdr_diagonal_loading == 0.04
+    assert angle.aggregation == "loop"
+
+    assert realtime_dsp.heatmap_ema_from_yaml_dict(cfg) == realtime_dsp.HeatmapEMAConfig(True, 0.27)
+    assert realtime_dsp.heatmap_spatial_filter_from_yaml_dict(cfg) == realtime_dsp.HeatmapSpatialFilterConfig(
+        True,
+        "gaussian_3x3",
+    )
+
+    moving_filters = realtime_dsp.detection_moving_pre_doppler_filters_from_yaml_dict(cfg)
+    assert moving_filters.slow_time.enabled
+    assert moving_filters.slow_time.mode == "highpass"
+    assert moving_filters.slow_time.highpass_beta == 0.66
+
+    tracking = realtime_dsp.tracking_from_yaml_dict(cfg)
+    tracker = realtime_dsp.tracker_from_yaml_dict(cfg)
+    assert not tracking.enabled
+    assert tracking.max_tracks == 6
+    assert tracking.min_hits_to_confirm == 4
+    assert tracking.max_missed_tentative == 5
+    assert tracking.max_missed_confirmed == 11
+    assert tracking.max_track_age == 13
+    assert tracker.gating_xy_m == 1.2
+    assert tracker.gating_doppler_mps == 0.45
+    assert tracker.birth_min_separation_m == 0.62
+    assert not tracker.use_doppler_in_cost
+    assert tracker.process_noise_pos == 0.44
+    assert tracker.process_noise_vel == 0.88
+    assert tracker.measurement_noise_xy == 0.19
+    assert tracker.moving_speed_threshold_mps == 0.31
+    assert tracker.stopped_speed_threshold_mps == 0.09
+    assert tracker.doppler_moving_threshold_mps == 0.21
+    assert tracker.motion_confirm_frames_moving == 3
+    assert tracker.motion_confirm_frames_stopped == 5
+    assert tracker.stopped_memory_s == 7.5
+    assert tracker.stopped_resume_gate_m == 0.71
+    assert tracker.stop_position_alpha == 0.41
+
+    static = realtime_dsp.detection_static_from_yaml_dict(cfg)
+    assert not static.enabled
+    assert static.threshold_mode == "ca_cfar"
+    assert static.threshold_db == -8.0
+    assert static.min_power_db == 3.0
+    assert static.max_detections == 7
+    assert static.localmax_range_bins == 2
+    assert static.localmax_angle_bins == 3
+    assert static.cfar_train_range_bins == 9
+    assert static.cfar_guard_range_bins == 4
+    assert static.cfar_train_col_bins == 10
+    assert static.cfar_guard_col_bins == 5
+    assert static.cfar_threshold_db == 11.0
+    assert static.os_cfar_rank == 6
+
+    moving = realtime_dsp.detection_moving_from_yaml_dict(cfg)
+    assert not moving.enabled
+    assert moving.threshold_mode == "os_cfar"
+    assert moving.threshold_db == -6.0
+    assert moving.min_power_db == 4.0
+    assert moving.max_detections == 8
+    assert moving.localmax_range_bins == 3
+    assert moving.localmax_doppler_bins == 4
+    assert moving.zero_doppler_exclusion_bins == 2
+    assert moving.cfar_train_range_bins == 11
+    assert moving.cfar_guard_range_bins == 5
+    assert moving.cfar_train_col_bins == 6
+    assert moving.cfar_guard_col_bins == 2
+    assert moving.cfar_threshold_db == 12.5
+    assert moving.os_cfar_rank == 7
+
+    fusion = realtime_dsp.fusion_from_yaml_dict(cfg)
+    assert not fusion.enabled
+    assert fusion.merge_xy_m == 0.61
+    assert fusion.merge_range_m == 0.42
+    assert fusion.merge_angle_deg == 9.5
+    assert fusion.prefer_moving_when_doppler_valid
+
+
+def test_runtime_config_patch_merges_nested_blocks_without_dropping_siblings() -> None:
+    base = {
+        "dsp": {
+            "window_range": "hanning",
+            "display_filters": {
+                "background_subtraction": {
+                    "enabled": True,
+                    "mode": "frozen",
+                    "alpha": 0.02,
+                },
+                "slow_time": {
+                    "enabled": False,
+                    "mode": "none",
+                },
+            },
+        },
+        "detection_static": {
+            "threshold_mode": "relative",
+            "threshold_db": -10.0,
+        },
+    }
+    patch = {
+        "dsp": {
+            "display_filters": {
+                "background_subtraction": {
+                    "alpha": 0.15,
+                },
+            },
+        },
+        "detection_static": {
+            "threshold_db": -7.0,
+        },
+    }
+
+    merged = realtime_dsp._deep_merge_dict(base, patch)
+
+    assert merged["dsp"]["window_range"] == "hanning"
+    assert merged["dsp"]["display_filters"]["background_subtraction"]["enabled"] is True
+    assert merged["dsp"]["display_filters"]["background_subtraction"]["mode"] == "frozen"
+    assert merged["dsp"]["display_filters"]["background_subtraction"]["alpha"] == 0.15
+    assert merged["dsp"]["display_filters"]["slow_time"]["mode"] == "none"
+    assert merged["detection_static"]["threshold_mode"] == "relative"
+    assert merged["detection_static"]["threshold_db"] == -7.0
+    assert base["dsp"]["display_filters"]["background_subtraction"]["alpha"] == 0.02
 
 
 def test_config_parsers_sanitize_invalid_values_and_legacy_aliases() -> None:
