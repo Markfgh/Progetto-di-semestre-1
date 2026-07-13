@@ -119,14 +119,22 @@ EXPECTED_TUNING_PATHS = {
 def _extract_tuning_paths_from_gui_source() -> set[str]:
     source = Path("main_refactory.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
-    paths: set[str] = set()
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Dict):
+        if not isinstance(node, ast.Assign):
             continue
-        for key, value in zip(node.keys, node.values):
-            if isinstance(key, ast.Constant) and key.value == "path" and isinstance(value, ast.Constant):
-                paths.add(str(value.value))
-    return paths
+        if not any(isinstance(target, ast.Name) and target.id == "TUNING_FIELD_SPECS" for target in node.targets):
+            continue
+        if not isinstance(node.value, ast.List):
+            raise AssertionError("TUNING_FIELD_SPECS deve essere una lista")
+        paths: set[str] = set()
+        for spec in node.value.elts:
+            if not isinstance(spec, ast.Dict):
+                continue
+            for key, value in zip(spec.keys, spec.values):
+                if isinstance(key, ast.Constant) and key.value == "path" and isinstance(value, ast.Constant):
+                    paths.add(str(value.value))
+        return paths
+    raise AssertionError("TUNING_FIELD_SPECS non trovato in main_refactory.py")
 
 
 def test_tuning_gui_paths_are_applied_by_runtime_config_parsers() -> None:

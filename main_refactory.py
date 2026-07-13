@@ -2,6 +2,7 @@ import socket
 import time
 import queue as pyqueue
 import atexit
+import threading
 from pathlib import Path
 from multiprocessing import Process, Queue, Value
 from array import array
@@ -1637,11 +1638,9 @@ def main():
     if DEBUG_STATS and psutil is None:
         print("[STATS] psutil not available: using Windows fallback for CPU%.")
 
-    offline_runtime = None
-    offline_error = ""
-    offline_info = {}
-    try:
-        offline_runtime = OfflineBPRuntime(
+    def _create_offline_runtime():
+        """Build an isolated offline runtime from the persisted configuration."""
+        return OfflineBPRuntime(
             offline_config_path=Path(__file__).with_name("offline_config.yaml"),
             fallback_capture_cfg=Path(__file__).with_name("Config.yaml"),
             c_m_s=float(C),
@@ -1654,6 +1653,12 @@ def main():
             image_h=int(gui_h),
             image_w=int(gui_w),
         )
+
+    offline_runtime = None
+    offline_error = ""
+    offline_info = {}
+    try:
+        offline_runtime = _create_offline_runtime()
         shutdown_resources["offline_runtime"] = offline_runtime
         offline_info = offline_runtime.start(timeout_s=45.0)
         print(
@@ -1774,6 +1779,7 @@ def main():
     TAB_REALTIME_TAG = "tab_tempo_reale"
     TAB_PROCESSED_TAG = "tab_dati_processati"
     TAB_TUNING_TAG = "tab_tuning_dsp"
+    TAB_OFFLINE_TUNING_TAG = "tab_tuning_offline"
     TAG_SIDEBAR     = "sidebar_col"
     TAG_CBAR_COL    = "cbar_col"
     TAG_RANGEFFT_COL = "rangefft_col"
@@ -1825,6 +1831,8 @@ def main():
     PROC_BTN_NORM = "proc_btn_norm"
     PROC_CMAP_SCALE_TAG = "proc_cmap_scale"
     PROC_CMAP_NUM_FMT = "%+6.1f"
+    TXT_OFFLINE_TUNING_STATUS_TAG = "txt_offline_tuning_status"
+    TXT_OFFLINE_TUNING_INFO_TAG = "txt_offline_tuning_info"
     CMAP_SCALE_TAG = "cmap_scale"
     CMAP_NUM_FMT = "%+6.1f"
     CMAP_VELOCITY_NUM_FMT = "%+5.2f"
@@ -1949,7 +1957,9 @@ def main():
     if off_x_end < off_x_start:
         off_x_start, off_x_end = off_x_end, off_x_start
     off_motion_mode = str(offline_info.get("motion_mode", "static_zero_doppler")) if offline_info else "static_zero_doppler"
-    off_motion_modes = ["static_zero_doppler", "all_doppler_incoherent"]
+    # MIMO-SAR currently implements only the compensated zero-Doppler path.
+    # Keeping an unsupported choice here made the processed-data tab fail at runtime.
+    off_motion_modes = ["static_zero_doppler"]
     if off_motion_mode not in off_motion_modes:
         off_motion_mode = "static_zero_doppler"
     off_norm_enabled = True
@@ -2858,6 +2868,243 @@ def main():
         off_ui_dirty = True
         off_ui_dirty_t = time.perf_counter()
 
+    # Offline tuning deliberately uses an explicit save/apply action.  Unlike
+    # realtime tuning, these settings are consumed while the offline reader is
+    # built and cannot be changed safely through its live command queue.
+    OFFLINE_TUNING_WINDOWS = ["none", "rectangular", "hanning", "hamming", "blackman"]
+    OFFLINE_TUNING_BG_MODES = ["ema", "running_mean", "window_mean", "frozen"]
+    OFFLINE_TUNING_SLOW_TIME_MODES = ["none", "mean_subtraction", "highpass"]
+    OFFLINE_TUNING_ANGLE_MODES = ["fft", "bartlett", "mvdr"]
+    OFFLINE_TUNING_AGGREGATIONS = ["frame_loop", "frame", "loop", "none"]
+    OFFLINE_TUNING_ALGORITHMS = ["synthetic_range_angle", "backprojection"]
+    OFFLINE_TUNING_BP_MODES = ["mimo_sar", "sar_only"]
+
+    OFFLINE_TUNING_FIELD_SPECS = [
+        {"section": "Dati e scansione", "path": "data.input_dir", "label": "Cartella input", "kind": "text", "default": "logs"},
+        {"section": "Dati e scansione", "path": "scan.x_start", "label": "Posizione iniziale", "kind": "int", "default": 1, "step": 1},
+        {"section": "Dati e scansione", "path": "scan.x_end", "label": "Posizione finale", "kind": "int", "default": 1, "step": 1},
+        {"section": "Dati e scansione", "path": "scan.x_step", "label": "Passo posizioni", "kind": "int", "default": 1, "min": 1, "step": 1},
+        {"section": "Dati e scansione", "path": "scan.x_pitch_m", "label": "Pitch X (m)", "kind": "float", "default": 0.01, "min": 0.000001, "step": 0.001, "format": "%.6f"},
+        {"section": "Ricostruzione", "path": "reconstruction.algorithm", "label": "Algoritmo", "kind": "combo", "items": OFFLINE_TUNING_ALGORITHMS, "default": "synthetic_range_angle"},
+        {"section": "Ricostruzione", "path": "bp.mode", "label": "Modalita BP", "kind": "combo", "items": OFFLINE_TUNING_BP_MODES, "default": "mimo_sar"},
+        {"section": "Ricostruzione", "path": "bp.phase_sign", "label": "Segno fase", "kind": "combo", "items": ["-1", "1"], "default": "-1"},
+        {"section": "Ricostruzione", "path": "bp.coherent_sum", "label": "Somma coerente", "kind": "bool", "default": True},
+        {"section": "Filtri range-angle", "path": "offline_sar_range_angle.use_realtime_filters", "label": "Abilita filtri", "kind": "bool", "default": True},
+        {"section": "Filtri range-angle", "path": "offline_sar_range_angle.window_range", "label": "Finestra range", "kind": "combo", "items": OFFLINE_TUNING_WINDOWS, "default": "hanning"},
+        {"section": "Filtri range-angle", "path": "offline_sar_range_angle.window_doppler", "label": "Finestra Doppler", "kind": "combo", "items": OFFLINE_TUNING_WINDOWS, "default": "hanning"},
+        {"section": "Filtri range-angle", "path": "offline_sar_range_angle.window_angle", "label": "Finestra angolare", "kind": "combo", "items": OFFLINE_TUNING_WINDOWS, "default": "hanning"},
+        {"section": "Filtri range-angle", "path": "offline_sar_range_angle.zero_after_range_fft_bins", "label": "Azzera bin iniziali", "kind": "int", "default": 0, "min": 0, "step": 1},
+        {"section": "Filtri range-angle", "path": "offline_sar_range_angle.mean_after_range_fft.enabled", "label": "Media dopo Range FFT", "kind": "bool", "default": False},
+        {"section": "Filtri range-angle", "path": "offline_sar_range_angle.slow_time.enabled", "label": "Filtro slow-time", "kind": "bool", "default": False},
+        {"section": "Filtri range-angle", "path": "offline_sar_range_angle.slow_time.mode", "label": "Modalita slow-time", "kind": "combo", "items": OFFLINE_TUNING_SLOW_TIME_MODES, "default": "mean_subtraction"},
+        {"section": "Filtri range-angle", "path": "offline_sar_range_angle.slow_time.highpass_beta", "label": "Slow-time beta", "kind": "float", "default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01},
+        {"section": "Background", "path": "offline_sar_range_angle.background_subtraction.enabled", "label": "Abilita background", "kind": "bool", "default": False},
+        {"section": "Background", "path": "offline_sar_range_angle.background_subtraction.mode", "label": "Modalita", "kind": "combo", "items": OFFLINE_TUNING_BG_MODES, "default": "frozen"},
+        {"section": "Background", "path": "offline_sar_range_angle.background_subtraction.alpha", "label": "Alpha", "kind": "float", "default": 0.02, "min": 0.0, "max": 1.0, "step": 0.01},
+        {"section": "Background", "path": "offline_sar_range_angle.background_subtraction.init_frames", "label": "Frame iniziali", "kind": "int", "default": 40, "min": 1, "step": 1},
+        {"section": "Background", "path": "offline_sar_range_angle.background_subtraction.window_frames", "label": "Finestra frame", "kind": "int", "default": 40, "min": 1, "step": 1},
+        {"section": "Background", "path": "offline_sar_range_angle.background_subtraction.clamp_positive_only", "label": "Mantieni solo positivo", "kind": "bool", "default": False},
+        {"section": "Stima angolare", "path": "offline_sar_range_angle.nfft_angle", "label": "Bin angolari", "kind": "int", "default": 256, "min": 16, "step": 16},
+        {"section": "Stima angolare", "path": "offline_sar_range_angle.angle_processing.mode", "label": "Metodo", "kind": "combo", "items": OFFLINE_TUNING_ANGLE_MODES, "default": "bartlett"},
+        {"section": "Stima angolare", "path": "offline_sar_range_angle.angle_processing.mvdr_diagonal_loading", "label": "Loading MVDR", "kind": "float", "default": 0.02, "min": 0.0, "step": 0.005},
+        {"section": "Stima angolare", "path": "offline_sar_range_angle.angle_processing.aggregation", "label": "Aggregazione", "kind": "combo", "items": OFFLINE_TUNING_AGGREGATIONS, "default": "frame_loop"},
+        {"section": "Stima angolare", "path": "offline_sar_range_angle.angle_processing.frame_index", "label": "Indice frame", "kind": "int", "default": 0, "min": 0, "step": 1},
+        {"section": "Stima angolare", "path": "offline_sar_range_angle.angle_processing.loop_index", "label": "Indice loop", "kind": "int", "default": 0, "min": 0, "step": 1},
+    ]
+    offline_config_path = Path(__file__).with_name("offline_config.yaml")
+    offline_tuning_cfg: dict = {}
+    offline_reload_lock = threading.Lock()
+    offline_reload_state = {"running": False, "runtime": None, "info": None, "error": ""}
+
+    def _offline_tune_tag(path: str) -> str:
+        return "offline_tune__" + str(path).replace(".", "__")
+
+    def _offline_cfg_path_get(source: dict, path: str, default=None):
+        node = source
+        for part in str(path).split("."):
+            if not isinstance(node, dict) or part not in node:
+                return default
+            node = node[part]
+        return node
+
+    def _offline_cfg_path_set(target: dict, path: str, value) -> None:
+        node = target
+        parts = str(path).split(".")
+        for part in parts[:-1]:
+            child = node.get(part)
+            if not isinstance(child, dict):
+                child = {}
+                node[part] = child
+            node = child
+        node[parts[-1]] = value
+
+    def _set_offline_tuning_status(message: str) -> None:
+        if dpg.does_item_exist(TXT_OFFLINE_TUNING_STATUS_TAG):
+            dpg.set_value(TXT_OFFLINE_TUNING_STATUS_TAG, str(message))
+
+    def _read_offline_tuning_config() -> bool:
+        nonlocal offline_tuning_cfg
+        try:
+            with offline_config_path.open("r", encoding="utf-8") as f:
+                loaded = yaml.safe_load(f) or {}
+            if not isinstance(loaded, dict):
+                raise ValueError("la radice YAML deve essere una mappa")
+            offline_tuning_cfg = loaded
+            for spec in OFFLINE_TUNING_FIELD_SPECS:
+                tag = _offline_tune_tag(spec["path"])
+                if not dpg.does_item_exist(tag):
+                    continue
+                value = _offline_cfg_path_get(offline_tuning_cfg, spec["path"], spec.get("default"))
+                if spec["kind"] == "combo":
+                    value = str(value)
+                    if value not in spec.get("items", []):
+                        value = str(spec.get("default"))
+                dpg.set_value(tag, value)
+            _set_offline_tuning_status("Configurazione offline caricata")
+            return True
+        except Exception as exc:
+            _set_offline_tuning_status(f"ERRORE lettura configurazione: {exc}")
+            return False
+
+    def _offline_tuning_widget_value(spec: dict):
+        value = dpg.get_value(_offline_tune_tag(spec["path"]))
+        kind = str(spec["kind"])
+        if kind == "text":
+            return str(value).strip()
+        if kind == "bool":
+            return bool(value)
+        if kind == "combo":
+            value_s = str(value)
+            if value_s not in spec.get("items", []):
+                value_s = str(spec.get("default"))
+            return int(value_s) if spec["path"] == "bp.phase_sign" else value_s
+        if kind == "int":
+            value_i = int(value)
+            if "min" in spec:
+                value_i = max(int(spec["min"]), value_i)
+            if "max" in spec:
+                value_i = min(int(spec["max"]), value_i)
+            return value_i
+        value_f = float(value)
+        if not np.isfinite(value_f):
+            raise ValueError(f"{spec['label']}: valore non finito")
+        if "min" in spec:
+            value_f = max(float(spec["min"]), value_f)
+        if "max" in spec:
+            value_f = min(float(spec["max"]), value_f)
+        return float(value_f)
+
+    def _collect_offline_tuning_config() -> dict:
+        base = yaml.safe_load(yaml.safe_dump(offline_tuning_cfg, sort_keys=False)) or {}
+        if not isinstance(base, dict):
+            base = {}
+        for spec in OFFLINE_TUNING_FIELD_SPECS:
+            _offline_cfg_path_set(base, spec["path"], _offline_tuning_widget_value(spec))
+
+        if not str(_offline_cfg_path_get(base, "data.input_dir", "")).strip():
+            raise ValueError("Cartella input obbligatoria")
+        if int(_offline_cfg_path_get(base, "scan.x_end")) < int(_offline_cfg_path_get(base, "scan.x_start")):
+            raise ValueError("La posizione finale deve essere >= della posizione iniziale")
+        if float(_offline_cfg_path_get(base, "scan.x_pitch_m")) <= 0.0:
+            raise ValueError("Il pitch X deve essere > 0")
+        algorithm = _offline_cfg_path_get(base, "reconstruction.algorithm")
+        bp_mode = _offline_cfg_path_get(base, "bp.mode")
+        if algorithm == "synthetic_range_angle" and bp_mode != "mimo_sar":
+            raise ValueError("synthetic_range_angle richiede la modalita BP mimo_sar")
+        return base
+
+    def _save_offline_tuning_config() -> dict | None:
+        nonlocal offline_tuning_cfg
+        try:
+            saved_cfg = _collect_offline_tuning_config()
+            temp_path = offline_config_path.with_suffix(".yaml.tmp")
+            temp_path.write_text(yaml.safe_dump(saved_cfg, sort_keys=False, allow_unicode=True), encoding="utf-8")
+            temp_path.replace(offline_config_path)
+            offline_tuning_cfg = saved_cfg
+            _set_offline_tuning_status("Configurazione salvata in offline_config.yaml")
+            return saved_cfg
+        except Exception as exc:
+            _set_offline_tuning_status(f"ERRORE configurazione: {exc}")
+            return None
+
+    def _on_save_offline_tuning(sender=None, app_data=None):
+        _save_offline_tuning_config()
+
+    def _on_reload_offline_tuning(sender=None, app_data=None):
+        _read_offline_tuning_config()
+
+    def _on_apply_offline_tuning(sender=None, app_data=None):
+        nonlocal offline_runtime
+        with offline_reload_lock:
+            if bool(offline_reload_state["running"]):
+                _set_offline_tuning_status("Ricalcolo offline gia in corso")
+                return
+        if _save_offline_tuning_config() is None:
+            return
+
+        old_runtime = offline_runtime
+        offline_runtime = None
+        # Keep the previous runtime registered until the worker has stopped it:
+        # an application shutdown in this small interval must still be able to
+        # clean up its child processes.
+        shutdown_resources["offline_runtime"] = old_runtime
+        with offline_reload_lock:
+            offline_reload_state.update({"running": True, "runtime": None, "info": None, "error": ""})
+        _set_offline_tuning_status("Ricarico dati e ricalcolo offline...")
+
+        def _reload_worker():
+            new_runtime = None
+            try:
+                if old_runtime is not None:
+                    old_runtime.stop()
+                if shutdown_state["in_progress"] or shutdown_state["done"]:
+                    with offline_reload_lock:
+                        offline_reload_state.update({"running": False, "runtime": None, "info": None, "error": ""})
+                    return
+                new_runtime = _create_offline_runtime()
+                info = new_runtime.start(timeout_s=45.0)
+                if shutdown_state["in_progress"] or shutdown_state["done"]:
+                    new_runtime.stop()
+                    with offline_reload_lock:
+                        offline_reload_state.update({"running": False, "runtime": None, "info": None, "error": ""})
+                    return
+                with offline_reload_lock:
+                    offline_reload_state.update({"running": False, "runtime": new_runtime, "info": info, "error": ""})
+            except Exception as exc:
+                if new_runtime is not None:
+                    try:
+                        new_runtime.stop()
+                    except Exception:
+                        pass
+                with offline_reload_lock:
+                    offline_reload_state.update({"running": False, "runtime": None, "info": None, "error": str(exc)})
+
+        threading.Thread(target=_reload_worker, name="offline-reload", daemon=True).start()
+
+    def _add_offline_tuning_widget(spec: dict, width: int = 300) -> None:
+        tag = _offline_tune_tag(spec["path"])
+        kind = str(spec["kind"])
+        default = _offline_cfg_path_get(offline_tuning_cfg, spec["path"], spec.get("default"))
+        if kind == "text":
+            dpg.add_input_text(label=spec["label"], tag=tag, default_value=str(default), width=width)
+        elif kind == "bool":
+            dpg.add_checkbox(label=spec["label"], tag=tag, default_value=bool(default))
+        elif kind == "combo":
+            items = list(spec.get("items", []))
+            default_s = str(default)
+            if default_s not in items:
+                default_s = str(spec.get("default", items[0]))
+            dpg.add_combo(items, label=spec["label"], tag=tag, default_value=default_s, width=width)
+        elif kind == "int":
+            dpg.add_input_int(label=spec["label"], tag=tag, default_value=int(default), step=int(spec.get("step", 1)), width=width, min_value=int(spec.get("min", 0)), min_clamped=("min" in spec))
+        else:
+            dpg.add_input_float(label=spec["label"], tag=tag, default_value=float(default), step=float(spec.get("step", 0.1)), width=width, min_value=float(spec.get("min", 0.0)), max_value=float(spec.get("max", 0.0)), min_clamped=("min" in spec), max_clamped=("max" in spec), format=spec.get("format", "%.3f"))
+
+    def _add_offline_tuning_section(section: str) -> None:
+        for spec in OFFLINE_TUNING_FIELD_SPECS:
+            if spec["section"] == section:
+                _add_offline_tuning_widget(spec)
+
     STATS_KEY_W = 16
     STATS_VAL_W = 13
 
@@ -3094,6 +3341,8 @@ def main():
                 current_group = group
             _add_tuning_widget(spec, width=width)
 
+    _read_offline_tuning_config()
+
     track_annotation_tags: list[str] = []
     supports_plot_annotation = bool(hasattr(dpg, "add_plot_annotation"))
 
@@ -3103,6 +3352,7 @@ def main():
             dpg.add_tab(label="Tempo Reale", tag=TAB_REALTIME_TAG)
             dpg.add_tab(label="Dati Processati", tag=TAB_PROCESSED_TAG)
             dpg.add_tab(label="Tuning DSP", tag=TAB_TUNING_TAG)
+            dpg.add_tab(label="Tuning Offline", tag=TAB_OFFLINE_TUNING_TAG)
 
         with dpg.table(header_row=False, resizable=True, policy=dpg.mvTable_SizingFixedFit, parent=TAB_REALTIME_TAG):
 
@@ -3696,6 +3946,37 @@ def main():
                     with dpg.child_window(width=-1, height=-1, border=False):
                         _add_tuning_section("Fusion", width=280)
 
+        with dpg.child_window(parent=TAB_OFFLINE_TUNING_TAG, width=-1, height=-1, border=True):
+            dpg.add_text("TUNING OFFLINE", color=(255, 200, 0))
+            dpg.add_text(
+                "Le modifiche restano locali finche non scegli 'Salva' o 'Salva e ricalcola offline'.",
+                wrap=-1,
+            )
+            dpg.add_separator()
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Ricarica da file", callback=_on_reload_offline_tuning, width=160)
+                dpg.add_button(label="Salva configurazione", callback=_on_save_offline_tuning, width=180)
+                dpg.add_button(label="Salva e ricalcola offline", callback=_on_apply_offline_tuning, width=230)
+            dpg.add_text("Pronto", tag=TXT_OFFLINE_TUNING_STATUS_TAG, wrap=-1)
+            dpg.add_text("", tag=TXT_OFFLINE_TUNING_INFO_TAG, wrap=-1, color=(180, 210, 255))
+            dpg.add_spacer(height=4)
+            with dpg.tab_bar(tag="offline_tuning_subtabbar"):
+                with dpg.tab(label="Dati"):
+                    with dpg.child_window(width=-1, height=-1, border=False):
+                        _add_offline_tuning_section("Dati e scansione")
+                with dpg.tab(label="Ricostruzione"):
+                    with dpg.child_window(width=-1, height=-1, border=False):
+                        _add_offline_tuning_section("Ricostruzione")
+                with dpg.tab(label="Filtri"):
+                    with dpg.child_window(width=-1, height=-1, border=False):
+                        _add_offline_tuning_section("Filtri range-angle")
+                with dpg.tab(label="Background"):
+                    with dpg.child_window(width=-1, height=-1, border=False):
+                        _add_offline_tuning_section("Background")
+                with dpg.tab(label="Angolo"):
+                    with dpg.child_window(width=-1, height=-1, border=False):
+                        _add_offline_tuning_section("Stima angolare")
+
     _update_heatmap_scale_input_labels(vis_heatmap_mode)
     _apply_heatmap_mode_controls(vis_heatmap_mode)
     _apply_heatmap_plot_geometry(vis_heatmap_mode, vis_rmax, vis_xmax, reset_limits=True)
@@ -3778,6 +4059,60 @@ def main():
     try:
         while dpg.is_dearpygui_running():
             now = time.perf_counter()
+
+            # A restart is performed in a worker because loading the capture
+            # files and building the first image can take seconds.  Adopt its
+            # result only from the GUI thread.
+            reload_runtime = None
+            reload_info = None
+            reload_error = ""
+            with offline_reload_lock:
+                if offline_reload_state.get("runtime") is not None or offline_reload_state.get("error"):
+                    reload_runtime = offline_reload_state.get("runtime")
+                    reload_info = offline_reload_state.get("info")
+                    reload_error = str(offline_reload_state.get("error") or "")
+                    offline_reload_state.update({"runtime": None, "info": None, "error": ""})
+            if reload_runtime is not None:
+                offline_runtime = reload_runtime
+                shutdown_resources["offline_runtime"] = offline_runtime
+                offline_info = dict(reload_info or offline_runtime.last_info)
+                off_pos_min = int(offline_info.get("pos_min", 0))
+                off_pos_max = int(offline_info.get("pos_max", off_pos_min))
+                if off_pos_max < off_pos_min:
+                    off_pos_min, off_pos_max = off_pos_max, off_pos_min
+                off_x_start = max(off_pos_min, min(off_pos_max, int(offline_info.get("x_start", off_pos_min))))
+                off_x_end = max(off_pos_min, min(off_pos_max, int(offline_info.get("x_end", off_pos_max))))
+                if off_x_end < off_x_start:
+                    off_x_start, off_x_end = off_x_end, off_x_start
+                off_ui_pending.update({
+                    "x_start": int(off_x_start),
+                    "x_end": int(off_x_end),
+                    "motion_mode": "static_zero_doppler",
+                    "reset_view": True,
+                })
+                off_ui_dirty = True
+                off_ui_dirty_t = now - 1.0
+                if dpg.does_item_exist(PROC_IN_XSTART):
+                    dpg.set_value(PROC_IN_XSTART, int(off_x_start))
+                if dpg.does_item_exist(PROC_IN_XEND):
+                    dpg.set_value(PROC_IN_XEND, int(off_x_end))
+                _set_offline_tuning_status("Ricalcolo offline completato")
+            elif reload_error:
+                _set_offline_tuning_status(f"ERRORE ricalcolo offline: {reload_error}")
+
+            if dpg.does_item_exist(TXT_OFFLINE_TUNING_INFO_TAG):
+                if bool(offline_reload_state.get("running")):
+                    dpg.set_value(TXT_OFFLINE_TUNING_INFO_TAG, "Runtime offline: ricarica dati in corso")
+                elif offline_runtime is not None:
+                    info_now = offline_runtime.last_info
+                    filters_now = info_now.get("range_angle_enabled_filters", ())
+                    filters_text = ", ".join(str(v) for v in filters_now) or "nessuno"
+                    dpg.set_value(
+                        TXT_OFFLINE_TUNING_INFO_TAG,
+                        f"Algoritmo: {info_now.get('algorithm', 'n/a')} | BP: {info_now.get('bp_mode', 'n/a')} | "
+                        f"Angolo: {info_now.get('angle_mode', info_now.get('range_angle_angle_mode_requested', 'n/a'))} | "
+                        f"Filtri: {filters_text}",
+                    )
 
 
             # --- UI apply (throttled, non-blocking) ---

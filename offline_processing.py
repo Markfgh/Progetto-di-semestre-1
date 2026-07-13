@@ -935,7 +935,9 @@ def _read_offline_sar_range_angle_cfg(
             }
         }
     )
-    nfft_angle_raw = _pick((fallback_cfg.get("fft", {}) or {}).get("nfft_angle"), 256)
+    # Keep the global setting as a fallback, but allow offline tuning without
+    # changing the realtime angular FFT resolution.
+    nfft_angle_raw = _pick(branch.get("nfft_angle"), (fallback_cfg.get("fft", {}) or {}).get("nfft_angle"), 256)
     try:
         nfft_angle = max(1, int(nfft_angle_raw))
     except (TypeError, ValueError):
