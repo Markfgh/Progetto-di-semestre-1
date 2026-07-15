@@ -1,0 +1,25 @@
+device:
+  serial_number: null
+  stepper_channel: 0
+  limit_min_channel: 0
+  limit_max_channel: 1
+  limit_min_polarity: 'NO'
+  limit_max_polarity: 'NO'
+mechanics:
+  belt_pitch_mm: 2.0
+  pulley_teeth: 20
+  motor_full_steps_per_rev: 200
+  gear_reduction: 0.44388776431
+motor:
+  velocity_microsteps_s: 400.0
+  acceleration_microsteps_s2: 4000.0
+  current_limit_a: 1.5
+homing:
+  search_distance_mm: 1000.0
+  release_distance_mm: 10.0
+  velocity_microsteps_s: 400.0
+  timeout_seconds: 30.0
+cycle:
+  step_mm: 100.0
+  wait_seconds: 1.0
+  cycles: 1
