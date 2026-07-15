@@ -43,6 +43,8 @@ class ControllerState(str, Enum):
     READY = "Pronto"
     CYCLE_MOVING = "Ciclo: movimento"
     CYCLE_WAITING = "Ciclo: attesa"
+    SCAN_MOVING = "Scansione SAR: movimento"
+    SCAN_WAITING = "Scansione SAR: cattura/attesa"
     LIMIT_STOPPED = "Arrestato da finecorsa"
     STOPPED = "Arrestato"
     FAULT = "Errore"
@@ -244,6 +246,12 @@ class PhidgetStepperController:
         self.min_released_event = threading.Event()
         self.home_contact_position: float | None = None
         self.cycle_progress: CycleProgress | None = None
+        # Prenotazione impostata prima di avviare il thread HOME: evita che
+        # due click ravvicinati creino due worker sullo stesso controller.
+        self.homing_worker_active = False
+        # La scansione SAR viene orchestrata dalla GUI radar, ma il backend
+        # mantiene l'esclusione dei comandi manuali sul controller fisico.
+        self.external_scan_active = False
 
     def _emit(self, event: str, value: Any) -> None:
         self.gui_queue.put((event, value))
@@ -271,6 +279,8 @@ class PhidgetStepperController:
                 "completed": progress.completed if progress else 0,
                 "total": progress.total if progress else 0,
                 "cycle_active": progress.active if progress else False,
+                "scan_active": self.external_scan_active,
+                "motion_active": self.command_direction != 0,
             }
 
     @staticmethod
@@ -332,6 +342,7 @@ class PhidgetStepperController:
             self.homed = False
             self.command_direction = 0
             self.cycle_progress = None
+            self.external_scan_active = False
         self._set_state(ControllerState.DISCONNECTED)
         self.log("Phidget disconnesso.")
 
@@ -353,11 +364,126 @@ class PhidgetStepperController:
             raise MotionError("Phidget non collegato.")
 
     def _require_manual_motion_allowed(self) -> None:
+        with self.lock:
+            if not self.connected:
+                raise MotionError("Phidget non collegato.")
+            if self.state in {ControllerState.FAULT, ControllerState.EMERGENCY}:
+                raise MotionError("Ripristinare la connessione e rieseguire HOME prima di muovere il carrello.")
+            if self.state in {
+                ControllerState.HOMING,
+                ControllerState.CYCLE_MOVING,
+                ControllerState.CYCLE_WAITING,
+                ControllerState.SCAN_MOVING,
+                ControllerState.SCAN_WAITING,
+            } or self.external_scan_active or self.homing_worker_active:
+                raise MotionError("Un'operazione automatica e' gia' in corso.")
+            if self.command_direction != 0:
+                raise MotionError("Attendere l'arresto del movimento corrente prima di inviare un altro comando.")
+
+    def begin_external_scan(self) -> None:
+        """Riserva il 1063 per una scansione coordinata dal radar.
+
+        Non fidarsi del solo stato READY: i jog manuali storici impostano
+        READY subito dopo aver inviato il target, quindi controlliamo anche
+        l'evento di moto ancora pendente.
+        """
         self._require_connected()
-        if self.state in {ControllerState.FAULT, ControllerState.EMERGENCY}:
-            raise MotionError("Ripristinare la connessione e rieseguire HOME prima di muovere il carrello.")
-        if self.state in {ControllerState.HOMING, ControllerState.CYCLE_MOVING, ControllerState.CYCLE_WAITING}:
-            raise MotionError("Un'operazione automatica e' gia' in corso.")
+        with self.lock:
+            if self.external_scan_active:
+                raise MotionError("Una scansione SAR e' gia' in corso.")
+            if not self.homed:
+                raise MotionError("Eseguire HOME prima di avviare la scansione SAR.")
+            if self.state not in {ControllerState.READY, ControllerState.STOPPED}:
+                raise MotionError("Il carrello deve essere fermo e pronto prima della scansione SAR.")
+            if self.command_direction != 0:
+                raise MotionError("Attendere il completamento del movimento manuale prima della scansione SAR.")
+            if self.limit_min_active and self.limit_max_active:
+                raise MotionError("Entrambi i finecorsa sono attivi: controllare cablaggio/polarita'.")
+            self.external_scan_active = True
+            self.stop_requested.clear()
+            self.cancel_requested.clear()
+        self._set_state(ControllerState.SCAN_WAITING, "pronto alla prima cattura")
+        self.log("Scansione SAR riservata al controller radar.")
+
+    def finish_external_scan(self, success: bool) -> None:
+        """Rilascia l'esclusione del carrello quando la scansione termina."""
+        with self.lock:
+            was_active = self.external_scan_active
+            self.external_scan_active = False
+            state = self.state
+        if not was_active:
+            return
+        if state in {ControllerState.FAULT, ControllerState.EMERGENCY, ControllerState.LIMIT_STOPPED}:
+            return
+        if self.cancel_requested.is_set() or self.stop_requested.is_set():
+            self._set_state(ControllerState.STOPPED, "scansione annullata - coppia mantenuta")
+        elif success:
+            self._set_state(ControllerState.READY, "scansione SAR completata - coppia mantenuta")
+        else:
+            self._set_state(ControllerState.FAULT, "scansione SAR fallita")
+
+    def position_microsteps(self) -> int:
+        """Quota attuale riferita al HOME, arrotondata al microstep."""
+        self._require_connected()
+        return int(round(self.stepper.getPosition()))
+
+    def position_mm(self) -> float:
+        return float(self.config.mechanics.mm_from_microsteps(self.position_microsteps()))
+
+    def move_absolute_microsteps_and_wait(
+        self,
+        target_microsteps: int,
+        timeout_seconds: float,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
+        """Muove un target di scansione e ritorna solo dopo ``Stopped``.
+
+        Questo è il percorso usato dalla scansione SAR: non accumula arrotondamenti
+        e non espone la GUI a una corsa ancora in movimento.
+        """
+        self._require_connected()
+        with self.lock:
+            if not self.external_scan_active:
+                raise MotionError("Il movimento SAR richiede una scansione attiva.")
+            if self.state not in {ControllerState.SCAN_WAITING, ControllerState.SCAN_MOVING}:
+                raise MotionError("Il carrello non e' nello stato valido per il movimento SAR.")
+        if cancel_event is not None and cancel_event.is_set():
+            raise MotionError("Scansione annullata.")
+
+        target = int(target_microsteps)
+        current = self.position_microsteps()
+        direction = (target > current) - (target < current)
+        if direction == 0:
+            self._emit("position", float(current))
+            return
+
+        target_mm = self.config.mechanics.mm_from_microsteps(target)
+        self._set_state(ControllerState.SCAN_MOVING, f"target {target_mm:.3f} mm")
+        self._issue_target(target, direction)
+
+        deadline = time.monotonic() + max(0.001, float(timeout_seconds))
+        while True:
+            if self.cancel_requested.is_set() or self.stop_requested.is_set() or (
+                cancel_event is not None and cancel_event.is_set()
+            ):
+                raise MotionError("Scansione annullata.")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                # Un timeout non deve lasciare il target precedente attivo:
+                # arresta mantenendo coppia e richiede un controllo operatore.
+                self._stop_keep_torque()
+                self._set_state(ControllerState.FAULT, "timeout movimento scansione SAR")
+                raise TimeoutError("Timeout movimento scansione SAR.")
+            if self.stopped_event.wait(min(0.05, remaining)):
+                break
+
+        if self.cancel_requested.is_set() or self.stop_requested.is_set() or (
+            cancel_event is not None and cancel_event.is_set()
+        ):
+            raise MotionError("Scansione annullata.")
+        actual = self.position_microsteps()
+        self._emit("position", float(actual))
+        self._set_state(ControllerState.SCAN_WAITING, f"arrivato a {self.position_mm():.3f} mm")
 
     def _on_attach(self, device: Stepper) -> None:
         self.log(f"Stepper rilevato, seriale {device.getDeviceSerialNumber()}.")
@@ -372,6 +498,11 @@ class PhidgetStepperController:
 
     def _on_error(self, device: Stepper, error_code: int, description: str) -> None:
         self.cancel_requested.set()
+        with self.lock:
+            # Dopo un errore hardware non possiamo più garantire né la quota
+            # open-loop né che il comando precedente sia ancora valido.
+            self.homed = False
+            self.command_direction = 0
         self.log(f"Errore Phidget {error_code}: {description}")
         try:
             self.stepper.setEngaged(False)
@@ -478,8 +609,38 @@ class PhidgetStepperController:
         self._set_state(ControllerState.READY, f"target {target_mm:.3f} mm")
 
     def start_homing(self) -> None:
-        self._require_manual_motion_allowed()
-        threading.Thread(target=self._homing_worker, name="phidget-home", daemon=True).start()
+        # Controllo e prenotazione devono avvenire sotto lo stesso lock: lo
+        # stato HOMING impostato dal worker sarebbe troppo tardi per bloccare
+        # un secondo click immediato.
+        with self.lock:
+            if not self.connected:
+                raise MotionError("Phidget non collegato.")
+            if self.state in {ControllerState.FAULT, ControllerState.EMERGENCY}:
+                raise MotionError("Ripristinare la connessione e rieseguire HOME prima di muovere il carrello.")
+            if self.state in {
+                ControllerState.HOMING,
+                ControllerState.CYCLE_MOVING,
+                ControllerState.CYCLE_WAITING,
+                ControllerState.SCAN_MOVING,
+                ControllerState.SCAN_WAITING,
+            } or self.external_scan_active or self.homing_worker_active:
+                raise MotionError("Un'operazione automatica e' gia' in corso.")
+            if self.command_direction != 0:
+                raise MotionError("Attendere l'arresto del movimento corrente prima di eseguire HOME.")
+            self.homing_worker_active = True
+            self.state = ControllerState.HOMING
+
+        self._emit("state", ControllerState.HOMING.value)
+        self._emit("snapshot", self.snapshot())
+        try:
+            threading.Thread(target=self._homing_worker, name="phidget-home", daemon=True).start()
+        except Exception:
+            with self.lock:
+                self.homing_worker_active = False
+                if self.state == ControllerState.HOMING:
+                    self.state = ControllerState.READY if self.homed else ControllerState.IDLE
+            self._emit("snapshot", self.snapshot())
+            raise
 
     def _wait_event(self, event: threading.Event, seconds: float, message: str) -> None:
         if not event.wait(seconds):
@@ -494,7 +655,6 @@ class PhidgetStepperController:
             self.min_active_event.clear()
             self.min_released_event.clear()
             self.home_contact_position = None
-            self._set_state(ControllerState.HOMING)
             home = self.config.homing
             if self.limit_min_active:
                 self.log("MIN gia' attivo: allontanamento prima di HOME.")
@@ -536,6 +696,9 @@ class PhidgetStepperController:
             if not self.stop_requested.is_set():
                 self._set_state(ControllerState.FAULT, "HOME fallito")
             self.log(f"Errore HOME: {exc}")
+        finally:
+            with self.lock:
+                self.homing_worker_active = False
 
     def _stop_keep_torque(self) -> None:
         self.cancel_requested.set()
@@ -550,8 +713,22 @@ class PhidgetStepperController:
     def stop(self) -> None:
         self.stop_requested.set()
         self._stop_keep_torque()
-        self._set_state(ControllerState.STOPPED, "coppia mantenuta")
-        self.log("STOP: moto annullato, coppia mantenuta.")
+        protected_states = {
+            ControllerState.FAULT,
+            ControllerState.EMERGENCY,
+            ControllerState.LIMIT_STOPPED,
+        }
+        with self.lock:
+            protected_state = self.state if self.state in protected_states else None
+            if protected_state is None:
+                self.state = ControllerState.STOPPED
+        if protected_state is None:
+            self._emit("state", f"{ControllerState.STOPPED.value}: coppia mantenuta")
+            self._emit("snapshot", self.snapshot())
+            self.log("STOP: moto annullato, coppia mantenuta.")
+        else:
+            self._emit("snapshot", self.snapshot())
+            self.log(f"STOP richiesto; stato protetto preservato: {protected_state.value}.")
 
     def cancel_motion(self, disengage: bool = False) -> None:
         self.stop_requested.set()

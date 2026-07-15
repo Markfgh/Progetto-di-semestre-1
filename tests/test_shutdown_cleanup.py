@@ -121,7 +121,7 @@ def test_cleanup_helpers_are_idempotent() -> None:
 
 def test_logger_flushes_pending_buffer_on_stop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(main_refactory, "BYTES_PER_FRAME", 4)
-    monkeypatch.setattr(main_refactory, "_build_capture_file_header", lambda pos_id: b"HDR")
+    monkeypatch.setattr(main_refactory, "_build_capture_file_header", lambda pos_id, **_kwargs: b"HDR")
 
     free_slots: queue.Queue[int] = queue.Queue()
     shm_frames = bytearray(b"ABCD")
@@ -135,6 +135,11 @@ def test_logger_flushes_pending_buffer_on_stop(tmp_path: Path, monkeypatch: pyte
     cap_pos_id = mp.Value("i", 7)
     cap_id = mp.Value("I", 0)
     cap_saved = mp.Value("i", 0)
+    cap_position_mm = mp.Value("d", 12.5)
+    cap_position_microsteps = mp.Value("q", 1000)
+    cap_cancel_id = mp.Value("I", 0)
+    cap_done_id = mp.Value("I", 0)
+    cap_result = mp.Value("i", 0)
     log_bytes = mp.Value("L", 0)
     stop_evt = threading.Event()
 
@@ -152,6 +157,11 @@ def test_logger_flushes_pending_buffer_on_stop(tmp_path: Path, monkeypatch: pyte
             "cap_pos_id": cap_pos_id,
             "cap_id": cap_id,
             "cap_saved": cap_saved,
+            "cap_position_mm": cap_position_mm,
+            "cap_position_microsteps": cap_position_microsteps,
+            "cap_cancel_id": cap_cancel_id,
+            "cap_done_id": cap_done_id,
+            "cap_result": cap_result,
             "log_bytes": log_bytes,
             "stop_evt": stop_evt,
             "out_dir_s": str(tmp_path),
@@ -184,6 +194,163 @@ def test_logger_flushes_pending_buffer_on_stop(tmp_path: Path, monkeypatch: pyte
     assert not worker.is_alive()
     assert (tmp_path / "capture_pos7.bin").read_bytes() == b"HDRABCD"
     assert list(free_slots.queue) == [0]
+
+
+def test_logger_completion_releases_surplus_capture_slots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Frame gia' taggati oltre il target non devono consumare il ring."""
+    monkeypatch.setattr(main_refactory, "BYTES_PER_FRAME", 4)
+    monkeypatch.setattr(main_refactory, "_build_capture_file_header", lambda pos_id, **_kwargs: b"HDR")
+
+    free_slots: queue.Queue[int] = queue.Queue()
+    shm_frames = bytearray(b"ABCDEFGH")
+    slot_state = mp.Array("i", [1, 1])
+    slot_ok = mp.Array("i", [1, 1])
+    slot_pos_id = mp.Array("i", [7, 7])
+    slot_usemask = mp.Array("i", [2, 2])
+    publish_lock = threading.Lock()
+    cap_active = mp.Value("i", 0)
+    cap_pos_id = mp.Value("i", 7)
+    cap_id = mp.Value("I", 0)
+    cap_saved = mp.Value("i", 0)
+    cap_position_mm = mp.Value("d", 1.0)
+    cap_position_microsteps = mp.Value("q", 10)
+    cap_cancel_id = mp.Value("I", 0)
+    cap_done_id = mp.Value("I", 0)
+    cap_result = mp.Value("i", 0)
+    log_bytes = mp.Value("L", 0)
+    stop_evt = threading.Event()
+    ready_evt = threading.Event()
+
+    worker = threading.Thread(
+        target=main_refactory.logger_worker,
+        kwargs={
+            "free_slots": free_slots,
+            "shm_frames": shm_frames,
+            "slot_state": slot_state,
+            "slot_ok": slot_ok,
+            "slot_pos_id": slot_pos_id,
+            "slot_usemask": slot_usemask,
+            "publish_lock": publish_lock,
+            "cap_active": cap_active,
+            "cap_pos_id": cap_pos_id,
+            "cap_id": cap_id,
+            "cap_saved": cap_saved,
+            "cap_position_mm": cap_position_mm,
+            "cap_position_microsteps": cap_position_microsteps,
+            "cap_cancel_id": cap_cancel_id,
+            "cap_done_id": cap_done_id,
+            "cap_result": cap_result,
+            "log_bytes": log_bytes,
+            "stop_evt": stop_evt,
+            "out_dir_s": str(tmp_path),
+            "frames_per_position": 1,
+            "block_frames": 4,
+            "ready_evt": ready_evt,
+        },
+        daemon=True,
+    )
+    worker.start()
+    assert ready_evt.wait(1.0)
+    with cap_active.get_lock():
+        cap_active.value = 1
+    with cap_id.get_lock():
+        cap_id.value = 1
+
+    deadline = time.perf_counter() + 2.0
+    while time.perf_counter() < deadline and int(cap_done_id.value) != 1:
+        time.sleep(0.005)
+    stop_evt.set()
+    worker.join(timeout=1.0)
+
+    assert int(cap_done_id.value) == 1
+    assert int(cap_result.value) == 1
+    assert int(cap_active.value) == 0
+    assert list(slot_usemask) == [0, 0]
+    assert list(slot_state) == [0, 0]
+    released = list(free_slots.queue)
+    assert len(released) == 2
+    assert set(released) == {0, 1}
+
+
+def test_logger_reports_flush_failure_as_capture_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(main_refactory, "BYTES_PER_FRAME", 4)
+    monkeypatch.setattr(main_refactory, "_build_capture_file_header", lambda pos_id, **_kwargs: b"HDR")
+
+    class FlushFailingFile:
+        def write(self, payload) -> int:
+            return len(payload)
+
+        def flush(self) -> None:
+            raise OSError("flush failed")
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("builtins.open", lambda *_args, **_kwargs: FlushFailingFile())
+
+    free_slots: queue.Queue[int] = queue.Queue()
+    slot_state = mp.Array("i", [1])
+    slot_ok = mp.Array("i", [1])
+    slot_pos_id = mp.Array("i", [9])
+    slot_usemask = mp.Array("i", [2])
+    cap_active = mp.Value("i", 0)
+    cap_pos_id = mp.Value("i", 9)
+    cap_id = mp.Value("I", 0)
+    cap_saved = mp.Value("i", 0)
+    cap_position_mm = mp.Value("d", 2.0)
+    cap_position_microsteps = mp.Value("q", 20)
+    cap_cancel_id = mp.Value("I", 0)
+    cap_done_id = mp.Value("I", 0)
+    cap_result = mp.Value("i", 0)
+    stop_evt = threading.Event()
+    ready_evt = threading.Event()
+
+    worker = threading.Thread(
+        target=main_refactory.logger_worker,
+        kwargs={
+            "free_slots": free_slots,
+            "shm_frames": bytearray(b"ABCD"),
+            "slot_state": slot_state,
+            "slot_ok": slot_ok,
+            "slot_pos_id": slot_pos_id,
+            "slot_usemask": slot_usemask,
+            "publish_lock": threading.Lock(),
+            "cap_active": cap_active,
+            "cap_pos_id": cap_pos_id,
+            "cap_id": cap_id,
+            "cap_saved": cap_saved,
+            "cap_position_mm": cap_position_mm,
+            "cap_position_microsteps": cap_position_microsteps,
+            "cap_cancel_id": cap_cancel_id,
+            "cap_done_id": cap_done_id,
+            "cap_result": cap_result,
+            "log_bytes": mp.Value("L", 0),
+            "stop_evt": stop_evt,
+            "out_dir_s": str(tmp_path),
+            "frames_per_position": 1,
+            "block_frames": 4,
+            "ready_evt": ready_evt,
+        },
+        daemon=True,
+    )
+    worker.start()
+    assert ready_evt.wait(1.0)
+    cap_active.value = 1
+    cap_id.value = 1
+    deadline = time.perf_counter() + 2.0
+    while time.perf_counter() < deadline and int(cap_done_id.value) != 1:
+        time.sleep(0.005)
+    stop_evt.set()
+    worker.join(timeout=1.0)
+
+    assert int(cap_done_id.value) == 1
+    assert int(cap_result.value) == -1
 
 
 def test_offline_runtime_start_failure_cleans_resources(

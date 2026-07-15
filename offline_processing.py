@@ -432,15 +432,17 @@ class SARReader:
             chirps = _to_int("header.capture.chirps", capture.get("chirps"))
             rx = _to_int("header.capture.rx", capture.get("rx"))
             tx = _to_int("header.capture.tx", capture.get("tx"))
-            frames = _pick(capture.get("x_frames"), capture.get("frames_per_position"))
-            frames_per_pos = None if frames is None else _to_int("header.capture.x_frames", frames)
+            # ``x_frames`` è il batch realtime; per le catture SAR recenti il
+            # numero realmente scritto dal logger è esplicito e prioritario.
+            frames = _pick(capture.get("frames_per_position"), capture.get("x_frames"))
+            frames_per_pos = None if frames is None else _to_int("header.capture.frames_per_position", frames)
 
             if samples <= 0 or chirps <= 0 or rx <= 0 or tx <= 0:
                 raise ValueError(f"{path.name}: header.capture contiene valori <= 0")
             if chirps % tx != 0:
                 raise ValueError(f"{path.name}: header.capture.chirps deve essere multiplo di tx")
             if frames_per_pos is not None and frames_per_pos <= 0:
-                raise ValueError(f"{path.name}: header.capture.x_frames deve essere > 0")
+                raise ValueError(f"{path.name}: header.capture.frames_per_position deve essere > 0")
 
             if samples_ref is None:
                 samples_ref, chirps_ref, rx_ref, tx_ref = samples, chirps, rx, tx
@@ -460,7 +462,7 @@ class SARReader:
                 )
             if frames_per_pos_ref is not None and frames_per_pos is not None and frames_per_pos != frames_per_pos_ref:
                 raise ValueError(
-                    f"{path.name}: x_frames incoerente ({frames_per_pos}, atteso {frames_per_pos_ref})"
+                    f"{path.name}: frames_per_position incoerente ({frames_per_pos}, atteso {frames_per_pos_ref})"
                 )
 
         if samples_ref is None or chirps_ref is None or rx_ref is None or tx_ref is None:

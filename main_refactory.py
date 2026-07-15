@@ -13,8 +13,24 @@ import numpy as np
 import dearpygui.dearpygui as dpg
 import os
 import json
+import re
 import struct
 from datetime import datetime
+
+from sar_capture import CaptureError, CaptureSessionManager
+from sar_scan import SarScanCoordinator, ScanError, ScanPlan
+
+try:
+    # Il backend non crea una finestra: la GUI standalone viene istanziata solo
+    # sotto il suo ``if __name__ == '__main__'``.  Main resta quindi l'unico
+    # proprietario del 1063 durante una scansione SAR.
+    from phidget_stepper_gui import PhidgetStepperController, load_config as load_stepper_config
+except Exception as exc:  # Il radar può restare utilizzabile senza SDK Phidget.
+    PhidgetStepperController = None
+    load_stepper_config = None
+    _PHIDGET_BACKEND_ERROR = str(exc)
+else:
+    _PHIDGET_BACKEND_ERROR = ""
 
 try:
     import psutil  # type: ignore
@@ -619,7 +635,12 @@ FRAMES_PER_POSITION = int(sar_cfg.get("frames_per_position", 8))
 CAPTURE_HEADER_MAGIC = b"RTPBIN1\x00"
 
 
-def _build_capture_file_header(pos_id: int) -> bytes:
+def _build_capture_file_header(
+    pos_id: int,
+    *,
+    carriage_position_mm: float | None = None,
+    carriage_microsteps: int | None = None,
+) -> bytes:
     header = {
         "format": "rt_capture_v1",
         "position": int(pos_id),
@@ -635,11 +656,265 @@ def _build_capture_file_header(pos_id: int) -> bytes:
             "chirps": int(CHIRPS),
             "rx": int(RX),
             "tx": int(TX),
-            "x_frames": int(X_FRAMES),
+            "x_frames": int(X_FRAMES),  # batch realtime, mantenuto per compatibilità
+            "frames_per_position": int(FRAMES_PER_POSITION),
         },
     }
+    if carriage_position_mm is not None or carriage_microsteps is not None:
+        stage: dict[str, float | int | str] = {"reference": "phidget_home_min"}
+        if carriage_position_mm is not None and np.isfinite(float(carriage_position_mm)):
+            stage["position_mm"] = float(carriage_position_mm)
+        if carriage_microsteps is not None:
+            stage["position_microsteps"] = int(carriage_microsteps)
+        header["stage"] = stage
     payload = json.dumps(header, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
     return CAPTURE_HEADER_MAGIC + struct.pack("<I", len(payload)) + payload
+
+
+def read_offline_scan_settings(path: Path) -> tuple[int, int, float]:
+    """Legge ``(start_position_id, default_positions, pitch_mm)`` dal YAML."""
+    with path.open("r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle) or {}
+    if not isinstance(raw, dict):
+        raise ValueError("offline_config.yaml deve contenere una mappa YAML")
+    scan = raw.get("scan", {})
+    if not isinstance(scan, dict):
+        raise ValueError("offline_config.yaml.scan deve contenere una mappa")
+    start = int(scan.get("x_start", 1))
+    end = int(scan.get("x_end", start))
+    step = int(scan.get("x_step", 1))
+    pitch_m = float(scan.get("x_pitch_m"))
+    if start <= 0 or end < start or step <= 0 or not np.isfinite(pitch_m) or pitch_m <= 0.0:
+        raise ValueError("scan.x_start/x_end/x_step/x_pitch_m non validi")
+    positions = ((end - start) // step) + 1
+    return int(start), int(positions), float(pitch_m * 1000.0)
+
+
+def _yaml_scalar_literal(value) -> str:
+    """Serializza un singolo scalare senza riscrivere l'intero YAML."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, (float, np.floating)):
+        value_f = float(value)
+        if not np.isfinite(value_f):
+            raise ValueError("Valore YAML non finito")
+        return repr(value_f)
+    # Una stringa JSON e' anche uno scalare YAML valido e protegge path,
+    # due punti e caratteri '#'.
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _split_yaml_inline_comment(value_text: str) -> tuple[str, str]:
+    """Separa un commento YAML non racchiuso tra apici dal valore."""
+    quote = ""
+    escaped = False
+    for index, char in enumerate(value_text):
+        if escaped:
+            escaped = False
+            continue
+        if quote == '"' and char == "\\":
+            escaped = True
+            continue
+        if char in {'"', "'"}:
+            if not quote:
+                quote = char
+            elif quote == char:
+                quote = ""
+            continue
+        if char == "#" and not quote and (index == 0 or value_text[index - 1].isspace()):
+            comment_start = index
+            while comment_start > 0 and value_text[comment_start - 1] in " \t":
+                comment_start -= 1
+            return value_text[:comment_start], value_text[comment_start:]
+    return value_text, ""
+
+
+def _update_top_level_yaml_scalars(
+    path: Path,
+    updates: dict[tuple[str, str], object],
+) -> None:
+    """Aggiorna chiavi dirette di sezioni YAML preservando commenti e ordine.
+
+    ``yaml.safe_dump`` eliminerebbe il commento che documenta il pitch fisico.
+    Questa routine modifica soltanto le poche chiavi di run controllate dalla
+    scansione automatica e inserisce una sezione/chiave se ancora assente.
+    """
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        original = handle.read()
+    newline = "\r\n" if "\r\n" in original else "\n"
+    lines = original.splitlines(keepends=True)
+
+    def _section_bounds(section: str) -> tuple[int, int] | None:
+        section_pattern = re.compile(rf"^{re.escape(section)}:[ \t]*(?:#.*)?(?:\r?\n)?$")
+        start = next((i for i, line in enumerate(lines) if section_pattern.match(line)), None)
+        if start is None:
+            return None
+        end = len(lines)
+        for i in range(start + 1, len(lines)):
+            if re.match(r"^[^\s#][^:]*:", lines[i]):
+                end = i
+                break
+        return start, end
+
+    for (section, key), value in updates.items():
+        bounds = _section_bounds(section)
+        literal = _yaml_scalar_literal(value)
+        if bounds is None:
+            if lines and lines[-1].strip():
+                lines.append(newline)
+            lines.extend((f"{section}:{newline}", f"  {key}: {literal}{newline}"))
+            continue
+
+        start, end = bounds
+        key_pattern = re.compile(rf"^(  {re.escape(key)}:[ \t]*)(.*?)(\r?\n)?$")
+        replaced = False
+        for index in range(start + 1, end):
+            match = key_pattern.match(lines[index])
+            if match is None:
+                continue
+            _old_value, comment = _split_yaml_inline_comment(match.group(2))
+            eol = match.group(3) or newline
+            prefix = match.group(1)
+            if not prefix.endswith((" ", "\t")):
+                prefix += " "
+            lines[index] = f"{prefix}{literal}{comment}{eol}"
+            replaced = True
+            break
+        if replaced:
+            continue
+
+        insert_at = end
+        while insert_at > start + 1 and not lines[insert_at - 1].strip():
+            insert_at -= 1
+        lines.insert(insert_at, f"  {key}: {literal}{newline}")
+
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8", newline="") as handle:
+        handle.write("".join(lines))
+    tmp_path.replace(path)
+
+
+def _update_existing_yaml_scalar_paths(
+    path: Path,
+    updates: dict[str, object],
+    *,
+    inline_comments: dict[str, str] | None = None,
+) -> None:
+    """Aggiorna percorsi YAML esistenti, inclusi quelli annidati, senza dump.
+
+    Il file di tuning contiene note operative utili. Il salvataggio manuale
+    modifica quindi solo gli scalari esposti dalla GUI e conserva struttura,
+    ordine e commenti di tutte le altre righe.
+    """
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        original = handle.read()
+    newline = "\r\n" if "\r\n" in original else "\n"
+    lines = original.splitlines(keepends=True)
+    stack: list[tuple[int, str]] = []
+    updated: set[str] = set()
+    comments = inline_comments or {}
+    mapping_line = re.compile(
+        r"^(?P<indent> *)(?P<key>[A-Za-z0-9_]+):(?P<rest>.*?)(?P<eol>\r?\n)?$"
+    )
+
+    for index, line in enumerate(lines):
+        match = mapping_line.match(line)
+        if match is None:
+            continue
+        indent = len(match.group("indent"))
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        key = match.group("key")
+        yaml_path = ".".join([part for _depth, part in stack] + [key])
+        value_text, old_comment = _split_yaml_inline_comment(match.group("rest"))
+        if not value_text.strip():
+            # Mappa a blocchi (eventualmente seguita da un commento).
+            stack.append((indent, key))
+            continue
+        if yaml_path not in updates:
+            continue
+        comment = old_comment
+        if yaml_path in comments:
+            requested = str(comments[yaml_path]).strip()
+            comment = f" # {requested}" if requested else ""
+        eol = match.group("eol") or newline
+        lines[index] = (
+            f"{match.group('indent')}{key}: {_yaml_scalar_literal(updates[yaml_path])}{comment}{eol}"
+        )
+        updated.add(yaml_path)
+
+    missing = sorted(set(updates) - updated)
+    if missing:
+        raise ValueError(
+            "Chiavi YAML di tuning mancanti (nessun file modificato): " + ", ".join(missing)
+        )
+
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8", newline="") as handle:
+        handle.write("".join(lines))
+    tmp_path.replace(path)
+
+
+def configure_offline_scan_for_run(
+    path: Path,
+    *,
+    output_dir: Path,
+    start_position_id: int,
+    positions: int,
+    frames_per_position: int | None = None,
+) -> float:
+    """Aggiorna il set di file che l'offline dovrà leggere dopo la scansione.
+
+    Il pitch non viene modificato: resta l'unica sorgente fisica della
+    configurazione offline e viene restituito in millimetri al coordinatore.
+    """
+    if int(positions) <= 0 or int(start_position_id) <= 0:
+        raise ValueError("Posizione iniziale e numero di posizioni devono essere positivi")
+    with path.open("r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle) or {}
+    if not isinstance(raw, dict):
+        raise ValueError("offline_config.yaml deve contenere una mappa YAML")
+    scan = raw.setdefault("scan", {})
+    if not isinstance(scan, dict):
+        raise ValueError("offline_config.yaml.scan deve contenere una mappa")
+    try:
+        pitch_m = float(scan["x_pitch_m"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("scan.x_pitch_m deve essere un numero positivo") from exc
+    if not np.isfinite(pitch_m) or pitch_m <= 0.0:
+        raise ValueError("scan.x_pitch_m deve essere un numero positivo")
+
+    x_start = int(start_position_id)
+    x_end = int(start_position_id) + int(positions) - 1
+    data = raw.setdefault("data", {})
+    if not isinstance(data, dict):
+        raise ValueError("offline_config.yaml.data deve contenere una mappa")
+    try:
+        relative_output = output_dir.resolve().relative_to(path.parent.resolve())
+        input_dir = str(relative_output)
+    except Exception:
+        input_dir = str(output_dir.resolve())
+    scalar_updates: dict[tuple[str, str], object] = {
+        ("data", "input_dir"): input_dir,
+        ("scan", "x_start"): x_start,
+        ("scan", "x_end"): x_end,
+        # I file prodotti dalla GUI sono sempre consecutivi: capture_posN.bin.
+        ("scan", "x_step"): 1,
+    }
+    if frames_per_position is not None:
+        if int(frames_per_position) <= 0:
+            raise ValueError("frames_per_position deve essere maggiore di zero")
+        capture = raw.setdefault("capture", {})
+        if not isinstance(capture, dict):
+            raise ValueError("offline_config.yaml.capture deve contenere una mappa")
+        scalar_updates[("capture", "frames_per_position")] = int(frames_per_position)
+
+    _update_top_level_yaml_scalars(path, scalar_updates)
+    return float(pitch_m * 1000.0)
 
 
 # ----------------------------
@@ -661,6 +936,11 @@ def radar_rx(
     cap_pos_id: Synchronized,
     cap_id: Synchronized,
     cap_saved: Synchronized,
+    cap_position_mm: Synchronized,
+    cap_position_microsteps: Synchronized,
+    cap_cancel_id: Synchronized,
+    cap_done_id: Synchronized,
+    cap_result: Synchronized,
     lost_pkts: Synchronized,
     rx_pkts: Synchronized,
     rx_last_packet_time_s: Synchronized,
@@ -690,7 +970,7 @@ def radar_rx(
       - se non ci sono slot liberi: drop (no block), ma manteniamo l'allineamento consumando i byte
 
     Capture:
-      - trigger via cmd_queue ("CAPTURE", pos_id)
+      - trigger via cmd_queue ("CAPTURE", pos_id, metadata)
       - dopo settling_delay_s: cap_active=1 e RX tagga slot_pos_id
       - il logger salva X frame validi per pos_id (puÃ² perdere frame, quindi dura piÃ¹ a lungo se necessario)
     """
@@ -776,8 +1056,35 @@ def radar_rx(
                     except Exception:
                         pass
                 continue
-            if cmd[0] == "CAPTURE":
+            cmd_type = str(cmd[0]).strip().upper()
+            if cmd_type == "CAPTURE_STOP":
+                pending = False
+                # La transizione e il tagging dei frame condividono lo stesso
+                # lock: dopo questo punto RX non puo' pubblicare nuovi slot
+                # appartenenti alla sessione annullata.
+                with publish_lock:
+                    cap_active.value = 0
+                with cap_id.get_lock():
+                    cancelled_id = int(cap_id.value)
+                if cancelled_id != 0:
+                    # Il logger pubblica cap_done_id solo dopo aver chiuso il
+                    # file (anche se non era ancora riuscito ad aprirlo).
+                    with cap_cancel_id.get_lock():
+                        cap_cancel_id.value = int(cancelled_id)
+                continue
+            if cmd_type == "CAPTURE":
                 pending_pos_id = int(cmd[1])
+                metadata = cmd[2] if len(cmd) >= 3 and isinstance(cmd[2], dict) else {}
+                try:
+                    position_mm = metadata.get("carriage_position_mm", None)
+                    position_mm = float(position_mm) if position_mm is not None else float("nan")
+                except (TypeError, ValueError):
+                    position_mm = float("nan")
+                try:
+                    position_microsteps = metadata.get("carriage_microsteps", None)
+                    position_microsteps = int(position_microsteps) if position_microsteps is not None else -1
+                except (TypeError, ValueError):
+                    position_microsteps = -1
                 pending_start_t = now_perf + max(0.0, float(settling_delay_s))
                 pending = True
 
@@ -786,20 +1093,33 @@ def radar_rx(
                     cap_saved.value = 0
                 with cap_pos_id.get_lock():
                     cap_pos_id.value = pending_pos_id
+                with cap_position_mm.get_lock():
+                    cap_position_mm.value = float(position_mm)
+                with cap_position_microsteps.get_lock():
+                    cap_position_microsteps.value = int(position_microsteps)
 
                 # bump cap_id (unique capture session)
                 with cap_id.get_lock():
-                    cap_id.value = (int(cap_id.value) + 1) & 0xFFFFFFFF
+                    next_cap_id = (int(cap_id.value) + 1) & 0xFFFFFFFF
+                    # Zero e' riservato a "nessuna sessione" nel protocollo
+                    # con il logger, quindi lo saltiamo al wrap uint32.
+                    cap_id.value = 1 if next_cap_id == 0 else next_cap_id
+                with cap_cancel_id.get_lock():
+                    cap_cancel_id.value = 0
+                with cap_result.get_lock():
+                    cap_result.value = 0
 
                 # not active until settling passes
-                with cap_active.get_lock():
+                with publish_lock:
                     cap_active.value = 0
 
     def _maybe_enable_capture(now_perf: float) -> None:
         nonlocal pending
-        if pending and (now_perf >= pending_start_t):
+        # Si arma soltanto tra due frame. In questo modo il primo frame salvato
+        # e' stato acquisito interamente dopo il tempo di assestamento.
+        if pending and w == 0 and (now_perf >= pending_start_t):
             pending = False
-            with cap_active.get_lock():
+            with publish_lock:
                 cap_active.value = 1
 
     def _free_current_slot():
@@ -880,17 +1200,18 @@ def radar_rx(
         if have_slot and (curr_slot is not None):
             if frame_ok:
                 slot = int(curr_slot)
-                # Prepare metadata first
-                m = 1  # DSP always consumes
-                if int(cap_active.value) == 1:
-                    slot_pos_id[slot] = int(cap_pos_id.value)
-                    m |= 2  # LOGGER also consumes during capture
-                else:
-                    slot_pos_id[slot] = -1
-
                 # --- ATOMIC PUBLISH (coherent READY+slot+seq) ---
                 next_seq = 0
                 with publish_lock:
+                    # Leggere cap_active sotto lo stesso lock usato dal logger
+                    # per il drain impedisce che uno slot riceva LOGGER_BIT
+                    # subito dopo la chiusura di una cattura.
+                    m = 1  # DSP always consumes
+                    if int(cap_active.value) == 1:
+                        slot_pos_id[slot] = int(cap_pos_id.value)
+                        m |= 2  # LOGGER also consumes during capture
+                    else:
+                        slot_pos_id[slot] = -1
                     next_seq = int(publish_seq) + 1
                     slot_ok[slot] = 1
                     slot_usemask[slot] = m
@@ -925,6 +1246,9 @@ def radar_rx(
         w = 0
         frame_ok = True
         _free_current_slot()
+        # Il deadline puo' scadere nel mezzo di un pacchetto UDP: questo e' il
+        # primo boundary sicuro da cui iniziare a taggare la cattura.
+        _maybe_enable_capture(time.perf_counter())
 
     try:
         while not stop_evt.is_set():
@@ -1065,11 +1389,17 @@ def logger_worker(
     cap_pos_id: Synchronized,
     cap_id: Synchronized,
     cap_saved: Synchronized,
+    cap_position_mm: Synchronized,
+    cap_position_microsteps: Synchronized,
+    cap_cancel_id: Synchronized,
+    cap_done_id: Synchronized,
+    cap_result: Synchronized,
     log_bytes: Synchronized,
     stop_evt,
-    out_dir_s: str,
+    out_dir_shared,
     frames_per_position: int,
     block_frames: int = 16,
+    ready_evt=None,
 ):
     """
     Logger capture-only (reworked for performance):
@@ -1080,8 +1410,21 @@ def logger_worker(
       - deve arrivare a frames_per_position frame completi per la posizione corrente.
         Se perde frame (ring overwrite / race), semplicemente continua finchÃ© non raggiunge X.
     """
-    out_dir = Path(out_dir_s)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    def _current_output_dir() -> Path:
+        """Legge la run selezionata dalla GUI prima di aprire ogni file."""
+        lock_getter = getattr(out_dir_shared, "get_lock", None)
+        if callable(lock_getter):
+            with lock_getter():
+                value = str(out_dir_shared.value)
+        else:
+            value = str(out_dir_shared.value)
+        if not value:
+            raise RuntimeError("Cartella output della cattura non configurata")
+        path = Path(value)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    _current_output_dir()
 
     shm_view = memoryview(shm_frames).cast("B")
 
@@ -1094,6 +1437,7 @@ def logger_worker(
     buf_used = 0
     saved_local = 0
     pos_local = -1
+    file_cap_id: int | None = None
 
     # scan pointer to avoid always starting at 0
     scan_i = 0
@@ -1101,8 +1445,18 @@ def logger_worker(
     LOGGER_BIT = 2
     LOGGER_BUSY_BIT = 0x80
 
-    def _close_file():
-        nonlocal fbin, buf, buf_used, saved_local, pos_local
+    def _mark_capture_finished(session_id: int | None, result: int) -> None:
+        if session_id is None or int(session_id) == 0:
+            return
+        with cap_result.get_lock():
+            cap_result.value = int(result)
+        with cap_done_id.get_lock():
+            cap_done_id.value = int(session_id)
+
+    def _close_file() -> tuple[int | None, bool]:
+        nonlocal fbin, buf, buf_used, saved_local, pos_local, file_cap_id
+        closed_cap_id = file_cap_id
+        io_ok = True
         if fbin is not None:
             try:
                 if buf_used and buf is not None:
@@ -1110,29 +1464,47 @@ def logger_worker(
                     if log_bytes is not None:
                         with log_bytes.get_lock():
                             log_bytes.value += int(buf_used)
+            except Exception:
+                io_ok = False
+            try:
                 fbin.flush()
             except Exception:
-                pass
+                io_ok = False
             try:
                 fbin.close()
             except Exception:
-                pass
+                io_ok = False
         fbin = None
         buf = None
         buf_used = 0
         saved_local = 0
         pos_local = -1
+        file_cap_id = None
+        return closed_cap_id, io_ok
 
-    def _open_file(pos_id: int):
-        nonlocal fbin, buf, buf_used, saved_local, pos_local
+    def _open_file(pos_id: int, session_id: int):
+        nonlocal fbin, buf, buf_used, saved_local, pos_local, file_cap_id
         _close_file()
         pos_local = int(pos_id)
+        file_cap_id = int(session_id)
         saved_local = 0
         buf_used = 0
         buf = bytearray(BYTES_PER_FRAME * int(block_frames))
-        p = out_dir / f"capture_pos{pos_local}.bin"
+        p = _current_output_dir() / f"capture_pos{pos_local}.bin"
         fbin = open(p, "wb", buffering=1024 * 1024)
-        header_blob = _build_capture_file_header(pos_local)
+        try:
+            position_mm_raw = float(cap_position_mm.value)
+        except Exception:
+            position_mm_raw = float("nan")
+        try:
+            position_steps_raw = int(cap_position_microsteps.value)
+        except Exception:
+            position_steps_raw = -1
+        header_blob = _build_capture_file_header(
+            pos_local,
+            carriage_position_mm=position_mm_raw if np.isfinite(position_mm_raw) else None,
+            carriage_microsteps=position_steps_raw if position_steps_raw >= 0 else None,
+        )
         fbin.write(header_blob)
         if log_bytes is not None:
             with log_bytes.get_lock():
@@ -1177,10 +1549,40 @@ def logger_worker(
             except Exception:
                 pass
 
+    def _stop_capture_and_release_logger_slots() -> None:
+        """Ferma il tagging RX e rilascia tutti gli slot rimasti al logger.
+
+        RX può pubblicare più frame di quanti ne servano mentre il logger sta
+        copiando/flushando l'ultimo blocco. Senza questo drain il bit LOGGER
+        residuo impedirebbe al DSP di riciclare quegli slot.
+        """
+        to_free: list[int] = []
+        with publish_lock:
+            cap_active.value = 0
+            for s in range(n_slots):
+                m = int(slot_usemask[s])
+                if (m & (LOGGER_BIT | LOGGER_BUSY_BIT)) == 0:
+                    continue
+                m &= ~(LOGGER_BIT | LOGGER_BUSY_BIT)
+                slot_usemask[s] = m
+                slot_pos_id[s] = -1
+                if m == 0:
+                    slot_state[s] = 0
+                    to_free.append(int(s))
+        for s in to_free:
+            try:
+                free_slots.put_nowait(int(s))
+            except Exception:
+                pass
+
+    if ready_evt is not None:
+        ready_evt.set()
+
     try:
         while not stop_evt.is_set():
             capid = int(cap_id.value)
             posid = int(cap_pos_id.value)
+            cancelled_id = int(cap_cancel_id.value)
     
             # Detect a new CAPTURE click (cap_id increments in RX when GUI sends CAPTURE)
             if capid != last_seen_cap_id:
@@ -1194,16 +1596,25 @@ def logger_worker(
     
             # Start logging only when capture is ACTIVE (set by RX) and we have a pending click
             if fbin is None:
+                if pending_cap_id is not None and int(cancelled_id) == int(pending_cap_id):
+                    _stop_capture_and_release_logger_slots()
+                    _mark_capture_finished(int(pending_cap_id), -1)
+                    pending_cap_id = None
+                    pending_pos_id = None
+                    time.sleep(0.002)
+                    continue
                 if pending_cap_id is None or int(cap_active.value) != 1:
                     time.sleep(0.002)
                     continue
-                _open_file(int(pending_pos_id))
+                _open_file(int(pending_pos_id), int(pending_cap_id))
                 pending_cap_id = None
                 pending_pos_id = None
-    
+
             # If capture was externally stopped, close the file and idle
-            if int(cap_active.value) != 1:
-                _close_file()
+            if int(cancelled_id) == int(file_cap_id or -1) or int(cap_active.value) != 1:
+                _stop_capture_and_release_logger_slots()
+                closed_id, _close_ok = _close_file()
+                _mark_capture_finished(closed_id, -1)
                 time.sleep(0.002)
                 continue
     
@@ -1238,19 +1649,11 @@ def logger_worker(
     
             # stop condition: reached target
             if saved_local >= int(frames_per_position):
-                if buf_used:
-                    fbin.write(buf[:buf_used])
-                    if log_bytes is not None:
-                        with log_bytes.get_lock():
-                            log_bytes.value += int(buf_used)
-                    buf_used = 0
-                try:
-                    fbin.flush()
-                except Exception:
-                    pass
-                _close_file()
-                with cap_active.get_lock():
-                    cap_active.value = 0
+                _stop_capture_and_release_logger_slots()
+                closed_id, close_ok = _close_file()
+                # cap_done_id e' una conferma di persistenza: un errore di
+                # write/flush/close non puo' essere pubblicato come successo.
+                _mark_capture_finished(closed_id, 1 if close_ok else -1)
                 continue
     
     
@@ -1259,7 +1662,9 @@ def logger_worker(
     
     
     finally:
-        _close_file()
+        _stop_capture_and_release_logger_slots()
+        closed_id, _close_ok = _close_file()
+        _mark_capture_finished(closed_id, -1)
 
 def main():
     shutdown_state = {
@@ -1275,6 +1680,8 @@ def main():
         "stop_evt": None,
         "offline_runtime": None,
         "mmwave_bridge": None,
+        "motor_controller": None,
+        "sar_scan": None,
     }
     mmwave_auto_rearm_armed = False
 
@@ -1300,6 +1707,21 @@ def main():
         shutdown_state["in_progress"] = True
         try:
             mmwave_auto_rearm_armed = False
+
+            scan = shutdown_resources.get("sar_scan")
+            if scan is not None:
+                try:
+                    scan.cancel()
+                    scan.join(timeout=0.5)
+                except Exception:
+                    pass
+
+            motor_controller = shutdown_resources.get("motor_controller")
+            if motor_controller is not None:
+                try:
+                    motor_controller.disconnect()
+                except Exception:
+                    pass
 
             bridge = shutdown_resources.get("mmwave_bridge")
             if bridge is not None:
@@ -1346,6 +1768,8 @@ def main():
             shutdown_resources["stop_evt"] = None
             shutdown_resources["offline_runtime"] = None
             shutdown_resources["mmwave_bridge"] = None
+            shutdown_resources["motor_controller"] = None
+            shutdown_resources["sar_scan"] = None
 
             if shutdown_state["dpg_context_created"] and not shutdown_state["dpg_context_destroyed"]:
                 try:
@@ -1394,6 +1818,13 @@ def main():
     cap_pos_id = _track_mp_ref(Value("i", 0))   # current position id (from GUI)
     cap_id = _track_mp_ref(Value("I", 0))       # increments each CAPTURE command
     cap_saved = _track_mp_ref(Value("i", 0))    # frames saved for current position
+    cap_position_mm = _track_mp_ref(Value("d", float("nan")))
+    cap_position_microsteps = _track_mp_ref(Value("q", -1))
+    cap_cancel_id = _track_mp_ref(Value("I", 0))
+    # Il logger pubblica questo ID solo dopo close+flush: è il segnale usato
+    # dalla scansione prima di comandare il movimento successivo.
+    cap_done_id = _track_mp_ref(Value("I", 0))
+    cap_result = _track_mp_ref(Value("i", 0))  # 1=ok, -1=annullata, 0=in corso
 
     dr_shared = C * FS / (2.0 * SLOPE * NFFT_RANGE)
     gui_h = max(1, int(display_zoom_cfg.output_height))
@@ -1459,8 +1890,15 @@ def main():
     dsp_cmd_q = _track_queue(Queue(maxsize=16))
 
     stop_evt = _track_mp_ref(mp.Event())
+    logger_ready_evt = _track_mp_ref(mp.Event())
     shutdown_resources["stop_evt"] = stop_evt
     sar_pos_counter = _track_mp_ref(Value("L", 0))  # GUI-only counter (pos id generator)
+    capture_sessions = CaptureSessionManager(
+        cmd_queue=cmd_q,
+        cap_id=cap_id,
+        cap_done_id=cap_done_id,
+        cap_result=cap_result,
+    )
     mmwave_bridge = MmwaveStudioBridge()
     shutdown_resources["mmwave_bridge"] = mmwave_bridge
     mmwave_radar_cfg = RadarConnectionConfig(
@@ -1495,10 +1933,29 @@ def main():
     stat_norm_min_db = _track_mp_ref(Value("d", float("nan")))
     stat_norm_max_db = _track_mp_ref(Value("d", float("nan")))
 
-    run_id = time.strftime("%Y%m%d_%H%M%S")
     out_root = Path(__file__).with_name("logs")
-    out_dir = out_root / f"run_{run_id}"
-    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _create_output_run() -> Path:
+        """Crea una nuova run senza rischiare di riusare un nome nello stesso secondo."""
+        out_root.mkdir(parents=True, exist_ok=True)
+        stem = f"run_{time.strftime('%Y%m%d_%H%M%S')}"
+        for suffix in range(10_000):
+            name = stem if suffix == 0 else f"{stem}_{suffix:02d}"
+            candidate = out_root / name
+            try:
+                candidate.mkdir(exist_ok=False)
+                return candidate
+            except FileExistsError:
+                continue
+        raise RuntimeError("Impossibile creare una nuova cartella di acquisizione")
+
+    out_dir = _create_output_run()
+    # Il logger è un processo separato: legge questa stringa condivisa prima
+    # di ogni nuova cattura, così la GUI può avviare una nuova run senza
+    # fermare radar, DCA1000 o applicazione.
+    output_dir_shared = _track_mp_ref(mp.Array("u", 1024, lock=True))
+    with output_dir_shared.get_lock():
+        output_dir_shared.value = str(out_dir)
 
     # --- AVVIO PROCESSI ---
     p_rx = Process(
@@ -1519,6 +1976,11 @@ def main():
             cap_pos_id,
             cap_id,
             cap_saved,
+            cap_position_mm,
+            cap_position_microsteps,
+            cap_cancel_id,
+            cap_done_id,
+            cap_result,
             lost_pkts,
             rx_pkts,
             rx_last_packet_time_s,
@@ -1546,11 +2008,17 @@ def main():
             cap_pos_id,
             cap_id,
             cap_saved,
+            cap_position_mm,
+            cap_position_microsteps,
+            cap_cancel_id,
+            cap_done_id,
+            cap_result,
             log_bytes,
             stop_evt,
-            str(out_dir),
+            output_dir_shared,
             FRAMES_PER_POSITION,
             16,  # block_frames
+            logger_ready_evt,
         ),
     )
     _track_process(p_log)
@@ -1621,6 +2089,8 @@ def main():
     p_rx.start()
     p_log.start()
     p_dsp.start()
+    if not logger_ready_evt.wait(timeout=5.0):
+        print("[LOGGER WARN] processo logger non pronto entro 5 s; catture temporaneamente non affidabili.")
 
     _apply_process_priority("MAIN", os.getpid(), PRIO_MAIN, PRIO_ENABLED)
     _apply_process_priority("RX", int(p_rx.pid or 0), PRIO_RX, PRIO_ENABLED)
@@ -1637,6 +2107,35 @@ def main():
     print(f"[AFF] enabled={AFF_ENABLED} main={AFF_MAIN} rx={AFF_RX} log={AFF_LOG} dsp={AFF_DSP}")
     if DEBUG_STATS and psutil is None:
         print("[STATS] psutil not available: using Windows fallback for CPU%.")
+
+    # Il 1063 viene aperto soltanto da questa istanza di main.  La GUI
+    # standalone resta utile per configurare phidget_stepper_config.yaml, ma
+    # una volta iniziata la scansione non deve essere eseguita in parallelo.
+    stepper_controller = None
+    stepper_error = _PHIDGET_BACKEND_ERROR
+    if PhidgetStepperController is not None and load_stepper_config is not None:
+        try:
+            stepper_controller = PhidgetStepperController(load_stepper_config())
+            shutdown_resources["motor_controller"] = stepper_controller
+        except Exception as exc:
+            stepper_error = f"Configurazione Phidget non disponibile: {exc}"
+            print(f"[PHIDGET WARN] {stepper_error}")
+
+    sar_scan = None
+    if stepper_controller is not None:
+        sar_scan = SarScanCoordinator(
+            begin_motion=stepper_controller.begin_external_scan,
+            finish_motion=stepper_controller.finish_external_scan,
+            get_position_microsteps=stepper_controller.position_microsteps,
+            mm_from_microsteps=stepper_controller.config.mechanics.mm_from_microsteps,
+            mm_per_microstep=lambda: stepper_controller.config.mechanics.mm_per_microstep,
+            move_to_microsteps=stepper_controller.move_absolute_microsteps_and_wait,
+            request_capture=capture_sessions.request,
+            wait_capture=capture_sessions.wait,
+            cancel_capture=capture_sessions.cancel,
+            stop_motion=stepper_controller.stop,
+        )
+        shutdown_resources["sar_scan"] = sar_scan
 
     def _create_offline_runtime():
         """Build an isolated offline runtime from the persisted configuration."""
@@ -1759,6 +2258,16 @@ def main():
         "reset_view": True,
     }
 
+    offline_scan_config_path = Path(__file__).with_name("offline_config.yaml")
+    try:
+        scan_start_id_default, scan_positions_default, scan_pitch_mm_default = read_offline_scan_settings(
+            offline_scan_config_path
+        )
+        scan_config_error = ""
+    except Exception as exc:
+        scan_start_id_default, scan_positions_default, scan_pitch_mm_default = 1, 1, float("nan")
+        scan_config_error = str(exc)
+
     # 2) DearPyGui Init
     dpg.create_context()
     shutdown_state["dpg_context_created"] = True
@@ -1792,6 +2301,18 @@ def main():
     IN_FFT_VMIN, IN_FFT_VMAX = "in_fft_vmin", "in_fft_vmax"
     TXT_POS_TAG = "txt_pos_counter"
     TXT_LOG_TAG = "txt_log"
+    TXT_MOTOR_STATUS_TAG = "txt_motor_status"
+    TXT_MOTOR_POSITION_TAG = "txt_motor_position"
+    TXT_MOTOR_LOG_TAG = "txt_motor_log"
+    TXT_SCAN_STATUS_TAG = "txt_scan_status"
+    TXT_SCAN_PITCH_TAG = "txt_sar_scan_pitch"
+    TXT_RUN_DIR_TAG = "txt_sar_run_dir"
+    IN_MOTOR_JOG_TAG = "in_motor_jog_mm"
+    IN_SCAN_POSITIONS_TAG = "in_sar_scan_positions"
+    BTN_CAPTURE_TAG = "btn_capture_frame"
+    BTN_NEW_SESSION_TAG = "btn_new_sar_session"
+    BTN_SCAN_START_TAG = "btn_sar_scan_start"
+    BTN_SCAN_CANCEL_TAG = "btn_sar_scan_cancel"
     BTN_NORM_TAG = "btn_norm_toggle"
     BTN_HEATMAP_MODE_TAG = "btn_heatmap_mode"
     BTN_FFT_VIEW_TAG = "btn_fft_view"
@@ -2359,15 +2880,272 @@ def main():
         ui_dirty = True
 
 
-    def _on_capture():
-        with sar_pos_counter.get_lock():
-            sar_pos_counter.value += 1
-            pid = int(sar_pos_counter.value)
+    # La configurazione offline della run viene confermata soltanto dopo il
+    # completamento di tutti i file. Su cancel/failure rimane quindi puntata
+    # all'ultima acquisizione completa.
+    scan_pending_run: dict[str, int | None] = {
+        "start_position_id": None,
+        "positions": None,
+    }
+
+    def _set_scan_status(text: str) -> None:
+        if dpg.does_item_exist(TXT_SCAN_STATUS_TAG):
+            dpg.set_value(TXT_SCAN_STATUS_TAG, str(text))
+
+    def _update_scan_pitch_label(pitch_mm: float | None = None, error: str = "") -> None:
+        if not dpg.does_item_exist(TXT_SCAN_PITCH_TAG):
+            return
+        if pitch_mm is not None and np.isfinite(float(pitch_mm)) and float(pitch_mm) > 0.0:
+            label = f"Pitch da offline_config: {float(pitch_mm):.6f} mm"
+        else:
+            label = f"Errore offline_config: {error or 'pitch non valido'}"
+        dpg.set_value(TXT_SCAN_PITCH_TAG, label)
+
+    def _motor_metadata_for_capture() -> tuple[float | None, int | None]:
+        if stepper_controller is None:
+            return None, None
         try:
-            cmd_q.put_nowait(("CAPTURE", pid))
+            snapshot = stepper_controller.snapshot()
+            if not bool(snapshot.get("connected")) or not bool(snapshot.get("homed")):
+                return None, None
+            if bool(snapshot.get("motion_active")):
+                raise CaptureError("Attendere che il carrello sia fermo prima di catturare.")
+            steps = int(stepper_controller.position_microsteps())
+            return float(stepper_controller.config.mechanics.mm_from_microsteps(steps)), steps
+        except CaptureError:
+            raise
+        except Exception:
+            return None, None
+
+    def _on_capture():
+        if sar_scan is not None and sar_scan.active:
+            _set_scan_status("La cattura manuale è bloccata durante la scansione SAR.")
+            return
+        try:
+            position_mm, position_steps = _motor_metadata_for_capture()
+            with sar_pos_counter.get_lock():
+                next_pid = int(sar_pos_counter.value) + 1
+            capture_sessions.request(next_pid, position_mm, position_steps)
+            with sar_pos_counter.get_lock():
+                sar_pos_counter.value = int(next_pid)
+            dpg.set_value(TXT_POS_TAG, f"Pos Counter: {next_pid}")
+            _set_scan_status(f"Cattura manuale posizione {next_pid} in corso")
+        except Exception as exc:
+            _set_scan_status(f"Cattura non avviata: {exc}")
+
+    def _on_new_sar_session() -> None:
+        """Passa a una cartella di acquisizione vuota senza riavviare la GUI."""
+        nonlocal out_dir
+        if capture_sessions.inflight:
+            _set_scan_status("Attendere il completamento o l'annullamento della cattura corrente.")
+            return
+        if sar_scan is not None and sar_scan.active:
+            _set_scan_status("Non è possibile cambiare sessione durante una scansione SAR.")
+            return
+        if scan_pending_run["start_position_id"] is not None:
+            _set_scan_status("Attendere la finalizzazione offline della scansione precedente.")
+            return
+        try:
+            new_dir = _create_output_run()
+            with output_dir_shared.get_lock():
+                output_dir_shared.value = str(new_dir)
+            out_dir = new_dir
+            with sar_pos_counter.get_lock():
+                sar_pos_counter.value = 0
+            if dpg.does_item_exist(TXT_POS_TAG):
+                dpg.set_value(TXT_POS_TAG, "Pos Counter: 0")
+            if dpg.does_item_exist(TXT_RUN_DIR_TAG):
+                dpg.set_value(TXT_RUN_DIR_TAG, f"Run corrente: {out_dir.name}")
+            _set_scan_status(f"Nuova sessione pronta: {out_dir.name}")
+        except Exception as exc:
+            _set_scan_status(f"Nuova sessione non creata: {exc}")
+
+    def _on_motor_connect() -> None:
+        if stepper_controller is None:
+            _set_scan_status(f"Phidget non disponibile: {stepper_error or 'backend non caricato'}")
+            return
+        threading.Thread(target=stepper_controller.connect, name="phidget-connect-main", daemon=True).start()
+
+    def _on_motor_home() -> None:
+        if stepper_controller is None:
+            return
+        try:
+            stepper_controller.start_homing()
+        except Exception as exc:
+            stepper_controller.log(f"HOME non avviato: {exc}")
+
+    def _on_motor_jog(sign: int) -> None:
+        if stepper_controller is None:
+            return
+        try:
+            distance = abs(float(dpg.get_value(IN_MOTOR_JOG_TAG))) * int(sign)
+            stepper_controller.move_relative_mm(distance)
+        except Exception as exc:
+            stepper_controller.log(f"Jog non avviato: {exc}")
+
+    def _on_motor_stop() -> None:
+        if sar_scan is not None and sar_scan.active:
+            sar_scan.cancel()
+            return
+        if capture_sessions.inflight:
+            capture_sessions.cancel()
+            _set_scan_status("Annullamento cattura richiesto...")
+            return
+        if stepper_controller is not None:
+            try:
+                stepper_controller.stop()
+            except Exception as exc:
+                stepper_controller.log(f"STOP non eseguito: {exc}")
+
+    def _on_start_sar_scan() -> None:
+        if sar_scan is None or stepper_controller is None:
+            _set_scan_status(f"Scansione non disponibile: {stepper_error or 'Phidget non configurato'}")
+            return
+        if capture_sessions.inflight:
+            _set_scan_status("Attendere il completamento o l'annullamento della cattura corrente.")
+            return
+        if scan_pending_run["start_position_id"] is not None:
+            _set_scan_status("Attendere la finalizzazione offline della scansione precedente.")
+            return
+        try:
+            motor_snapshot = stepper_controller.snapshot()
+            if not bool(motor_snapshot.get("connected")):
+                raise ScanError("Connettere il Phidget prima di avviare la scansione.")
+            if not bool(motor_snapshot.get("homed")):
+                raise ScanError("Eseguire HOME e posizionare manualmente il carrello prima della scansione.")
+            if bool(motor_snapshot.get("motion_active")):
+                raise ScanError("Attendere l'arresto del movimento manuale prima della scansione.")
+            radar_state = mmwave_bridge.get_gui_state()
+            if not radar_state.connected:
+                raise ScanError("Collegare prima radar e DCA1000 con il pulsante mmWave: Connect.")
+            if not radar_state.streaming:
+                raise ScanError("Avviare prima il radar con Radar: Start.")
+            with rx_pkts.get_lock():
+                received_packets = int(rx_pkts.value)
+            with rx_last_packet_time_s.get_lock():
+                udp_idle_s = max(0.0, time.time() - float(rx_last_packet_time_s.value))
+            if received_packets <= 0 or udp_idle_s > 2.0:
+                raise ScanError("Streaming richiesto ma UDP non attivo: attendere i dati radar prima della scansione.")
+            n_positions = int(dpg.get_value(IN_SCAN_POSITIONS_TAG))
+            start_id, _default_positions, pitch_mm = read_offline_scan_settings(offline_scan_config_path)
+            _update_scan_pitch_label(pitch_mm)
+            if n_positions <= 0:
+                raise ScanError("Il numero di posizioni deve essere maggiore di zero.")
+            existing = [
+                out_dir / f"capture_pos{position_id}.bin"
+                for position_id in range(start_id, start_id + n_positions)
+                if (out_dir / f"capture_pos{position_id}.bin").exists()
+            ]
+            if existing:
+                raise ScanError(
+                    "Esistono già catture nella run corrente (avvia una nuova sessione per non sovrascriverle)."
+                )
+            with sar_pos_counter.get_lock():
+                sar_pos_counter.value = int(start_id) - 1
+            plan = ScanPlan(
+                positions=n_positions,
+                pitch_mm=float(pitch_mm),
+                start_position_id=int(start_id),
+                # radar_rx applica già SETTLING_DELAY_S dopo che il carrello è
+                # fermo; non duplicare inutilmente l'attesa qui.
+                settling_seconds=0.0,
+                motion_timeout_seconds=max(1.0, float(sar_cfg.get("scan_motion_timeout_s", 120.0))),
+                capture_timeout_seconds=max(1.0, float(sar_cfg.get("scan_capture_timeout_s", 120.0))),
+            )
+            sar_scan.start(plan)
+            scan_pending_run.update(
+                {
+                    "start_position_id": int(start_id),
+                    "positions": int(n_positions),
+                }
+            )
+            _set_scan_status(
+                f"Scansione avviata: {n_positions} posizioni, pitch {pitch_mm:.6f} mm"
+            )
+        except Exception as exc:
+            _set_scan_status(f"Scansione non avviata: {exc}")
+
+    def _on_cancel_sar_scan() -> None:
+        if sar_scan is None or not sar_scan.active:
+            _set_scan_status("Nessuna scansione SAR attiva.")
+            return
+        sar_scan.cancel()
+        _set_scan_status("Annullamento scansione richiesto...")
+
+    motor_log_lines: list[str] = []
+
+    def _drain_motor_events() -> None:
+        if stepper_controller is None:
+            return
+        try:
+            while True:
+                event, value = stepper_controller.gui_queue.get_nowait()
+                if event == "log":
+                    motor_log_lines.append(str(value))
+                elif event == "position":
+                    try:
+                        mm = stepper_controller.config.mechanics.mm_from_microsteps(float(value))
+                        if dpg.does_item_exist(TXT_MOTOR_POSITION_TAG):
+                            dpg.set_value(TXT_MOTOR_POSITION_TAG, f"Posizione: {mm:.4f} mm ({float(value):.0f} microstep)")
+                    except Exception:
+                        pass
+        except pyqueue.Empty:
+            pass
+        except Exception as exc:
+            motor_log_lines.append(f"[motor event error] {exc}")
+
+        try:
+            snapshot = stepper_controller.snapshot()
+            state = str(snapshot.get("state", "--"))
+            connected = "collegato" if bool(snapshot.get("connected")) else "disconnesso"
+            homed = "HOME ok" if bool(snapshot.get("homed")) else "HOME richiesto"
+            limits = f"MIN={'ATTIVO' if snapshot.get('min_active') else 'libero'} MAX={'ATTIVO' if snapshot.get('max_active') else 'libero'}"
+            if dpg.does_item_exist(TXT_MOTOR_STATUS_TAG):
+                dpg.set_value(TXT_MOTOR_STATUS_TAG, f"Carrello: {connected} | {state}\n{homed} | {limits}")
         except Exception:
             pass
-        dpg.set_value(TXT_POS_TAG, f"Pos Counter: {pid}")
+
+        if dpg.does_item_exist(TXT_MOTOR_LOG_TAG):
+            dpg.set_value(TXT_MOTOR_LOG_TAG, "\n".join(motor_log_lines[-4:]))
+
+    def _refresh_sar_scan_ui() -> str:
+        """Aggiorna i controlli dal thread GUI e restituisce lo stato scan."""
+        state = "idle"
+        active = False
+        if sar_scan is not None:
+            status = sar_scan.status()
+            state = str(status.state)
+            active = sar_scan.active
+            detail = str(status.message)
+            if status.position_id is not None:
+                detail += f" | id={int(status.position_id)}"
+            if status.position_mm is not None:
+                detail += f" | x={float(status.position_mm):.4f} mm"
+            if status.total:
+                detail += f" | {int(status.completed)}/{int(status.total)}"
+            if status.error:
+                detail += f" | ERRORE: {status.error}"
+            if dpg.does_item_exist(TXT_SCAN_STATUS_TAG):
+                dpg.set_value(TXT_SCAN_STATUS_TAG, detail)
+            if state == "capturing" and status.position_id is not None:
+                with sar_pos_counter.get_lock():
+                    sar_pos_counter.value = int(status.position_id)
+                if dpg.does_item_exist(TXT_POS_TAG):
+                    dpg.set_value(TXT_POS_TAG, f"Pos Counter: {int(status.position_id)}")
+
+        busy_capture = bool(capture_sessions.inflight)
+        if dpg.does_item_exist(BTN_CAPTURE_TAG):
+            dpg.configure_item(BTN_CAPTURE_TAG, enabled=not active and not busy_capture)
+        if dpg.does_item_exist(BTN_NEW_SESSION_TAG):
+            dpg.configure_item(
+                BTN_NEW_SESSION_TAG,
+                enabled=not active and not busy_capture and scan_pending_run["start_position_id"] is None,
+            )
+        if dpg.does_item_exist(BTN_SCAN_START_TAG):
+            dpg.configure_item(BTN_SCAN_START_TAG, enabled=sar_scan is not None and not active and not busy_capture)
+        if dpg.does_item_exist(BTN_SCAN_CANCEL_TAG):
+            dpg.configure_item(BTN_SCAN_CANCEL_TAG, enabled=active)
+        return state
 
     def _mmwave_connect_label(connected: bool) -> str:
         return "mmWave: Disconnect" if connected else "mmWave: Connect"
@@ -2379,6 +3157,8 @@ def main():
     mmwave_outage_dca_done = False
     mmwave_outage_heavy_done = False
     mmwave_auto_rearm_armed = False
+    mmwave_connected_since_perf: float | None = None
+    MMWAVE_CONNECT_SETTLE_S = 3.0
     MMWAVE_RX_IDLE_DCA_REARM_S = 1.00
     MMWAVE_RX_IDLE_HEAVY_REARM_S = 3.0
 
@@ -2403,11 +3183,27 @@ def main():
             dpg.configure_item(BTN_MMWAVE_CONNECT_TAG, label=_mmwave_connect_label(state.connected))
         if dpg.does_item_exist(BTN_MMWAVE_STREAM_TAG):
             dpg.configure_item(BTN_MMWAVE_STREAM_TAG, label=_mmwave_stream_label(state.streaming))
-            dpg.configure_item(BTN_MMWAVE_STREAM_TAG, enabled=bool(state.connected))
+            connect_wait_remaining = 0.0
+            if state.connected and not state.streaming and mmwave_connected_since_perf is not None:
+                connect_wait_remaining = max(
+                    0.0,
+                    MMWAVE_CONNECT_SETTLE_S - (time.perf_counter() - mmwave_connected_since_perf),
+                )
+            dpg.configure_item(
+                BTN_MMWAVE_STREAM_TAG,
+                enabled=bool(state.connected) and (state.streaming or connect_wait_remaining <= 0.0),
+            )
         if dpg.does_item_exist(TXT_MMWAVE_STATUS_TAG):
             status_text = state.last_error if state.last_error else state.last_message
             if not status_text:
                 status_text = "mmWave Studio bridge idle"
+            if state.connected and not state.streaming and mmwave_connected_since_perf is not None:
+                remaining = max(
+                    0.0,
+                    MMWAVE_CONNECT_SETTLE_S - (time.perf_counter() - mmwave_connected_since_perf),
+                )
+                if remaining > 0.0:
+                    status_text = f"Radar collegato: attendere {remaining:.1f} s prima di START"
             dpg.set_value(TXT_MMWAVE_STATUS_TAG, status_text)
         if dpg.does_item_exist(TXT_MMWAVE_LINKS_TAG):
             udp_idle_s = max(0.0, _sync_mmwave_udp_activity())
@@ -2463,16 +3259,21 @@ def main():
             _refresh_mmwave_controls()
 
     def _on_mmwave_connect_toggle():
-        nonlocal mmwave_last_rx_pkt_t, mmwave_outage_dca_done, mmwave_outage_heavy_done, mmwave_auto_rearm_armed
+        nonlocal mmwave_last_rx_pkt_t, mmwave_outage_dca_done, mmwave_outage_heavy_done
+        nonlocal mmwave_auto_rearm_armed, mmwave_connected_since_perf
         if dpg.does_item_exist(TXT_MMWAVE_STATUS_TAG):
             dpg.set_value(TXT_MMWAVE_STATUS_TAG, "mmWave connect/disconnect in progress...")
         print("[gui] mmWave connect button pressed", flush=True)
         try:
-            mmwave_bridge.toggle_connection(radar=mmwave_radar_cfg, dca=mmwave_dca_cfg)
+            was_connected = bool(mmwave_bridge.get_gui_state().connected)
+            new_state = mmwave_bridge.toggle_connection(radar=mmwave_radar_cfg, dca=mmwave_dca_cfg)
             mmwave_last_rx_pkt_t = time.time()
             mmwave_outage_dca_done = False
             mmwave_outage_heavy_done = False
-            if not mmwave_bridge.get_gui_state().connected:
+            if new_state.connected and not was_connected:
+                mmwave_connected_since_perf = time.perf_counter()
+            elif not new_state.connected:
+                mmwave_connected_since_perf = None
                 mmwave_auto_rearm_armed = False
         except MmwaveStudioError as exc:
             state = mmwave_bridge.get_gui_state()
@@ -2490,6 +3291,17 @@ def main():
             dpg.set_value(TXT_MMWAVE_STATUS_TAG, "Radar start/stop in progress...")
         print("[gui] Radar start/stop button pressed", flush=True)
         try:
+            state_before = mmwave_bridge.get_gui_state()
+            if state_before.connected and not state_before.streaming and mmwave_connected_since_perf is not None:
+                remaining = MMWAVE_CONNECT_SETTLE_S - (
+                    time.perf_counter() - mmwave_connected_since_perf
+                )
+                if remaining > 0.0:
+                    mmwave_bridge.set_status(
+                        message=f"Attendere ancora {remaining:.1f} s prima di avviare il radar"
+                    )
+                    _refresh_mmwave_controls()
+                    return
             mmwave_bridge.toggle_streaming(
                 mmwave_dca_cfg.adc_data_path,
                 capture_mode=1,
@@ -2942,6 +3754,12 @@ def main():
         if dpg.does_item_exist(TXT_OFFLINE_TUNING_STATUS_TAG):
             dpg.set_value(TXT_OFFLINE_TUNING_STATUS_TAG, str(message))
 
+    def _offline_tuning_locked_by_scan() -> bool:
+        return bool(
+            (sar_scan is not None and sar_scan.active)
+            or scan_pending_run["start_position_id"] is not None
+        )
+
     def _read_offline_tuning_config() -> bool:
         nonlocal offline_tuning_cfg
         try:
@@ -2960,6 +3778,11 @@ def main():
                     if value not in spec.get("items", []):
                         value = str(spec.get("default"))
                 dpg.set_value(tag, value)
+            try:
+                pitch_mm = float(_offline_cfg_path_get(offline_tuning_cfg, "scan.x_pitch_m")) * 1000.0
+                _update_scan_pitch_label(pitch_mm)
+            except (TypeError, ValueError):
+                _update_scan_pitch_label(error="scan.x_pitch_m non valido")
             _set_offline_tuning_status("Configurazione offline caricata")
             return True
         except Exception as exc:
@@ -3013,14 +3836,29 @@ def main():
             raise ValueError("synthetic_range_angle richiede la modalita BP mimo_sar")
         return base
 
-    def _save_offline_tuning_config() -> dict | None:
+    def _save_offline_tuning_config(*, allow_scan_finalize: bool = False) -> dict | None:
         nonlocal offline_tuning_cfg
+        if _offline_tuning_locked_by_scan() and not allow_scan_finalize:
+            _set_offline_tuning_status("Configurazione bloccata durante la scansione/finalizzazione SAR")
+            return None
         try:
             saved_cfg = _collect_offline_tuning_config()
-            temp_path = offline_config_path.with_suffix(".yaml.tmp")
-            temp_path.write_text(yaml.safe_dump(saved_cfg, sort_keys=False, allow_unicode=True), encoding="utf-8")
-            temp_path.replace(offline_config_path)
+            tuning_updates = {
+                str(spec["path"]): _offline_cfg_path_get(saved_cfg, str(spec["path"]))
+                for spec in OFFLINE_TUNING_FIELD_SPECS
+            }
+            pitch_mm = float(_offline_cfg_path_get(saved_cfg, "scan.x_pitch_m")) * 1000.0
+            pitch_comment_value = f"{pitch_mm:.6f}".rstrip("0").rstrip(".")
+            _update_existing_yaml_scalar_paths(
+                offline_config_path,
+                tuning_updates,
+                inline_comments={"scan.x_pitch_m": f"{pitch_comment_value} mm pitch"},
+            )
             offline_tuning_cfg = saved_cfg
+            try:
+                _update_scan_pitch_label(pitch_mm)
+            except (TypeError, ValueError):
+                _update_scan_pitch_label(error="scan.x_pitch_m non valido")
             _set_offline_tuning_status("Configurazione salvata in offline_config.yaml")
             return saved_cfg
         except Exception as exc:
@@ -3031,16 +3869,28 @@ def main():
         _save_offline_tuning_config()
 
     def _on_reload_offline_tuning(sender=None, app_data=None):
+        if _offline_tuning_locked_by_scan():
+            _set_offline_tuning_status("Ricarica bloccata durante la scansione/finalizzazione SAR")
+            return False
         _read_offline_tuning_config()
 
-    def _on_apply_offline_tuning(sender=None, app_data=None):
+    def _on_apply_offline_tuning(
+        sender=None,
+        app_data=None,
+        *,
+        save_config: bool = True,
+        allow_scan_finalize: bool = False,
+    ) -> bool:
         nonlocal offline_runtime
+        if _offline_tuning_locked_by_scan() and not allow_scan_finalize:
+            _set_offline_tuning_status("Ricalcolo bloccato durante la scansione/finalizzazione SAR")
+            return False
         with offline_reload_lock:
             if bool(offline_reload_state["running"]):
                 _set_offline_tuning_status("Ricalcolo offline gia in corso")
-                return
-        if _save_offline_tuning_config() is None:
-            return
+                return False
+        if save_config and _save_offline_tuning_config(allow_scan_finalize=allow_scan_finalize) is None:
+            return False
 
         old_runtime = offline_runtime
         offline_runtime = None
@@ -3079,7 +3929,16 @@ def main():
                 with offline_reload_lock:
                     offline_reload_state.update({"running": False, "runtime": None, "info": None, "error": str(exc)})
 
-        threading.Thread(target=_reload_worker, name="offline-reload", daemon=True).start()
+        try:
+            threading.Thread(target=_reload_worker, name="offline-reload", daemon=True).start()
+        except Exception as exc:
+            offline_runtime = old_runtime
+            shutdown_resources["offline_runtime"] = old_runtime
+            with offline_reload_lock:
+                offline_reload_state.update({"running": False, "runtime": None, "info": None, "error": ""})
+            _set_offline_tuning_status(f"ERRORE avvio ricalcolo offline: {exc}")
+            return False
+        return True
 
     def _add_offline_tuning_widget(spec: dict, width: int = 300) -> None:
         tag = _offline_tune_tag(spec["path"])
@@ -3418,9 +4277,69 @@ def main():
                         dpg.add_spacer(height=14)
                         dpg.add_text("SAR CONTROL", color=(255, 200, 0))
                         dpg.add_separator()
-                        dpg.add_button(label="CAPTURE FRAME", callback=_on_capture, width=-1, height=40)
+                        dpg.add_button(label="CAPTURE FRAME", tag=BTN_CAPTURE_TAG, callback=_on_capture, width=-1, height=40)
                         dpg.add_text("Pos Counter: 0", tag=TXT_POS_TAG)
+                        dpg.add_text(f"Run corrente: {out_dir.name}", tag=TXT_RUN_DIR_TAG, wrap=-1)
+                        dpg.add_button(
+                            label="NUOVA SESSIONE / CARTELLA",
+                            tag=BTN_NEW_SESSION_TAG,
+                            callback=_on_new_sar_session,
+                            width=-1,
+                            height=30,
+                        )
                         dpg.add_text("", tag=TXT_LOG_TAG, wrap=-1)
+                        dpg.add_spacer(height=12)
+                        dpg.add_text("CARRELLO / SCANSIONE SAR", color=(255, 200, 0))
+                        dpg.add_separator()
+                        if stepper_controller is None:
+                            dpg.add_text(
+                                f"Phidget non disponibile: {stepper_error or 'backend non caricato'}",
+                                tag=TXT_MOTOR_STATUS_TAG,
+                                wrap=-1,
+                                color=(255, 150, 120),
+                            )
+                        else:
+                            dpg.add_text("Carrello: disconnesso", tag=TXT_MOTOR_STATUS_TAG, wrap=-1)
+                        dpg.add_text("Posizione: --", tag=TXT_MOTOR_POSITION_TAG, color=(100, 220, 255))
+                        with dpg.group(horizontal=True):
+                            dpg.add_button(label="Connetti", callback=_on_motor_connect, width=105)
+                            dpg.add_button(label="HOME", callback=_on_motor_home, width=105)
+                        dpg.add_input_float(
+                            label="Jog [mm]",
+                            tag=IN_MOTOR_JOG_TAG,
+                            default_value=float(stepper_controller.config.cycle.step_mm) if stepper_controller is not None else 1.0,
+                            min_value=0.001,
+                            min_clamped=True,
+                            width=150,
+                        )
+                        with dpg.group(horizontal=True):
+                            dpg.add_button(label="JOG -", callback=lambda: _on_motor_jog(-1), width=105)
+                            dpg.add_button(label="JOG +", callback=lambda: _on_motor_jog(+1), width=105)
+                        dpg.add_button(label="STOP CARRELLO / ANNULLA", callback=_on_motor_stop, width=-1, height=30)
+                        dpg.add_text(
+                            "Parametri motore: phidget_stepper_config.yaml. HOME e posizione iniziale devono essere impostati qui.",
+                            wrap=-1,
+                            color=(190, 190, 190),
+                        )
+                        dpg.add_separator()
+                        pitch_label = (
+                            f"Pitch da offline_config: {scan_pitch_mm_default:.6f} mm"
+                            if np.isfinite(scan_pitch_mm_default)
+                            else f"Errore offline_config: {scan_config_error}"
+                        )
+                        dpg.add_text(pitch_label, tag=TXT_SCAN_PITCH_TAG, wrap=-1)
+                        dpg.add_input_int(
+                            label="Numero posizioni SAR",
+                            tag=IN_SCAN_POSITIONS_TAG,
+                            default_value=int(scan_positions_default),
+                            min_value=1,
+                            min_clamped=True,
+                            width=150,
+                        )
+                        dpg.add_button(label="AVVIA SCANSIONE SAR", tag=BTN_SCAN_START_TAG, callback=_on_start_sar_scan, width=-1, height=38)
+                        dpg.add_button(label="ANNULLA SCANSIONE SAR", tag=BTN_SCAN_CANCEL_TAG, callback=_on_cancel_sar_scan, width=-1, height=30)
+                        dpg.add_text("Pronto", tag=TXT_SCAN_STATUS_TAG, wrap=-1)
+                        dpg.add_text("", tag=TXT_MOTOR_LOG_TAG, wrap=-1)
                         _refresh_mmwave_controls()
 
                         if DEBUG_STATS:
@@ -4052,6 +4971,7 @@ def main():
     lut_last = float(jet_lut.shape[0] - 1)
     fft_plot_period_s = 0.05
     fft_plot_last_t = 0.0
+    last_scan_terminal_state = ""
     if DEBUG_STATS:
         ring_hwm = 0
         cpu_state = {}
@@ -4059,6 +4979,58 @@ def main():
     try:
         while dpg.is_dearpygui_running():
             now = time.perf_counter()
+
+            _drain_motor_events()
+            scan_state_now = _refresh_sar_scan_ui()
+            if scan_state_now not in {"completed", "cancelled", "failed"}:
+                last_scan_terminal_state = ""
+            elif scan_state_now == "completed" and last_scan_terminal_state != "completed":
+                with offline_reload_lock:
+                    reload_already_running = bool(offline_reload_state["running"])
+                if reload_already_running:
+                    # Non consumare lo stato terminale: appena il ricalcolo
+                    # precedente termina, questo ramo viene ritentato.
+                    _set_scan_status("Scansione completata: attendo il ricalcolo offline precedente...")
+                else:
+                    start_id = scan_pending_run["start_position_id"]
+                    positions = scan_pending_run["positions"]
+                    if start_id is None or positions is None:
+                        _set_scan_status("Scansione SAR completata.")
+                        last_scan_terminal_state = "completed"
+                    else:
+                        try:
+                            # Solo ora tutti i file sono chiusi con successo:
+                            # conferma directory/range della nuova run.
+                            pitch_mm = configure_offline_scan_for_run(
+                                offline_scan_config_path,
+                                output_dir=out_dir,
+                                start_position_id=int(start_id),
+                                positions=int(positions),
+                                frames_per_position=FRAMES_PER_POSITION,
+                            )
+                            _update_scan_pitch_label(pitch_mm)
+                            if not _read_offline_tuning_config():
+                                raise RuntimeError("impossibile rileggere offline_config.yaml")
+                            reload_started = _on_apply_offline_tuning(
+                                save_config=False,
+                                allow_scan_finalize=True,
+                            )
+                            if reload_started:
+                                scan_pending_run.update({"start_position_id": None, "positions": None})
+                                _set_scan_status("Scansione completata: ricarica offline avviata.")
+                                last_scan_terminal_state = "completed"
+                        except Exception as exc:
+                            # I file restano validi; sblocca il tuning manuale
+                            # e comunica chiaramente il solo errore offline.
+                            scan_pending_run.update({"start_position_id": None, "positions": None})
+                            _set_scan_status(f"Scansione completata; ricarica offline non avviata: {exc}")
+                            last_scan_terminal_state = "completed"
+            elif scan_state_now in {"cancelled", "failed"}:
+                # Non puntare l'offline a un insieme di file parziale.
+                scan_pending_run.update({"start_position_id": None, "positions": None})
+                last_scan_terminal_state = scan_state_now
+            else:
+                last_scan_terminal_state = scan_state_now
 
             # A restart is performed in a worker because loading the capture
             # files and building the first image can take seconds.  Adopt its

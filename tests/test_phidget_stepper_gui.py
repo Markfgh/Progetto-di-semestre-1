@@ -5,8 +5,10 @@ import pytest
 from phidget_stepper_gui import (
     AppConfig,
     ConfigError,
+    ControllerState,
     CycleProgress,
     MotionError,
+    PhidgetStepperController,
     direction_is_allowed,
     load_config,
     save_config,
@@ -61,3 +63,79 @@ def test_limit_policy_blocks_only_toward_active_limit():
     assert direction_is_allowed(1, limit_min_active=True, limit_max_active=False)
     assert not direction_is_allowed(1, limit_min_active=False, limit_max_active=True)
     assert direction_is_allowed(-1, limit_min_active=False, limit_max_active=True)
+
+
+def test_manual_command_is_blocked_while_previous_motion_is_active():
+    controller = PhidgetStepperController(AppConfig())
+    controller.connected = True
+    controller.state = ControllerState.READY
+    controller.command_direction = 1
+
+    with pytest.raises(MotionError, match="movimento corrente"):
+        controller.move_relative_mm(1.0)
+
+
+def test_home_is_reserved_before_worker_start(monkeypatch):
+    controller = PhidgetStepperController(AppConfig())
+    controller.connected = True
+    controller.state = ControllerState.READY
+
+    class DeferredThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr("phidget_stepper_gui.threading.Thread", DeferredThread)
+
+    controller.start_homing()
+    assert controller.homing_worker_active
+    assert controller.state == ControllerState.HOMING
+    with pytest.raises(MotionError, match="operazione automatica"):
+        controller.start_homing()
+
+
+class _FakeStepper:
+    def __init__(self):
+        self.engaged = True
+        self.position = 123.0
+
+    def setEngaged(self, value):
+        self.engaged = bool(value)
+
+    def getPosition(self):
+        return self.position
+
+    def setTargetPosition(self, value):
+        self.position = float(value)
+
+
+def test_phidget_error_invalidates_home_and_motion_state():
+    controller = PhidgetStepperController(AppConfig())
+    controller.stepper = _FakeStepper()
+    controller.connected = True
+    controller.homed = True
+    controller.command_direction = 1
+
+    controller._on_error(controller.stepper, 99, "errore test")
+
+    assert not controller.homed
+    assert controller.command_direction == 0
+    assert controller.state == ControllerState.FAULT
+    assert not controller.stepper.engaged
+
+
+@pytest.mark.parametrize(
+    "protected_state",
+    [ControllerState.FAULT, ControllerState.EMERGENCY, ControllerState.LIMIT_STOPPED],
+)
+def test_stop_preserves_protected_controller_states(protected_state):
+    controller = PhidgetStepperController(AppConfig())
+    controller.stepper = _FakeStepper()
+    controller.connected = True
+    controller.state = protected_state
+
+    controller.stop()
+
+    assert controller.state == protected_state

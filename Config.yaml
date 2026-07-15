@@ -283,3 +283,6 @@ debug:
 sar:
   frames_per_position: 8
   settling_delay_s: 0.4
+  # Timeout usati dal coordinatore della scansione SAR automatica in main.
+  scan_motion_timeout_s: 120.0
+  scan_capture_timeout_s: 120.0
