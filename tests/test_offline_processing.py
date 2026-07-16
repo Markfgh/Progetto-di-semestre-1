@@ -141,6 +141,7 @@ def test_read_bp_runtime_cfg_parses_synthetic_range_angle_settings(tmp_path: Pat
                 "window_range": "blackman",
                 "window_doppler": "hamming",
                 "window_angle": "hanning",
+                "nfft_range": 512,
                 "nfft_angle": 64,
                 "zero_after_range_fft_bins": 7,
                 "background_subtraction": {
@@ -184,10 +185,42 @@ def test_read_bp_runtime_cfg_parses_synthetic_range_angle_settings(tmp_path: Pat
     assert range_angle_cfg.post_range_fft_filters.background_subtraction.enabled is True
     assert range_angle_cfg.post_range_fft_filters.background_subtraction.mode == "frozen"
     assert range_angle_cfg.angle_processing.mode == "mvdr"
+    assert range_angle_cfg.nfft_range == 512
     assert range_angle_cfg.nfft_angle == 64
 
 
-def test_read_bp_runtime_cfg_synthetic_range_angle_inherits_nfft_angle_when_not_overridden(tmp_path: Path) -> None:
+def test_offline_synthetic_range_angle_ignores_legacy_slow_time_filter(tmp_path: Path) -> None:
+    offline_cfg = tmp_path / "offline_config.yaml"
+    fallback_cfg = tmp_path / "Config.yaml"
+    _write_yaml(
+        offline_cfg,
+        {
+            **_offline_reconstruction_cfg(algorithm="synthetic_range_angle"),
+            "offline_sar_range_angle": {
+                "slow_time": {"enabled": True, "mode": "mean_subtraction"},
+            },
+        },
+    )
+    _write_yaml(
+        fallback_cfg,
+        {
+            **_fallback_capture_cfg(),
+            "dsp": {
+                "display_filters": {
+                    "slow_time": {"enabled": True, "mode": "highpass"},
+                }
+            },
+        },
+    )
+
+    runtime = _read_bp_runtime_cfg(offline_cfg, fallback_cfg)
+
+    slow_time = runtime["range_angle"].post_range_fft_filters.slow_time
+    assert slow_time.enabled is False
+    assert slow_time.mode == "none"
+
+
+def test_read_bp_runtime_cfg_inherits_fft_sizes_when_not_overridden(tmp_path: Path) -> None:
     offline_cfg = tmp_path / "offline_config.yaml"
     fallback_cfg = tmp_path / "Config.yaml"
     _write_yaml(offline_cfg, _offline_reconstruction_cfg(algorithm="synthetic_range_angle"))
@@ -195,11 +228,12 @@ def test_read_bp_runtime_cfg_synthetic_range_angle_inherits_nfft_angle_when_not_
         fallback_cfg,
         {
             **_fallback_capture_cfg(),
-            "fft": {"nfft_angle": 128},
+            "fft": {"nfft_range": 512, "nfft_angle": 128},
             "dsp": {"display_filters": {}, "angle_processing": {"mode": "bartlett"}},
         },
     )
 
     runtime = _read_bp_runtime_cfg(offline_cfg, fallback_cfg)
 
+    assert runtime["range_angle"].nfft_range == 512
     assert runtime["range_angle"].nfft_angle == 128

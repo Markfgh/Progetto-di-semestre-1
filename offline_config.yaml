@@ -1,23 +1,23 @@
 data:
   # Puoi mettere direttamente una run: logs/run_YYYYMMDD_HHMMSS
   # Se lasci "logs", SARReader prende automaticamente l'ultima run con capture_pos*.bin.
-  input_dir: "logs\\run_20260715_114430"
+  input_dir: "logs\\run_20260716_140024"
 
 capture:
   frames_per_position: 8
 
 scan:
   x_start: 1
-  x_end: 10
+  x_end: 150
   x_step: 1
-  x_pitch_m: 0.007792 # 7.792 mm pitch
+  x_pitch_m: 0.007792000193148851 # 7.792 mm pitch
 
 reconstruction:
-  algorithm: synthetic_range_angle # Options: backprojection, synthetic_range_angle.
+  algorithm: "synthetic_range_angle" # Options: backprojection, synthetic_range_angle.
 
 bp:
-  mode: mimo_sar # BackProjection MIMO per scena statica, con selezione Doppler zero
-  phase_sign: -1
+  mode: "mimo_sar" # BackProjection MIMO per scena statica, con selezione Doppler zero
+  phase_sign: 1
   motion_mode: static_zero_doppler
   tx_offsets_lambda: null
   rx_offsets_lambda: null
@@ -26,29 +26,29 @@ bp:
   coherent_sum: true
 
 offline_sar_range_angle:
+  # Le tre finestre sono condivise anche dal ramo backprojection MIMO-SAR:
+  # range=fast-time, doppler=loop prima del bin zero, angle=apertura posizioni×antenne.
   use_realtime_filters: true
-  # Override locale: non modifica fft.nfft_angle usato dal realtime.
-  nfft_angle: 256
-  window_range: hanning
-  window_doppler: hanning
-  window_angle: hanning
+  # Dimensioni FFT offline, indipendenti dal realtime.
+  # Valore < input: usa/tronca i primi campioni range o una sotto-apertura angolare centrata.
+  # Valore > input: conserva tutto l'ingresso e aggiunge zero-padding.
+  # nfft_angle si applica come FFT/padding solo con angle_processing.mode=fft;
+  # in Bartlett/MVDR indica invece il numero di punti della griglia angolare.
+  nfft_range: 2048
+  nfft_angle: 2048
+  window_range: "hanning"
+  window_doppler: "hanning"
+  window_angle: "rectangular"
   zero_after_range_fft_bins: 0
 
   mean_after_range_fft:
     enabled: false
     axes: [range_bin]
 
-  slow_time:
-    enabled: false
-    mode: mean_subtraction
-    highpass_beta: 0.9
-    doppler_fft_shift: true
-    doppler_zero_notch: false
-
   background_subtraction:
     enabled: false
-    mode: frozen
-    alpha: 0.02
+    mode: "frozen"
+    alpha: 0.05000000074505806
     init_frames: 40
     window_frames: 40
     clamp_positive_only: false
@@ -57,8 +57,8 @@ offline_sar_range_angle:
     enabled: false
 
   angle_processing:
-    mode: bartlett # Options: fft,bartlett, mvdr
-    mvdr_diagonal_loading: 0.02
-    aggregation: frame_loop
+    mode: "mvdr" # Options: fft,bartlett, mvdr
+    mvdr_diagonal_loading: 0.05000000074505806
+    aggregation: "frame_loop"
     frame_index: 0
     loop_index: 0

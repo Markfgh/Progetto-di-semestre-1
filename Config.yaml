@@ -1,19 +1,19 @@
 radar:
   c: 3e8                 # Speed of light [m/s].
   fs: 10e6               # ADC sampling rate [Hz].
-  slope: 60.012e12       # FMCW slope [Hz/s].
+  slope: 14.967e12       # FMCW slope [Hz/s] = 14.967 MHz/us; must match the applied mmWave Studio value.
   fc: 77e9               # Carrier [Hz] (used for doppler axis in m/s).
-  chirp_period_s: 160e-6 # Chirp repetition period [s].
+  chirp_period_s: 353.892e-6 # PRI [s] = idle 100 us + ramp 253.892 us; must match mmWave Studio.
 
 capture:
-  samples: 256   # ADC samples/chirp.
+  samples: 1024  # ADC samples/chirp; maximum for IWR1443 with 4 RX and complex samples.
   chirps: 256    # Chirps/frame.
   rx: 4          # Current IQ conversion assumes RX=4.
   tx: 2          # Uniform TDM-MIMO TX count; Doppler axis/compensation assume equal chirp spacing across TX.
   x_frames: 1    # Frames processed per DSP batch.
 
 fft:
-  nfft_range: 256 # Typical: 256 or 512. Higher = finer range bins, more CPU.
+  nfft_range: 1024 # Matches the 1024 acquired ADC samples.
   nfft_angle: 256 # Typical: 128/256/512. Higher = finer angular grid, more CPU.
   workers: 8      # FFT worker threads.
 
@@ -26,8 +26,8 @@ display:
   velocity_vmax_mps:  0.70 # Default mode-1 signed-velocity scale max [m/s].
   projection_mode:   cartesian # Options: polar_stretched, cartesian.
   projection_interp: bilinear  # Used only in cartesian mode: nearest, bilinear.
-  range_max:  3    # Hard limit shown on Y axis [m].
-  crossrange_max: 2  # X extent [m]; use "auto" to derive it from angle FOV for the realtime heatmap.
+  range_max:  50.0    # Hard limit shown on Y axis [m].
+  crossrange_max: 6  # X extent [m]; use "auto" to derive it from angle FOV for the realtime heatmap.
   rangefft_db_min: 0
   rangefft_db_max: 95
   rangefft_lin_min: 0
@@ -40,14 +40,14 @@ display_zoom:
   output_height: 256
   realtime_method: auto
   offline_method: viewport_grid
-  max_zoom_nfft_range: 256
+  max_zoom_nfft_range: 1024
   max_zoom_nfft_angle: 256
   max_update_hz: 22.0
   dsp_budget_ms: 8.0 
   fallback_mode: baseline_projection #
 
 processing:
-  range_max_m: 12.5 # Physical processing/detection limit [m]. If missing, falls back to display.range_max.
+  range_max_m: 50.0 # Physical processing/detection limit [m]. If missing, falls back to display.range_max.
 
 dsp:
   window_range: hanning # Options: none, rectangular, hanning, hamming, blackman.
@@ -187,7 +187,7 @@ antenna:
 
 tracking:
   enabled: true # Enables/disables the multi-object tracker.
-  dt_s: 0.04096 # Nominal frame period fallback [s]; the tracker now prefers real timestamp/sequence deltas when available.
+  dt_s: 0.100 # Nominal frame period fallback [s], matching the requested 100 ms mmWave Studio frame periodicity.
   model: kalman_cv_2d # Dynamic model in use: constant-velocity 2D Kalman filter (x, y, vx, vy).
   max_tracks: 8 # Maximum number of live tracks kept at the same time.
   min_hits_to_confirm: 3 # Required matches before a track changes from tentative to confirmed.
@@ -282,7 +282,7 @@ debug:
 
 sar:
   frames_per_position: 8
-  settling_delay_s: 0.4
+  settling_delay_s: 1
   # Timeout usati dal coordinatore della scansione SAR automatica in main.
   scan_motion_timeout_s: 120.0
   scan_capture_timeout_s: 120.0

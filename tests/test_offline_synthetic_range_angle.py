@@ -10,6 +10,10 @@ import realtime_dsp
 from offline_dsp import build_mimo_geometry
 from offline_processing import (
     OfflineSyntheticRangeAngleConfig,
+    _apply_offline_backprojection_aperture_window,
+    _apply_offline_backprojection_range_window,
+    _select_offline_range_fft_input,
+    _apply_offline_sar_range_angle_pre_filters,
     _apply_offline_sar_range_angle_background,
     _compute_synthetic_range_angle_image,
 )
@@ -24,11 +28,11 @@ def _range_angle_cfg(**overrides) -> OfflineSyntheticRangeAngleConfig:
         zero_after_range_fft_bins=0,
         post_range_fft_filters=realtime_dsp.PostRangeFftFilterConfig(
             mean_after_range_fft=realtime_dsp.MeanSelection(enabled=False),
-            slow_time=realtime_dsp.SlowTimeConfig(enabled=False),
             background_subtraction=realtime_dsp.BackgroundSubtractionConfig(enabled=False),
             loop_average_after_background=realtime_dsp.LoopAverageConfig(enabled=False),
         ),
         angle_processing=realtime_dsp.AngleProcessingConfig(mode="fft"),
+        nfft_range=64,
         nfft_angle=16,
         projection=realtime_dsp.DisplayProjectionConfig(projection_mode="cartesian", projection_interp="nearest"),
         filter_warnings=(),
@@ -68,6 +72,52 @@ def test_offline_frozen_background_uses_warmup_and_excludes_it_from_output() -> 
     expected_model = cube[:2].mean(axis=0, dtype=np.complex64)
     np.testing.assert_allclose(out, cube[2:] - expected_model, atol=1e-6, rtol=0.0)
     assert out.shape[0] == 2
+
+
+def test_offline_pre_filters_ignore_slow_time_even_if_supplied() -> None:
+    raw_mimo = np.ones((1, 1, 8, 2, 4, 3), dtype=np.complex64)
+    filters_cfg = realtime_dsp.PostRangeFftFilterConfig(
+        mean_after_range_fft=realtime_dsp.MeanSelection(enabled=False),
+        slow_time=realtime_dsp.SlowTimeConfig(enabled=True, mode="mean_subtraction"),
+        background_subtraction=realtime_dsp.BackgroundSubtractionConfig(enabled=False),
+        loop_average_after_background=realtime_dsp.LoopAverageConfig(enabled=False),
+    )
+
+    out = _apply_offline_sar_range_angle_pre_filters(raw_mimo, filters_cfg=filters_cfg, fft_workers=1)
+
+    np.testing.assert_allclose(out, raw_mimo, atol=0.0, rtol=0.0)
+
+
+def test_backprojection_range_window_applies_on_fast_time_only() -> None:
+    signal = np.ones((2, 1, 3, 4, 8), dtype=np.complex64) * np.complex64(1.0 + 2.0j)
+
+    out = _apply_offline_backprojection_range_window(
+        signal,
+        window_type="hamming",
+        enabled=True,
+    )
+
+    expected = signal * np.hamming(8).astype(np.float32).reshape(1, 1, 1, 1, 8)
+    np.testing.assert_allclose(out, expected, atol=1e-6, rtol=0.0)
+    np.testing.assert_allclose(
+        _apply_offline_backprojection_range_window(signal, window_type="hamming", enabled=False),
+        signal,
+        atol=0.0,
+        rtol=0.0,
+    )
+
+
+def test_backprojection_aperture_window_uses_position_major_antenna_order() -> None:
+    snapshots = np.ones((2, 3, 4, 5), dtype=np.complex64)
+
+    out = _apply_offline_backprojection_aperture_window(
+        snapshots,
+        window_type="hamming",
+        enabled=True,
+    )
+
+    expected = snapshots * np.hamming(8).astype(np.float32).reshape(2, 1, 4, 1)
+    np.testing.assert_allclose(out, expected, atol=1e-6, rtol=0.0)
 
 
 def test_offline_frozen_background_returns_empty_when_only_warmup_frames_exist() -> None:
@@ -211,6 +261,111 @@ def test_uniform_synthetic_geometry_keeps_fft_mode(monkeypatch: pytest.MonkeyPat
     )
 
     assert captured["mode"] == "fft"
+
+
+def test_range_fft_input_is_truncated_or_kept_for_zero_padding() -> None:
+    signal = np.arange(8, dtype=np.float32).astype(np.complex64).reshape(1, 8)
+
+    truncated = _select_offline_range_fft_input(signal, nfft_range=5)
+    padded_input = _select_offline_range_fft_input(signal, nfft_range=16)
+
+    assert truncated.shape == (1, 5)
+    np.testing.assert_array_equal(truncated, signal[:, :5])
+    assert padded_input.shape == (1, 8)
+    np.testing.assert_array_equal(padded_input, signal)
+
+
+def test_measured_motor_pitch_is_uniform_and_angle_fft_supports_padding_and_truncation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    x_tx_ant_m, x_rx_ant_m = _geometry()
+    n_positions = 194
+    captured: list[dict[str, int | str]] = []
+
+    monkeypatch.setattr(
+        offline_processing,
+        "_prepare_mimo_snapshots",
+        lambda raw_mimo, *, n_tx, motion_mode, window_doppler: np.ones(
+            (n_positions, 1, 8, 4), dtype=np.complex64
+        ),
+    )
+
+    def fake_heatmap(virtual_array, *, angle_cfg, dsp_cfg, **kwargs):
+        captured.append({
+            "mode": str(angle_cfg.mode),
+            "nfft_angle": int(dsp_cfg.nfft_angle),
+            "synthetic_antennas": int(virtual_array.shape[-1]),
+        })
+        return np.ones((4, int(dsp_cfg.nfft_angle)), dtype=np.float32)
+
+    monkeypatch.setattr(offline_processing, "compute_angle_heatmap", fake_heatmap)
+
+    _, padded_meta = _compute_synthetic_range_angle_image(
+        np.zeros((n_positions, 1, 2, 8, 4), dtype=np.complex64),
+        selected_positions=np.arange(1, n_positions + 1, dtype=np.int32),
+        x_pitch_m=0.007792000193148851,
+        tx_i=2,
+        rx_i=4,
+        x_tx_ant_m=x_tx_ant_m,
+        x_rx_ant_m=x_rx_ant_m,
+        range_angle_cfg=_range_angle_cfg(
+            nfft_angle=2048,
+            angle_processing=realtime_dsp.AngleProcessingConfig(mode="fft"),
+        ),
+        c_m_s=3.0e8,
+        fs_hz=10.0e6,
+        slope_hz_s=14.967e12,
+        fc_hz=77.0e9,
+        fft_workers=1,
+        nfft_range=1024,
+        gui_h=9,
+        gui_w=9,
+        viewport=_viewport(),
+    )
+
+    _, truncated_meta = _compute_synthetic_range_angle_image(
+        np.zeros((n_positions, 1, 2, 8, 4), dtype=np.complex64),
+        selected_positions=np.arange(1, n_positions + 1, dtype=np.int32),
+        x_pitch_m=0.007792000193148851,
+        tx_i=2,
+        rx_i=4,
+        x_tx_ant_m=x_tx_ant_m,
+        x_rx_ant_m=x_rx_ant_m,
+        range_angle_cfg=_range_angle_cfg(
+            nfft_angle=256,
+            angle_processing=realtime_dsp.AngleProcessingConfig(mode="fft"),
+        ),
+        c_m_s=3.0e8,
+        fs_hz=10.0e6,
+        slope_hz_s=14.967e12,
+        fc_hz=77.0e9,
+        fft_workers=1,
+        nfft_range=1024,
+        gui_h=9,
+        gui_w=9,
+        viewport=_viewport(),
+    )
+
+    assert captured[0] == {
+        "mode": "fft",
+        "nfft_angle": 2048,
+        "synthetic_antennas": 1552,
+    }
+    assert captured[1] == {
+        "mode": "fft",
+        "nfft_angle": 256,
+        "synthetic_antennas": 256,
+    }
+    assert padded_meta["fft_uniform_geometry"] is True
+    assert padded_meta["angle_input_elements"] == 1552
+    assert padded_meta["angle_elements_used"] == 1552
+    assert padded_meta["nfft_angle_requested"] == 2048
+    assert padded_meta["nfft_angle_effective"] == 2048
+    assert truncated_meta["fft_uniform_geometry"] is True
+    assert truncated_meta["angle_input_elements"] == 1552
+    assert truncated_meta["angle_elements_used"] == 256
+    assert truncated_meta["nfft_angle_requested"] == 256
+    assert truncated_meta["nfft_angle_effective"] == 256
 
 
 def test_nonuniform_synthetic_geometry_falls_back_to_bartlett_with_warning(

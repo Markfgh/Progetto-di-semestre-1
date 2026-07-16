@@ -676,16 +676,16 @@ def read_offline_scan_settings(path: Path) -> tuple[int, int, float]:
     with path.open("r", encoding="utf-8") as handle:
         raw = yaml.safe_load(handle) or {}
     if not isinstance(raw, dict):
-        raise ValueError("offline_config.yaml deve contenere una mappa YAML")
+        raise ValueError("offline_config.yaml must contain a YAML mapping")
     scan = raw.get("scan", {})
     if not isinstance(scan, dict):
-        raise ValueError("offline_config.yaml.scan deve contenere una mappa")
+        raise ValueError("offline_config.yaml.scan must contain a mapping")
     start = int(scan.get("x_start", 1))
     end = int(scan.get("x_end", start))
     step = int(scan.get("x_step", 1))
     pitch_m = float(scan.get("x_pitch_m"))
     if start <= 0 or end < start or step <= 0 or not np.isfinite(pitch_m) or pitch_m <= 0.0:
-        raise ValueError("scan.x_start/x_end/x_step/x_pitch_m non validi")
+        raise ValueError("invalid scan.x_start/x_end/x_step/x_pitch_m")
     positions = ((end - start) // step) + 1
     return int(start), int(positions), float(pitch_m * 1000.0)
 
@@ -850,7 +850,7 @@ def _update_existing_yaml_scalar_paths(
     missing = sorted(set(updates) - updated)
     if missing:
         raise ValueError(
-            "Chiavi YAML di tuning mancanti (nessun file modificato): " + ", ".join(missing)
+            "Missing YAML tuning keys (file not modified): " + ", ".join(missing)
         )
 
     tmp_path = path.with_suffix(path.suffix + ".tmp")
@@ -873,26 +873,26 @@ def configure_offline_scan_for_run(
     configurazione offline e viene restituito in millimetri al coordinatore.
     """
     if int(positions) <= 0 or int(start_position_id) <= 0:
-        raise ValueError("Posizione iniziale e numero di posizioni devono essere positivi")
+        raise ValueError("start position and number of positions must be positive")
     with path.open("r", encoding="utf-8") as handle:
         raw = yaml.safe_load(handle) or {}
     if not isinstance(raw, dict):
-        raise ValueError("offline_config.yaml deve contenere una mappa YAML")
+        raise ValueError("offline_config.yaml must contain a YAML mapping")
     scan = raw.setdefault("scan", {})
     if not isinstance(scan, dict):
-        raise ValueError("offline_config.yaml.scan deve contenere una mappa")
+        raise ValueError("offline_config.yaml.scan must contain a mapping")
     try:
         pitch_m = float(scan["x_pitch_m"])
     except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("scan.x_pitch_m deve essere un numero positivo") from exc
+        raise ValueError("scan.x_pitch_m must be a positive number") from exc
     if not np.isfinite(pitch_m) or pitch_m <= 0.0:
-        raise ValueError("scan.x_pitch_m deve essere un numero positivo")
+        raise ValueError("scan.x_pitch_m must be a positive number")
 
     x_start = int(start_position_id)
     x_end = int(start_position_id) + int(positions) - 1
     data = raw.setdefault("data", {})
     if not isinstance(data, dict):
-        raise ValueError("offline_config.yaml.data deve contenere una mappa")
+        raise ValueError("offline_config.yaml.data must contain a mapping")
     try:
         relative_output = output_dir.resolve().relative_to(path.parent.resolve())
         input_dir = str(relative_output)
@@ -907,10 +907,10 @@ def configure_offline_scan_for_run(
     }
     if frames_per_position is not None:
         if int(frames_per_position) <= 0:
-            raise ValueError("frames_per_position deve essere maggiore di zero")
+            raise ValueError("frames_per_position must be greater than zero")
         capture = raw.setdefault("capture", {})
         if not isinstance(capture, dict):
-            raise ValueError("offline_config.yaml.capture deve contenere una mappa")
+            raise ValueError("offline_config.yaml.capture must contain a mapping")
         scalar_updates[("capture", "frames_per_position")] = int(frames_per_position)
 
     _update_top_level_yaml_scalars(path, scalar_updates)
@@ -1377,6 +1377,37 @@ def radar_rx(
         except Exception:
             pass
 
+def _read_shared_text(buffer) -> str:
+    """Legge una stringa terminata da NUL da un ``multiprocessing.Array``."""
+    lock_getter = getattr(buffer, "get_lock", None)
+    if callable(lock_getter):
+        with lock_getter():
+            chars = buffer[:]
+    else:
+        chars = buffer[:]
+    return "".join(chars).split("\x00", 1)[0]
+
+
+def _write_shared_text(buffer, value: str) -> None:
+    """Scrive una stringa in un ``multiprocessing.Array`` senza usare ``.value``.
+
+    ``Array('u', ...)`` restituisce un ``SynchronizedArray`` su Windows e non
+    espone l'attributo ``value`` dei ``Value``: usare esplicitamente lo slice
+    lo rende portabile anche nel processo figlio del logger.
+    """
+    text = str(value)
+    if "\x00" in text or len(text) >= len(buffer):
+        raise ValueError("output folder path is invalid or too long")
+    lock_getter = getattr(buffer, "get_lock", None)
+    if callable(lock_getter):
+        with lock_getter():
+            buffer[:] = "\x00" * len(buffer)
+            buffer[:len(text)] = text
+    else:
+        buffer[:] = "\x00" * len(buffer)
+        buffer[:len(text)] = text
+
+
 def logger_worker(
     free_slots: Queue,
     shm_frames,
@@ -1412,14 +1443,9 @@ def logger_worker(
     """
     def _current_output_dir() -> Path:
         """Legge la run selezionata dalla GUI prima di aprire ogni file."""
-        lock_getter = getattr(out_dir_shared, "get_lock", None)
-        if callable(lock_getter):
-            with lock_getter():
-                value = str(out_dir_shared.value)
-        else:
-            value = str(out_dir_shared.value)
+        value = _read_shared_text(out_dir_shared)
         if not value:
-            raise RuntimeError("Cartella output della cattura non configurata")
+            raise RuntimeError("capture output folder is not configured")
         path = Path(value)
         path.mkdir(parents=True, exist_ok=True)
         return path
@@ -1947,15 +1973,14 @@ def main():
                 return candidate
             except FileExistsError:
                 continue
-        raise RuntimeError("Impossibile creare una nuova cartella di acquisizione")
+        raise RuntimeError("Unable to create a new acquisition folder")
 
     out_dir = _create_output_run()
     # Il logger è un processo separato: legge questa stringa condivisa prima
     # di ogni nuova cattura, così la GUI può avviare una nuova run senza
     # fermare radar, DCA1000 o applicazione.
     output_dir_shared = _track_mp_ref(mp.Array("u", 1024, lock=True))
-    with output_dir_shared.get_lock():
-        output_dir_shared.value = str(out_dir)
+    _write_shared_text(output_dir_shared, str(out_dir))
 
     # --- AVVIO PROCESSI ---
     p_rx = Process(
@@ -2118,7 +2143,7 @@ def main():
             stepper_controller = PhidgetStepperController(load_stepper_config())
             shutdown_resources["motor_controller"] = stepper_controller
         except Exception as exc:
-            stepper_error = f"Configurazione Phidget non disponibile: {exc}"
+            stepper_error = f"Phidget configuration unavailable: {exc}"
             print(f"[PHIDGET WARN] {stepper_error}")
 
     sar_scan = None
@@ -2156,25 +2181,33 @@ def main():
     offline_runtime = None
     offline_error = ""
     offline_info = {}
+    offline_boot_cfg: dict = {}
+    offline_config_boot_path = Path(__file__).with_name("offline_config.yaml")
     try:
-        offline_runtime = _create_offline_runtime()
-        shutdown_resources["offline_runtime"] = offline_runtime
-        offline_info = offline_runtime.start(timeout_s=45.0)
+        with offline_config_boot_path.open("r", encoding="utf-8") as handle:
+            offline_boot_cfg = yaml.safe_load(handle) or {}
+        if not isinstance(offline_boot_cfg, dict):
+            raise ValueError("offline_config.yaml must contain a YAML mapping")
+        scan_boot = offline_boot_cfg.get("scan", {}) or {}
+        x_start_boot = int(scan_boot.get("x_start", 1))
+        x_end_boot = int(scan_boot.get("x_end", x_start_boot))
+        if x_end_boot < x_start_boot:
+            x_start_boot, x_end_boot = x_end_boot, x_start_boot
+        offline_info = {
+            "pos_min": int(x_start_boot),
+            "pos_max": int(x_end_boot),
+            "x_start": int(x_start_boot),
+            "x_end": int(x_end_boot),
+            "algorithm": str((offline_boot_cfg.get("reconstruction", {}) or {}).get("algorithm", "backprojection")),
+        }
         print(
-            f"[OFFLINE] ready pos={offline_info.get('pos_min')}..{offline_info.get('pos_max')} "
-            f"default={offline_info.get('x_start')}..{offline_info.get('x_end')} "
-            f"alg={offline_info.get('algorithm')} motion={offline_info.get('motion_mode')}"
+            f"[OFFLINE] deferred load configured positions={x_start_boot}..{x_end_boot}; "
+            "press LOAD / CALCULATE OFFLINE in the GUI"
         )
     except Exception as exc:
         offline_error = str(exc)
-        try:
-            if offline_runtime is not None:
-                offline_runtime.stop()
-        except Exception:
-            pass
-        offline_runtime = None
-        shutdown_resources["offline_runtime"] = None
         print(f"[OFFLINE WARN] {offline_error}")
+    shutdown_resources["offline_runtime"] = None
 
     # =========================================================================
     # GUI SETUP (RESPONSIVE - CLEAN)
@@ -2300,7 +2333,7 @@ def main():
     IN_FFT_XMIN, IN_FFT_XMAX = "in_fft_xmin", "in_fft_xmax"
     IN_FFT_VMIN, IN_FFT_VMAX = "in_fft_vmin", "in_fft_vmax"
     TXT_POS_TAG = "txt_pos_counter"
-    TXT_LOG_TAG = "txt_log"
+    TXT_CAPTURE_STATUS_TAG = "txt_capture_status"
     TXT_MOTOR_STATUS_TAG = "txt_motor_status"
     TXT_MOTOR_POSITION_TAG = "txt_motor_position"
     TXT_MOTOR_LOG_TAG = "txt_motor_log"
@@ -2343,13 +2376,19 @@ def main():
     PROC_IMG_SERIES_TAG = "proc_img_series"
     PROC_IN_XSTART = "proc_in_xstart"
     PROC_IN_XEND = "proc_in_xend"
-    PROC_MOTION_MODE = "proc_motion_mode"
     PROC_TXT_STATUS = "proc_txt_status"
+    PROC_BTN_LOAD_OFFLINE = "proc_btn_load_offline"
+    PROC_TXT_MEMORY_ESTIMATE = "proc_txt_memory_estimate"
     PROC_IN_VMIN = "proc_in_vmin"
     PROC_IN_VMAX = "proc_in_vmax"
     PROC_IN_RMAX = "proc_in_rmax"
     PROC_IN_XMAX = "proc_in_xmax"
     PROC_BTN_NORM = "proc_btn_norm"
+    PROC_IN_ZOOM_XMIN = "proc_in_zoom_xmin"
+    PROC_IN_ZOOM_XMAX = "proc_in_zoom_xmax"
+    PROC_IN_ZOOM_YMIN = "proc_in_zoom_ymin"
+    PROC_IN_ZOOM_YMAX = "proc_in_zoom_ymax"
+    PROC_TXT_ZOOM_STATUS = "proc_txt_zoom_status"
     PROC_CMAP_SCALE_TAG = "proc_cmap_scale"
     PROC_CMAP_NUM_FMT = "%+6.1f"
     TXT_OFFLINE_TUNING_STATUS_TAG = "txt_offline_tuning_status"
@@ -2477,12 +2516,108 @@ def main():
     off_x_end = int(offline_info.get("x_end", off_pos_max)) if offline_info else off_pos_max
     if off_x_end < off_x_start:
         off_x_start, off_x_end = off_x_end, off_x_start
-    off_motion_mode = str(offline_info.get("motion_mode", "static_zero_doppler")) if offline_info else "static_zero_doppler"
-    # MIMO-SAR currently implements only the compensated zero-Doppler path.
-    # Keeping an unsupported choice here made the processed-data tab fail at runtime.
-    off_motion_modes = ["static_zero_doppler"]
-    if off_motion_mode not in off_motion_modes:
-        off_motion_mode = "static_zero_doppler"
+
+    def _estimate_offline_memory(cfg_source: dict | None = None) -> dict:
+        """Estimate offline allocations using file sizes only; never read capture payloads."""
+        source = cfg_source if isinstance(cfg_source, dict) else {}
+        data_cfg = source.get("data", {}) or {}
+        scan_cfg = source.get("scan", {}) or {}
+        fft_cfg = source.get("offline_sar_range_angle", {}) or {}
+        input_raw = str(data_cfg.get("input_dir", "logs")).strip() or "logs"
+        input_path = Path(input_raw)
+        if not input_path.is_absolute():
+            input_path = offline_config_boot_path.parent / input_path
+        if not input_path.exists():
+            raise FileNotFoundError(f"input folder not found: {input_path}")
+        source_dir = input_path
+        direct_files = list(source_dir.glob("capture_pos*.bin"))
+        if not direct_files:
+            run_dirs = sorted(
+                (path for path in source_dir.glob("run_*") if path.is_dir()),
+                key=lambda path: path.name,
+                reverse=True,
+            )
+            source_dir = next(
+                (path for path in run_dirs if any(path.glob("capture_pos*.bin"))),
+                source_dir,
+            )
+
+        x_start_est = int(scan_cfg.get("x_start", 1))
+        x_end_est = int(scan_cfg.get("x_end", x_start_est))
+        x_step_est = max(1, int(scan_cfg.get("x_step", 1)))
+        expected_ids = set(range(x_start_est, x_end_est + 1, x_step_est))
+        selected_files: list[Path] = []
+        for path in source_dir.glob("capture_pos*.bin"):
+            match = re.match(r"^capture_pos(-?\d+)\.bin$", path.name)
+            if match is not None and int(match.group(1)) in expected_ids:
+                selected_files.append(path)
+        if not selected_files:
+            raise FileNotFoundError(f"no configured capture files found in {source_dir}")
+
+        capture_bytes = sum(int(path.stat().st_size) for path in selected_files)
+        samples_input = max(1, int(SAMPLES))
+        try:
+            with selected_files[0].open("rb") as handle:
+                prefix = handle.read(12)
+                if len(prefix) == 12 and prefix[:8] == b"RTPBIN1\x00":
+                    header_len = int(struct.unpack("<I", prefix[8:12])[0])
+                    header_payload = json.loads(handle.read(header_len).decode("utf-8"))
+                    samples_input = max(
+                        1,
+                        int(((header_payload.get("capture", {}) or {}).get("samples", samples_input))),
+                    )
+        except Exception:
+            # The actual loader will perform strict validation. The estimate
+            # can safely fall back to Config.yaml without touching payloads.
+            samples_input = max(1, int(SAMPLES))
+        nfft_range_est = max(1, int(fft_cfg.get("nfft_range", NFFT_RANGE)))
+        # Capture payload is int16 I + int16 Q (4 B/complex); the reader expands
+        # it to complex64 (8 B/complex). Header bytes are negligible here.
+        iq_bytes = int(capture_bytes) * 2
+        samples_used = min(int(samples_input), int(nfft_range_est))
+        range_window = str(fft_cfg.get("window_range", "none")).strip().lower()
+        preprocessing = bool(fft_cfg.get("use_realtime_filters", True))
+        window_copy_bytes = (
+            int(iq_bytes * samples_used / samples_input)
+            if preprocessing and range_window not in {"none", "rectangular"}
+            else 0
+        )
+        fft_bytes = int(iq_bytes * nfft_range_est / samples_input)
+        # During handoff, both the FFT result and its shared-memory copy coexist.
+        peak_bytes = int(iq_bytes + window_copy_bytes + (2 * fft_bytes))
+        return {
+            "source_dir": str(source_dir),
+            "files": int(len(selected_files)),
+            "samples_input": int(samples_input),
+            "nfft_range": int(nfft_range_est),
+            "capture_bytes": int(capture_bytes),
+            "iq_bytes": int(iq_bytes),
+            "fft_bytes": int(fft_bytes),
+            "peak_bytes": int(peak_bytes),
+        }
+
+    def _format_offline_memory_estimate(cfg_source: dict | None = None) -> str:
+        try:
+            estimate = _estimate_offline_memory(cfg_source)
+            gib = float(1024 ** 3)
+            padding_note = (
+                "zero-padding"
+                if int(estimate["nfft_range"]) > int(estimate["samples_input"])
+                else "no range zero-padding"
+            )
+            return (
+                f"Memory estimate (payload not loaded): {estimate['files']} files | "
+                f"Range {estimate['samples_input']} -> {estimate['nfft_range']} ({padding_note})\n"
+                f"IQ {estimate['iq_bytes'] / gib:.1f} GiB | Range FFT {estimate['fft_bytes'] / gib:.1f} GiB | "
+                f"temporary peak up to {estimate['peak_bytes'] / gib:.1f} GiB"
+            )
+        except Exception as exc:
+            return f"Memory estimate unavailable: {exc}"
+
+    offline_memory_estimate_text = _format_offline_memory_estimate(offline_boot_cfg)
+    # L'attuale pipeline MIMO-SAR supporta solo questo percorso: non esporre
+    # un selettore GUI per una scelta che non esiste realmente.
+    off_motion_mode = "static_zero_doppler"
     off_norm_enabled = True
     if off_norm_enabled:
         off_vmin = float(VMIN_NORM)
@@ -2624,6 +2759,9 @@ def main():
 
     off_ui_dirty = False
     off_ui_dirty_t = 0.0
+    # DearPyGui may defer GPU creation for textures contained in a hidden tab.
+    # Re-upload the cached offline texture whenever the main tab changes.
+    off_texture_upload_requested = True
     off_ui_pending = {
         "x_start": int(off_x_start),
         "x_end": int(off_x_end),
@@ -2634,10 +2772,19 @@ def main():
         "xmax": float(off_xmax),
         "norm_enabled": bool(off_norm_enabled),
         "reset_view": True,
+        "reconstruct": True,
+        "display_refresh": True,
     }
-    off_status_text = "Offline runtime non disponibile" if offline_runtime is None else "Offline ready"
+    off_status_text = (
+        "Offline data not loaded. Press LOAD / CALCULATE OFFLINE when needed.\n"
+        + offline_memory_estimate_text
+    )
     if offline_error:
-        off_status_text = f"ERRORE: {offline_error}"
+        off_status_text = f"ERROR: {offline_error}"
+
+    def _on_main_tab_changed(sender=None, app_data=None):
+        nonlocal off_texture_upload_requested
+        off_texture_upload_requested = True
 
     with dpg.texture_registry(show=False):
         dpg.add_dynamic_texture(
@@ -2896,9 +3043,9 @@ def main():
         if not dpg.does_item_exist(TXT_SCAN_PITCH_TAG):
             return
         if pitch_mm is not None and np.isfinite(float(pitch_mm)) and float(pitch_mm) > 0.0:
-            label = f"Pitch da offline_config: {float(pitch_mm):.6f} mm"
+            label = f"Pitch from offline_config: {float(pitch_mm):.6f} mm"
         else:
-            label = f"Errore offline_config: {error or 'pitch non valido'}"
+            label = f"offline_config error: {error or 'invalid pitch'}"
         dpg.set_value(TXT_SCAN_PITCH_TAG, label)
 
     def _motor_metadata_for_capture() -> tuple[float | None, int | None]:
@@ -2909,7 +3056,7 @@ def main():
             if not bool(snapshot.get("connected")) or not bool(snapshot.get("homed")):
                 return None, None
             if bool(snapshot.get("motion_active")):
-                raise CaptureError("Attendere che il carrello sia fermo prima di catturare.")
+                raise CaptureError("Wait for the carriage to stop before capturing.")
             steps = int(stepper_controller.position_microsteps())
             return float(stepper_controller.config.mechanics.mm_from_microsteps(steps)), steps
         except CaptureError:
@@ -2919,7 +3066,7 @@ def main():
 
     def _on_capture():
         if sar_scan is not None and sar_scan.active:
-            _set_scan_status("La cattura manuale è bloccata durante la scansione SAR.")
+            _set_scan_status("Manual capture is disabled during a SAR scan.")
             return
         try:
             position_mm, position_steps = _motor_metadata_for_capture()
@@ -2928,43 +3075,57 @@ def main():
             capture_sessions.request(next_pid, position_mm, position_steps)
             with sar_pos_counter.get_lock():
                 sar_pos_counter.value = int(next_pid)
-            dpg.set_value(TXT_POS_TAG, f"Pos Counter: {next_pid}")
-            _set_scan_status(f"Cattura manuale posizione {next_pid} in corso")
+            dpg.set_value(TXT_POS_TAG, f"Last position: {next_pid} | next ID: {next_pid + 1}")
+            _set_scan_status(f"Manual capture for position {next_pid} is running")
         except Exception as exc:
-            _set_scan_status(f"Cattura non avviata: {exc}")
+            _set_scan_status(f"Capture did not start: {exc}")
 
     def _on_new_sar_session() -> None:
         """Passa a una cartella di acquisizione vuota senza riavviare la GUI."""
         nonlocal out_dir
         if capture_sessions.inflight:
-            _set_scan_status("Attendere il completamento o l'annullamento della cattura corrente.")
+            _set_scan_status("Wait for the current capture to complete or be cancelled.")
             return
         if sar_scan is not None and sar_scan.active:
-            _set_scan_status("Non è possibile cambiare sessione durante una scansione SAR.")
+            _set_scan_status("A session cannot be changed during a SAR scan.")
             return
         if scan_pending_run["start_position_id"] is not None:
-            _set_scan_status("Attendere la finalizzazione offline della scansione precedente.")
+            _set_scan_status("Wait for the previous scan offline finalization.")
             return
         try:
             new_dir = _create_output_run()
-            with output_dir_shared.get_lock():
-                output_dir_shared.value = str(new_dir)
+            _write_shared_text(output_dir_shared, str(new_dir))
             out_dir = new_dir
             with sar_pos_counter.get_lock():
                 sar_pos_counter.value = 0
             if dpg.does_item_exist(TXT_POS_TAG):
-                dpg.set_value(TXT_POS_TAG, "Pos Counter: 0")
+                dpg.set_value(TXT_POS_TAG, "Next ID: 1")
             if dpg.does_item_exist(TXT_RUN_DIR_TAG):
-                dpg.set_value(TXT_RUN_DIR_TAG, f"Run corrente: {out_dir.name}")
-            _set_scan_status(f"Nuova sessione pronta: {out_dir.name}")
+                dpg.set_value(TXT_RUN_DIR_TAG, f"Current run: {out_dir.name}")
+            _set_scan_status(f"New session ready: {out_dir.name}")
         except Exception as exc:
-            _set_scan_status(f"Nuova sessione non creata: {exc}")
+            _set_scan_status(f"New session was not created: {exc}")
 
     def _on_motor_connect() -> None:
         if stepper_controller is None:
-            _set_scan_status(f"Phidget non disponibile: {stepper_error or 'backend non caricato'}")
+            _set_scan_status(f"Phidget unavailable: {stepper_error or 'backend not loaded'}")
             return
         threading.Thread(target=stepper_controller.connect, name="phidget-connect-main", daemon=True).start()
+
+    def _on_motor_disconnect() -> None:
+        if stepper_controller is None:
+            return
+        if sar_scan is not None and sar_scan.active:
+            _set_scan_status("Cancel the SAR scan before disconnecting the carriage.")
+            return
+        if capture_sessions.inflight:
+            _set_scan_status("Wait for the current capture to complete or be cancelled.")
+            return
+        threading.Thread(
+            target=stepper_controller.disconnect,
+            name="phidget-disconnect-main",
+            daemon=True,
+        ).start()
 
     def _on_motor_home() -> None:
         if stepper_controller is None:
@@ -2972,7 +3133,7 @@ def main():
         try:
             stepper_controller.start_homing()
         except Exception as exc:
-            stepper_controller.log(f"HOME non avviato: {exc}")
+            stepper_controller.log(f"HOME did not start: {exc}")
 
     def _on_motor_jog(sign: int) -> None:
         if stepper_controller is None:
@@ -2981,7 +3142,7 @@ def main():
             distance = abs(float(dpg.get_value(IN_MOTOR_JOG_TAG))) * int(sign)
             stepper_controller.move_relative_mm(distance)
         except Exception as exc:
-            stepper_controller.log(f"Jog non avviato: {exc}")
+            stepper_controller.log(f"Jog did not start: {exc}")
 
     def _on_motor_stop() -> None:
         if sar_scan is not None and sar_scan.active:
@@ -2989,48 +3150,48 @@ def main():
             return
         if capture_sessions.inflight:
             capture_sessions.cancel()
-            _set_scan_status("Annullamento cattura richiesto...")
+            _set_scan_status("Capture cancellation requested...")
             return
         if stepper_controller is not None:
             try:
                 stepper_controller.stop()
             except Exception as exc:
-                stepper_controller.log(f"STOP non eseguito: {exc}")
+                stepper_controller.log(f"STOP failed: {exc}")
 
     def _on_start_sar_scan() -> None:
         if sar_scan is None or stepper_controller is None:
-            _set_scan_status(f"Scansione non disponibile: {stepper_error or 'Phidget non configurato'}")
+            _set_scan_status(f"Scan unavailable: {stepper_error or 'Phidget not configured'}")
             return
         if capture_sessions.inflight:
-            _set_scan_status("Attendere il completamento o l'annullamento della cattura corrente.")
+            _set_scan_status("Wait for the current capture to complete or be cancelled.")
             return
         if scan_pending_run["start_position_id"] is not None:
-            _set_scan_status("Attendere la finalizzazione offline della scansione precedente.")
+            _set_scan_status("Wait for the previous scan offline finalization.")
             return
         try:
             motor_snapshot = stepper_controller.snapshot()
             if not bool(motor_snapshot.get("connected")):
-                raise ScanError("Connettere il Phidget prima di avviare la scansione.")
+                raise ScanError("Connect the Phidget before starting a scan.")
             if not bool(motor_snapshot.get("homed")):
-                raise ScanError("Eseguire HOME e posizionare manualmente il carrello prima della scansione.")
+                raise ScanError("Run HOME and manually set the carriage start position before scanning.")
             if bool(motor_snapshot.get("motion_active")):
-                raise ScanError("Attendere l'arresto del movimento manuale prima della scansione.")
+                raise ScanError("Wait for manual motion to stop before scanning.")
             radar_state = mmwave_bridge.get_gui_state()
             if not radar_state.connected:
-                raise ScanError("Collegare prima radar e DCA1000 con il pulsante mmWave: Connect.")
+                raise ScanError("Connect the radar and DCA1000 first with mmWave: Connect.")
             if not radar_state.streaming:
-                raise ScanError("Avviare prima il radar con Radar: Start.")
+                raise ScanError("Start the radar first with Radar: Start.")
             with rx_pkts.get_lock():
                 received_packets = int(rx_pkts.value)
             with rx_last_packet_time_s.get_lock():
                 udp_idle_s = max(0.0, time.time() - float(rx_last_packet_time_s.value))
             if received_packets <= 0 or udp_idle_s > 2.0:
-                raise ScanError("Streaming richiesto ma UDP non attivo: attendere i dati radar prima della scansione.")
+                raise ScanError("Streaming is enabled but UDP is inactive: wait for radar data before scanning.")
             n_positions = int(dpg.get_value(IN_SCAN_POSITIONS_TAG))
             start_id, _default_positions, pitch_mm = read_offline_scan_settings(offline_scan_config_path)
             _update_scan_pitch_label(pitch_mm)
             if n_positions <= 0:
-                raise ScanError("Il numero di posizioni deve essere maggiore di zero.")
+                raise ScanError("The number of positions must be greater than zero.")
             existing = [
                 out_dir / f"capture_pos{position_id}.bin"
                 for position_id in range(start_id, start_id + n_positions)
@@ -3038,7 +3199,7 @@ def main():
             ]
             if existing:
                 raise ScanError(
-                    "Esistono già catture nella run corrente (avvia una nuova sessione per non sovrascriverle)."
+                    "The current run already contains captures (start a new session to avoid overwriting them)."
                 )
             with sar_pos_counter.get_lock():
                 sar_pos_counter.value = int(start_id) - 1
@@ -3060,19 +3221,38 @@ def main():
                 }
             )
             _set_scan_status(
-                f"Scansione avviata: {n_positions} posizioni, pitch {pitch_mm:.6f} mm"
+                f"Scan started: {n_positions} positions, pitch {pitch_mm:.6f} mm"
             )
         except Exception as exc:
-            _set_scan_status(f"Scansione non avviata: {exc}")
+            _set_scan_status(f"Scan did not start: {exc}")
 
     def _on_cancel_sar_scan() -> None:
         if sar_scan is None or not sar_scan.active:
-            _set_scan_status("Nessuna scansione SAR attiva.")
+            _set_scan_status("No SAR scan is active.")
             return
         sar_scan.cancel()
-        _set_scan_status("Annullamento scansione richiesto...")
+        _set_scan_status("Scan cancellation requested...")
 
     motor_log_lines: list[str] = []
+
+    def _english_scan_message(message: str) -> str:
+        """Translate the coordinator's legacy Italian status for the English GUI."""
+        text = str(message)
+        translations = {
+            "Pronto": "Ready",
+            "Preparazione scansione SAR": "Preparing SAR scan",
+            "Assestamento meccanico": "Mechanical settling",
+            "Annullamento scansione...": "Cancelling scan...",
+            "Scansione SAR annullata": "SAR scan cancelled",
+            "Scansione SAR interrotta": "SAR scan interrupted",
+            "Errore chiusura scansione": "Scan finalization error",
+            "Scansione SAR completata": "SAR scan completed",
+            "Scansione annullata.": "Scan cancelled.",
+        }
+        text = translations.get(text, text)
+        text = re.sub(r"^Cattura posizione (.+)$", r"Capturing position \1", text)
+        text = re.sub(r"^Movimento verso posizione (.+)$", r"Moving to position \1", text)
+        return text
 
     def _drain_motor_events() -> None:
         if stepper_controller is None:
@@ -3086,7 +3266,7 @@ def main():
                     try:
                         mm = stepper_controller.config.mechanics.mm_from_microsteps(float(value))
                         if dpg.does_item_exist(TXT_MOTOR_POSITION_TAG):
-                            dpg.set_value(TXT_MOTOR_POSITION_TAG, f"Posizione: {mm:.4f} mm ({float(value):.0f} microstep)")
+                            dpg.set_value(TXT_MOTOR_POSITION_TAG, f"Position: {mm:.4f} mm ({float(value):.0f} microsteps)")
                     except Exception:
                         pass
         except pyqueue.Empty:
@@ -3097,11 +3277,11 @@ def main():
         try:
             snapshot = stepper_controller.snapshot()
             state = str(snapshot.get("state", "--"))
-            connected = "collegato" if bool(snapshot.get("connected")) else "disconnesso"
-            homed = "HOME ok" if bool(snapshot.get("homed")) else "HOME richiesto"
-            limits = f"MIN={'ATTIVO' if snapshot.get('min_active') else 'libero'} MAX={'ATTIVO' if snapshot.get('max_active') else 'libero'}"
+            connected = "connected" if bool(snapshot.get("connected")) else "disconnected"
+            homed = "HOME complete" if bool(snapshot.get("homed")) else "HOME required"
+            limits = f"MIN={'ACTIVE' if snapshot.get('min_active') else 'clear'} MAX={'ACTIVE' if snapshot.get('max_active') else 'clear'}"
             if dpg.does_item_exist(TXT_MOTOR_STATUS_TAG):
-                dpg.set_value(TXT_MOTOR_STATUS_TAG, f"Carrello: {connected} | {state}\n{homed} | {limits}")
+                dpg.set_value(TXT_MOTOR_STATUS_TAG, f"Carriage: {connected} | {state}\n{homed} | {limits}")
         except Exception:
             pass
 
@@ -3116,7 +3296,7 @@ def main():
             status = sar_scan.status()
             state = str(status.state)
             active = sar_scan.active
-            detail = str(status.message)
+            detail = _english_scan_message(str(status.message))
             if status.position_id is not None:
                 detail += f" | id={int(status.position_id)}"
             if status.position_mm is not None:
@@ -3124,16 +3304,27 @@ def main():
             if status.total:
                 detail += f" | {int(status.completed)}/{int(status.total)}"
             if status.error:
-                detail += f" | ERRORE: {status.error}"
+                detail += f" | ERROR: {_english_scan_message(str(status.error))}"
             if dpg.does_item_exist(TXT_SCAN_STATUS_TAG):
                 dpg.set_value(TXT_SCAN_STATUS_TAG, detail)
             if state == "capturing" and status.position_id is not None:
                 with sar_pos_counter.get_lock():
                     sar_pos_counter.value = int(status.position_id)
                 if dpg.does_item_exist(TXT_POS_TAG):
-                    dpg.set_value(TXT_POS_TAG, f"Pos Counter: {int(status.position_id)}")
+                    dpg.set_value(TXT_POS_TAG, f"Scan: position ID {int(status.position_id)}")
 
         busy_capture = bool(capture_sessions.inflight)
+        if dpg.does_item_exist(TXT_CAPTURE_STATUS_TAG):
+            if active:
+                capture_detail = "Automatic capture is managed by the active scan."
+            elif busy_capture:
+                capture_detail = (
+                    f"Manual capture in progress | position {int(cap_pos_id.value)} | "
+                    f"{int(cap_saved.value)}/{int(FRAMES_PER_POSITION)} frame"
+                )
+            else:
+                capture_detail = "Ready for a manual capture in the current run."
+            dpg.set_value(TXT_CAPTURE_STATUS_TAG, capture_detail)
         if dpg.does_item_exist(BTN_CAPTURE_TAG):
             dpg.configure_item(BTN_CAPTURE_TAG, enabled=not active and not busy_capture)
         if dpg.does_item_exist(BTN_NEW_SESSION_TAG):
@@ -3203,7 +3394,7 @@ def main():
                     MMWAVE_CONNECT_SETTLE_S - (time.perf_counter() - mmwave_connected_since_perf),
                 )
                 if remaining > 0.0:
-                    status_text = f"Radar collegato: attendere {remaining:.1f} s prima di START"
+                    status_text = f"Radar connected: wait {remaining:.1f} s before START"
             dpg.set_value(TXT_MMWAVE_STATUS_TAG, status_text)
         if dpg.does_item_exist(TXT_MMWAVE_LINKS_TAG):
             udp_idle_s = max(0.0, _sync_mmwave_udp_activity())
@@ -3298,7 +3489,7 @@ def main():
                 )
                 if remaining > 0.0:
                     mmwave_bridge.set_status(
-                        message=f"Attendere ancora {remaining:.1f} s prima di avviare il radar"
+                        message=f"Wait another {remaining:.1f} s before starting the radar"
                     )
                     _refresh_mmwave_controls()
                     return
@@ -3620,6 +3811,87 @@ def main():
             dpg.set_value(PROC_IN_VMAX, base_vmax)
         _apply_offline_params()
 
+    def _write_offline_zoom_inputs(viewport: DisplayViewport) -> None:
+        values = (
+            (PROC_IN_ZOOM_XMIN, float(viewport.x_min_m)),
+            (PROC_IN_ZOOM_XMAX, float(viewport.x_max_m)),
+            (PROC_IN_ZOOM_YMIN, float(viewport.y_min_m)),
+            (PROC_IN_ZOOM_YMAX, float(viewport.y_max_m)),
+        )
+        for tag, value in values:
+            if dpg.does_item_exist(tag):
+                dpg.set_value(tag, value)
+
+    def _apply_offline_display_zoom(sender=None, app_data=None):
+        """Change only the plot ROI; the already reconstructed texture is reused."""
+        nonlocal off_requested_viewport_current
+        try:
+            x0 = float(dpg.get_value(PROC_IN_ZOOM_XMIN))
+            x1 = float(dpg.get_value(PROC_IN_ZOOM_XMAX))
+            y0 = float(dpg.get_value(PROC_IN_ZOOM_YMIN))
+            y1 = float(dpg.get_value(PROC_IN_ZOOM_YMAX))
+        except (TypeError, ValueError):
+            return
+        if not all(np.isfinite(value) for value in (x0, x1, y0, y1)):
+            return
+
+        home = off_home_viewport_current
+        x0, x1 = sorted((x0, x1))
+        y0, y1 = sorted((y0, y1))
+        x0 = max(float(home.x_min_m), min(float(home.x_max_m), x0))
+        x1 = max(float(home.x_min_m), min(float(home.x_max_m), x1))
+        y0 = max(float(home.y_min_m), min(float(home.y_max_m), y0))
+        y1 = max(float(home.y_min_m), min(float(home.y_max_m), y1))
+
+        min_x_span = max((float(home.x_max_m) - float(home.x_min_m)) / float(max(1, gui_w)), 1e-6)
+        min_y_span = max(float(dr_plot), 1e-6)
+        if x1 <= x0:
+            x1 = min(float(home.x_max_m), x0 + min_x_span)
+            if x1 <= x0:
+                x0 = max(float(home.x_min_m), x1 - min_x_span)
+        if y1 <= y0:
+            y1 = min(float(home.y_max_m), y0 + min_y_span)
+            if y1 <= y0:
+                y0 = max(float(home.y_min_m), y1 - min_y_span)
+
+        off_requested_viewport_current = build_display_viewport(
+            x_min_m=float(x0),
+            x_max_m=float(x1),
+            y_min_m=float(y0),
+            y_max_m=float(y1),
+            dr_m=float(dr_plot),
+            seq=int(off_requested_viewport_current.seq) + 1,
+            home_viewport=home,
+        )
+        _write_offline_zoom_inputs(off_requested_viewport_current)
+        if dpg.does_item_exist(PROC_XAXIS_TAG) and dpg.does_item_exist(PROC_YAXIS_TAG):
+            dpg.set_axis_limits(PROC_XAXIS_TAG, float(x0), float(x1))
+            dpg.set_axis_limits(PROC_YAXIS_TAG, float(y0), float(y1))
+        if dpg.does_item_exist(PROC_TXT_ZOOM_STATUS):
+            dpg.set_value(
+                PROC_TXT_ZOOM_STATUS,
+                f"ROI: X [{x0:.3f}, {x1:.3f}] m | Y [{y0:.3f}, {y1:.3f}] m\n"
+                "Display only: backprojection not recalculated.",
+            )
+
+    def _reset_offline_display_zoom(sender=None, app_data=None):
+        nonlocal off_requested_viewport_current
+        off_requested_viewport_current = off_home_viewport_current
+        _write_offline_zoom_inputs(off_home_viewport_current)
+        if dpg.does_item_exist(PROC_XAXIS_TAG) and dpg.does_item_exist(PROC_YAXIS_TAG):
+            dpg.set_axis_limits(
+                PROC_XAXIS_TAG,
+                float(off_home_viewport_current.x_min_m),
+                float(off_home_viewport_current.x_max_m),
+            )
+            dpg.set_axis_limits(
+                PROC_YAXIS_TAG,
+                float(off_home_viewport_current.y_min_m),
+                float(off_home_viewport_current.y_max_m),
+            )
+        if dpg.does_item_exist(PROC_TXT_ZOOM_STATUS):
+            dpg.set_value(PROC_TXT_ZOOM_STATUS, "Full reconstructed map.")
+
     def _apply_offline_params(sender=None, app_data=None):
         nonlocal off_ui_dirty, off_ui_dirty_t, off_ui_pending, off_status_text
 
@@ -3633,9 +3905,7 @@ def main():
         except (TypeError, ValueError):
             return
 
-        motion_mode = str(dpg.get_value(PROC_MOTION_MODE)).strip().lower()
-        if motion_mode not in off_motion_modes:
-            motion_mode = "static_zero_doppler"
+        motion_mode = "static_zero_doppler"
 
         x_start_cl = max(off_pos_min, min(off_pos_max, x_start))
         x_end_cl = max(off_pos_min, min(off_pos_max, x_end))
@@ -3659,6 +3929,14 @@ def main():
 
         prev_off_rmax = float(off_ui_pending.get("rmax", rmax_cl))
         prev_off_xmax = float(off_ui_pending.get("xmax", xmax_cl))
+        prev_x_start = int(off_ui_pending.get("x_start", x_start_cl))
+        prev_x_end = int(off_ui_pending.get("x_end", x_end_cl))
+        prev_motion_mode = str(off_ui_pending.get("motion_mode", motion_mode))
+        reconstruction_changed = bool(
+            prev_x_start != int(x_start_cl)
+            or prev_x_end != int(x_end_cl)
+            or prev_motion_mode != str(motion_mode)
+        )
         off_ui_pending["vmin"] = float(vmin)
         off_ui_pending["vmax"] = float(vmax)
         off_ui_pending["rmax"] = float(rmax_cl)
@@ -3666,14 +3944,25 @@ def main():
         off_ui_pending["x_start"] = int(x_start_cl)
         off_ui_pending["x_end"] = int(x_end_cl)
         off_ui_pending["motion_mode"] = str(motion_mode)
+        off_ui_pending["reconstruct"] = bool(
+            off_ui_pending.get("reconstruct", False) or reconstruction_changed
+        )
+        off_ui_pending["display_refresh"] = True
         off_ui_pending["reset_view"] = bool(
             off_ui_pending.get("reset_view", False)
             or abs(float(prev_off_rmax) - float(rmax_cl)) > 1e-6
             or abs(float(prev_off_xmax) - float(xmax_cl)) > 1e-6
         )
+        update_label = (
+            "Offline reconstruction update pending"
+            if bool(off_ui_pending.get("reconstruct", False))
+            else "Offline display updated from cached matrix"
+        )
         off_status_text = (
-            f"Pending update | x={x_start_cl}:{x_end_cl} | motion={motion_mode} | "
-            f"v={vmin:.1f}:{vmax:.1f}"
+            f"{update_label}\n"
+            f"SAR positions: {x_start_cl} - {x_end_cl}\n"
+            f"Motion mode: {motion_mode}\n"
+            f"Image scale: {vmin:.1f} - {vmax:.1f} dB"
         )
         if dpg.does_item_exist(PROC_TXT_STATUS):
             dpg.set_value(PROC_TXT_STATUS, off_status_text)
@@ -3685,43 +3974,40 @@ def main():
     # built and cannot be changed safely through its live command queue.
     OFFLINE_TUNING_WINDOWS = ["none", "rectangular", "hanning", "hamming", "blackman"]
     OFFLINE_TUNING_BG_MODES = ["ema", "running_mean", "window_mean", "frozen"]
-    OFFLINE_TUNING_SLOW_TIME_MODES = ["none", "mean_subtraction", "highpass"]
     OFFLINE_TUNING_ANGLE_MODES = ["fft", "bartlett", "mvdr"]
     OFFLINE_TUNING_AGGREGATIONS = ["frame_loop", "frame", "loop", "none"]
     OFFLINE_TUNING_ALGORITHMS = ["synthetic_range_angle", "backprojection"]
     OFFLINE_TUNING_BP_MODES = ["mimo_sar", "sar_only"]
 
     OFFLINE_TUNING_FIELD_SPECS = [
-        {"section": "Dati e scansione", "path": "data.input_dir", "label": "Cartella input", "kind": "text", "default": "logs"},
-        {"section": "Dati e scansione", "path": "scan.x_start", "label": "Posizione iniziale", "kind": "int", "default": 1, "step": 1},
-        {"section": "Dati e scansione", "path": "scan.x_end", "label": "Posizione finale", "kind": "int", "default": 1, "step": 1},
-        {"section": "Dati e scansione", "path": "scan.x_step", "label": "Passo posizioni", "kind": "int", "default": 1, "min": 1, "step": 1},
-        {"section": "Dati e scansione", "path": "scan.x_pitch_m", "label": "Pitch X (m)", "kind": "float", "default": 0.01, "min": 0.000001, "step": 0.001, "format": "%.6f"},
-        {"section": "Ricostruzione", "path": "reconstruction.algorithm", "label": "Algoritmo", "kind": "combo", "items": OFFLINE_TUNING_ALGORITHMS, "default": "synthetic_range_angle"},
-        {"section": "Ricostruzione", "path": "bp.mode", "label": "Modalita BP", "kind": "combo", "items": OFFLINE_TUNING_BP_MODES, "default": "mimo_sar"},
-        {"section": "Ricostruzione", "path": "bp.phase_sign", "label": "Segno fase", "kind": "combo", "items": ["-1", "1"], "default": "-1"},
-        {"section": "Ricostruzione", "path": "bp.coherent_sum", "label": "Somma coerente", "kind": "bool", "default": True},
-        {"section": "Filtri range-angle", "path": "offline_sar_range_angle.use_realtime_filters", "label": "Abilita filtri", "kind": "bool", "default": True},
-        {"section": "Filtri range-angle", "path": "offline_sar_range_angle.window_range", "label": "Finestra range", "kind": "combo", "items": OFFLINE_TUNING_WINDOWS, "default": "hanning"},
-        {"section": "Filtri range-angle", "path": "offline_sar_range_angle.window_doppler", "label": "Finestra Doppler", "kind": "combo", "items": OFFLINE_TUNING_WINDOWS, "default": "hanning"},
-        {"section": "Filtri range-angle", "path": "offline_sar_range_angle.window_angle", "label": "Finestra angolare", "kind": "combo", "items": OFFLINE_TUNING_WINDOWS, "default": "hanning"},
-        {"section": "Filtri range-angle", "path": "offline_sar_range_angle.zero_after_range_fft_bins", "label": "Azzera bin iniziali", "kind": "int", "default": 0, "min": 0, "step": 1},
-        {"section": "Filtri range-angle", "path": "offline_sar_range_angle.mean_after_range_fft.enabled", "label": "Media dopo Range FFT", "kind": "bool", "default": False},
-        {"section": "Filtri range-angle", "path": "offline_sar_range_angle.slow_time.enabled", "label": "Filtro slow-time", "kind": "bool", "default": False},
-        {"section": "Filtri range-angle", "path": "offline_sar_range_angle.slow_time.mode", "label": "Modalita slow-time", "kind": "combo", "items": OFFLINE_TUNING_SLOW_TIME_MODES, "default": "mean_subtraction"},
-        {"section": "Filtri range-angle", "path": "offline_sar_range_angle.slow_time.highpass_beta", "label": "Slow-time beta", "kind": "float", "default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01},
-        {"section": "Background", "path": "offline_sar_range_angle.background_subtraction.enabled", "label": "Abilita background", "kind": "bool", "default": False},
-        {"section": "Background", "path": "offline_sar_range_angle.background_subtraction.mode", "label": "Modalita", "kind": "combo", "items": OFFLINE_TUNING_BG_MODES, "default": "frozen"},
+        {"section": "Data and scan", "path": "data.input_dir", "label": "Input folder", "kind": "text", "default": "logs"},
+        {"section": "Data and scan", "path": "scan.x_start", "label": "Start position", "kind": "int", "default": 1, "step": 1},
+        {"section": "Data and scan", "path": "scan.x_end", "label": "End position", "kind": "int", "default": 1, "step": 1},
+        {"section": "Data and scan", "path": "scan.x_step", "label": "Position step", "kind": "int", "default": 1, "min": 1, "step": 1},
+        {"section": "Data and scan", "path": "scan.x_pitch_m", "label": "X pitch (m)", "kind": "float", "default": 0.01, "min": 0.000001, "step": 0.001, "format": "%.6f"},
+        {"section": "Reconstruction", "path": "reconstruction.algorithm", "label": "Algorithm", "kind": "combo", "items": OFFLINE_TUNING_ALGORITHMS, "default": "synthetic_range_angle"},
+        {"section": "Reconstruction", "path": "bp.mode", "label": "BP mode", "kind": "combo", "items": OFFLINE_TUNING_BP_MODES, "default": "mimo_sar"},
+        {"section": "Reconstruction", "path": "bp.phase_sign", "label": "Phase sign", "kind": "combo", "items": ["-1", "1"], "default": "-1"},
+        {"section": "Reconstruction", "path": "bp.coherent_sum", "label": "Coherent sum", "kind": "bool", "default": True},
+        {"section": "FFT sizing", "path": "offline_sar_range_angle.nfft_range", "label": "Range FFT bins", "kind": "int", "default": 1024, "min": 1, "step": 64},
+        {"section": "FFT sizing", "path": "offline_sar_range_angle.nfft_angle", "label": "Angle FFT bins", "kind": "int", "default": 2048, "min": 1, "step": 64},
+        {"section": "Shared windows", "path": "offline_sar_range_angle.use_realtime_filters", "label": "Enable preprocessing", "kind": "bool", "default": True},
+        {"section": "Shared windows", "path": "offline_sar_range_angle.window_range", "label": "Range window", "kind": "combo", "items": OFFLINE_TUNING_WINDOWS, "default": "hanning"},
+        {"section": "Shared windows", "path": "offline_sar_range_angle.window_doppler", "label": "Doppler window", "kind": "combo", "items": OFFLINE_TUNING_WINDOWS, "default": "hanning"},
+        {"section": "Shared windows", "path": "offline_sar_range_angle.window_angle", "label": "Aperture window", "kind": "combo", "items": OFFLINE_TUNING_WINDOWS, "default": "hanning"},
+        {"section": "Range-angle filters", "path": "offline_sar_range_angle.zero_after_range_fft_bins", "label": "Zero initial bins", "kind": "int", "default": 0, "min": 0, "step": 1},
+        {"section": "Range-angle filters", "path": "offline_sar_range_angle.mean_after_range_fft.enabled", "label": "Mean after Range FFT", "kind": "bool", "default": False},
+        {"section": "Background", "path": "offline_sar_range_angle.background_subtraction.enabled", "label": "Enable background subtraction", "kind": "bool", "default": False},
+        {"section": "Background", "path": "offline_sar_range_angle.background_subtraction.mode", "label": "Mode", "kind": "combo", "items": OFFLINE_TUNING_BG_MODES, "default": "frozen"},
         {"section": "Background", "path": "offline_sar_range_angle.background_subtraction.alpha", "label": "Alpha", "kind": "float", "default": 0.02, "min": 0.0, "max": 1.0, "step": 0.01},
-        {"section": "Background", "path": "offline_sar_range_angle.background_subtraction.init_frames", "label": "Frame iniziali", "kind": "int", "default": 40, "min": 1, "step": 1},
-        {"section": "Background", "path": "offline_sar_range_angle.background_subtraction.window_frames", "label": "Finestra frame", "kind": "int", "default": 40, "min": 1, "step": 1},
-        {"section": "Background", "path": "offline_sar_range_angle.background_subtraction.clamp_positive_only", "label": "Mantieni solo positivo", "kind": "bool", "default": False},
-        {"section": "Stima angolare", "path": "offline_sar_range_angle.nfft_angle", "label": "Bin angolari", "kind": "int", "default": 256, "min": 16, "step": 16},
-        {"section": "Stima angolare", "path": "offline_sar_range_angle.angle_processing.mode", "label": "Metodo", "kind": "combo", "items": OFFLINE_TUNING_ANGLE_MODES, "default": "bartlett"},
-        {"section": "Stima angolare", "path": "offline_sar_range_angle.angle_processing.mvdr_diagonal_loading", "label": "Loading MVDR", "kind": "float", "default": 0.02, "min": 0.0, "step": 0.005},
-        {"section": "Stima angolare", "path": "offline_sar_range_angle.angle_processing.aggregation", "label": "Aggregazione", "kind": "combo", "items": OFFLINE_TUNING_AGGREGATIONS, "default": "frame_loop"},
-        {"section": "Stima angolare", "path": "offline_sar_range_angle.angle_processing.frame_index", "label": "Indice frame", "kind": "int", "default": 0, "min": 0, "step": 1},
-        {"section": "Stima angolare", "path": "offline_sar_range_angle.angle_processing.loop_index", "label": "Indice loop", "kind": "int", "default": 0, "min": 0, "step": 1},
+        {"section": "Background", "path": "offline_sar_range_angle.background_subtraction.init_frames", "label": "Initial frames", "kind": "int", "default": 40, "min": 1, "step": 1},
+        {"section": "Background", "path": "offline_sar_range_angle.background_subtraction.window_frames", "label": "Frame window", "kind": "int", "default": 40, "min": 1, "step": 1},
+        {"section": "Background", "path": "offline_sar_range_angle.background_subtraction.clamp_positive_only", "label": "Keep positive values only", "kind": "bool", "default": False},
+        {"section": "Angle estimation", "path": "offline_sar_range_angle.angle_processing.mode", "label": "Method", "kind": "combo", "items": OFFLINE_TUNING_ANGLE_MODES, "default": "bartlett"},
+        {"section": "Angle estimation", "path": "offline_sar_range_angle.angle_processing.mvdr_diagonal_loading", "label": "MVDR loading", "kind": "float", "default": 0.02, "min": 0.0, "step": 0.005},
+        {"section": "Angle estimation", "path": "offline_sar_range_angle.angle_processing.aggregation", "label": "Aggregation", "kind": "combo", "items": OFFLINE_TUNING_AGGREGATIONS, "default": "frame_loop"},
+        {"section": "Angle estimation", "path": "offline_sar_range_angle.angle_processing.frame_index", "label": "Frame index", "kind": "int", "default": 0, "min": 0, "step": 1},
+        {"section": "Angle estimation", "path": "offline_sar_range_angle.angle_processing.loop_index", "label": "Loop index", "kind": "int", "default": 0, "min": 0, "step": 1},
     ]
     offline_config_path = Path(__file__).with_name("offline_config.yaml")
     offline_tuning_cfg: dict = {}
@@ -3760,6 +4046,26 @@ def main():
             or scan_pending_run["start_position_id"] is not None
         )
 
+    def _refresh_offline_memory_estimate(cfg_source: dict | None = None) -> str:
+        nonlocal offline_memory_estimate_text, off_status_text
+        source = cfg_source if isinstance(cfg_source, dict) else offline_tuning_cfg
+        offline_memory_estimate_text = _format_offline_memory_estimate(source)
+        if dpg.does_item_exist(PROC_TXT_MEMORY_ESTIMATE):
+            dpg.set_value(PROC_TXT_MEMORY_ESTIMATE, offline_memory_estimate_text)
+        if offline_runtime is None and not bool(offline_reload_state.get("running")):
+            off_status_text = (
+                "Offline data not loaded. Press LOAD / CALCULATE OFFLINE when needed.\n"
+                + offline_memory_estimate_text
+            )
+            if dpg.does_item_exist(PROC_TXT_STATUS):
+                dpg.set_value(PROC_TXT_STATUS, off_status_text)
+            if dpg.does_item_exist(TXT_OFFLINE_TUNING_INFO_TAG):
+                dpg.set_value(
+                    TXT_OFFLINE_TUNING_INFO_TAG,
+                    "Offline runtime not loaded.\n" + offline_memory_estimate_text,
+                )
+        return offline_memory_estimate_text
+
     def _read_offline_tuning_config() -> bool:
         nonlocal offline_tuning_cfg
         try:
@@ -3782,11 +4088,12 @@ def main():
                 pitch_mm = float(_offline_cfg_path_get(offline_tuning_cfg, "scan.x_pitch_m")) * 1000.0
                 _update_scan_pitch_label(pitch_mm)
             except (TypeError, ValueError):
-                _update_scan_pitch_label(error="scan.x_pitch_m non valido")
-            _set_offline_tuning_status("Configurazione offline caricata")
+                _update_scan_pitch_label(error="invalid scan.x_pitch_m")
+            _refresh_offline_memory_estimate(offline_tuning_cfg)
+            _set_offline_tuning_status("Offline configuration loaded")
             return True
         except Exception as exc:
-            _set_offline_tuning_status(f"ERRORE lettura configurazione: {exc}")
+            _set_offline_tuning_status(f"Configuration read error: {exc}")
             return False
 
     def _offline_tuning_widget_value(spec: dict):
@@ -3825,21 +4132,21 @@ def main():
             _offline_cfg_path_set(base, spec["path"], _offline_tuning_widget_value(spec))
 
         if not str(_offline_cfg_path_get(base, "data.input_dir", "")).strip():
-            raise ValueError("Cartella input obbligatoria")
+            raise ValueError("Input folder is required")
         if int(_offline_cfg_path_get(base, "scan.x_end")) < int(_offline_cfg_path_get(base, "scan.x_start")):
-            raise ValueError("La posizione finale deve essere >= della posizione iniziale")
+            raise ValueError("End position must be greater than or equal to start position")
         if float(_offline_cfg_path_get(base, "scan.x_pitch_m")) <= 0.0:
             raise ValueError("Il pitch X deve essere > 0")
         algorithm = _offline_cfg_path_get(base, "reconstruction.algorithm")
         bp_mode = _offline_cfg_path_get(base, "bp.mode")
         if algorithm == "synthetic_range_angle" and bp_mode != "mimo_sar":
-            raise ValueError("synthetic_range_angle richiede la modalita BP mimo_sar")
+            raise ValueError("synthetic_range_angle requires mimo_sar BP mode")
         return base
 
     def _save_offline_tuning_config(*, allow_scan_finalize: bool = False) -> dict | None:
         nonlocal offline_tuning_cfg
         if _offline_tuning_locked_by_scan() and not allow_scan_finalize:
-            _set_offline_tuning_status("Configurazione bloccata durante la scansione/finalizzazione SAR")
+            _set_offline_tuning_status("Configuration is locked during SAR scan/finalization")
             return None
         try:
             saved_cfg = _collect_offline_tuning_config()
@@ -3855,14 +4162,15 @@ def main():
                 inline_comments={"scan.x_pitch_m": f"{pitch_comment_value} mm pitch"},
             )
             offline_tuning_cfg = saved_cfg
+            _refresh_offline_memory_estimate(saved_cfg)
             try:
                 _update_scan_pitch_label(pitch_mm)
             except (TypeError, ValueError):
-                _update_scan_pitch_label(error="scan.x_pitch_m non valido")
-            _set_offline_tuning_status("Configurazione salvata in offline_config.yaml")
+                _update_scan_pitch_label(error="invalid scan.x_pitch_m")
+            _set_offline_tuning_status("Configuration saved to offline_config.yaml")
             return saved_cfg
         except Exception as exc:
-            _set_offline_tuning_status(f"ERRORE configurazione: {exc}")
+            _set_offline_tuning_status(f"Configuration error: {exc}")
             return None
 
     def _on_save_offline_tuning(sender=None, app_data=None):
@@ -3870,7 +4178,7 @@ def main():
 
     def _on_reload_offline_tuning(sender=None, app_data=None):
         if _offline_tuning_locked_by_scan():
-            _set_offline_tuning_status("Ricarica bloccata durante la scansione/finalizzazione SAR")
+            _set_offline_tuning_status("Reload is locked during SAR scan/finalization")
             return False
         _read_offline_tuning_config()
 
@@ -3881,13 +4189,13 @@ def main():
         save_config: bool = True,
         allow_scan_finalize: bool = False,
     ) -> bool:
-        nonlocal offline_runtime
+        nonlocal offline_runtime, off_status_text
         if _offline_tuning_locked_by_scan() and not allow_scan_finalize:
-            _set_offline_tuning_status("Ricalcolo bloccato durante la scansione/finalizzazione SAR")
+            _set_offline_tuning_status("Recalculation is locked during SAR scan/finalization")
             return False
         with offline_reload_lock:
             if bool(offline_reload_state["running"]):
-                _set_offline_tuning_status("Ricalcolo offline gia in corso")
+                _set_offline_tuning_status("Offline recalculation already in progress")
                 return False
         if save_config and _save_offline_tuning_config(allow_scan_finalize=allow_scan_finalize) is None:
             return False
@@ -3900,7 +4208,16 @@ def main():
         shutdown_resources["offline_runtime"] = old_runtime
         with offline_reload_lock:
             offline_reload_state.update({"running": True, "runtime": None, "info": None, "error": ""})
-        _set_offline_tuning_status("Ricarico dati e ricalcolo offline...")
+        _set_offline_tuning_status("Reloading data and recalculating offline...")
+        estimate_text = _refresh_offline_memory_estimate(offline_tuning_cfg)
+        off_status_text = "Offline load/calculation in progress...\n" + estimate_text
+        if dpg.does_item_exist(PROC_TXT_STATUS):
+            dpg.set_value(PROC_TXT_STATUS, off_status_text)
+        if dpg.does_item_exist(PROC_BTN_LOAD_OFFLINE):
+            dpg.configure_item(PROC_BTN_LOAD_OFFLINE, label="LOADING OFFLINE...", enabled=False)
+        for tag in (PROC_IN_XSTART, PROC_IN_XEND):
+            if dpg.does_item_exist(tag):
+                dpg.configure_item(tag, enabled=False)
 
         def _reload_worker():
             new_runtime = None
@@ -3912,7 +4229,10 @@ def main():
                         offline_reload_state.update({"running": False, "runtime": None, "info": None, "error": ""})
                     return
                 new_runtime = _create_offline_runtime()
-                info = new_runtime.start(timeout_s=45.0)
+                # Register immediately so application shutdown can stop a
+                # runtime that is still reading/transforming offline data.
+                shutdown_resources["offline_runtime"] = new_runtime
+                info = new_runtime.start(timeout_s=300.0)
                 if shutdown_state["in_progress"] or shutdown_state["done"]:
                     new_runtime.stop()
                     with offline_reload_lock:
@@ -3926,6 +4246,8 @@ def main():
                         new_runtime.stop()
                     except Exception:
                         pass
+                    if shutdown_resources.get("offline_runtime") is new_runtime:
+                        shutdown_resources["offline_runtime"] = None
                 with offline_reload_lock:
                     offline_reload_state.update({"running": False, "runtime": None, "info": None, "error": str(exc)})
 
@@ -3936,9 +4258,16 @@ def main():
             shutdown_resources["offline_runtime"] = old_runtime
             with offline_reload_lock:
                 offline_reload_state.update({"running": False, "runtime": None, "info": None, "error": ""})
-            _set_offline_tuning_status(f"ERRORE avvio ricalcolo offline: {exc}")
+            _set_offline_tuning_status(f"Offline recalculation start error: {exc}")
             return False
         return True
+
+    def _on_load_offline(sender=None, app_data=None) -> bool:
+        # The Processed Data button always uses the persisted YAML. Unsaved
+        # tuning edits remain local until Save/Save and Recalculate is chosen.
+        if not _read_offline_tuning_config():
+            return False
+        return _on_apply_offline_tuning(save_config=False)
 
     def _add_offline_tuning_widget(spec: dict, width: int = 300) -> None:
         tag = _offline_tune_tag(spec["path"])
@@ -4136,7 +4465,7 @@ def main():
         try:
             dsp_cmd_q.put_nowait({"type": "update_runtime_config", "cfg_patch": patch, "reset_runtime_state": True})
             if dpg.does_item_exist(TXT_TUNING_STATUS_TAG):
-                dpg.set_value(TXT_TUNING_STATUS_TAG, "Runtime update + soft reset DSP inviati")
+                dpg.set_value(TXT_TUNING_STATUS_TAG, "Runtime update and DSP soft reset sent")
         except Exception as e:
             if dpg.does_item_exist(TXT_TUNING_STATUS_TAG):
                 dpg.set_value(TXT_TUNING_STATUS_TAG, f"ERR tuning: {e}")
@@ -4207,9 +4536,9 @@ def main():
 
     # 6) Build UI (ONLY TABLE LAYOUT)
     with dpg.window(tag=TAG_MAIN_WINDOW):
-        with dpg.tab_bar(tag=TAG_MAIN_TABBAR):
-            dpg.add_tab(label="Tempo Reale", tag=TAB_REALTIME_TAG)
-            dpg.add_tab(label="Dati Processati", tag=TAB_PROCESSED_TAG)
+        with dpg.tab_bar(tag=TAG_MAIN_TABBAR, callback=_on_main_tab_changed):
+            dpg.add_tab(label="Real Time", tag=TAB_REALTIME_TAG)
+            dpg.add_tab(label="Processed Data", tag=TAB_PROCESSED_TAG)
             dpg.add_tab(label="Tuning DSP", tag=TAB_TUNING_TAG)
             dpg.add_tab(label="Tuning Offline", tag=TAB_OFFLINE_TUNING_TAG)
 
@@ -4275,71 +4604,86 @@ def main():
                         dpg.add_text("mmWave Studio bridge idle", tag=TXT_MMWAVE_STATUS_TAG, wrap=-1)
                         dpg.add_text("", tag=TXT_MMWAVE_LINKS_TAG, wrap=-1)
                         dpg.add_spacer(height=14)
-                        dpg.add_text("SAR CONTROL", color=(255, 200, 0))
+                        dpg.add_text("SAR ACQUISITION", color=(255, 200, 0))
                         dpg.add_separator()
-                        dpg.add_button(label="CAPTURE FRAME", tag=BTN_CAPTURE_TAG, callback=_on_capture, width=-1, height=40)
-                        dpg.add_text("Pos Counter: 0", tag=TXT_POS_TAG)
-                        dpg.add_text(f"Run corrente: {out_dir.name}", tag=TXT_RUN_DIR_TAG, wrap=-1)
+                        dpg.add_text(f"Current run: {out_dir.name}", tag=TXT_RUN_DIR_TAG, wrap=CTRL_W, color=(120, 210, 255))
+                        dpg.add_text("Ready for a manual capture in the current run.", tag=TXT_CAPTURE_STATUS_TAG, wrap=CTRL_W)
+                        dpg.add_text("Next ID: 1", tag=TXT_POS_TAG, color=(190, 190, 190))
                         dpg.add_button(
-                            label="NUOVA SESSIONE / CARTELLA",
+                            label="CAPTURE POSITION",
+                            tag=BTN_CAPTURE_TAG,
+                            callback=_on_capture,
+                            width=CTRL_W,
+                            height=38,
+                        )
+                        dpg.add_button(
+                            label="NEW SESSION",
                             tag=BTN_NEW_SESSION_TAG,
                             callback=_on_new_sar_session,
-                            width=-1,
-                            height=30,
+                            width=CTRL_W,
+                            height=32,
                         )
-                        dpg.add_text("", tag=TXT_LOG_TAG, wrap=-1)
+                        dpg.add_text(
+                            f"Each position saves {int(FRAMES_PER_POSITION)} radar frames.",
+                            color=(170, 170, 170),
+                            wrap=CTRL_W,
+                        )
                         dpg.add_spacer(height=12)
-                        dpg.add_text("CARRELLO / SCANSIONE SAR", color=(255, 200, 0))
+                        dpg.add_text("CARRIAGE AND SCAN", color=(255, 200, 0))
                         dpg.add_separator()
+                        dpg.add_text("1. Carriage positioning", color=(210, 210, 210))
                         if stepper_controller is None:
                             dpg.add_text(
-                                f"Phidget non disponibile: {stepper_error or 'backend non caricato'}",
+                                f"Phidget unavailable: {stepper_error or 'backend not loaded'}",
                                 tag=TXT_MOTOR_STATUS_TAG,
-                                wrap=-1,
+                                wrap=CTRL_W,
                                 color=(255, 150, 120),
                             )
                         else:
-                            dpg.add_text("Carrello: disconnesso", tag=TXT_MOTOR_STATUS_TAG, wrap=-1)
-                        dpg.add_text("Posizione: --", tag=TXT_MOTOR_POSITION_TAG, color=(100, 220, 255))
-                        with dpg.group(horizontal=True):
-                            dpg.add_button(label="Connetti", callback=_on_motor_connect, width=105)
-                            dpg.add_button(label="HOME", callback=_on_motor_home, width=105)
+                            dpg.add_text("Carriage: disconnected", tag=TXT_MOTOR_STATUS_TAG, wrap=CTRL_W)
+                        dpg.add_text("Position: --", tag=TXT_MOTOR_POSITION_TAG, color=(100, 220, 255))
+                        dpg.add_button(label="CONNECT", callback=_on_motor_connect, width=CTRL_W)
+                        dpg.add_button(label="DISCONNECT", callback=_on_motor_disconnect, width=CTRL_W)
+                        dpg.add_button(label="HOME", callback=_on_motor_home, width=CTRL_W)
+                        dpg.add_text("Manual step [mm]", color=(210, 210, 210))
                         dpg.add_input_float(
-                            label="Jog [mm]",
+                            label="",
                             tag=IN_MOTOR_JOG_TAG,
                             default_value=float(stepper_controller.config.cycle.step_mm) if stepper_controller is not None else 1.0,
                             min_value=0.001,
                             min_clamped=True,
-                            width=150,
+                            width=CTRL_W,
                         )
-                        with dpg.group(horizontal=True):
-                            dpg.add_button(label="JOG -", callback=lambda: _on_motor_jog(-1), width=105)
-                            dpg.add_button(label="JOG +", callback=lambda: _on_motor_jog(+1), width=105)
-                        dpg.add_button(label="STOP CARRELLO / ANNULLA", callback=_on_motor_stop, width=-1, height=30)
+                        dpg.add_button(label="MOVE -", callback=lambda: _on_motor_jog(-1), width=CTRL_W)
+                        dpg.add_button(label="MOVE +", callback=lambda: _on_motor_jog(+1), width=CTRL_W)
+                        dpg.add_button(label="STOP / CANCEL", callback=_on_motor_stop, width=CTRL_W, height=30)
                         dpg.add_text(
-                            "Parametri motore: phidget_stepper_config.yaml. HOME e posizione iniziale devono essere impostati qui.",
-                            wrap=-1,
+                            "Before scanning, run HOME and move the carriage to the start position.",
+                            wrap=CTRL_W,
                             color=(190, 190, 190),
                         )
                         dpg.add_separator()
+                        dpg.add_text("2. Automatic scan", color=(210, 210, 210))
                         pitch_label = (
                             f"Pitch da offline_config: {scan_pitch_mm_default:.6f} mm"
                             if np.isfinite(scan_pitch_mm_default)
-                            else f"Errore offline_config: {scan_config_error}"
+                            else f"offline_config error: {scan_config_error}"
                         )
-                        dpg.add_text(pitch_label, tag=TXT_SCAN_PITCH_TAG, wrap=-1)
+                        dpg.add_text(pitch_label, tag=TXT_SCAN_PITCH_TAG, wrap=CTRL_W)
+                        dpg.add_text("Number of positions", color=(210, 210, 210))
                         dpg.add_input_int(
-                            label="Numero posizioni SAR",
+                            label="",
                             tag=IN_SCAN_POSITIONS_TAG,
                             default_value=int(scan_positions_default),
                             min_value=1,
                             min_clamped=True,
-                            width=150,
+                            width=CTRL_W,
                         )
-                        dpg.add_button(label="AVVIA SCANSIONE SAR", tag=BTN_SCAN_START_TAG, callback=_on_start_sar_scan, width=-1, height=38)
-                        dpg.add_button(label="ANNULLA SCANSIONE SAR", tag=BTN_SCAN_CANCEL_TAG, callback=_on_cancel_sar_scan, width=-1, height=30)
-                        dpg.add_text("Pronto", tag=TXT_SCAN_STATUS_TAG, wrap=-1)
-                        dpg.add_text("", tag=TXT_MOTOR_LOG_TAG, wrap=-1)
+                        dpg.add_button(label="START SCAN", tag=BTN_SCAN_START_TAG, callback=_on_start_sar_scan, width=CTRL_W, height=38)
+                        dpg.add_button(label="CANCEL SCAN", tag=BTN_SCAN_CANCEL_TAG, callback=_on_cancel_sar_scan, width=CTRL_W, height=30)
+                        dpg.add_text("Scan status: ready", tag=TXT_SCAN_STATUS_TAG, wrap=CTRL_W, color=(190, 220, 190))
+                        with dpg.collapsing_header(label="Carriage diagnostics", default_open=False):
+                            dpg.add_text("No motor events.", tag=TXT_MOTOR_LOG_TAG, wrap=CTRL_W, color=(175, 175, 175))
                         _refresh_mmwave_controls()
 
                         if DEBUG_STATS:
@@ -4347,7 +4691,7 @@ def main():
                             dpg.add_text("SYSTEM STATS", color=(255, 200, 0))
                             dpg.add_separator()
                             dpg.add_button(
-                                label="Esegui Calibrazione Boresight",
+                                label="Run Boresight Calibration",
                                 callback=_on_calibrate_boresight,
                                 width=-1,
                                 height=32,
@@ -4728,6 +5072,22 @@ def main():
             with dpg.table_row():
                 with dpg.table_cell():
                     with dpg.child_window(width=-1, height=-1, border=True):
+                        dpg.add_text("OFFLINE PROCESSING", color=(255, 200, 0))
+                        dpg.add_separator()
+                        dpg.add_button(
+                            label="LOAD / CALCULATE OFFLINE",
+                            tag=PROC_BTN_LOAD_OFFLINE,
+                            callback=_on_load_offline,
+                            width=-1,
+                            height=38,
+                        )
+                        dpg.add_text(
+                            offline_memory_estimate_text,
+                            tag=PROC_TXT_MEMORY_ESTIMATE,
+                            wrap=300,
+                            color=(255, 190, 120),
+                        )
+                        dpg.add_spacer(height=12)
                         dpg.add_text("DISPLAY PARAMETERS", color=(255, 200, 0))
                         dpg.add_separator()
                         dpg.add_spacer(width=20)
@@ -4784,6 +5144,58 @@ def main():
                             height=32,
                         )
                         dpg.add_spacer(height=14)
+                        dpg.add_text("DISPLAY ZOOM (NO RECALC)", color=(255, 200, 0))
+                        dpg.add_separator()
+                        dpg.add_input_float(
+                            label="X min (m)",
+                            tag=PROC_IN_ZOOM_XMIN,
+                            default_value=float(off_home_viewport_current.x_min_m),
+                            step=0.25,
+                            width=220,
+                            on_enter=False,
+                        )
+                        dpg.add_input_float(
+                            label="X max (m)",
+                            tag=PROC_IN_ZOOM_XMAX,
+                            default_value=float(off_home_viewport_current.x_max_m),
+                            step=0.25,
+                            width=220,
+                            on_enter=False,
+                        )
+                        dpg.add_input_float(
+                            label="Y min (m)",
+                            tag=PROC_IN_ZOOM_YMIN,
+                            default_value=float(off_home_viewport_current.y_min_m),
+                            step=0.5,
+                            width=220,
+                            on_enter=False,
+                        )
+                        dpg.add_input_float(
+                            label="Y max (m)",
+                            tag=PROC_IN_ZOOM_YMAX,
+                            default_value=float(off_home_viewport_current.y_max_m),
+                            step=0.5,
+                            width=220,
+                            on_enter=False,
+                        )
+                        with dpg.group(horizontal=True):
+                            dpg.add_button(
+                                label="Apply zoom",
+                                callback=_apply_offline_display_zoom,
+                                width=140,
+                            )
+                            dpg.add_button(
+                                label="Full map",
+                                callback=_reset_offline_display_zoom,
+                                width=140,
+                            )
+                        dpg.add_text(
+                            "Full reconstructed map.",
+                            tag=PROC_TXT_ZOOM_STATUS,
+                            wrap=300,
+                            color=(180, 210, 255),
+                        )
+                        dpg.add_spacer(height=14)
                         dpg.add_text("OFFLINE BP CONTROL", color=(255, 200, 0))
                         dpg.add_separator()
                         dpg.add_input_int(
@@ -4806,16 +5218,13 @@ def main():
                             callback=_apply_offline_params,
                             on_enter=False,
                         )
-                        dpg.add_combo(
-                            off_motion_modes,
-                            label="Motion mode",
-                            tag=PROC_MOTION_MODE,
-                            default_value=str(off_motion_mode),
-                            width=220,
-                            callback=_apply_offline_params,
+                        dpg.add_text(
+                            "Motion mode: static_zero_doppler (fixed)",
+                            wrap=300,
+                            color=(190, 190, 190),
                         )
                         dpg.add_separator()
-                        dpg.add_text(off_status_text, tag=PROC_TXT_STATUS, wrap=-1)
+                        dpg.add_text(off_status_text, tag=PROC_TXT_STATUS, wrap=300)
 
                 with dpg.table_cell():
                     with dpg.plot(tag=PROC_HEAT_PLOT_TAG, width=-1, height=-1, equal_aspects=True):
@@ -4846,7 +5255,7 @@ def main():
         with dpg.child_window(parent=TAB_TUNING_TAG, width=-1, height=-1, border=True):
             dpg.add_text("RUNTIME TUNING", color=(255, 200, 0))
             dpg.add_separator()
-            dpg.add_text("Pronto", tag=TXT_TUNING_STATUS_TAG, wrap=-1)
+            dpg.add_text("Ready", tag=TXT_TUNING_STATUS_TAG, wrap=-1)
             dpg.add_spacer(height=6)
             with dpg.tab_bar(tag="tuning_subtabbar"):
                 with dpg.tab(label="DSP"):
@@ -4868,33 +5277,49 @@ def main():
         with dpg.child_window(parent=TAB_OFFLINE_TUNING_TAG, width=-1, height=-1, border=True):
             dpg.add_text("TUNING OFFLINE", color=(255, 200, 0))
             dpg.add_text(
-                "Le modifiche restano locali finche non scegli 'Salva' o 'Salva e ricalcola offline'.",
+                "Changes remain local until you choose 'Save' or 'Save and Recalculate Offline'.",
                 wrap=-1,
             )
             dpg.add_separator()
             with dpg.group(horizontal=True):
-                dpg.add_button(label="Ricarica da file", callback=_on_reload_offline_tuning, width=160)
-                dpg.add_button(label="Salva configurazione", callback=_on_save_offline_tuning, width=180)
-                dpg.add_button(label="Salva e ricalcola offline", callback=_on_apply_offline_tuning, width=230)
-            dpg.add_text("Pronto", tag=TXT_OFFLINE_TUNING_STATUS_TAG, wrap=-1)
-            dpg.add_text("", tag=TXT_OFFLINE_TUNING_INFO_TAG, wrap=-1, color=(180, 210, 255))
+                dpg.add_button(label="Reload from File", callback=_on_reload_offline_tuning, width=160)
+                dpg.add_button(label="Save Configuration", callback=_on_save_offline_tuning, width=180)
+                dpg.add_button(label="Save and Recalculate Offline", callback=_on_apply_offline_tuning, width=230)
+            dpg.add_text("Ready", tag=TXT_OFFLINE_TUNING_STATUS_TAG, wrap=-1)
+            dpg.add_text(
+                "Offline runtime not loaded.\n" + offline_memory_estimate_text,
+                tag=TXT_OFFLINE_TUNING_INFO_TAG,
+                wrap=-1,
+                color=(180, 210, 255),
+            )
             dpg.add_spacer(height=4)
             with dpg.tab_bar(tag="offline_tuning_subtabbar"):
-                with dpg.tab(label="Dati"):
+                with dpg.tab(label="Data"):
                     with dpg.child_window(width=-1, height=-1, border=False):
-                        _add_offline_tuning_section("Dati e scansione")
-                with dpg.tab(label="Ricostruzione"):
+                        _add_offline_tuning_section("Data and scan")
+                with dpg.tab(label="Reconstruction"):
                     with dpg.child_window(width=-1, height=-1, border=False):
-                        _add_offline_tuning_section("Ricostruzione")
-                with dpg.tab(label="Filtri"):
+                        _add_offline_tuning_section("Reconstruction")
+                with dpg.tab(label="FFT"):
                     with dpg.child_window(width=-1, height=-1, border=False):
-                        _add_offline_tuning_section("Filtri range-angle")
+                        dpg.add_text(
+                            "Below input: truncate data. Equal: no padding. Above input: zero-padding. "
+                            "Angle FFT is not used by backprojection; with Bartlett/MVDR it is the output grid size.",
+                            wrap=-1,
+                        )
+                        _add_offline_tuning_section("FFT sizing")
+                with dpg.tab(label="Filters"):
+                    with dpg.child_window(width=-1, height=-1, border=False):
+                        dpg.add_text("Windows are used by both offline algorithms; the aperture window tapers SAR positions × antennas in backprojection.", wrap=-1)
+                        _add_offline_tuning_section("Shared windows")
+                        dpg.add_separator()
+                        _add_offline_tuning_section("Range-angle filters")
                 with dpg.tab(label="Background"):
                     with dpg.child_window(width=-1, height=-1, border=False):
                         _add_offline_tuning_section("Background")
-                with dpg.tab(label="Angolo"):
+                with dpg.tab(label="Angle"):
                     with dpg.child_window(width=-1, height=-1, border=False):
-                        _add_offline_tuning_section("Stima angolare")
+                        _add_offline_tuning_section("Angle estimation")
 
     _update_heatmap_scale_input_labels(vis_heatmap_mode)
     _apply_heatmap_mode_controls(vis_heatmap_mode)
@@ -4914,7 +5339,7 @@ def main():
         )
 
     if offline_runtime is None:
-        for tag in (PROC_IN_XSTART, PROC_IN_XEND, PROC_MOTION_MODE):
+        for tag in (PROC_IN_XSTART, PROC_IN_XEND):
             if dpg.does_item_exist(tag):
                 dpg.configure_item(tag, enabled=False)
     else:
@@ -4969,6 +5394,29 @@ def main():
     proc_rgba_frame = np.empty((proc_tex_h, proc_tex_w, 4), dtype=np.float32)
     proc_view_frame = np.empty((proc_tex_h, proc_tex_w), dtype=np.float32)
     lut_last = float(jet_lut.shape[0] - 1)
+
+    def _refresh_offline_texture_from_cached_matrix() -> None:
+        """Reapply normalization/levels/LUT without invoking offline DSP."""
+        if off_norm_enabled and proc_frame.size > 0:
+            finite_values = proc_frame[np.isfinite(proc_frame)]
+            peak_db = float(np.max(finite_values)) if finite_values.size > 0 else 0.0
+            np.subtract(proc_frame, peak_db, out=proc_view_frame)
+        else:
+            proc_view_frame[:, :] = proc_frame
+
+        denom = max(float(off_vmax - off_vmin), 1e-6)
+        np.subtract(proc_view_frame, float(off_vmin), out=proc_norm_frame)
+        np.multiply(proc_norm_frame, float(1.0 / denom), out=proc_norm_frame)
+        np.clip(proc_norm_frame, 0.0, 1.0, out=proc_norm_frame)
+        np.nan_to_num(proc_norm_frame, copy=False, nan=0.0, posinf=1.0, neginf=0.0)
+        np.multiply(proc_norm_frame, lut_last, out=proc_norm_frame)
+        np.rint(proc_norm_frame, out=proc_norm_frame)
+        proc_lut_idx[:, :] = proc_norm_frame
+        np.take(jet_lut, proc_lut_idx[::-1, :], axis=0, out=proc_rgba_frame)
+        proc_tex_np[:] = proc_rgba_frame.reshape(-1)
+        if dpg.does_item_exist(PROC_TEX_TAG):
+            dpg.set_value(PROC_TEX_TAG, proc_tex_buf)
+
     fft_plot_period_s = 0.05
     fft_plot_last_t = 0.0
     last_scan_terminal_state = ""
@@ -4979,6 +5427,8 @@ def main():
     try:
         while dpg.is_dearpygui_running():
             now = time.perf_counter()
+            refresh_offline_display = bool(off_texture_upload_requested)
+            off_texture_upload_requested = False
 
             _drain_motor_events()
             scan_state_now = _refresh_sar_scan_ui()
@@ -4990,12 +5440,12 @@ def main():
                 if reload_already_running:
                     # Non consumare lo stato terminale: appena il ricalcolo
                     # precedente termina, questo ramo viene ritentato.
-                    _set_scan_status("Scansione completata: attendo il ricalcolo offline precedente...")
+                    _set_scan_status("Scan completed: waiting for the previous offline recalculation...")
                 else:
                     start_id = scan_pending_run["start_position_id"]
                     positions = scan_pending_run["positions"]
                     if start_id is None or positions is None:
-                        _set_scan_status("Scansione SAR completata.")
+                        _set_scan_status("SAR scan completed.")
                         last_scan_terminal_state = "completed"
                     else:
                         try:
@@ -5017,13 +5467,13 @@ def main():
                             )
                             if reload_started:
                                 scan_pending_run.update({"start_position_id": None, "positions": None})
-                                _set_scan_status("Scansione completata: ricarica offline avviata.")
+                                _set_scan_status("Scan completed: offline reload started.")
                                 last_scan_terminal_state = "completed"
                         except Exception as exc:
                             # I file restano validi; sblocca il tuning manuale
                             # e comunica chiaramente il solo errore offline.
                             scan_pending_run.update({"start_position_id": None, "positions": None})
-                            _set_scan_status(f"Scansione completata; ricarica offline non avviata: {exc}")
+                            _set_scan_status(f"Scan completed; offline reload did not start: {exc}")
                             last_scan_terminal_state = "completed"
             elif scan_state_now in {"cancelled", "failed"}:
                 # Non puntare l'offline a un insieme di file parziale.
@@ -5066,24 +5516,72 @@ def main():
                 off_ui_dirty_t = now - 1.0
                 if dpg.does_item_exist(PROC_IN_XSTART):
                     dpg.set_value(PROC_IN_XSTART, int(off_x_start))
+                    dpg.configure_item(PROC_IN_XSTART, enabled=True)
                 if dpg.does_item_exist(PROC_IN_XEND):
                     dpg.set_value(PROC_IN_XEND, int(off_x_end))
-                _set_offline_tuning_status("Ricalcolo offline completato")
+                    dpg.configure_item(PROC_IN_XEND, enabled=True)
+                if dpg.does_item_exist(PROC_BTN_LOAD_OFFLINE):
+                    dpg.configure_item(
+                        PROC_BTN_LOAD_OFFLINE,
+                        label="RELOAD / RECALCULATE OFFLINE",
+                        enabled=True,
+                    )
+                _set_offline_tuning_status("Offline recalculation completed")
             elif reload_error:
-                _set_offline_tuning_status(f"ERRORE ricalcolo offline: {reload_error}")
+                offline_runtime = None
+                shutdown_resources["offline_runtime"] = None
+                for tag in (PROC_IN_XSTART, PROC_IN_XEND):
+                    if dpg.does_item_exist(tag):
+                        dpg.configure_item(tag, enabled=False)
+                if dpg.does_item_exist(PROC_BTN_LOAD_OFFLINE):
+                    dpg.configure_item(
+                        PROC_BTN_LOAD_OFFLINE,
+                        label="RETRY LOAD / CALCULATE OFFLINE",
+                        enabled=True,
+                    )
+                off_status_text = f"Offline load/calculation error:\n{reload_error}\n{offline_memory_estimate_text}"
+                if dpg.does_item_exist(PROC_TXT_STATUS):
+                    dpg.set_value(PROC_TXT_STATUS, off_status_text)
+                _set_offline_tuning_status(f"Offline recalculation error: {reload_error}")
 
             if dpg.does_item_exist(TXT_OFFLINE_TUNING_INFO_TAG):
                 if bool(offline_reload_state.get("running")):
-                    dpg.set_value(TXT_OFFLINE_TUNING_INFO_TAG, "Runtime offline: ricarica dati in corso")
+                    if dpg.does_item_exist(PROC_BTN_LOAD_OFFLINE):
+                        dpg.configure_item(PROC_BTN_LOAD_OFFLINE, label="LOADING OFFLINE...", enabled=False)
+                    loading_runtime = shutdown_resources.get("offline_runtime")
+                    try:
+                        loading_info = loading_runtime.last_info if loading_runtime is not None else {}
+                    except RuntimeError:
+                        loading_info = {}
+                    loading_phase = str(loading_info.get("phase", "starting offline workers"))
+                    loading_text = f"Offline load/calculation in progress: {loading_phase}\n{offline_memory_estimate_text}"
+                    if dpg.does_item_exist(PROC_TXT_STATUS):
+                        dpg.set_value(PROC_TXT_STATUS, loading_text)
+                    dpg.set_value(
+                        TXT_OFFLINE_TUNING_INFO_TAG,
+                        loading_text,
+                    )
                 elif offline_runtime is not None:
                     info_now = offline_runtime.last_info
                     filters_now = info_now.get("range_angle_enabled_filters", ())
-                    filters_text = ", ".join(str(v) for v in filters_now) or "nessuno"
+                    filters_text = ", ".join(str(v) for v in filters_now) or "none"
+                    range_input = info_now.get("range_input_samples", "n/a")
+                    range_used = info_now.get("range_samples_used", "n/a")
+                    range_nfft = info_now.get("nfft_range", "n/a")
+                    if str(info_now.get("algorithm", "")) == "backprojection":
+                        angle_fft_text = "Angle FFT: n/a for backprojection"
+                    else:
+                        angle_fft_text = (
+                            f"Angle: input {info_now.get('angle_input_elements', 'n/a')} -> "
+                            f"used {info_now.get('angle_elements_used', 'n/a')} -> "
+                            f"FFT/grid {info_now.get('nfft_angle_effective', info_now.get('range_angle_nfft_angle', 'n/a'))}"
+                        )
                     dpg.set_value(
                         TXT_OFFLINE_TUNING_INFO_TAG,
-                        f"Algoritmo: {info_now.get('algorithm', 'n/a')} | BP: {info_now.get('bp_mode', 'n/a')} | "
-                        f"Angolo: {info_now.get('angle_mode', info_now.get('range_angle_angle_mode_requested', 'n/a'))} | "
-                        f"Filtri: {filters_text}",
+                        f"Algorithm: {info_now.get('algorithm', 'n/a')} | BP: {info_now.get('bp_mode', 'n/a')} | "
+                        f"Angle: {info_now.get('angle_mode', info_now.get('range_angle_angle_mode_requested', 'n/a'))} | "
+                        f"Filters: {filters_text}\n"
+                        f"Range: input {range_input} -> used {range_used} -> FFT {range_nfft} | {angle_fft_text}",
                     )
 
 
@@ -5228,6 +5726,10 @@ def main():
                 off_xmax = max(0.0, min(float(off_ui_pending["xmax"]), XMAX_HARD_MAX))
                 off_norm_enabled = bool(off_ui_pending.get("norm_enabled", True))
                 reset_offline_view = bool(off_ui_pending.get("reset_view", False))
+                reconstruct_offline = bool(off_ui_pending.get("reconstruct", False))
+                display_refresh_requested = bool(off_ui_pending.get("display_refresh", False))
+                off_ui_pending["reconstruct"] = False
+                off_ui_pending["display_refresh"] = False
                 if off_vmax <= off_vmin:
                     off_vmax = off_vmin + 1.0
                     if dpg.does_item_exist(PROC_IN_VMAX):
@@ -5238,20 +5740,15 @@ def main():
                 off_ui_pending["rmax"] = float(off_rmax)
                 off_ui_pending["xmax"] = float(off_xmax)
                 off_ui_pending["norm_enabled"] = bool(off_norm_enabled)
-                off_home_viewport_current = build_display_viewport(
-                    x_min_m=-float(off_xmax),
-                    x_max_m=float(off_xmax),
-                    y_min_m=0.0,
-                    y_max_m=float(off_rmax),
-                    dr_m=float(dr_plot),
-                    seq=int(off_requested_viewport_current.seq),
-                )
                 if reset_offline_view:
-                    off_requested_viewport_current = off_home_viewport_current
-                    off_applied_meta_current = applied_viewport_meta_from_viewport(
-                        off_requested_viewport_current,
-                        fallback_used=bool(off_applied_meta_current.fallback_used),
-                        frame_seq=int(off_applied_meta_current.frame_seq),
+                    off_requested_viewport_current = build_display_viewport(
+                        x_min_m=-float(off_xmax),
+                        x_max_m=float(off_xmax),
+                        y_min_m=0.0,
+                        y_max_m=float(off_rmax),
+                        dr_m=float(dr_plot),
+                        seq=int(off_requested_viewport_current.seq) + 1,
+                        home_viewport=off_home_viewport_current,
                     )
 
                 if dpg.does_item_exist(PROC_IN_RMAX):
@@ -5263,7 +5760,14 @@ def main():
                 if reset_offline_view and dpg.does_item_exist(PROC_XAXIS_TAG) and dpg.does_item_exist(PROC_YAXIS_TAG):
                     dpg.set_axis_limits(PROC_XAXIS_TAG, -float(off_xmax), +float(off_xmax))
                     dpg.set_axis_limits(PROC_YAXIS_TAG, 0.0, float(off_rmax))
-                    _configure_image_bounds(PROC_IMG_SERIES_TAG, off_applied_meta_current)
+                    _write_offline_zoom_inputs(off_requested_viewport_current)
+                    if dpg.does_item_exist(PROC_TXT_ZOOM_STATUS):
+                        dpg.set_value(
+                            PROC_TXT_ZOOM_STATUS,
+                            f"ROI: X [{-float(off_xmax):.3f}, {float(off_xmax):.3f}] m | "
+                            f"Y [0.000, {float(off_rmax):.3f}] m\n"
+                            "Display only: reconstruction unchanged.",
+                        )
                 off_ui_pending["reset_view"] = False
                 if dpg.does_item_exist(PROC_CMAP_SCALE_TAG):
                     dpg.configure_item(
@@ -5273,39 +5777,27 @@ def main():
                         format=PROC_CMAP_NUM_FMT,
                     )
 
-                if offline_runtime is not None:
+                refresh_offline_display = bool(display_refresh_requested and not reconstruct_offline)
+
+                if offline_runtime is not None and reconstruct_offline:
                     try:
                         offline_runtime.update_params(
                             x_start=int(off_ui_pending["x_start"]),
                             x_end=int(off_ui_pending["x_end"]),
                             motion_mode=str(off_ui_pending["motion_mode"]),
-                            viewport=off_requested_viewport_current,
+                            # Reconstruction always keeps the full configured map.
+                            # Exact ROI zoom is performed by clipping the existing
+                            # image in the plot, without another backprojection.
+                            viewport=off_home_viewport_current,
                         )
                     except Exception as e:
-                        off_status_text = f"ERR update: {e}"
+                        off_status_text = f"Offline update error:\n{e}"
                         if dpg.does_item_exist(PROC_TXT_STATUS):
                             dpg.set_value(PROC_TXT_STATUS, off_status_text)
 
-            if offline_runtime is not None:
-                polled_off_viewport = _poll_requested_viewport(
-                    x_axis_tag=PROC_XAXIS_TAG,
-                    y_axis_tag=PROC_YAXIS_TAG,
-                    home_viewport=off_home_viewport_current,
-                    current_viewport=off_requested_viewport_current,
-                )
-                if display_viewport_signature(polled_off_viewport) != display_viewport_signature(off_requested_viewport_current):
-                    off_requested_viewport_current = polled_off_viewport
-                    try:
-                        offline_runtime.update_params(
-                            x_start=int(off_ui_pending["x_start"]),
-                            x_end=int(off_ui_pending["x_end"]),
-                            motion_mode=str(off_ui_pending["motion_mode"]),
-                            viewport=off_requested_viewport_current,
-                        )
-                    except Exception as e:
-                        off_status_text = f"ERR viewport: {e}"
-                        if dpg.does_item_exist(PROC_TXT_STATUS):
-                            dpg.set_value(PROC_TXT_STATUS, off_status_text)
+            # Offline plot zoom/pan is intentionally display-only.  DearPyGui
+            # clips the full reconstructed texture to the current axis limits;
+            # unlike realtime zoom, axis changes are not sent to the DSP worker.
 
             # --- OFFLINE FRAME update (double-buffer latest-wins) ---
             if offline_runtime is not None:
@@ -5313,6 +5805,7 @@ def main():
                 if off_frame is not None:
                     frame_db, info = off_frame
                     proc_frame[:, :] = frame_db
+                    refresh_offline_display = True
                     try:
                         off_applied_meta_current = AppliedViewportMeta(
                             x_min_m=float(info.get("applied_viewport_x_min_m", off_applied_meta_current.x_min_m)),
@@ -5331,38 +5824,39 @@ def main():
                         _configure_image_bounds(PROC_IMG_SERIES_TAG, off_applied_meta_current)
                     except Exception:
                         pass
+                    zoom_status = "safety fallback" if bool(info.get("fallback_used", False)) else "ok"
+                    bp_windows = tuple(str(item) for item in info.get("bp_window_stages", ()) or ())
+                    bp_windows_text = ", ".join(bp_windows) if bp_windows else "none"
+                    algorithm_text = str(info.get("algorithm", "backprojection"))
+                    if algorithm_text == "backprojection":
+                        angle_fft_status = "Angle FFT: n/a for backprojection"
+                    else:
+                        angle_fft_status = (
+                            f"Angle input/used/NFFT: {info.get('angle_input_elements', 'n/a')}/"
+                            f"{info.get('angle_elements_used', 'n/a')}/"
+                            f"{info.get('nfft_angle_effective', info.get('range_angle_nfft_angle', 'n/a'))}"
+                        )
                     off_status_text = (
-                        f"x={info.get('x_start')}:{info.get('x_end')} | "
-                        f"alg={info.get('algorithm', 'backprojection')} | "
-                        f"motion={info.get('motion_mode')} | "
-                        f"dop={info.get('doppler_bins_used', 'n/a')} | "
-                        f"geom={info.get('geometry_source', 'n/a')} | "
-                        f"pos={info.get('n_pos_used', 'n/a')} | "
-                        f"BP={float(info.get('elapsed_ms', 0.0)):.1f} ms | "
-                        f"zoom={'fallback' if bool(info.get('fallback_used', False)) else 'ok'}"
+                        "Offline processing completed\n"
+                        f"SAR positions: {info.get('x_start')} - {info.get('x_end')} "
+                        f"({info.get('n_pos_used', 'n/a')} used)\n"
+                        f"Algorithm: {algorithm_text}\n"
+                        f"Angle: {info.get('angle_mode', info.get('angle_mode_requested', 'n/a'))} | "
+                        f"Range input/used/NFFT: {info.get('range_input_samples', 'n/a')}/"
+                        f"{info.get('range_samples_used', 'n/a')}/{info.get('nfft_range', 'n/a')} | "
+                        f"{angle_fft_status}\n"
+                        f"Motion mode: {info.get('motion_mode')} | Doppler: {info.get('doppler_bins_used', 'n/a')} bins\n"
+                        f"Processing time: {float(info.get('elapsed_ms', 0.0)):.1f} ms | Zoom: {zoom_status}\n"
+                        f"Geometry: {info.get('geometry_source', 'n/a')}\n"
+                        f"BP windows: {bp_windows_text}"
                     )
                     if dpg.does_item_exist(PROC_TXT_STATUS):
                         dpg.set_value(PROC_TXT_STATUS, off_status_text)
-
-                    if off_norm_enabled and proc_frame.size > 0:
-                        np.subtract(proc_frame, float(np.max(proc_frame)), out=proc_view_frame)
-                    else:
-                        proc_view_frame[:, :] = proc_frame
-
-                    off_denom = float(off_vmax - off_vmin)
-                    if off_denom < 1e-6:
-                        off_denom = 1e-6
-                    np.subtract(proc_view_frame, float(off_vmin), out=proc_norm_frame)
-                    proc_norm_frame *= float(1.0 / off_denom)
-                    np.clip(proc_norm_frame, 0.0, 1.0, out=proc_norm_frame)
-                    np.multiply(proc_norm_frame, lut_last, out=proc_norm_frame)
-                    np.rint(proc_norm_frame, out=proc_norm_frame)
-                    proc_lut_idx[:, :] = proc_norm_frame
-                    np.take(jet_lut, proc_lut_idx[::-1, :], axis=0, out=proc_rgba_frame)
-                    proc_tex_np[:] = proc_rgba_frame.reshape(-1)
-                    dpg.set_value(PROC_TEX_TAG, proc_tex_buf)
                 elif offline_runtime.last_error and dpg.does_item_exist(PROC_TXT_STATUS):
-                    dpg.set_value(PROC_TXT_STATUS, f"ERRORE: {offline_runtime.last_error}")
+                    dpg.set_value(PROC_TXT_STATUS, f"ERROR: {offline_runtime.last_error}")
+
+            if refresh_offline_display:
+                _refresh_offline_texture_from_cached_matrix()
 
             
             # 1. STATS UPDATE (1Hz) - GESTIONE DATI STAMPATI
@@ -5445,17 +5939,6 @@ def main():
                 stats_str = _format_stats_table(stats_rows)
 
                 dpg.set_value(TXT_STATS_TAG, stats_str)
-                
-                # Update Log Info
-                dpg.set_value(
-                    TXT_LOG_TAG,
-                    "LOGGER\n"
-                    f"{'dir':<12}{out_dir.name}\n"
-                    f"{'cap':<12}{int(cap_active.value):>8d}\n"
-                    f"{'pos_id':<12}{int(cap_pos_id.value):>8d}\n"
-                    f"{'saved':<12}{int(cap_saved.value):>8d}/{int(FRAMES_PER_POSITION)}\n"
-                    f"{'sar_pos':<12}{int(sar_pos_counter.value):>8d}"
-                )
                 _refresh_mmwave_controls()
             # 2. GUI TEXTURE UPDATE (double-buffer latest-wins)
             seq_now = int(gui_latest_seq.value)

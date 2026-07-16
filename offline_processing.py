@@ -28,7 +28,6 @@ from realtime_dsp import (
     VirtualArrayGeometry,
     angle_processing_from_yaml_dict,
     apply_background_subtraction,
-    apply_slow_time_filter,
     build_display_viewport,
     build_angle_axis_deg,
     build_angle_steering_matrix,
@@ -153,6 +152,7 @@ class OfflineSyntheticRangeAngleConfig:
     zero_after_range_fft_bins: int
     post_range_fft_filters: PostRangeFftFilterConfig
     angle_processing: AngleProcessingConfig
+    nfft_range: int
     nfft_angle: int
     projection: DisplayProjectionConfig
     filter_warnings: tuple[str, ...] = ()
@@ -730,8 +730,6 @@ def _offline_sar_range_angle_filters_enabled(cfg: OfflineSyntheticRangeAngleConf
             enabled.append("zero_after_range_fft_bins")
         if cfg.post_range_fft_filters.mean_after_range_fft.enabled:
             enabled.append("mean_after_range_fft")
-        if cfg.post_range_fft_filters.slow_time.enabled and cfg.post_range_fft_filters.slow_time.mode != "none":
-            enabled.append(f"slow_time:{cfg.post_range_fft_filters.slow_time.mode}")
         if cfg.post_range_fft_filters.background_subtraction.enabled:
             enabled.append(f"background:{cfg.post_range_fft_filters.background_subtraction.mode}")
         if cfg.post_range_fft_filters.loop_average_after_background.enabled:
@@ -741,6 +739,98 @@ def _offline_sar_range_angle_filters_enabled(cfg: OfflineSyntheticRangeAngleConf
         if str(cfg.window_angle) not in {"none", "rectangular"}:
             enabled.append("window_angle")
     return tuple(enabled)
+
+
+def _offline_backprojection_windows_enabled(cfg: OfflineSyntheticRangeAngleConfig) -> tuple[str, ...]:
+    """Return the window stages shared by the offline BP pipeline.
+
+    The settings live under ``offline_sar_range_angle`` for historical
+    compatibility, but they are useful preprocessing controls for both
+    reconstruction algorithms.  Unlike mean/background filters, a window
+    does not remove static scene content and is therefore safe for the
+    zero-Doppler backprojection path.
+    """
+    if not cfg.use_realtime_filters:
+        return ()
+
+    enabled: list[str] = []
+    for stage, window_type in (
+        ("range_window", cfg.window_range),
+        ("doppler_window", cfg.window_doppler),
+        ("aperture_window", cfg.window_angle),
+    ):
+        if str(window_type).strip().lower() not in {"none", "rectangular"}:
+            enabled.append(f"{stage}:{window_type}")
+    return tuple(enabled)
+
+
+def _apply_offline_backprojection_range_window(
+    signal: np.ndarray,
+    *,
+    window_type: str,
+    enabled: bool,
+) -> np.ndarray:
+    """Apodize fast-time before the Range FFT for offline BP.
+
+    ``signal`` may be MIMO ``[pos, frame, loop, ant, sample]`` or legacy
+    SAR-only ``[pos, frame, loop, sample]``.  The last axis is always the
+    ADC fast-time axis.
+    """
+    src = np.asarray(signal, dtype=np.complex64)
+    if not enabled or src.ndim < 1:
+        return src
+
+    window = _build_window_1d(str(window_type), int(src.shape[-1]))
+    if np.allclose(window, 1.0):
+        return src
+
+    out = np.array(src, dtype=np.complex64, copy=True)
+    out *= window.reshape((1,) * (out.ndim - 1) + (int(window.size),)).astype(
+        np.complex64,
+        copy=False,
+    )
+    return out.astype(np.complex64, copy=False)
+
+
+def _select_offline_range_fft_input(signal: np.ndarray, *, nfft_range: int) -> np.ndarray:
+    """Select fast-time samples before windowing and the Range FFT.
+
+    ``nfft_range`` smaller than the capture uses the first N ADC samples;
+    a larger value keeps every captured sample and the FFT performs zero-padding.
+    """
+    src = np.asarray(signal, dtype=np.complex64)
+    if src.ndim < 1:
+        raise ValueError("signal must have a fast-time axis")
+    nfft_i = max(1, int(nfft_range))
+    samples_used = min(int(src.shape[-1]), nfft_i)
+    return src[..., :samples_used]
+
+
+def _apply_offline_backprojection_aperture_window(
+    snapshots: np.ndarray,
+    *,
+    window_type: str,
+    enabled: bool,
+) -> np.ndarray:
+    """Taper the complete position×antenna aperture before coherent BP.
+
+    ``snapshots`` has shape ``[pos, frame, ant, range_bin]``.  Flattening
+    position-major / antenna-minor matches the MIMO-SAR aperture order used
+    by the reader, so a Hamming/Hanning/Blackman window lowers spatial
+    sidelobes without changing range or phase geometry.
+    """
+    src = np.asarray(snapshots, dtype=np.complex64)
+    if not enabled or src.ndim != 4:
+        return src
+
+    n_pos, _n_frames, n_ant, _n_bins = src.shape
+    window = _build_window_1d(str(window_type), int(n_pos) * int(n_ant))
+    if np.allclose(window, 1.0):
+        return src
+
+    out = np.array(src, dtype=np.complex64, copy=True)
+    out *= window.reshape(int(n_pos), 1, int(n_ant), 1).astype(np.complex64, copy=False)
+    return out.astype(np.complex64, copy=False)
 
 
 def _to_bool(field_name: str, value: Any) -> bool:
@@ -893,12 +983,9 @@ def _read_offline_sar_range_angle_cfg(
                         fallback_dsp.get("mean_after_range_fft", {}),
                     )
                     or {},
-                    "slow_time": _pick(
-                        branch.get("slow_time"),
-                        fallback_display_filters.get("slow_time"),
-                        fallback_dsp.get("slow_time", {}),
-                    )
-                    or {},
+                    # Offline reconstruction is static-only: never inherit
+                    # realtime slow-time filters, which suppress Doppler zero.
+                    "slow_time": {"enabled": False, "mode": "none"},
                     "background_subtraction": _pick(
                         branch.get("background_subtraction"),
                         fallback_display_filters.get("background_subtraction"),
@@ -916,15 +1003,6 @@ def _read_offline_sar_range_angle_cfg(
         }
     )
     filters_cfg, filter_warnings = sanitize_display_post_range_fft_filters(filters_cfg)
-    if filters_cfg.slow_time.enabled and filters_cfg.slow_time.mode == "doppler_fft":
-        filter_warnings.append(
-            "offline_sar_range_angle.slow_time.mode=doppler_fft conflicts with the dedicated zero-Doppler "
-            "TDM-MIMO reconstruction step; forcing slow_time off."
-        )
-        filters_cfg = replace(
-            filters_cfg,
-            slow_time=replace(filters_cfg.slow_time, enabled=False, mode="none", doppler_zero_notch=False),
-        )
 
     angle_processing = angle_processing_from_yaml_dict(
         {
@@ -937,9 +1015,21 @@ def _read_offline_sar_range_angle_cfg(
             }
         }
     )
-    # Keep the global setting as a fallback, but allow offline tuning without
-    # changing the realtime angular FFT resolution.
-    nfft_angle_raw = _pick(branch.get("nfft_angle"), (fallback_cfg.get("fft", {}) or {}).get("nfft_angle"), 256)
+    # Keep the global settings as fallbacks, but allow offline tuning without
+    # changing the realtime FFT sizes.
+    fallback_fft = fallback_cfg.get("fft", {}) or {}
+    fallback_capture = fallback_cfg.get("capture", {}) or {}
+    nfft_range_raw = _pick(
+        branch.get("nfft_range"),
+        fallback_fft.get("nfft_range"),
+        fallback_capture.get("samples"),
+        256,
+    )
+    try:
+        nfft_range = max(1, int(nfft_range_raw))
+    except (TypeError, ValueError):
+        nfft_range = 256
+    nfft_angle_raw = _pick(branch.get("nfft_angle"), fallback_fft.get("nfft_angle"), 256)
     try:
         nfft_angle = max(1, int(nfft_angle_raw))
     except (TypeError, ValueError):
@@ -960,6 +1050,7 @@ def _read_offline_sar_range_angle_cfg(
         zero_after_range_fft_bins=int(zero_after_range_fft_bins),
         post_range_fft_filters=filters_cfg,
         angle_processing=angle_processing,
+        nfft_range=int(nfft_range),
         nfft_angle=int(nfft_angle),
         projection=projection,
         filter_warnings=tuple(str(w) for w in filter_warnings),
@@ -1083,10 +1174,7 @@ def _apply_offline_sar_range_angle_pre_filters(
 ) -> np.ndarray:
     if raw_mimo.ndim != 6:
         raise ValueError(f"raw_mimo shape non valido per pre-filters: {raw_mimo.shape!r}")
-    if (
-        (not filters_cfg.mean_after_range_fft.enabled or not filters_cfg.mean_after_range_fft.axes)
-        and (not filters_cfg.slow_time.enabled or filters_cfg.slow_time.mode == "none")
-    ):
+    if not filters_cfg.mean_after_range_fft.enabled or not filters_cfg.mean_after_range_fft.axes:
         return np.asarray(raw_mimo, dtype=np.complex64, copy=False)
 
     out = np.array(raw_mimo, dtype=np.complex64, copy=True)
@@ -1094,7 +1182,6 @@ def _apply_offline_sar_range_angle_pre_filters(
     for pos_i in range(n_pos):
         # Reuse the realtime helper axis convention: [frame, loop, tx, range_bin, rx].
         view = np.transpose(out[pos_i], (0, 1, 2, 4, 3)).astype(np.complex64, copy=False)
-        view = apply_slow_time_filter(view, filters_cfg.slow_time, fft_workers=int(fft_workers))
         view = subtract_selected_mean(view, filters_cfg.mean_after_range_fft)
         out[pos_i] = np.transpose(view, (0, 1, 2, 4, 3)).astype(np.complex64, copy=False)
     return out.astype(np.complex64, copy=False)
@@ -1244,8 +1331,12 @@ def _compute_synthetic_range_angle_image(
     if int(n_ant_sel) <= 0 or int(n_bins_sel) <= 0:
         return np.zeros((int(gui_h), int(gui_w)), dtype=np.float32), {
             "synthetic_antennas": 0,
+            "angle_input_elements": 0,
+            "angle_elements_used": 0,
             "angle_mode_requested": str(range_angle_cfg.angle_processing.mode),
             "angle_mode": str(range_angle_cfg.angle_processing.mode),
+            "nfft_angle_requested": int(range_angle_cfg.nfft_angle),
+            "nfft_angle_effective": int(range_angle_cfg.nfft_angle),
             "fft_uniform_geometry": False,
             "enabled_filters": _offline_sar_range_angle_filters_enabled(range_angle_cfg),
         }
@@ -1286,7 +1377,7 @@ def _compute_synthetic_range_angle_image(
         x_tx_ant_m=x_tx_ant_m,
         x_rx_ant_m=x_rx_ant_m,
     )
-    geometry, fft_uniform = _build_synthetic_virtual_array_geometry(
+    _full_geometry, fft_uniform = _build_synthetic_virtual_array_geometry(
         synthetic.x_element_m,
         wavelength_m=float(c_m_s) / float(fc_hz),
     )
@@ -1305,34 +1396,56 @@ def _compute_synthetic_range_angle_image(
         )
         if range_angle_cfg.post_range_fft_filters.loop_average_after_background.enabled and synthetic_cube.ndim == 4:
             synthetic_cube = synthetic_cube.mean(axis=1, keepdims=True, dtype=np.complex64)
-        if synthetic_cube.size > 0:
-            w_angle = _build_window_1d(str(range_angle_cfg.window_angle), int(synthetic_cube.shape[-1]))
-            synthetic_cube *= w_angle.reshape(1, 1, 1, int(synthetic_cube.shape[-1])).astype(
-                np.complex64,
-                copy=False,
-            )
 
-    synthetic_ant = int(synthetic.x_element_m.size)
+    synthetic_ant_input = int(synthetic.x_element_m.size)
+    requested_nfft_angle = max(1, int(range_angle_cfg.nfft_angle))
+    effective_nfft_angle = int(requested_nfft_angle)
+    angle_elements_used = int(synthetic_ant_input)
+    x_element_used = np.asarray(synthetic.x_element_m, dtype=np.float32).reshape(-1)
+    if angle_cfg_eff.mode == "fft" and int(requested_nfft_angle) < int(synthetic_ant_input):
+        # Explicitly use a centered sub-aperture.  Slicing before apodization
+        # ensures the selected elements receive a complete symmetric window.
+        angle_elements_used = int(requested_nfft_angle)
+        first = (int(synthetic_ant_input) - int(angle_elements_used)) // 2
+        last = first + int(angle_elements_used)
+        synthetic_cube = synthetic_cube[..., first:last]
+        x_element_used = x_element_used[first:last]
+
+    geometry, _used_fft_uniform = _build_synthetic_virtual_array_geometry(
+        x_element_used,
+        wavelength_m=float(c_m_s) / float(fc_hz),
+    )
+    if range_angle_cfg.use_realtime_filters and synthetic_cube.size > 0:
+        w_angle = _build_window_1d(str(range_angle_cfg.window_angle), int(synthetic_cube.shape[-1]))
+        synthetic_cube *= w_angle.reshape(1, 1, 1, int(synthetic_cube.shape[-1])).astype(
+            np.complex64,
+            copy=False,
+        )
+
     dsp_cfg = _build_synthetic_angle_dsp_cfg(
         c_m_s=float(c_m_s),
         fs_hz=float(fs_hz),
         slope_hz_s=float(slope_hz_s),
         nfft_range=int(nfft_range),
-        nfft_angle=int(range_angle_cfg.nfft_angle),
+        nfft_angle=int(effective_nfft_angle),
         range_max_m=float(viewport.y_max_m),
-        synthetic_ant=int(synthetic_ant),
+        synthetic_ant=int(angle_elements_used),
         fft_workers=int(fft_workers),
         frames_like=int(max(1, synthetic_cube.shape[0] if synthetic_cube.ndim == 4 else 1)),
     )
-    angle_axis = build_angle_axis_deg(int(range_angle_cfg.nfft_angle), geometry=geometry)
-    angle_steering = build_angle_steering_matrix(
-        int(synthetic_ant),
-        int(range_angle_cfg.nfft_angle),
-        geometry=geometry,
+    angle_axis = build_angle_axis_deg(int(effective_nfft_angle), geometry=geometry)
+    angle_steering = (
+        np.empty((0, 0), dtype=np.complex64)
+        if angle_cfg_eff.mode == "fft"
+        else build_angle_steering_matrix(
+            int(angle_elements_used),
+            int(effective_nfft_angle),
+            geometry=geometry,
+        )
     )
 
     if synthetic_cube.ndim != 4 or int(synthetic_cube.shape[0]) <= 0:
-        heatmap_lin = np.zeros((int(n_bins_sel), int(range_angle_cfg.nfft_angle)), dtype=np.float32)
+        heatmap_lin = np.zeros((int(n_bins_sel), int(effective_nfft_angle)), dtype=np.float32)
     else:
         heatmap_lin = compute_angle_heatmap(
             synthetic_cube,
@@ -1343,7 +1456,7 @@ def _compute_synthetic_range_angle_image(
             ant_spacing=None,
         ).astype(np.float32, copy=False)
         if heatmap_lin.ndim != 2:
-            heatmap_lin = np.zeros((int(n_bins_sel), int(range_angle_cfg.nfft_angle)), dtype=np.float32)
+            heatmap_lin = np.zeros((int(n_bins_sel), int(effective_nfft_angle)), dtype=np.float32)
 
     projection_mode = "cartesian"
     projection_interp = str(range_angle_cfg.projection.projection_interp)
@@ -1377,9 +1490,13 @@ def _compute_synthetic_range_angle_image(
     )
     img_db = _power_image_to_db(projected_lin)
     meta = {
-        "synthetic_antennas": int(synthetic_ant),
+        "synthetic_antennas": int(synthetic_ant_input),
+        "angle_input_elements": int(synthetic_ant_input),
+        "angle_elements_used": int(angle_elements_used),
         "angle_mode_requested": str(range_angle_cfg.angle_processing.mode),
         "angle_mode": str(angle_cfg_eff.mode),
+        "nfft_angle_requested": int(requested_nfft_angle),
+        "nfft_angle_effective": int(effective_nfft_angle),
         "fft_uniform_geometry": bool(fft_uniform),
         "enabled_filters": _offline_sar_range_angle_filters_enabled(range_angle_cfg),
         "selected_positions": tuple(int(v) for v in np.asarray(selected_positions, dtype=np.int32).reshape(-1).tolist()),
@@ -1410,7 +1527,23 @@ def _offline_reader_worker(
         algorithm = str(bp_runtime_cfg.get("algorithm", "backprojection"))
         bp_mode: BpMode = bp_runtime_cfg["mode"]
         range_angle_cfg: OfflineSyntheticRangeAngleConfig = bp_runtime_cfg["range_angle"]
+        nfft_range = max(1, int(nfft_range))
+        if int(range_angle_cfg.nfft_range) != int(nfft_range):
+            range_angle_cfg = replace(range_angle_cfg, nfft_range=int(nfft_range))
+        _queue_put_latest(status_q, {"type": "progress", "phase": "reading IQ capture files"})
         data = reader.load(keep_raw=False)
+        range_input_samples = int(data.samples)
+        range_samples_used = min(int(range_input_samples), int(nfft_range))
+        _queue_put_latest(
+            status_q,
+            {
+                "type": "progress",
+                "phase": "computing Range FFT",
+                "range_input_samples": int(range_input_samples),
+                "range_samples_used": int(range_samples_used),
+                "nfft_range": int(nfft_range),
+            },
+        )
 
         mimo_geometry = None
         if bp_mode == "mimo_sar":
@@ -1432,21 +1565,29 @@ def _offline_reader_worker(
 
         if bp_mode == "mimo_sar":
             # MIMO-SAR: preserva asse antenna [pos, frame, loop, ant, sample].
-            sig = data.iq_cube
-            if algorithm == "synthetic_range_angle" and range_angle_cfg.use_realtime_filters:
-                sig = np.array(sig, dtype=np.complex64, copy=True)
-                w_range = _build_window_1d(str(range_angle_cfg.window_range), int(data.samples))
-                sig *= w_range.reshape(1, 1, 1, 1, int(data.samples)).astype(np.complex64, copy=False)
+            sig = _select_offline_range_fft_input(data.iq_cube, nfft_range=int(nfft_range))
+            sig = _apply_offline_backprojection_range_window(
+                sig,
+                window_type=str(range_angle_cfg.window_range),
+                enabled=bool(range_angle_cfg.use_realtime_filters),
+            )
             range_fft = fft.fft(sig, n=int(nfft_range), axis=-1, workers=fft_workers).astype(np.complex64, copy=False)
         else:
             # Legacy SAR-only: media preliminare sulle antenne virtuali.
             sig = data.iq_cube.mean(axis=3, dtype=np.complex64)  # [pos, frame, loop, sample]
+            sig = _select_offline_range_fft_input(sig, nfft_range=int(nfft_range))
+            sig = _apply_offline_backprojection_range_window(
+                sig,
+                window_type=str(range_angle_cfg.window_range),
+                enabled=bool(range_angle_cfg.use_realtime_filters),
+            )
             range_fft = fft.fft(sig, n=int(nfft_range), axis=-1, workers=fft_workers).astype(np.complex64, copy=False)
         if algorithm == "synthetic_range_angle" and range_angle_cfg.use_realtime_filters:
             zero_bins = min(int(range_angle_cfg.zero_after_range_fft_bins), int(range_fft.shape[-1]))
             if zero_bins > 0:
                 range_fft[..., :zero_bins] = np.complex64(0.0)
         range_fft = np.ascontiguousarray(range_fft, dtype=np.complex64)
+        _queue_put_latest(status_q, {"type": "progress", "phase": "copying Range FFT to shared memory"})
         shm_range_fft = shared_memory.SharedMemory(create=True, size=int(range_fft.nbytes))
         shm_arr = np.ndarray(range_fft.shape, dtype=np.complex64, buffer=shm_range_fft.buf)
         shm_arr[:] = range_fft
@@ -1464,6 +1605,9 @@ def _offline_reader_worker(
             "bp_motion_mode": str(bp_runtime_cfg["motion_mode"]),
             "bp_coherent_sum": bool(bp_runtime_cfg["coherent_sum"]),
             "range_angle_cfg": range_angle_cfg,
+            "nfft_range": int(nfft_range),
+            "range_input_samples": int(range_input_samples),
+            "range_samples_used": int(range_samples_used),
             "tx": int(data.tx),
             "rx": int(data.rx),
         }
@@ -1485,6 +1629,9 @@ def _offline_reader_worker(
                 "range_angle_enabled_filters": _offline_sar_range_angle_filters_enabled(range_angle_cfg),
                 "range_angle_use_realtime_filters": bool(range_angle_cfg.use_realtime_filters),
                 "range_angle_angle_mode": str(range_angle_cfg.angle_processing.mode),
+                "nfft_range": int(nfft_range),
+                "range_input_samples": int(range_input_samples),
+                "range_samples_used": int(range_samples_used),
                 "range_angle_nfft_angle": int(range_angle_cfg.nfft_angle),
                 "geometry_source": None if mimo_geometry is None else str(mimo_geometry["geometry_source"]),
             },
@@ -1598,6 +1745,7 @@ def _offline_dsp_worker(
                 zero_after_range_fft_bins=0,
                 post_range_fft_filters=PostRangeFftFilterConfig(),
                 angle_processing=AngleProcessingConfig(),
+                nfft_range=max(1, int(nfft_range)),
                 nfft_angle=256,
                 projection=DisplayProjectionConfig(),
                 filter_warnings=(),
@@ -1612,6 +1760,12 @@ def _offline_dsp_worker(
             raise ValueError("positions non coerente con range_fft")
         if algorithm == "synthetic_range_angle" and bp_mode != "mimo_sar":
             raise ValueError("synthetic_range_angle richiede range_fft MIMO-SAR a 5 dimensioni")
+
+        nfft_range = max(1, int(_pick(init_msg.get("nfft_range"), range_angle_cfg.nfft_range, nfft_range)))
+        range_input_samples = max(1, int(_pick(init_msg.get("range_input_samples"), nfft_range)))
+        range_samples_used = max(1, int(_pick(init_msg.get("range_samples_used"), min(range_input_samples, nfft_range))))
+
+        bp_window_stages = _offline_backprojection_windows_enabled(range_angle_cfg)
 
         coherent_sum = _to_bool(
             "init_msg: bp_coherent_sum",
@@ -1683,6 +1837,9 @@ def _offline_dsp_worker(
                 "img_h": int(gui_h),
                 "img_w": int(gui_w),
                 "dr_m": float(dr_m),
+                "nfft_range": int(nfft_range),
+                "range_input_samples": int(range_input_samples),
+                "range_samples_used": int(range_samples_used),
                 "bp_mode": str(bp_mode),
                 "virtual_antennas": int(n_ant_used),
                 "geometry_source": str(geometry_source),
@@ -1691,13 +1848,16 @@ def _offline_dsp_worker(
                 "range_angle_enabled_filters": _offline_sar_range_angle_filters_enabled(range_angle_cfg),
                 "range_angle_angle_mode_requested": str(range_angle_cfg.angle_processing.mode),
                 "range_angle_nfft_angle": int(range_angle_cfg.nfft_angle),
+                "bp_window_stages": bp_window_stages,
                 **_viewport_status_fields(applied_viewport, fallback_used=False),
             },
         )
         print(
             f"[OFFLINE INFO] algorithm={algorithm} bp_mode={bp_mode} "
             f"default_positions={x_start}:{x_end} angle_mode={range_angle_cfg.angle_processing.mode} "
-            f"filters={_offline_sar_range_angle_filters_enabled(range_angle_cfg)}"
+            f"range={range_input_samples}->{nfft_range} used={range_samples_used} "
+            f"filters={_offline_sar_range_angle_filters_enabled(range_angle_cfg)} "
+            f"bp_windows={bp_window_stages}"
         )
 
         last_job_key = None
@@ -1859,6 +2019,7 @@ def _offline_dsp_worker(
                             int(max_bin),
                             int(tx_i),
                             int(rx_i),
+                            bp_window_stages,
                         )
                         if prepared_cache_key == prepared_key and prepared_cache is not None:
                             prepared = prepared_cache
@@ -1871,11 +2032,22 @@ def _offline_dsp_worker(
                                 int(rx_i),
                                 int(n_bins_sel),
                             ).astype(np.complex64, copy=False)
+                            doppler_window = None
+                            if bool(range_angle_cfg.use_realtime_filters):
+                                doppler_window = _build_window_1d(
+                                    str(range_angle_cfg.window_doppler),
+                                    int(n_loops_sel),
+                                )
                             prepared = _prepare_mimo_snapshots(
                                 raw_mimo,
                                 n_tx=int(tx_i),
                                 motion_mode=motion_mode,
-                                window_doppler=None,
+                                window_doppler=doppler_window,
+                            )
+                            prepared = _apply_offline_backprojection_aperture_window(
+                                prepared,
+                                window_type=str(range_angle_cfg.window_angle),
+                                enabled=bool(range_angle_cfg.use_realtime_filters),
                             )
                             prepared_cache_key = prepared_key
                             prepared_cache = prepared
@@ -1964,7 +2136,10 @@ def _offline_dsp_worker(
                 print(
                     f"[OFFLINE INFO] frame algorithm={algorithm} positions={sel_key} "
                     f"synthetic_ant={frame_meta.get('synthetic_antennas', n_ant_used)} "
+                    f"angle_used={frame_meta.get('angle_elements_used', 'n/a')} "
                     f"angle_mode={frame_meta.get('angle_mode', range_angle_cfg.angle_processing.mode)} "
+                    f"nfft_range={nfft_range} "
+                    f"nfft_angle={frame_meta.get('nfft_angle_effective', range_angle_cfg.nfft_angle)} "
                     f"filters={frame_meta.get('enabled_filters', _offline_sar_range_angle_filters_enabled(range_angle_cfg))} "
                     f"fft_uniform={frame_meta.get('fft_uniform_geometry', 'n/a')}"
                 )
@@ -1982,16 +2157,28 @@ def _offline_dsp_worker(
                         "bp_mode": str(bp_mode),
                         "geometry_source": str(geometry_source),
                         "doppler_bins_used": int(doppler_bins_used),
+                        "nfft_range": int(nfft_range),
+                        "range_input_samples": int(range_input_samples),
+                        "range_samples_used": int(range_samples_used),
                         "synthetic_antennas": int(frame_meta.get("synthetic_antennas", 0)),
+                        "angle_input_elements": int(frame_meta.get("angle_input_elements", 0)),
+                        "angle_elements_used": int(frame_meta.get("angle_elements_used", 0)),
                         "angle_mode_requested": str(
                             frame_meta.get("angle_mode_requested", range_angle_cfg.angle_processing.mode)
                         ),
                         "angle_mode": str(frame_meta.get("angle_mode", range_angle_cfg.angle_processing.mode)),
+                        "nfft_angle_requested": int(
+                            frame_meta.get("nfft_angle_requested", range_angle_cfg.nfft_angle)
+                        ),
+                        "nfft_angle_effective": int(
+                            frame_meta.get("nfft_angle_effective", range_angle_cfg.nfft_angle)
+                        ),
                         "fft_uniform_geometry": bool(frame_meta.get("fft_uniform_geometry", False)),
                         "range_angle_enabled_filters": frame_meta.get(
                             "enabled_filters",
                             _offline_sar_range_angle_filters_enabled(range_angle_cfg),
                         ),
+                        "bp_window_stages": bp_window_stages,
                         "elapsed_ms": float((t1 - t0) * 1000.0),
                         **_viewport_status_fields(applied_viewport, fallback_used=False),
                     },
@@ -2051,7 +2238,6 @@ class OfflineBPRuntime:
         self.fs_hz = float(fs_hz)
         self.slope_hz_s = float(slope_hz_s)
         self.fc_hz = float(fc_hz)
-        self.nfft_range = int(nfft_range)
         self.range_max_m = float(range_max_m)
         self.crossrange_max_m = float(crossrange_max_m)
         self.image_h = int(image_h)
@@ -2063,6 +2249,14 @@ class OfflineBPRuntime:
             _pick(reconstruction_cfg.get("algorithm"), "backprojection")
         )
         self.range_angle_cfg = _read_offline_sar_range_angle_cfg(offline_cfg_dict, fallback_cfg_dict)
+        offline_fft_branch = offline_cfg_dict.get("offline_sar_range_angle", {}) or {}
+        self.nfft_range = int(
+            self.range_angle_cfg.nfft_range
+            if "nfft_range" in offline_fft_branch
+            else max(1, int(nfft_range))
+        )
+        if int(self.range_angle_cfg.nfft_range) != int(self.nfft_range):
+            self.range_angle_cfg = replace(self.range_angle_cfg, nfft_range=int(self.nfft_range))
         self.fft_workers = int(_read_fft_workers(self.fallback_capture_cfg))
         self.x_pitch_m = float(x_pitch_m) if x_pitch_m is not None else _read_x_pitch_m(self.offline_config_path)
         self.default_avg_mode = _avg_mode_normalize(

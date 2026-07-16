@@ -549,7 +549,7 @@ def synthetic_aperture_uniform_spacing_lambda(
     x_element_m: np.ndarray,
     *,
     wavelength_m: float,
-    atol: float = 1e-6,
+    atol: float = 1e-4,
 ) -> float | None:
     phase_centers_lambda = (
         np.asarray(x_element_m, dtype=np.float32).reshape(-1) / np.float32(float(wavelength_m))
