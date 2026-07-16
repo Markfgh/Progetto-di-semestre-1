@@ -13,7 +13,7 @@ scan:
   x_pitch_m: 0.007792000193148851 # 7.792 mm pitch
 
 reconstruction:
-  algorithm: "synthetic_range_angle" # Options: backprojection, synthetic_range_angle.
+  algorithm: "backprojection" # Options: backprojection, synthetic_range_angle.
 
 bp:
   mode: "mimo_sar" # BackProjection MIMO per scena statica, con selezione Doppler zero
@@ -34,8 +34,8 @@ offline_sar_range_angle:
   # Valore > input: conserva tutto l'ingresso e aggiunge zero-padding.
   # nfft_angle si applica come FFT/padding solo con angle_processing.mode=fft;
   # in Bartlett/MVDR indica invece il numero di punti della griglia angolare.
-  nfft_range: 2048
-  nfft_angle: 2048
+  nfft_range: 32768
+  nfft_angle: 32768
   window_range: "hanning"
   window_doppler: "hanning"
   window_angle: "rectangular"

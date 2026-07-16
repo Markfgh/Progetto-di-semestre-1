@@ -7,6 +7,7 @@ from offline_dsp import (
     _interp_cubic_complex,
     _interp_linear_complex,
     build_mimo_back_projection_plan,
+    back_projection_power_mimo_frames,
     back_projection_power_mimo_snapshot,
     back_projection_image_mimo,
     build_mimo_geometry,
@@ -55,7 +56,7 @@ def test_bistatic_bp_point_target() -> None:
     c_m_s = np.float32(3e8)
     fc_hz = np.float32(77e9)
     dr_m = np.float32(0.02)
-    n_bins = 256
+    n_bins = 128
     lambda_m = (c_m_s / fc_hz).astype(np.float32, copy=False)
     x_tx_phys, x_rx_phys = _physical_iwr1443_geometry(lambda_m)
     x_tx_ant_m, x_rx_ant_m = build_mimo_geometry(2, 4, fc_hz=float(fc_hz), c_m_s=float(c_m_s))
@@ -80,8 +81,8 @@ def test_bistatic_bp_point_target() -> None:
                 phase=np.exp(-1j * np.float32(k_bistatic * r_total)),
             )
 
-    x_axis = np.linspace(-0.6, 0.6, 161, dtype=np.float32)
-    y_axis = np.linspace(0.8, 2.8, 161, dtype=np.float32)
+    x_axis = np.linspace(-0.6, 0.6, 256, dtype=np.float32)
+    y_axis = np.linspace(0.8, 2.8, 256, dtype=np.float32)
     x_grid, y_grid = np.meshgrid(x_axis, y_axis)
     img_db = back_projection_image_mimo(
         snapshots,
@@ -256,6 +257,88 @@ def test_prepare_mimo_snapshots_returns_4d_and_uses_all_virtual_antennas() -> No
     prepared = prepare_mimo_snapshots(raw, n_tx=n_tx, motion_mode="static_zero_doppler")
 
     assert prepared.shape == (n_pos, n_frames, n_tx * n_rx, n_bins)
+
+
+@pytest.mark.parametrize("window_name", ["rectangular", "hanning"])
+def test_prepare_mimo_snapshots_matches_explicit_zero_doppler_fft(window_name: str) -> None:
+    rng = np.random.default_rng(4242)
+    shape = (2, 3, 16, 2, 4, 11)
+    raw = (
+        rng.standard_normal(shape, dtype=np.float32)
+        + 1j * rng.standard_normal(shape, dtype=np.float32)
+    ).astype(np.complex64)
+    window = (
+        np.ones(shape[2], dtype=np.float32)
+        if window_name == "rectangular"
+        else np.hanning(shape[2]).astype(np.float32)
+    )
+
+    explicit = np.fft.fft(
+        raw * window.reshape(1, 1, shape[2], 1, 1, 1),
+        axis=2,
+    ).astype(np.complex64, copy=False)[:, :, 0]
+    explicit = explicit.reshape(shape[0], shape[1], shape[3] * shape[4], shape[5])
+    prepared = prepare_mimo_snapshots(
+        raw,
+        n_tx=shape[3],
+        motion_mode="static_zero_doppler",
+        window_doppler=window,
+    )
+
+    np.testing.assert_allclose(prepared, explicit, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize("coherent_sum", [True, False])
+@pytest.mark.parametrize("phase_sign", [-1, 1])
+def test_multi_frame_backprojection_matches_legacy_frame_loop(
+    coherent_sum: bool,
+    phase_sign: int,
+) -> None:
+    rng = np.random.default_rng(909)
+    snapshots = (
+        rng.standard_normal((3, 4, 2, 24), dtype=np.float32)
+        + 1j * rng.standard_normal((3, 4, 2, 24), dtype=np.float32)
+    ).astype(np.complex64)
+    x_pos_m = np.asarray([-0.03, 0.0, 0.03], dtype=np.float32)
+    x_tx_ant_m = np.asarray([-0.004, 0.004], dtype=np.float32)
+    x_rx_ant_m = np.asarray([-0.002, 0.002], dtype=np.float32)
+    x_grid, y_grid = np.meshgrid(
+        np.linspace(-0.08, 0.08, 9, dtype=np.float32),
+        np.linspace(0.2, 0.7, 11, dtype=np.float32),
+    )
+
+    legacy = np.zeros_like(x_grid, dtype=np.float32)
+    for frame_i in range(snapshots.shape[1]):
+        legacy += back_projection_power_mimo_snapshot(
+            snapshots[:, frame_i],
+            x_pos_m,
+            x_tx_ant_m,
+            x_rx_ant_m,
+            x_grid,
+            y_grid,
+            dr_m=0.04,
+            fc_hz=77e9,
+            c_m_s=3e8,
+            max_bin=24,
+            phase_sign=phase_sign,
+            coherent_sum=coherent_sum,
+        )
+    optimized = back_projection_power_mimo_frames(
+        snapshots,
+        x_pos_m,
+        x_tx_ant_m,
+        x_rx_ant_m,
+        x_grid,
+        y_grid,
+        dr_m=0.04,
+        fc_hz=77e9,
+        c_m_s=3e8,
+        max_bin=24,
+        phase_sign=phase_sign,
+        coherent_sum=coherent_sum,
+    )
+
+    np.testing.assert_allclose(optimized, legacy, atol=3e-4, rtol=2e-5)
 
 
 def test_prepare_synthetic_aperture_data_flattens_selected_positions_and_antennas() -> None:

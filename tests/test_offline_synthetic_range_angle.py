@@ -174,6 +174,48 @@ def test_synthetic_range_angle_uses_one_combined_aperture_and_projects_to_gui(mo
     assert meta["synthetic_antennas"] == 32
 
 
+def test_synthetic_range_angle_accepts_prepared_zero_doppler_snapshots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    x_tx_ant_m, x_rx_ant_m = _geometry()
+    prepared = np.ones((2, 3, 8, 6), dtype=np.complex64)
+    captured: dict[str, object] = {}
+
+    def fail_prepare(*args, **kwargs):
+        raise AssertionError("prepared input must not run Doppler preparation again")
+
+    def fake_heatmap(virtual_array, **kwargs):
+        captured["shape"] = tuple(int(v) for v in virtual_array.shape)
+        return np.ones((6, 16), dtype=np.float32)
+
+    monkeypatch.setattr(offline_processing, "_prepare_mimo_snapshots", fail_prepare)
+    monkeypatch.setattr(offline_processing, "compute_angle_heatmap", fake_heatmap)
+
+    img_db, meta = _compute_synthetic_range_angle_image(
+        prepared,
+        selected_positions=np.asarray([0, 1], dtype=np.int32),
+        x_pitch_m=0.1,
+        tx_i=2,
+        rx_i=4,
+        x_tx_ant_m=x_tx_ant_m,
+        x_rx_ant_m=x_rx_ant_m,
+        range_angle_cfg=_range_angle_cfg(use_realtime_filters=False),
+        c_m_s=3.0e8,
+        fs_hz=10.0e6,
+        slope_hz_s=60.0e12,
+        fc_hz=77.0e9,
+        fft_workers=1,
+        nfft_range=64,
+        gui_h=17,
+        gui_w=19,
+        viewport=_viewport(),
+    )
+
+    assert captured["shape"] == (3, 1, 6, 16)
+    assert img_db.shape == (17, 19)
+    assert meta["synthetic_antennas"] == 16
+
+
 def test_synthetic_range_angle_applies_window_angle_over_flattened_aperture(monkeypatch: pytest.MonkeyPatch) -> None:
     x_tx_ant_m, x_rx_ant_m = _geometry()
     captured: dict[str, np.ndarray] = {}

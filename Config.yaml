@@ -27,12 +27,17 @@ display:
   projection_mode:   cartesian # Options: polar_stretched, cartesian.
   projection_interp: bilinear  # Used only in cartesian mode: nearest, bilinear.
   range_max:  50.0    # Hard limit shown on Y axis [m].
-  crossrange_max: 6  # X extent [m]; use "auto" to derive it from angle FOV for the realtime heatmap.
+  crossrange_max: 25  # X extent [m]; use "auto" to derive it from angle FOV for the realtime heatmap.
   rangefft_db_min: 0
   rangefft_db_max: 95
   rangefft_lin_min: 0
   rangefft_lin_max: 15e7
   normalize_skip_range_bins: 0 # Normalized display: ignore the first N range bins when choosing the frame peak.
+  # Fixed output rasters.  They are independent from Range/Angle FFT sizes and
+  # are allocated when the application starts.
+  image_resolution:
+    realtime: { width: 256, height: 256 }
+    offline:  { width: 256, height: 256 }
 
 display_zoom:
   enabled: true

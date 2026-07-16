@@ -398,6 +398,7 @@ from realtime_dsp import (
     build_display_viewport,
     calibration_from_yaml_dict,
     clamp_display_viewport,
+    display_image_resolutions_from_yaml_dict,
     display_projection_from_yaml_dict,
     display_viewport_signature,
     display_zoom_method_warnings,
@@ -450,6 +451,7 @@ RANGE_MAX_DISPLAY = float(cfg["display"]["range_max"])
 RANGE_MAX_PROCESSING = float(resolve_processing_range_max_m(cfg))
 display_projection_cfg = display_projection_from_yaml_dict(cfg)
 display_zoom_cfg = display_zoom_from_yaml_dict(cfg)
+display_image_resolutions_cfg = display_image_resolutions_from_yaml_dict(cfg)
 for warn_msg in display_zoom_method_warnings(display_zoom_cfg):
     print(f"[DISPLAY WARN] {warn_msg}")
 HEATMAP_CROSSRANGE_MAX_DISPLAY = float(
@@ -1853,9 +1855,14 @@ def main():
     cap_result = _track_mp_ref(Value("i", 0))  # 1=ok, -1=annullata, 0=in corso
 
     dr_shared = C * FS / (2.0 * SLOPE * NFFT_RANGE)
-    gui_h = max(1, int(display_zoom_cfg.output_height))
+    # The realtime and offline rasters are fixed for the lifetime of their
+    # respective shared buffers/textures.  They intentionally do not follow
+    # range/angle NFFT dimensions.
+    gui_h = max(1, int(display_image_resolutions_cfg.realtime.height))
     fft_plot_h = max(1, int(NFFT_RANGE))
-    gui_w = max(1, int(display_zoom_cfg.output_width))
+    gui_w = max(1, int(display_image_resolutions_cfg.realtime.width))
+    offline_gui_h = max(1, int(display_image_resolutions_cfg.offline.height))
+    offline_gui_w = max(1, int(display_image_resolutions_cfg.offline.width))
     gui_dbuf = _track_mp_ref(RawArray("f", 2 * gui_h * gui_w))
     gui_alpha_dbuf = _track_mp_ref(RawArray("f", 2 * gui_h * gui_w))
     gui_prof_dbuf = _track_mp_ref(RawArray("f", 2 * RANGE_PROFILE_COUNT * fft_plot_h))
@@ -2174,8 +2181,8 @@ def main():
             nfft_range=int(NFFT_RANGE),
             range_max_m=float(RANGE_MAX_PROCESSING),
             crossrange_max_m=float(CROSSRANGE_MAX_DISPLAY),
-            image_h=int(gui_h),
-            image_w=int(gui_w),
+            image_h=int(offline_gui_h),
+            image_w=int(offline_gui_w),
         )
 
     offline_runtime = None
@@ -2504,7 +2511,7 @@ def main():
     doppler_diag_tex_w, doppler_diag_tex_h = int(DOPPLERFFT_BINS), int(fft_plot_h)
     doppler_diag_tex_buf = array("f", [0.0]) * (doppler_diag_tex_w * doppler_diag_tex_h * 4)
     doppler_diag_tex_np = np.frombuffer(doppler_diag_tex_buf, dtype=np.float32)
-    proc_tex_w, proc_tex_h = int(gui_w), int(gui_h)
+    proc_tex_w, proc_tex_h = int(offline_gui_w), int(offline_gui_h)
     proc_tex_buf = array("f", [0.0]) * (proc_tex_w * proc_tex_h * 4)
     proc_tex_np = np.frombuffer(proc_tex_buf, dtype=np.float32)
 
@@ -2555,25 +2562,36 @@ def main():
             raise FileNotFoundError(f"no configured capture files found in {source_dir}")
 
         capture_bytes = sum(int(path.stat().st_size) for path in selected_files)
+        max_position_bytes = max(int(path.stat().st_size) for path in selected_files)
         samples_input = max(1, int(SAMPLES))
+        chirps_input = max(1, int(CHIRPS))
+        rx_input = max(1, int(RX))
+        tx_input = max(1, int(TX))
+        frames_input = max(1, int(FRAMES_PER_POSITION))
         try:
             with selected_files[0].open("rb") as handle:
                 prefix = handle.read(12)
                 if len(prefix) == 12 and prefix[:8] == b"RTPBIN1\x00":
                     header_len = int(struct.unpack("<I", prefix[8:12])[0])
                     header_payload = json.loads(handle.read(header_len).decode("utf-8"))
-                    samples_input = max(
+                    capture_header = (header_payload.get("capture", {}) or {})
+                    samples_input = max(1, int(capture_header.get("samples", samples_input)))
+                    chirps_input = max(1, int(capture_header.get("chirps", chirps_input)))
+                    rx_input = max(1, int(capture_header.get("rx", rx_input)))
+                    tx_input = max(1, int(capture_header.get("tx", tx_input)))
+                    frames_input = max(
                         1,
-                        int(((header_payload.get("capture", {}) or {}).get("samples", samples_input))),
+                        int(capture_header.get("frames_per_position", capture_header.get("x_frames", frames_input))),
                     )
         except Exception:
             # The actual loader will perform strict validation. The estimate
             # can safely fall back to Config.yaml without touching payloads.
             samples_input = max(1, int(SAMPLES))
         nfft_range_est = max(1, int(fft_cfg.get("nfft_range", NFFT_RANGE)))
-        # Capture payload is int16 I + int16 Q (4 B/complex); the reader expands
-        # it to complex64 (8 B/complex). Header bytes are negligible here.
-        iq_bytes = int(capture_bytes) * 2
+        # Streaming pipeline: only one capture payload and its complex64
+        # conversion are resident while the compact zero-Doppler snapshot cube
+        # for every configured position is filled directly in shared memory.
+        iq_bytes = int(max_position_bytes) * 2
         samples_used = min(int(samples_input), int(nfft_range_est))
         range_window = str(fft_cfg.get("window_range", "none")).strip().lower()
         preprocessing = bool(fft_cfg.get("use_realtime_filters", True))
@@ -2583,8 +2601,28 @@ def main():
             else 0
         )
         fft_bytes = int(iq_bytes * nfft_range_est / samples_input)
-        # During handoff, both the FFT result and its shared-memory copy coexist.
-        peak_bytes = int(iq_bytes + window_copy_bytes + (2 * fft_bytes))
+        prepared_bytes = int(
+            len(selected_files)
+            * int(frames_input)
+            * int(tx_input)
+            * int(rx_input)
+            * int(nfft_range_est)
+            * np.dtype(np.complex64).itemsize
+        )
+        reader_peak_bytes = int(
+            prepared_bytes
+            + max_position_bytes
+            + iq_bytes
+            + window_copy_bytes
+            + fft_bytes
+        )
+        display_pixels = int(offline_gui_h) * int(offline_gui_w)
+        bp_workspace_bytes = int(
+            int(frames_input) * display_pixels * np.dtype(np.complex64).itemsize
+            + 8 * display_pixels * np.dtype(np.float32).itemsize
+        )
+        dsp_peak_bytes = int((2 * prepared_bytes) + bp_workspace_bytes)
+        peak_bytes = max(reader_peak_bytes, dsp_peak_bytes)
         return {
             "source_dir": str(source_dir),
             "files": int(len(selected_files)),
@@ -2593,6 +2631,7 @@ def main():
             "capture_bytes": int(capture_bytes),
             "iq_bytes": int(iq_bytes),
             "fft_bytes": int(fft_bytes),
+            "prepared_bytes": int(prepared_bytes),
             "peak_bytes": int(peak_bytes),
         }
 
@@ -2608,8 +2647,10 @@ def main():
             return (
                 f"Memory estimate (payload not loaded): {estimate['files']} files | "
                 f"Range {estimate['samples_input']} -> {estimate['nfft_range']} ({padding_note})\n"
-                f"IQ {estimate['iq_bytes'] / gib:.1f} GiB | Range FFT {estimate['fft_bytes'] / gib:.1f} GiB | "
-                f"temporary peak up to {estimate['peak_bytes'] / gib:.1f} GiB"
+                f"Per-position IQ {estimate['iq_bytes'] / gib:.2f} GiB | "
+                f"Range FFT workspace {estimate['fft_bytes'] / gib:.2f} GiB | "
+                f"Doppler-zero shared {estimate['prepared_bytes'] / gib:.2f} GiB | "
+                f"streaming peak about {estimate['peak_bytes'] / gib:.2f} GiB"
             )
         except Exception as exc:
             return f"Memory estimate unavailable: {exc}"
@@ -2618,6 +2659,7 @@ def main():
     # L'attuale pipeline MIMO-SAR supporta solo questo percorso: non esporre
     # un selettore GUI per una scelta che non esiste realmente.
     off_motion_mode = "static_zero_doppler"
+    offline_frame_valid = False
     off_norm_enabled = True
     if off_norm_enabled:
         off_vmin = float(VMIN_NORM)
@@ -3823,8 +3865,8 @@ def main():
                 dpg.set_value(tag, value)
 
     def _apply_offline_display_zoom(sender=None, app_data=None):
-        """Change only the plot ROI; the already reconstructed texture is reused."""
-        nonlocal off_requested_viewport_current
+        """Reconstruct the requested offline ROI on the fixed offline grid."""
+        nonlocal off_requested_viewport_current, off_ui_dirty, off_ui_dirty_t
         try:
             x0 = float(dpg.get_value(PROC_IN_ZOOM_XMIN))
             x1 = float(dpg.get_value(PROC_IN_ZOOM_XMAX))
@@ -3843,7 +3885,10 @@ def main():
         y0 = max(float(home.y_min_m), min(float(home.y_max_m), y0))
         y1 = max(float(home.y_min_m), min(float(home.y_max_m), y1))
 
-        min_x_span = max((float(home.x_max_m) - float(home.x_min_m)) / float(max(1, gui_w)), 1e-6)
+        min_x_span = max(
+            (float(home.x_max_m) - float(home.x_min_m)) / float(max(1, offline_gui_w)),
+            1e-6,
+        )
         min_y_span = max(float(dr_plot), 1e-6)
         if x1 <= x0:
             x1 = min(float(home.x_max_m), x0 + min_x_span)
@@ -3863,6 +3908,13 @@ def main():
             seq=int(off_requested_viewport_current.seq) + 1,
             home_viewport=home,
         )
+        # The offline DSP worker uses this viewport to build its x/y grid, so
+        # this is a real back-projection request rather than a plot crop.
+        off_ui_pending["reset_view"] = False
+        off_ui_pending["reconstruct"] = True
+        off_ui_pending["display_refresh"] = False
+        off_ui_dirty = True
+        off_ui_dirty_t = time.perf_counter()
         _write_offline_zoom_inputs(off_requested_viewport_current)
         if dpg.does_item_exist(PROC_XAXIS_TAG) and dpg.does_item_exist(PROC_YAXIS_TAG):
             dpg.set_axis_limits(PROC_XAXIS_TAG, float(x0), float(x1))
@@ -3871,12 +3923,16 @@ def main():
             dpg.set_value(
                 PROC_TXT_ZOOM_STATUS,
                 f"ROI: X [{x0:.3f}, {x1:.3f}] m | Y [{y0:.3f}, {y1:.3f}] m\n"
-                "Display only: backprojection not recalculated.",
+                f"Backprojection queued on {offline_gui_w}x{offline_gui_h} grid.",
             )
 
     def _reset_offline_display_zoom(sender=None, app_data=None):
-        nonlocal off_requested_viewport_current
+        nonlocal off_requested_viewport_current, off_ui_dirty, off_ui_dirty_t
         off_requested_viewport_current = off_home_viewport_current
+        off_ui_pending["reconstruct"] = True
+        off_ui_pending["display_refresh"] = False
+        off_ui_dirty = True
+        off_ui_dirty_t = time.perf_counter()
         _write_offline_zoom_inputs(off_home_viewport_current)
         if dpg.does_item_exist(PROC_XAXIS_TAG) and dpg.does_item_exist(PROC_YAXIS_TAG):
             dpg.set_axis_limits(
@@ -3890,7 +3946,10 @@ def main():
                 float(off_home_viewport_current.y_max_m),
             )
         if dpg.does_item_exist(PROC_TXT_ZOOM_STATUS):
-            dpg.set_value(PROC_TXT_ZOOM_STATUS, "Full reconstructed map.")
+            dpg.set_value(
+                PROC_TXT_ZOOM_STATUS,
+                f"Full-map backprojection queued on {offline_gui_w}x{offline_gui_h} grid.",
+            )
 
     def _apply_offline_params(sender=None, app_data=None):
         nonlocal off_ui_dirty, off_ui_dirty_t, off_ui_pending, off_status_text
@@ -3936,6 +3995,8 @@ def main():
             prev_x_start != int(x_start_cl)
             or prev_x_end != int(x_end_cl)
             or prev_motion_mode != str(motion_mode)
+            or abs(float(prev_off_rmax) - float(rmax_cl)) > 1e-6
+            or abs(float(prev_off_xmax) - float(xmax_cl)) > 1e-6
         )
         off_ui_pending["vmin"] = float(vmin)
         off_ui_pending["vmax"] = float(vmax)
@@ -3953,11 +4014,12 @@ def main():
             or abs(float(prev_off_rmax) - float(rmax_cl)) > 1e-6
             or abs(float(prev_off_xmax) - float(xmax_cl)) > 1e-6
         )
-        update_label = (
-            "Offline reconstruction update pending"
-            if bool(off_ui_pending.get("reconstruct", False))
-            else "Offline display updated from cached matrix"
-        )
+        if bool(off_ui_pending.get("reconstruct", False)):
+            update_label = "Offline reconstruction update pending"
+        elif offline_frame_valid:
+            update_label = "Offline display updated from cached matrix"
+        else:
+            update_label = "No valid offline result; load/recalculate first"
         off_status_text = (
             f"{update_label}\n"
             f"SAR positions: {x_start_cl} - {x_end_cl}\n"
@@ -5144,7 +5206,7 @@ def main():
                             height=32,
                         )
                         dpg.add_spacer(height=14)
-                        dpg.add_text("DISPLAY ZOOM (NO RECALC)", color=(255, 200, 0))
+                        dpg.add_text("OFFLINE ROI BACKPROJECTION", color=(255, 200, 0))
                         dpg.add_separator()
                         dpg.add_input_float(
                             label="X min (m)",
@@ -5397,6 +5459,13 @@ def main():
 
     def _refresh_offline_texture_from_cached_matrix() -> None:
         """Reapply normalization/levels/LUT without invoking offline DSP."""
+        if not offline_frame_valid:
+            proc_lut_idx.fill(0)
+            np.take(jet_lut, proc_lut_idx, axis=0, out=proc_rgba_frame)
+            proc_tex_np[:] = proc_rgba_frame.reshape(-1)
+            if dpg.does_item_exist(PROC_TEX_TAG):
+                dpg.set_value(PROC_TEX_TAG, proc_tex_buf)
+            return
         if off_norm_enabled and proc_frame.size > 0:
             finite_values = proc_frame[np.isfinite(proc_frame)]
             peak_db = float(np.max(finite_values)) if finite_values.size > 0 else 0.0
@@ -5766,7 +5835,7 @@ def main():
                             PROC_TXT_ZOOM_STATUS,
                             f"ROI: X [{-float(off_xmax):.3f}, {float(off_xmax):.3f}] m | "
                             f"Y [0.000, {float(off_rmax):.3f}] m\n"
-                            "Display only: reconstruction unchanged.",
+                            f"Backprojection queued on {offline_gui_w}x{offline_gui_h} grid.",
                         )
                 off_ui_pending["reset_view"] = False
                 if dpg.does_item_exist(PROC_CMAP_SCALE_TAG):
@@ -5785,19 +5854,16 @@ def main():
                             x_start=int(off_ui_pending["x_start"]),
                             x_end=int(off_ui_pending["x_end"]),
                             motion_mode=str(off_ui_pending["motion_mode"]),
-                            # Reconstruction always keeps the full configured map.
-                            # Exact ROI zoom is performed by clipping the existing
-                            # image in the plot, without another backprojection.
-                            viewport=off_home_viewport_current,
+                            viewport=off_requested_viewport_current,
                         )
                     except Exception as e:
                         off_status_text = f"Offline update error:\n{e}"
                         if dpg.does_item_exist(PROC_TXT_STATUS):
                             dpg.set_value(PROC_TXT_STATUS, off_status_text)
 
-            # Offline plot zoom/pan is intentionally display-only.  DearPyGui
-            # clips the full reconstructed texture to the current axis limits;
-            # unlike realtime zoom, axis changes are not sent to the DSP worker.
+            # The manual offline ROI controls submit a new viewport to the DSP
+            # worker.  Direct plot pan/zoom remains a display-only interaction
+            # until the user confirms it through "Apply zoom".
 
             # --- OFFLINE FRAME update (double-buffer latest-wins) ---
             if offline_runtime is not None:
@@ -5805,6 +5871,7 @@ def main():
                 if off_frame is not None:
                     frame_db, info = off_frame
                     proc_frame[:, :] = frame_db
+                    offline_frame_valid = True
                     refresh_offline_display = True
                     try:
                         off_applied_meta_current = AppliedViewportMeta(
@@ -5926,7 +5993,9 @@ def main():
                     ("DSP ms avg/p95", f"{dsp_avg_now:.2f}/{dsp_p95_now:.2f}"),
                     ("DSP skip", f"{dsp_skip_now}"),
                     ("GUI Hz", f"{img_hz:.1f}"),
-                    ("GUI tex bins", f"{gui_w}x{gui_h}"),
+                    ("Image grid RT", f"{gui_w}x{gui_h}"),
+                    ("Image grid OFF", f"{offline_gui_w}x{offline_gui_h}"),
+                    ("FFT range/angle", f"{NFFT_RANGE}/{NFFT_ANGLE}"),
                     ("RAW min/max dB", raw_minmax_str),
                     ("NORM min/max dB", norm_minmax_str),
                     ("LOG MB/s", f"{log_mbps:.2f}"),

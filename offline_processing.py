@@ -50,7 +50,6 @@ from offline_dsp import (
     back_projection_image as _back_projection_image,
     back_projection_image_mimo as _back_projection_image_mimo,
     bp_mode_normalize as _bp_mode_normalize,
-    build_mimo_back_projection_plan as _build_mimo_back_projection_plan,
     build_mimo_geometry as _build_mimo_geometry,
     motion_mode_normalize as _motion_mode_normalize,
     phase_sign_normalize as _phase_sign_normalize,
@@ -137,6 +136,20 @@ class SARData:
     raw_frames: np.ndarray | None
     n_frames_per_position: int
     bytes_per_frame: int
+    samples: int
+    chirps: int
+    rx: int
+    tx: int
+
+
+@dataclass(frozen=True)
+class SARStreamLayout:
+    source_dir: Path
+    positions: np.ndarray
+    files: tuple[Path, ...]
+    n_frames_per_position: int
+    bytes_per_frame: int
+    i16_per_frame: int
     samples: int
     chirps: int
     rx: int
@@ -247,6 +260,88 @@ class SARReader:
             rx=rx,
             tx=tx,
         )
+
+    def describe_stream(self) -> SARStreamLayout:
+        """Validate the configured run without loading capture payloads."""
+        source_dir = self._resolve_source_dir(self.config.input_dir)
+        pos_files = self._scan_position_files(source_dir)
+        expected_positions = list(range(self.config.x_start, self.config.x_end + 1, self.config.x_step))
+        self._validate_positions(pos_files, expected_positions)
+        samples, chirps, rx, tx, frames_per_pos_hdr = self._derive_capture_layout(pos_files)
+
+        bytes_per_frame = int(chirps) * int(samples) * int(rx) * 4
+        i16_per_frame = bytes_per_frame // 2
+        frames_expected = self.config.frames_per_position
+        if frames_expected is None:
+            frames_expected = frames_per_pos_hdr
+
+        pos_to_file = {int(pos): path for pos, path in pos_files}
+        ordered_files: list[Path] = []
+        actual_frames_ref: int | None = None
+        for pos in expected_positions:
+            path = pos_to_file[int(pos)]
+            file_size = int(path.stat().st_size)
+            data_offset = int(self._detect_capture_data_offset(path, file_size))
+            payload_size = int(file_size - data_offset)
+            if payload_size % int(bytes_per_frame) != 0:
+                raise ValueError(
+                    f"{path.name}: payload_size={payload_size} (offset={data_offset}) "
+                    f"non multiplo di bytes_per_frame={bytes_per_frame}"
+                )
+            n_frames = int(payload_size // int(bytes_per_frame))
+            if n_frames <= 0:
+                raise ValueError(f"{path.name}: nessun frame nel payload (offset={data_offset})")
+            if frames_expected is not None and n_frames != int(frames_expected):
+                raise ValueError(
+                    f"Posizione {pos}: n_frames={n_frames}, "
+                    f"atteso frames_per_position={int(frames_expected)}"
+                )
+            if actual_frames_ref is None:
+                actual_frames_ref = int(n_frames)
+            elif int(n_frames) != int(actual_frames_ref):
+                raise ValueError(
+                    f"Posizione {pos}: n_frames={n_frames}, atteso {actual_frames_ref} "
+                    "(tutti i file devono avere uguale numero di frame)"
+                )
+            ordered_files.append(path)
+
+        if actual_frames_ref is None:
+            raise RuntimeError("Nessun dato configurato")
+        return SARStreamLayout(
+            source_dir=source_dir,
+            positions=np.asarray(expected_positions, dtype=np.int32),
+            files=tuple(ordered_files),
+            n_frames_per_position=int(actual_frames_ref),
+            bytes_per_frame=int(bytes_per_frame),
+            i16_per_frame=int(i16_per_frame),
+            samples=int(samples),
+            chirps=int(chirps),
+            rx=int(rx),
+            tx=int(tx),
+        )
+
+    def iter_iq_positions(self, layout: SARStreamLayout):
+        """Yield one decoded IQ position at a time."""
+        for pos, path in zip(layout.positions.tolist(), layout.files):
+            raw_frames, n_frames = self.read_position(
+                path,
+                bytes_per_frame=int(layout.bytes_per_frame),
+                i16_per_frame=int(layout.i16_per_frame),
+            )
+            if int(n_frames) != int(layout.n_frames_per_position):
+                raise ValueError(
+                    f"Posizione {pos}: n_frames={n_frames}, "
+                    f"atteso {layout.n_frames_per_position}"
+                )
+            iq_frames = self._raw_to_iq(
+                raw_frames,
+                int(n_frames),
+                samples=int(layout.samples),
+                chirps=int(layout.chirps),
+                rx=int(layout.rx),
+                tx=int(layout.tx),
+            )
+            yield int(pos), iq_frames
 
     def read_position(
         self,
@@ -658,6 +753,10 @@ def _viewport_from_cmd_payload(
         output_height=int(output_height),
         dr_m=float(dr_m),
         seq=int(seq),
+        # A BP grid can sample arbitrary physical coordinates.  Unlike a
+        # realtime raster viewport, preserve the explicitly requested ROI
+        # instead of snapping it to a display-pixel quantum.
+        quantize=False,
     )
 
 
@@ -1319,13 +1418,19 @@ def _compute_synthetic_range_angle_image(
     viewport: DisplayViewport,
     projection_lut: dict[str, Any] | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    if range_fft_sel.ndim != 5:
+    if range_fft_sel.ndim not in (4, 5):
         raise ValueError(
             "range_fft_sel shape non valido per synthetic_range_angle: "
-            f"{range_fft_sel.shape!r}; atteso [pos, frame, loop, ant, bin]."
+            f"{range_fft_sel.shape!r}; atteso [pos, frame, ant, bin] "
+            "oppure [pos, frame, loop, ant, bin]."
         )
 
-    n_pos_sel, n_frames_sel, n_loops_sel, n_ant_sel, n_bins_sel = range_fft_sel.shape
+    prepared_input = range_fft_sel.ndim == 4
+    if prepared_input:
+        n_pos_sel, n_frames_sel, n_ant_sel, n_bins_sel = range_fft_sel.shape
+        n_loops_sel = 1
+    else:
+        n_pos_sel, n_frames_sel, n_loops_sel, n_ant_sel, n_bins_sel = range_fft_sel.shape
     if x_tx_ant_m.size != int(n_ant_sel) or x_rx_ant_m.size != int(n_ant_sel):
         raise ValueError("x_tx_ant_m/x_rx_ant_m size != asse antenna synthetic_range_angle")
     if int(n_ant_sel) <= 0 or int(n_bins_sel) <= 0:
@@ -1345,31 +1450,34 @@ def _compute_synthetic_range_angle_image(
             f"tx/rx non coerente con asse antenna synthetic_range_angle: tx={tx_i}, rx={rx_i}, ant={n_ant_sel}"
         )
 
-    raw_mimo = range_fft_sel.reshape(
-        int(n_pos_sel),
-        int(n_frames_sel),
-        int(n_loops_sel),
-        int(tx_i),
-        int(rx_i),
-        int(n_bins_sel),
-    ).astype(np.complex64, copy=False)
-    if range_angle_cfg.use_realtime_filters:
-        filtered_mimo = _apply_offline_sar_range_angle_pre_filters(
-            raw_mimo,
-            filters_cfg=range_angle_cfg.post_range_fft_filters,
-            fft_workers=int(fft_workers),
-        )
-        doppler_window = _build_window_1d(str(range_angle_cfg.window_doppler), int(n_loops_sel))
+    if prepared_input:
+        zero_doppler = np.asarray(range_fft_sel, dtype=np.complex64)
     else:
-        filtered_mimo = raw_mimo
-        doppler_window = None
+        raw_mimo = range_fft_sel.reshape(
+            int(n_pos_sel),
+            int(n_frames_sel),
+            int(n_loops_sel),
+            int(tx_i),
+            int(rx_i),
+            int(n_bins_sel),
+        ).astype(np.complex64, copy=False)
+        if range_angle_cfg.use_realtime_filters:
+            filtered_mimo = _apply_offline_sar_range_angle_pre_filters(
+                raw_mimo,
+                filters_cfg=range_angle_cfg.post_range_fft_filters,
+                fft_workers=int(fft_workers),
+            )
+            doppler_window = _build_window_1d(str(range_angle_cfg.window_doppler), int(n_loops_sel))
+        else:
+            filtered_mimo = raw_mimo
+            doppler_window = None
 
-    zero_doppler = _prepare_mimo_snapshots(
-        filtered_mimo,
-        n_tx=int(tx_i),
-        motion_mode="static_zero_doppler",
-        window_doppler=doppler_window,
-    )
+        zero_doppler = _prepare_mimo_snapshots(
+            filtered_mimo,
+            n_tx=int(tx_i),
+            motion_mode="static_zero_doppler",
+            window_doppler=doppler_window,
+        )
     synthetic = _prepare_synthetic_aperture_data(
         zero_doppler,
         selected_positions=np.asarray(selected_positions, dtype=np.int32).reshape(-1),
@@ -1530,9 +1638,9 @@ def _offline_reader_worker(
         nfft_range = max(1, int(nfft_range))
         if int(range_angle_cfg.nfft_range) != int(nfft_range):
             range_angle_cfg = replace(range_angle_cfg, nfft_range=int(nfft_range))
-        _queue_put_latest(status_q, {"type": "progress", "phase": "reading IQ capture files"})
-        data = reader.load(keep_raw=False)
-        range_input_samples = int(data.samples)
+        _queue_put_latest(status_q, {"type": "progress", "phase": "validating capture files"})
+        stream_layout = reader.describe_stream()
+        range_input_samples = int(stream_layout.samples)
         range_samples_used = min(int(range_input_samples), int(nfft_range))
         _queue_put_latest(
             status_q,
@@ -1549,8 +1657,8 @@ def _offline_reader_worker(
         if bp_mode == "mimo_sar":
             mimo_geometry = _resolve_offline_mimo_geometry(
                 fallback_capture_cfg,
-                tx_i=int(data.tx),
-                rx_i=int(data.rx),
+                tx_i=int(stream_layout.tx),
+                rx_i=int(stream_layout.rx),
                 tx_offsets_override_m=bp_runtime_cfg.get("tx_offsets_m"),
                 rx_offsets_override_m=bp_runtime_cfg.get("rx_offsets_m"),
             )
@@ -1563,17 +1671,93 @@ def _offline_reader_worker(
         for warning in range_angle_cfg.filter_warnings:
             print(f"[OFFLINE WARN] {warning}")
 
+        data_stage = "range_fft"
         if bp_mode == "mimo_sar":
-            # MIMO-SAR: preserva asse antenna [pos, frame, loop, ant, sample].
-            sig = _select_offline_range_fft_input(data.iq_cube, nfft_range=int(nfft_range))
-            sig = _apply_offline_backprojection_range_window(
-                sig,
-                window_type=str(range_angle_cfg.window_range),
-                enabled=bool(range_angle_cfg.use_realtime_filters),
+            n_pos = int(stream_layout.positions.size)
+            n_frames = int(stream_layout.n_frames_per_position)
+            n_ant = int(stream_layout.tx) * int(stream_layout.rx)
+            prepared_shape = (n_pos, n_frames, n_ant, int(nfft_range))
+            shm_range_fft = shared_memory.SharedMemory(
+                create=True,
+                size=int(np.prod(prepared_shape, dtype=np.int64)) * np.dtype(np.complex64).itemsize,
             )
-            range_fft = fft.fft(sig, n=int(nfft_range), axis=-1, workers=fft_workers).astype(np.complex64, copy=False)
+            shm_arr = np.ndarray(prepared_shape, dtype=np.complex64, buffer=shm_range_fft.buf)
+            doppler_window = None
+            if bool(range_angle_cfg.use_realtime_filters):
+                doppler_window = _build_window_1d(
+                    str(range_angle_cfg.window_doppler),
+                    int(stream_layout.chirps) // int(stream_layout.tx),
+                )
+
+            for pos_idx, (position_id, iq_position) in enumerate(reader.iter_iq_positions(stream_layout)):
+                if stop_evt.is_set():
+                    raise RuntimeError("offline reader stopped")
+                _queue_put_latest(
+                    status_q,
+                    {
+                        "type": "progress",
+                        "phase": f"streaming Range FFT + Doppler zero {pos_idx + 1}/{n_pos}",
+                        "position": int(position_id),
+                        "completed_positions": int(pos_idx),
+                        "total_positions": int(n_pos),
+                    },
+                )
+                sig = _select_offline_range_fft_input(iq_position, nfft_range=int(nfft_range))
+                sig = _apply_offline_backprojection_range_window(
+                    sig,
+                    window_type=str(range_angle_cfg.window_range),
+                    enabled=bool(range_angle_cfg.use_realtime_filters),
+                )
+                range_fft_pos = fft.fft(
+                    sig,
+                    n=int(nfft_range),
+                    axis=-1,
+                    workers=fft_workers,
+                ).astype(np.complex64, copy=False)
+                raw_mimo = range_fft_pos.reshape(
+                    1,
+                    int(n_frames),
+                    int(stream_layout.chirps) // int(stream_layout.tx),
+                    int(stream_layout.tx),
+                    int(stream_layout.rx),
+                    int(nfft_range),
+                )
+                if algorithm == "synthetic_range_angle" and range_angle_cfg.use_realtime_filters:
+                    raw_mimo = _apply_offline_sar_range_angle_pre_filters(
+                        raw_mimo,
+                        filters_cfg=range_angle_cfg.post_range_fft_filters,
+                        fft_workers=int(fft_workers),
+                    )
+                    zero_bins = min(
+                        int(range_angle_cfg.zero_after_range_fft_bins),
+                        int(raw_mimo.shape[-1]),
+                    )
+                    if zero_bins > 0:
+                        raw_mimo[..., :zero_bins] = np.complex64(0.0)
+                prepared_pos = _prepare_mimo_snapshots(
+                    raw_mimo,
+                    n_tx=int(stream_layout.tx),
+                    motion_mode="static_zero_doppler",
+                    window_doppler=doppler_window,
+                    log_info=False,
+                )
+                shm_arr[pos_idx] = prepared_pos[0]
+                del prepared_pos, raw_mimo, range_fft_pos, sig, iq_position
+
+            range_fft = shm_arr
+            data_stage = "zero_doppler_snapshots"
+            _queue_put_latest(
+                status_q,
+                {
+                    "type": "progress",
+                    "phase": "zero-Doppler snapshots ready",
+                    "completed_positions": int(n_pos),
+                    "total_positions": int(n_pos),
+                },
+            )
         else:
             # Legacy SAR-only: media preliminare sulle antenne virtuali.
+            data = reader.load(keep_raw=False)
             sig = data.iq_cube.mean(axis=3, dtype=np.complex64)  # [pos, frame, loop, sample]
             sig = _select_offline_range_fft_input(sig, nfft_range=int(nfft_range))
             sig = _apply_offline_backprojection_range_window(
@@ -1582,22 +1766,24 @@ def _offline_reader_worker(
                 enabled=bool(range_angle_cfg.use_realtime_filters),
             )
             range_fft = fft.fft(sig, n=int(nfft_range), axis=-1, workers=fft_workers).astype(np.complex64, copy=False)
-        if algorithm == "synthetic_range_angle" and range_angle_cfg.use_realtime_filters:
+        if bp_mode != "mimo_sar" and algorithm == "synthetic_range_angle" and range_angle_cfg.use_realtime_filters:
             zero_bins = min(int(range_angle_cfg.zero_after_range_fft_bins), int(range_fft.shape[-1]))
             if zero_bins > 0:
                 range_fft[..., :zero_bins] = np.complex64(0.0)
-        range_fft = np.ascontiguousarray(range_fft, dtype=np.complex64)
-        _queue_put_latest(status_q, {"type": "progress", "phase": "copying Range FFT to shared memory"})
-        shm_range_fft = shared_memory.SharedMemory(create=True, size=int(range_fft.nbytes))
-        shm_arr = np.ndarray(range_fft.shape, dtype=np.complex64, buffer=shm_range_fft.buf)
-        shm_arr[:] = range_fft
+        if bp_mode != "mimo_sar":
+            range_fft = np.ascontiguousarray(range_fft, dtype=np.complex64)
+            _queue_put_latest(status_q, {"type": "progress", "phase": "copying Range FFT to shared memory"})
+            shm_range_fft = shared_memory.SharedMemory(create=True, size=int(range_fft.nbytes))
+            shm_arr = np.ndarray(range_fft.shape, dtype=np.complex64, buffer=shm_range_fft.buf)
+            shm_arr[:] = range_fft
 
         msg = {
             "type": "data",
             "range_fft_shm_name": str(shm_range_fft.name),
             "range_fft_shape": tuple(int(x) for x in range_fft.shape),
             "range_fft_dtype": "complex64",
-            "positions": data.positions.astype(np.int32, copy=False),
+            "data_stage": str(data_stage),
+            "positions": stream_layout.positions.astype(np.int32, copy=False),
             "x_start_cfg": int(reader.config.x_start),
             "x_end_cfg": int(reader.config.x_end),
             "algorithm": str(algorithm),
@@ -1608,8 +1794,8 @@ def _offline_reader_worker(
             "nfft_range": int(nfft_range),
             "range_input_samples": int(range_input_samples),
             "range_samples_used": int(range_samples_used),
-            "tx": int(data.tx),
-            "rx": int(data.rx),
+            "tx": int(stream_layout.tx),
+            "rx": int(stream_layout.rx),
         }
         if mimo_geometry is not None:
             msg["bp_x_tx_ant_m"] = np.asarray(mimo_geometry["x_tx_ant_m"], dtype=np.float32)
@@ -1621,8 +1807,9 @@ def _offline_reader_worker(
             status_q,
             {
                 "type": "reader_ready",
-                "positions": int(data.positions.size),
-                "frames_per_pos": int(data.n_frames_per_position),
+                "phase": "zero-Doppler snapshots ready" if data_stage == "zero_doppler_snapshots" else "Range FFT ready",
+                "positions": int(stream_layout.positions.size),
+                "frames_per_pos": int(stream_layout.n_frames_per_position),
                 "algorithm": str(algorithm),
                 "bp_mode": str(bp_mode),
                 "motion_mode": str(bp_runtime_cfg["motion_mode"]),
@@ -1634,6 +1821,7 @@ def _offline_reader_worker(
                 "range_samples_used": int(range_samples_used),
                 "range_angle_nfft_angle": int(range_angle_cfg.nfft_angle),
                 "geometry_source": None if mimo_geometry is None else str(mimo_geometry["geometry_source"]),
+                "data_stage": str(data_stage),
             },
         )
     except Exception as exc:
@@ -1647,6 +1835,12 @@ def _offline_reader_worker(
         except Exception:
             pass
     finally:
+        # On Windows a named mapping disappears when the last open handle is
+        # closed.  Keep the producer handle alive for the runtime lifetime so
+        # the DSP process can always attach, even if process scheduling delays
+        # it after the queue message has been delivered.
+        if shm_range_fft is not None and shm_cleanup_transferred:
+            stop_evt.wait()
         if shm_range_fft is not None:
             if not shm_cleanup_transferred:
                 try:
@@ -1657,7 +1851,6 @@ def _offline_reader_worker(
                 shm_range_fft.close()
             except Exception:
                 pass
-        stop_evt.wait(0.01)
 
 
 def _range_fft_from_init_msg(init_msg: dict[str, Any]) -> tuple[np.ndarray, shared_memory.SharedMemory | None]:
@@ -1729,6 +1922,8 @@ def _offline_dsp_worker(
 
         range_fft_data, shm_range_fft = _range_fft_from_init_msg(init_msg)
         positions = np.asarray(init_msg["positions"], dtype=np.int32)
+        data_stage = str(init_msg.get("data_stage", "range_fft")).strip().lower()
+        prepared_zero_doppler = data_stage == "zero_doppler_snapshots"
         algorithm = _reconstruction_algorithm_normalize(_pick(init_msg.get("algorithm"), "backprojection"))
         bp_mode: BpMode = _bp_mode_normalize(_pick(init_msg.get("bp_mode"), "sar_only"))
         if ("bp_mode" not in init_msg) and range_fft_data.ndim == 5:
@@ -1754,12 +1949,17 @@ def _offline_dsp_worker(
             raise ValueError(f"range_fft shape non valido: {range_fft_data.shape!r}")
         if bp_mode == "sar_only" and range_fft_data.ndim != 4:
             raise ValueError(f"range_fft shape non coerente con bp.mode=sar_only: {range_fft_data.shape!r}")
-        if bp_mode == "mimo_sar" and range_fft_data.ndim != 5:
-            raise ValueError(f"range_fft shape non coerente con bp.mode=mimo_sar: {range_fft_data.shape!r}")
+        if bp_mode == "mimo_sar":
+            expected_ndim = 4 if prepared_zero_doppler else 5
+            if range_fft_data.ndim != expected_ndim:
+                raise ValueError(
+                    "range_fft shape non coerente con bp.mode=mimo_sar "
+                    f"e data_stage={data_stage}: {range_fft_data.shape!r}"
+                )
         if positions.ndim != 1 or positions.size != range_fft_data.shape[0]:
             raise ValueError("positions non coerente con range_fft")
         if algorithm == "synthetic_range_angle" and bp_mode != "mimo_sar":
-            raise ValueError("synthetic_range_angle richiede range_fft MIMO-SAR a 5 dimensioni")
+            raise ValueError("synthetic_range_angle richiede dati MIMO-SAR")
 
         nfft_range = max(1, int(_pick(init_msg.get("nfft_range"), range_angle_cfg.nfft_range, nfft_range)))
         range_input_samples = max(1, int(_pick(init_msg.get("range_input_samples"), nfft_range)))
@@ -1783,7 +1983,7 @@ def _offline_dsp_worker(
             x_tx_ant_m = np.asarray(init_msg.get("bp_x_tx_ant_m"), dtype=np.float32).reshape(-1)
             x_rx_ant_m = np.asarray(init_msg.get("bp_x_rx_ant_m"), dtype=np.float32).reshape(-1)
             geometry_source = str(_pick(init_msg.get("bp_geometry_source"), "unknown"))
-            n_ant_data = int(range_fft_data.shape[3])
+            n_ant_data = int(range_fft_data.shape[2] if prepared_zero_doppler else range_fft_data.shape[3])
             if x_tx_ant_m.size != n_ant_data or x_rx_ant_m.size != n_ant_data:
                 raise ValueError("bp_x_tx_ant_m/bp_x_rx_ant_m size != asse antenna range_fft")
             n_ant_used = int(n_ant_data)
@@ -1864,8 +2064,6 @@ def _offline_dsp_worker(
         dirty = True
         prepared_cache_key = None
         prepared_cache = None
-        bp_plan_cache_key = None
-        bp_plan_cache = None
         grid_cache_key = None
         grid_cache = None
         synthetic_projection_lut_cache_key = None
@@ -1939,13 +2137,38 @@ def _offline_dsp_worker(
                 sel_idx = np.where(sel_mask)[0]
                 sel_key = tuple(int(v) for v in sel_idx.tolist())
                 frame_meta: dict[str, Any] = {}
+                # The back-projection only interpolates bins that can reach a
+                # pixel in the active ROI.  Keep a small guard for the cubic
+                # interpolator while respecting the configured processing cap.
+                viewport_max_bin = max(
+                    1,
+                    min(
+                        int(max_bin),
+                        int(np.ceil(float(applied_viewport.range_max_bin_f))) + 2,
+                    ),
+                )
                 if algorithm == "synthetic_range_angle":
                     selected_positions = positions[sel_idx].astype(np.int32, copy=False)
-                    range_fft_sel = range_fft_data[sel_idx, :, :, :, :max_bin]
-                    n_pos_sel, _n_frames_sel, _n_loops_sel, n_ant_sel, _n_bins_sel = range_fft_sel.shape
+                    if prepared_zero_doppler:
+                        range_fft_sel = range_fft_data[sel_idx, :, :, :max_bin]
+                        n_pos_sel, n_frames_sel, n_ant_sel, _n_bins_sel = range_fft_sel.shape
+                    else:
+                        range_fft_sel = range_fft_data[sel_idx, :, :, :, :max_bin]
+                        n_pos_sel, n_frames_sel, _n_loops_sel, n_ant_sel, _n_bins_sel = range_fft_sel.shape
                     if int(n_ant_sel) != int(tx_i) * int(rx_i):
                         raise ValueError(
                             f"asse antenna synthetic={n_ant_sel} non coerente con tx/rx={tx_i}/{rx_i}"
+                        )
+                    mvdr_elements = int(n_pos_sel) * int(n_ant_sel)
+                    if (
+                        str(range_angle_cfg.angle_processing.mode) == "mvdr"
+                        and int(n_frames_sel) < int(mvdr_elements)
+                    ):
+                        raise ValueError(
+                            "MVDR offline sottodeterminato: "
+                            f"snapshot={n_frames_sel}, elementi={mvdr_elements}. "
+                            "Seleziona meno posizioni (con 8 frame usare una sola posizione), "
+                            "aumenta frames_per_position oppure usa Bartlett/backprojection."
                         )
                     synthetic_projection_lut_key = (
                         str(algorithm),
@@ -2007,8 +2230,13 @@ def _offline_dsp_worker(
 
                     x_pos_m_sel = x_pos_m_full[sel_idx]
                     if bp_mode == "mimo_sar":
-                        range_fft_sel = range_fft_data[sel_idx, :, :, :, :max_bin]
-                        n_pos_sel, n_frames_sel, n_loops_sel, n_ant_sel, n_bins_sel = range_fft_sel.shape
+                        if prepared_zero_doppler:
+                            range_fft_sel = range_fft_data[sel_idx, :, :, :viewport_max_bin]
+                            n_pos_sel, n_frames_sel, n_ant_sel, n_bins_sel = range_fft_sel.shape
+                            n_loops_sel = 1
+                        else:
+                            range_fft_sel = range_fft_data[sel_idx, :, :, :, :viewport_max_bin]
+                            n_pos_sel, n_frames_sel, n_loops_sel, n_ant_sel, n_bins_sel = range_fft_sel.shape
                         if int(n_ant_sel) != int(tx_i) * int(rx_i):
                             raise ValueError(
                                 f"asse antenna mimo={n_ant_sel} non coerente con tx/rx={tx_i}/{rx_i}"
@@ -2016,7 +2244,7 @@ def _offline_dsp_worker(
                         prepared_key = (
                             sel_key,
                             str(motion_mode),
-                            int(max_bin),
+                            int(viewport_max_bin),
                             int(tx_i),
                             int(rx_i),
                             bp_window_stages,
@@ -2024,26 +2252,29 @@ def _offline_dsp_worker(
                         if prepared_cache_key == prepared_key and prepared_cache is not None:
                             prepared = prepared_cache
                         else:
-                            raw_mimo = range_fft_sel.reshape(
-                                int(n_pos_sel),
-                                int(n_frames_sel),
-                                int(n_loops_sel),
-                                int(tx_i),
-                                int(rx_i),
-                                int(n_bins_sel),
-                            ).astype(np.complex64, copy=False)
-                            doppler_window = None
-                            if bool(range_angle_cfg.use_realtime_filters):
-                                doppler_window = _build_window_1d(
-                                    str(range_angle_cfg.window_doppler),
+                            if prepared_zero_doppler:
+                                prepared = np.asarray(range_fft_sel, dtype=np.complex64)
+                            else:
+                                raw_mimo = range_fft_sel.reshape(
+                                    int(n_pos_sel),
+                                    int(n_frames_sel),
                                     int(n_loops_sel),
+                                    int(tx_i),
+                                    int(rx_i),
+                                    int(n_bins_sel),
+                                ).astype(np.complex64, copy=False)
+                                doppler_window = None
+                                if bool(range_angle_cfg.use_realtime_filters):
+                                    doppler_window = _build_window_1d(
+                                        str(range_angle_cfg.window_doppler),
+                                        int(n_loops_sel),
+                                    )
+                                prepared = _prepare_mimo_snapshots(
+                                    raw_mimo,
+                                    n_tx=int(tx_i),
+                                    motion_mode=motion_mode,
+                                    window_doppler=doppler_window,
                                 )
-                            prepared = _prepare_mimo_snapshots(
-                                raw_mimo,
-                                n_tx=int(tx_i),
-                                motion_mode=motion_mode,
-                                window_doppler=doppler_window,
-                            )
                             prepared = _apply_offline_backprojection_aperture_window(
                                 prepared,
                                 window_type=str(range_angle_cfg.window_angle),
@@ -2051,35 +2282,6 @@ def _offline_dsp_worker(
                             )
                             prepared_cache_key = prepared_key
                             prepared_cache = prepared
-
-                        bp_plan_key = (
-                            sel_key,
-                            int(gui_h),
-                            int(gui_w),
-                            int(max_bin),
-                            int(phase_sign_i),
-                            float(dr_m),
-                            float(fc_hz),
-                            float(c_m_s),
-                            display_viewport_signature(applied_viewport),
-                        )
-                        if bp_plan_cache_key == bp_plan_key and bp_plan_cache is not None:
-                            bp_plan = bp_plan_cache
-                        else:
-                            bp_plan = _build_mimo_back_projection_plan(
-                                x_pos_m_sel,
-                                x_tx_ant_m,
-                                x_rx_ant_m,
-                                x_grid,
-                                y_grid,
-                                dr_m=dr_m,
-                                fc_hz=fc_hz,
-                                c_m_s=c_m_s,
-                                max_bin=max_bin,
-                                phase_sign=phase_sign_i,
-                            )
-                            bp_plan_cache_key = bp_plan_key
-                            bp_plan_cache = bp_plan
 
                         img_db = _back_projection_image_mimo(
                             prepared,
@@ -2091,16 +2293,16 @@ def _offline_dsp_worker(
                             dr_m=dr_m,
                             fc_hz=fc_hz,
                             c_m_s=c_m_s,
-                            max_bin=max_bin,
+                            max_bin=viewport_max_bin,
                             motion_mode=motion_mode,
                             phase_sign=phase_sign_i,
                             chunk_size=16384,
                             coherent_sum=bool(coherent_sum),
-                            bp_plan=bp_plan,
+                            bp_plan=None,
                         )
                         doppler_bins_used = 1
                     else:
-                        range_fft_sel = range_fft_data[sel_idx, :, :, :max_bin]
+                        range_fft_sel = range_fft_data[sel_idx, :, :, :viewport_max_bin]
                         reduced = _reduce_avg_mode(range_fft_sel, avg_mode)
                         if reduced.ndim != 3:
                             raise ValueError(f"reduce_avg_mode sar_only shape non valido: {reduced.shape!r}")
@@ -2112,7 +2314,7 @@ def _offline_dsp_worker(
                             dr_m=dr_m,
                             fc_hz=fc_hz,
                             c_m_s=c_m_s,
-                            max_bin=max_bin,
+                            max_bin=viewport_max_bin,
                             phase_sign=phase_sign_i,
                             chunk_size=16384,
                         )
@@ -2133,8 +2335,14 @@ def _offline_dsp_worker(
                     gui_latest_seq.value = int(gui_latest_seq.value) + 1
 
                 t1 = time.perf_counter()
+                positions_text = (
+                    f"{int(positions[sel_idx[0]])}..{int(positions[sel_idx[-1]])} "
+                    f"count={int(sel_idx.size)}"
+                    if int(sel_idx.size) > 0
+                    else "none"
+                )
                 print(
-                    f"[OFFLINE INFO] frame algorithm={algorithm} positions={sel_key} "
+                    f"[OFFLINE INFO] frame algorithm={algorithm} positions={positions_text} "
                     f"synthetic_ant={frame_meta.get('synthetic_antennas', n_ant_used)} "
                     f"angle_used={frame_meta.get('angle_elements_used', 'n/a')} "
                     f"angle_mode={frame_meta.get('angle_mode', range_angle_cfg.angle_processing.mode)} "
@@ -2157,6 +2365,7 @@ def _offline_dsp_worker(
                         "bp_mode": str(bp_mode),
                         "geometry_source": str(geometry_source),
                         "doppler_bins_used": int(doppler_bins_used),
+                        "bp_range_bins_used": int(viewport_max_bin),
                         "nfft_range": int(nfft_range),
                         "range_input_samples": int(range_input_samples),
                         "range_samples_used": int(range_samples_used),
@@ -2208,9 +2417,10 @@ def _offline_dsp_worker(
 class OfflineBPRuntime:
     """
     Runtime/controller offline a due processi:
-    - reader process: carica bin e prepara range-FFT 4D/5D
-      [pos, frame, loop, range] oppure [pos, frame, loop, ant, range]
-    - dsp process: applica media runtime + back projection e pubblica frame su double-buffer
+    - reader process: elabora una posizione alla volta e pubblica snapshot
+      Doppler-zero MIMO ``[pos, frame, ant, range]``;
+    - dsp process: applica la ricostruzione richiesta e pubblica frame su
+      double-buffer senza conservare un piano geometrico globale.
     """
 
     def __init__(

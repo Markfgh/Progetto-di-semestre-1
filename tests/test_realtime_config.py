@@ -654,6 +654,44 @@ def test_display_zoom_parser_and_viewport_clamps_are_stable() -> None:
     assert clamped.zoom_level >= 1.0
 
 
+def test_display_image_resolutions_are_independent_and_keep_legacy_fallback() -> None:
+    legacy_cfg = {
+        "radar": {"c": 3.0e8, "fs": 2.0e6, "slope": 30.0e12},
+        "fft": {"nfft_range": 32768, "nfft_angle": 64},
+        "display": {"range_max": 4.0},
+        "display_zoom": {"output_width": 192, "output_height": 96},
+    }
+    legacy = realtime_dsp.display_image_resolutions_from_yaml_dict(legacy_cfg)
+    assert legacy.realtime == realtime_dsp.DisplayImageResolution(width=192, height=96)
+    assert legacy.offline == realtime_dsp.DisplayImageResolution(width=192, height=96)
+
+    explicit_cfg = {
+        **legacy_cfg,
+        "display": {
+            "range_max": 4.0,
+            "image_resolution": {
+                "realtime": {"width": 256, "height": 128},
+                "offline": {"width": 512, "height": 256},
+            },
+        },
+    }
+    explicit = realtime_dsp.display_image_resolutions_from_yaml_dict(explicit_cfg)
+    assert explicit.realtime == realtime_dsp.DisplayImageResolution(width=256, height=128)
+    assert explicit.offline == realtime_dsp.DisplayImageResolution(width=512, height=256)
+
+    invalid = realtime_dsp.display_image_resolutions_from_yaml_dict(
+        {
+            **legacy_cfg,
+            "display": {
+                "range_max": 4.0,
+                "image_resolution": {"realtime": {"width": -7, "height": "not-a-number"}},
+            },
+        }
+    )
+    assert invalid.realtime == realtime_dsp.DisplayImageResolution(width=1, height=96)
+    assert invalid.offline == realtime_dsp.DisplayImageResolution(width=192, height=96)
+
+
 def test_display_zoom_method_warnings_are_explicit_for_unsupported_values() -> None:
     warnings = realtime_dsp.display_zoom_method_warnings(
         realtime_dsp.DisplayZoomConfig(

@@ -233,6 +233,22 @@ class DisplayProjectionConfig:
 
 
 @dataclass(frozen=True)
+class DisplayImageResolution:
+    """Fixed raster size used by one rendered image stream."""
+
+    width: int = 128
+    height: int = 128
+
+
+@dataclass(frozen=True)
+class DisplayImageResolutions:
+    """Independent fixed output grids for realtime and offline images."""
+
+    realtime: DisplayImageResolution = field(default_factory=DisplayImageResolution)
+    offline: DisplayImageResolution = field(default_factory=DisplayImageResolution)
+
+
+@dataclass(frozen=True)
 class DisplayZoomConfig:
     enabled: bool = False
     output_width: int = 128
@@ -692,6 +708,37 @@ def display_zoom_from_yaml_dict(cfg: dict[str, Any]) -> DisplayZoomConfig:
         max_update_hz=float(max_update_hz),
         dsp_budget_ms=float(dsp_budget_ms),
         fallback_mode=fallback_mode,
+    )
+
+
+def display_image_resolutions_from_yaml_dict(cfg: dict[str, Any]) -> DisplayImageResolutions:
+    """Read fixed image grids without coupling them to either FFT size.
+
+    ``display.image_resolution`` is the current public configuration.  The
+    legacy ``display_zoom.output_width/output_height`` pair remains the
+    fallback for both streams so existing configurations retain their raster
+    sizes unchanged.
+    """
+    legacy = display_zoom_from_yaml_dict(cfg)
+    legacy_resolution = DisplayImageResolution(
+        width=max(1, int(legacy.output_width)),
+        height=max(1, int(legacy.output_height)),
+    )
+    display_cfg = cfg.get("display", {}) or {}
+    root = display_cfg.get("image_resolution", {}) if isinstance(display_cfg, dict) else {}
+    root = root if isinstance(root, dict) else {}
+
+    def _parse_stream(name: str) -> DisplayImageResolution:
+        block = root.get(name, {})
+        block = block if isinstance(block, dict) else {}
+        return DisplayImageResolution(
+            width=max(1, _to_int(block.get("width", legacy_resolution.width), legacy_resolution.width)),
+            height=max(1, _to_int(block.get("height", legacy_resolution.height), legacy_resolution.height)),
+        )
+
+    return DisplayImageResolutions(
+        realtime=_parse_stream("realtime"),
+        offline=_parse_stream("offline"),
     )
 
 
@@ -1475,6 +1522,7 @@ def clamp_display_viewport(
     seq: int = 0,
     doppler_min_mps: float | None = None,
     doppler_max_mps: float | None = None,
+    quantize: bool = True,
 ) -> DisplayViewport:
     home_x0 = float(home_viewport.x_min_m)
     home_x1 = float(home_viewport.x_max_m)
@@ -1501,12 +1549,13 @@ def clamp_display_viewport(
     def _quantize_ceil(value: float, origin: float, step: float) -> float:
         return float(origin + math.ceil((value - origin) / step) * step)
 
-    # Quantize outward so the applied viewport always covers the user's
-    # requested ROI instead of shrinking it and clipping the display edges.
-    x0 = _quantize_floor(x0, home_x0, x_step)
-    x1 = _quantize_ceil(x1, home_x0, x_step)
-    y0 = _quantize_floor(y0, home_y0, y_step)
-    y1 = _quantize_ceil(y1, home_y0, y_step)
+    if quantize:
+        # Quantize outward so the applied viewport always covers the user's
+        # requested ROI instead of shrinking it and clipping the display edges.
+        x0 = _quantize_floor(x0, home_x0, x_step)
+        x1 = _quantize_ceil(x1, home_x0, x_step)
+        y0 = _quantize_floor(y0, home_y0, y_step)
+        y1 = _quantize_ceil(y1, home_y0, y_step)
 
     x0 = max(home_x0, min(home_x1, x0))
     x1 = max(home_x0, min(home_x1, x1))
