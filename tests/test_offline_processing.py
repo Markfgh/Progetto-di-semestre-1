@@ -4,18 +4,22 @@ from pathlib import Path
 import json
 from multiprocessing import Event, Process, Queue, shared_memory
 import struct
+import time
 
 import numpy as np
 import pytest
 import yaml
 
 from offline_processing import (
+    CylindricalPlane,
+    OfflineBPRuntime,
     SARReader,
     _backprojection_viewport_max_bin,
     _offline_reader_worker,
     _read_bp_runtime_cfg,
     _subtract_reference_background,
     _viewport_from_cmd_payload,
+    cylindrical_capture_world_coordinates,
     offline_map_bounds_from_yaml_dict,
 )
 from realtime_dsp import build_display_viewport
@@ -87,6 +91,63 @@ def _write_capture(
     path.write_bytes(b"RTPBIN1\x00" + struct.pack("<I", len(header)) + header + raw)
 
 
+def _write_capture_v2(
+    path: Path,
+    *,
+    capture_id: int,
+    acquisition_index: int,
+    angle_index: int,
+    height_index: int,
+    azimuth_rad: float,
+    height_m: float,
+    radius_m: float = 2.5,
+    scene_center_m: tuple[float, float, float] = (1.0, -2.0, 0.5),
+    angle_count: int = 4,
+    height_count: int | None = None,
+    position_legacy: int = -999,
+    frames: int = 2,
+    samples: int = 8,
+    chirps: int = 4,
+    rx: int = 4,
+    tx: int = 2,
+) -> None:
+    """Write a small rt_capture_v2 fixture with a regular-cylinder header."""
+    capture = {
+        "samples": samples,
+        "chirps": chirps,
+        "rx": rx,
+        "tx": tx,
+        "frames_per_position": frames,
+    }
+    cylindrical: dict[str, object] = {
+        "angle_index": angle_index,
+        "height_index": height_index,
+        "angle_count": angle_count,
+        "azimuth_rad": azimuth_rad,
+        "height_m": height_m,
+        "radius_m": radius_m,
+        "scene_center_m": list(scene_center_m),
+    }
+    if height_count is not None:
+        cylindrical["height_count"] = height_count
+    header = json.dumps(
+        {
+            "format": "rt_capture_v2",
+            "position": position_legacy,
+            "capture_id": capture_id,
+            "acquisition_index": acquisition_index,
+            "capture": capture,
+            "cylindrical": cylindrical,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    i16_count = frames * chirps * samples * rx * 2
+    raw_i16 = np.arange(i16_count, dtype=np.int16) + np.int16(capture_id * 7)
+    path.write_bytes(
+        b"RTPBIN1\x00" + struct.pack("<I", len(header)) + header + raw_i16.tobytes()
+    )
+
+
 def test_read_bp_runtime_cfg_rejects_invalid_reconstruction_algorithm(tmp_path: Path) -> None:
     offline_cfg = tmp_path / "offline_config.yaml"
     fallback_cfg = tmp_path / "Config.yaml"
@@ -142,6 +203,36 @@ def test_offline_map_bounds_are_loaded_from_reconstruction_config(tmp_path: Path
     assert runtime["map_bounds"].x_max_m == pytest.approx(4.0)
     assert runtime["map_bounds"].y_min_m == pytest.approx(1.5)
     assert runtime["map_bounds"].y_max_m == pytest.approx(8.0)
+
+
+def test_read_bp_runtime_cfg_parses_signed_cylindrical_plane_separately_from_legacy_bounds(
+    tmp_path: Path,
+) -> None:
+    offline_cfg = tmp_path / "offline_config.yaml"
+    fallback_cfg = tmp_path / "Config.yaml"
+    _write_yaml(
+        offline_cfg,
+        {
+            "reconstruction": {
+                "algorithm": "backprojection",
+                "cylindrical_plane": {
+                    "x_min_m": -1.0,
+                    "x_max_m": 1.0,
+                    "y_min_m": -2.0,
+                    "y_max_m": 2.0,
+                    "z_m": 0.35,
+                },
+            }
+        },
+    )
+    _write_yaml(fallback_cfg, _fallback_capture_cfg())
+
+    runtime = _read_bp_runtime_cfg(offline_cfg, fallback_cfg)
+
+    plane = runtime["cylindrical_plane"]
+    assert isinstance(plane, CylindricalPlane)
+    assert plane.y_min_m == pytest.approx(-2.0)
+    assert plane.z_m == pytest.approx(0.35)
 
 
 @pytest.mark.parametrize(
@@ -434,6 +525,296 @@ def test_stream_reader_validates_without_loading_full_cube(tmp_path: Path) -> No
     assert layout.n_frames_per_position == 2
     assert [pos for pos, _iq in streamed] == [1, 2]
     assert streamed[0][1].shape == (2, 2, 8, 8)
+
+
+def test_stream_reader_orders_regular_cylindrical_v2_by_acquisition_index(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run_cylinder"
+    run_dir.mkdir()
+    # Deliberately create the files in neither filename nor capture-ID order.
+    # The legacy ``position`` values are intentionally unrelated to geometry.
+    records = [
+        (44, 3, 3, 0, 1.5 * np.pi, 0.0, 4003),
+        (21, 0, 0, 0, 0.0, 0.0, -101),
+        (88, 6, 2, 1, np.pi, 0.35, 710),
+        (53, 1, 1, 0, 0.5 * np.pi, 0.0, 999),
+        (97, 7, 3, 1, 1.5 * np.pi, 0.35, 17),
+        (32, 4, 0, 1, 0.0, 0.35, 70),
+        (65, 5, 1, 1, 0.5 * np.pi, 0.35, -7),
+        (76, 2, 2, 0, np.pi, 0.0, 313),
+    ]
+    for capture_id, acquisition_index, angle_index, height_index, azimuth, height, position in records:
+        _write_capture_v2(
+            run_dir / f"capture_pos{capture_id}.bin",
+            capture_id=capture_id,
+            acquisition_index=acquisition_index,
+            angle_index=angle_index,
+            height_index=height_index,
+            azimuth_rad=azimuth,
+            height_m=height,
+            height_count=2,
+            position_legacy=position,
+        )
+
+    offline_cfg = tmp_path / "offline_config.yaml"
+    # A cylindrical v2 run does not use or require the legacy linear scan block.
+    _write_yaml(
+        offline_cfg,
+        {"data": {"input_dir": str(run_dir)}, "capture": {"frames_per_position": 2}},
+    )
+
+    layout = SARReader(offline_cfg).describe_stream()
+    streamed = list(SARReader(offline_cfg).iter_iq_positions(layout))
+
+    assert layout.geometry_mode == "cylindrical_regular"
+    assert layout.positions.tolist() == [21, 53, 76, 44, 32, 65, 88, 97]
+    assert layout.capture_ids is not None
+    assert layout.capture_ids.tolist() == layout.positions.tolist()
+    assert layout.acquisition_indices is not None
+    assert layout.acquisition_indices.tolist() == list(range(8))
+    assert [capture.angle_index for capture in layout.cylindrical_captures] == [0, 1, 2, 3, 0, 1, 2, 3]
+    assert [capture.height_index for capture in layout.cylindrical_captures] == [0, 0, 0, 0, 1, 1, 1, 1]
+    assert [capture.height_m for capture in layout.cylindrical_captures] == pytest.approx(
+        [0.0, 0.0, 0.0, 0.0, 0.35, 0.35, 0.35, 0.35]
+    )
+    # ``position`` is legacy-only in v2: the derived physical pose comes from
+    # radius/azimuth/height/scene-center and is independent of it.
+    np.testing.assert_allclose(
+        layout.cylindrical_captures[0].position_world_m,
+        [3.5, -2.0, 0.5],
+    )
+    assert [capture_id for capture_id, _iq in streamed] == layout.capture_ids.tolist()
+    assert streamed[0][1].shape == (2, 2, 8, 8)
+
+    tx_global_m, rx_global_m = cylindrical_capture_world_coordinates(
+        layout,
+        fc_hz=77.0e9,
+        c_m_s=3.0e8,
+    )
+    assert tx_global_m.shape == (8, 8, 3)
+    assert rx_global_m.shape == (8, 8, 3)
+    # The first capture has theta=0 and reference position [3.5, -2, 0.5].
+    # Body +X is tangential (+world Y), so all local ULA offsets leave X/Z
+    # unchanged while preserving physical TX/RX separation along world Y.
+    np.testing.assert_allclose(tx_global_m[0, :, 0], 3.5)
+    np.testing.assert_allclose(rx_global_m[0, :, 0], 3.5)
+    np.testing.assert_allclose(tx_global_m[0, :, 2], 0.5)
+    np.testing.assert_allclose(rx_global_m[0, :, 2], 0.5)
+
+
+def test_stream_reader_rejects_non_regular_cylindrical_v2_sequence(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_bad_cylinder"
+    run_dir.mkdir()
+    # The third capture claims angle 3 even though acquisition index 2 must
+    # be angle 2 for a single regular turn at this height.
+    angle_indices = [0, 1, 3, 2]
+    for acquisition_index, angle_index in enumerate(angle_indices):
+        _write_capture_v2(
+            run_dir / f"capture_pos{100 + acquisition_index}.bin",
+            capture_id=100 + acquisition_index,
+            acquisition_index=acquisition_index,
+            angle_index=angle_index,
+            height_index=0,
+            azimuth_rad=float(angle_index) * 0.5 * np.pi,
+            height_m=0.0,
+            height_count=1,
+            position_legacy=acquisition_index - 20,
+        )
+    offline_cfg = tmp_path / "offline_config.yaml"
+    _write_yaml(offline_cfg, {"data": {"input_dir": str(run_dir)}})
+
+    with pytest.raises(ValueError, match="Sequenza cilindrica non regolare"):
+        SARReader(offline_cfg).describe_stream()
+
+
+def test_stream_reader_rejects_nonuniform_azimuth_steps_in_cylindrical_v2(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_bad_azimuth"
+    run_dir.mkdir()
+    for acquisition_index, azimuth in enumerate((0.0, 0.3, np.pi, 1.5 * np.pi)):
+        _write_capture_v2(
+            run_dir / f"capture_pos{100 + acquisition_index}.bin",
+            capture_id=100 + acquisition_index,
+            acquisition_index=acquisition_index,
+            angle_index=acquisition_index,
+            height_index=0,
+            azimuth_rad=float(azimuth),
+            height_m=0.0,
+            height_count=1,
+            position_legacy=0,
+        )
+    offline_cfg = tmp_path / "offline_config.yaml"
+    _write_yaml(offline_cfg, {"data": {"input_dir": str(run_dir)}})
+
+    with pytest.raises(ValueError, match="passi regolari"):
+        SARReader(offline_cfg).describe_stream()
+
+
+def test_stream_reader_accepts_a_regular_clockwise_cylindrical_turn(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_clockwise"
+    run_dir.mkdir()
+    for acquisition_index, azimuth in enumerate((0.0, 1.5 * np.pi, np.pi, 0.5 * np.pi)):
+        _write_capture_v2(
+            run_dir / f"capture_pos{200 + acquisition_index}.bin",
+            capture_id=200 + acquisition_index,
+            acquisition_index=acquisition_index,
+            angle_index=acquisition_index,
+            height_index=0,
+            azimuth_rad=float(azimuth),
+            height_m=0.0,
+            height_count=1,
+        )
+    offline_cfg = tmp_path / "offline_config.yaml"
+    _write_yaml(offline_cfg, {"data": {"input_dir": str(run_dir)}})
+
+    layout = SARReader(offline_cfg).describe_stream()
+    assert layout.geometry_mode == "cylindrical_regular"
+    assert layout.acquisition_indices is not None
+    assert layout.acquisition_indices.tolist() == [0, 1, 2, 3]
+
+
+def test_offline_reader_worker_publishes_v2_physical_world_geometry(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_cylinder_worker"
+    run_dir.mkdir()
+    for acquisition_index in range(4):
+        _write_capture_v2(
+            run_dir / f"capture_pos{20 + acquisition_index}.bin",
+            capture_id=20 + acquisition_index,
+            acquisition_index=acquisition_index,
+            angle_index=acquisition_index,
+            height_index=0,
+            azimuth_rad=float(acquisition_index) * 0.5 * np.pi,
+            height_m=0.0,
+            height_count=1,
+            position_legacy=999 - acquisition_index,
+        )
+    offline_cfg = tmp_path / "offline_config.yaml"
+    fallback_cfg = tmp_path / "Config.yaml"
+    _write_yaml(
+        offline_cfg,
+        {
+            "data": {"input_dir": str(run_dir)},
+            "capture": {"frames_per_position": 2},
+            "reconstruction": {
+                "algorithm": "backprojection",
+                "cylindrical_plane": {
+                    "x_min_m": -0.4,
+                    "x_max_m": 0.4,
+                    "y_min_m": -0.4,
+                    "y_max_m": 0.4,
+                    "z_m": 0.0,
+                },
+            },
+            "bp": {},
+        },
+    )
+    fallback_payload = _fallback_capture_cfg()
+    fallback_payload["capture"].update({"samples": 8, "chirps": 4})
+    fallback_payload["fft"] = {"workers": 1}
+    _write_yaml(fallback_cfg, fallback_payload)
+
+    data_q: Queue = Queue()
+    status_q: Queue = Queue()
+    stop_evt = Event()
+    worker = Process(
+        target=_offline_reader_worker,
+        args=(str(offline_cfg), str(fallback_cfg), 8, data_q, status_q, stop_evt),
+    )
+    worker.start()
+    msg = data_q.get(timeout=3.0)
+    assert msg.get("type") == "data", msg
+    assert msg["geometry_mode"] == "cylindrical_regular"
+    assert msg["bp_tx_global_m"].shape == (4, 8, 3)
+    assert msg["bp_rx_global_m"].shape == (4, 8, 3)
+    assert isinstance(msg["cylindrical_plane"], CylindricalPlane)
+    assert msg["cylindrical_plane"].y_min_m == pytest.approx(-0.4)
+    assert "bp_x_tx_ant_m" not in msg
+    shm = shared_memory.SharedMemory(name=str(msg["range_fft_shm_name"]))
+    try:
+        assert tuple(msg["range_fft_shape"]) == (4, 2, 8, 8)
+    finally:
+        shm.close()
+        stop_evt.set()
+        worker.join(timeout=2.0)
+        if worker.is_alive():
+            worker.terminate()
+            worker.join(timeout=1.0)
+        try:
+            shm.unlink()
+        except FileNotFoundError:
+            pass
+        data_q.close()
+        status_q.close()
+
+
+def test_offline_runtime_uses_v2_world_geometry_for_circular_plane(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_circular_runtime"
+    run_dir.mkdir()
+    for acquisition_index in range(4):
+        _write_capture_v2(
+            run_dir / f"capture_pos{30 + acquisition_index}.bin",
+            capture_id=30 + acquisition_index,
+            acquisition_index=acquisition_index,
+            angle_index=acquisition_index,
+            height_index=0,
+            azimuth_rad=float(acquisition_index) * 0.5 * np.pi,
+            height_m=0.0,
+            height_count=1,
+        )
+    offline_cfg = tmp_path / "offline_config.yaml"
+    fallback_cfg = tmp_path / "Config.yaml"
+    _write_yaml(
+        offline_cfg,
+        {
+            "data": {"input_dir": str(run_dir)},
+            "capture": {"frames_per_position": 2},
+            "reconstruction": {
+                "algorithm": "backprojection",
+                "cylindrical_plane": {
+                    "x_min_m": -0.25,
+                    "x_max_m": 0.25,
+                    "y_min_m": -0.25,
+                    "y_max_m": 0.25,
+                    "z_m": 0.0,
+                },
+            },
+            "bp": {},
+        },
+    )
+    fallback_payload = _fallback_capture_cfg()
+    fallback_payload["capture"].update({"samples": 8, "chirps": 4})
+    fallback_payload["fft"] = {"workers": 1}
+    _write_yaml(fallback_cfg, fallback_payload)
+
+    runtime = OfflineBPRuntime(
+        offline_config_path=offline_cfg,
+        fallback_capture_cfg=fallback_cfg,
+        c_m_s=3.0e8,
+        fs_hz=10.0e6,
+        slope_hz_s=14.967e12,
+        fc_hz=77.0e9,
+        nfft_range=8,
+        image_h=8,
+        image_w=8,
+    )
+    try:
+        ready = runtime.start(timeout_s=8.0)
+        assert ready["geometry_mode"] == "cylindrical_regular"
+        assert ready["cylindrical_plane"]["y_min_m"] == pytest.approx(-0.25)
+        frame = None
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline and frame is None:
+            frame = runtime.poll_frame()
+            if frame is None:
+                time.sleep(0.03)
+        assert frame is not None, runtime.last_error
+        image, info = frame
+        assert image.shape == (8, 8)
+        assert np.all(np.isfinite(image))
+        assert info["geometry_mode"] == "cylindrical_regular"
+        assert info["n_pos_used"] == 4
+    finally:
+        runtime.stop()
 
 
 @pytest.mark.parametrize("nfft_range", [4, 8, 16])

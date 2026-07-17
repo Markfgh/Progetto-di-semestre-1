@@ -229,6 +229,172 @@ def prepare_mimo_snapshots(
     return out
 
 
+def _back_projection_weights(
+    value: np.ndarray | None,
+    *,
+    expected_size: int,
+    field_name: str,
+) -> np.ndarray:
+    """Return a real coherent weight for each pose or physical channel."""
+    if value is None:
+        return np.ones(int(expected_size), dtype=np.float32)
+
+    weights = np.asarray(value, dtype=np.float32)
+    if weights.ndim != 1 or int(weights.size) != int(expected_size):
+        raise ValueError(f"{field_name} non coerente: atteso vettore di {int(expected_size)} elementi")
+    if not np.all(np.isfinite(weights)):
+        raise ValueError(f"{field_name} contiene valori non finiti")
+    return weights.astype(np.float32, copy=False)
+
+
+def back_projection_power_mimo_geometry(
+    snapshot_frame_ant_range: np.ndarray,
+    tx_global_m: np.ndarray,
+    rx_global_m: np.ndarray,
+    voxel_xyz: np.ndarray,
+    *,
+    dr_m: float,
+    fc_hz: float,
+    c_m_s: float,
+    max_bin: int,
+    phase_sign: int = -1,
+    chunk_size: int = 16384,
+    pose_weights: np.ndarray | None = None,
+    channel_weights: np.ndarray | None = None,
+) -> np.ndarray:
+    """Backproject physical bistatic TX/RX coordinates into an arbitrary 3-D grid.
+
+    ``snapshot_frame_ant_range`` has shape ``[pose, frame, antenna, range_bin]``.
+    ``tx_global_m`` and ``rx_global_m`` have shape ``[pose, antenna, 3]`` and
+    contain the *physical* transmitter and receiver coordinates in the same
+    world frame as ``voxel_xyz``.  The output has shape ``voxel_xyz.shape[:-1]``.
+
+    The coherent sum is evaluated independently for each frame and the frame
+    powers are summed, as in the legacy linear implementation.  ``pose_weights``
+    and ``channel_weights`` are independent real coherent weights; omitted
+    weights are uniform ones.  No position-times-channel aperture window is
+    applied here.
+    """
+    snapshots = np.asarray(snapshot_frame_ant_range, dtype=np.complex64)
+    if snapshots.ndim != 4:
+        raise ValueError(
+            "snapshot_frame_ant_range shape non valido: "
+            f"{snapshots.shape!r}; atteso [pos, frame, ant, bin]."
+        )
+
+    n_pos, n_frames, n_ant, n_bins_avail = (int(v) for v in snapshots.shape)
+    expected_geometry_shape = (n_pos, n_ant, 3)
+    tx_global = np.asarray(tx_global_m, dtype=np.float32)
+    rx_global = np.asarray(rx_global_m, dtype=np.float32)
+    if tx_global.shape != expected_geometry_shape or rx_global.shape != expected_geometry_shape:
+        raise ValueError(
+            "tx_global_m e rx_global_m devono avere shape "
+            f"{expected_geometry_shape!r}; trovate {tx_global.shape!r}/{rx_global.shape!r}"
+        )
+    if not np.all(np.isfinite(tx_global)) or not np.all(np.isfinite(rx_global)):
+        raise ValueError("tx_global_m e rx_global_m devono contenere coordinate finite")
+
+    voxels = np.asarray(voxel_xyz, dtype=np.float32)
+    if voxels.ndim < 1 or int(voxels.shape[-1]) != 3:
+        raise ValueError("voxel_xyz deve avere shape [..., 3]")
+    if not np.all(np.isfinite(voxels)):
+        raise ValueError("voxel_xyz deve contenere coordinate finite")
+
+    dr_f = float(dr_m)
+    fc_f = float(fc_hz)
+    c_f = float(c_m_s)
+    if not np.isfinite(dr_f) or dr_f <= 0.0:
+        raise ValueError("dr_m deve essere > 0")
+    if not np.isfinite(fc_f) or fc_f <= 0.0:
+        raise ValueError("fc_hz deve essere > 0")
+    if not np.isfinite(c_f) or c_f <= 0.0:
+        raise ValueError("c_m_s deve essere > 0")
+
+    phase_sign_i = phase_sign_normalize(phase_sign, field_name="phase_sign")
+    pose_weight = _back_projection_weights(
+        pose_weights,
+        expected_size=n_pos,
+        field_name="pose_weights",
+    )
+    channel_weight = _back_projection_weights(
+        channel_weights,
+        expected_size=n_ant,
+        field_name="channel_weights",
+    )
+
+    output_shape = voxels.shape[:-1]
+    max_bin_eff = max(0, min(int(max_bin), n_bins_avail))
+    if max_bin_eff < 2 or n_frames <= 0:
+        return np.zeros(output_shape, dtype=np.float32)
+
+    voxel_flat = voxels.reshape(-1, 3).astype(np.float32, copy=False)
+    k = np.float32((2.0 * np.pi * fc_f) / c_f)
+    phase_scale = np.float32(float(phase_sign_i)) * k
+    inv_dr = np.float32(1.0 / dr_f)
+    chunk_n = max(1, int(chunk_size))
+    frame_acc = np.zeros((n_frames, int(voxel_flat.shape[0])), dtype=np.complex64)
+
+    for pos_i in range(n_pos):
+        current_pose_weight = np.float32(pose_weight[pos_i])
+        if current_pose_weight == np.float32(0.0):
+            continue
+        for ant_i in range(n_ant):
+            coherent_weight = np.float32(current_pose_weight * channel_weight[ant_i])
+            if coherent_weight == np.float32(0.0):
+                continue
+
+            tx = tx_global[pos_i, ant_i]
+            rx = rx_global[pos_i, ant_i]
+            for start in range(0, int(voxel_flat.shape[0]), chunk_n):
+                stop = min(start + chunk_n, int(voxel_flat.shape[0]))
+                voxel_chunk = voxel_flat[start:stop]
+                if voxel_chunk.size == 0:
+                    continue
+
+                delta_tx = (voxel_chunk - tx).astype(np.float32, copy=False)
+                delta_rx = (voxel_chunk - rx).astype(np.float32, copy=False)
+                r_tx = np.sqrt(
+                    delta_tx[:, 0] * delta_tx[:, 0]
+                    + delta_tx[:, 1] * delta_tx[:, 1]
+                    + delta_tx[:, 2] * delta_tx[:, 2]
+                ).astype(np.float32, copy=False)
+                r_rx = np.sqrt(
+                    delta_rx[:, 0] * delta_rx[:, 0]
+                    + delta_rx[:, 1] * delta_rx[:, 1]
+                    + delta_rx[:, 2] * delta_rx[:, 2]
+                ).astype(np.float32, copy=False)
+                r_total = (r_tx + r_rx).astype(np.float32, copy=False)
+                bins = (np.float32(0.5) * r_total * inv_dr).astype(np.float32, copy=False)
+                valid = np.isfinite(bins) & (bins >= 0.0) & (bins < np.float32(max_bin_eff - 1))
+                valid_idx = np.flatnonzero(valid)
+                if valid_idx.size == 0:
+                    continue
+
+                valid_bins = bins[valid_idx]
+                phase = np.exp(
+                    1j * (phase_scale * r_total[valid_idx])
+                ).astype(np.complex64, copy=False)
+                output_idx = (start + valid_idx).astype(np.intp, copy=False)
+                for frame_i in range(n_frames):
+                    interp = _interp_cubic_complex(
+                        snapshots[pos_i, frame_i, ant_i],
+                        valid_bins,
+                        max_bin_eff,
+                    )
+                    contribution = interp * phase
+                    if coherent_weight != np.float32(1.0):
+                        contribution = contribution * coherent_weight
+                    frame_acc[frame_i, output_idx] += contribution
+
+    total_power = np.sum(
+        frame_acc.real.astype(np.float32, copy=False) ** np.float32(2.0)
+        + frame_acc.imag.astype(np.float32, copy=False) ** np.float32(2.0),
+        axis=0,
+        dtype=np.float32,
+    )
+    return total_power.reshape(output_shape).astype(np.float32, copy=False)
+
+
 def back_projection_power_mimo_frames(
     snapshot_frame_ant_range: np.ndarray,
     x_pos_m: np.ndarray,
@@ -244,13 +410,13 @@ def back_projection_power_mimo_frames(
     phase_sign: int = -1,
     chunk_size: int = 16384,
 ) -> np.ndarray:
-    """Coherently backproject every frame while computing geometry only once.
+    """Reference-compatible adapter for the historical linear z=0 BP.
 
-    Input shape is ``[position, frame, antenna, range_bin]``.  ``x_grid`` and
-    ``y_grid`` may have any common two-dimensional shape: their shape is the
-    output image resolution and is independent of ``max_bin`` and the FFT
-    length that produced the snapshots. This bounded-memory implementation keeps only one complex image
-    accumulator per frame and reuses each geometry chunk across those frames.
+    The 3-D kernel above is the implementation for new cylindrical captures.
+    This legacy entry point intentionally retains the exact arithmetic and
+    chunk traversal of the previous linear implementation: existing linear
+    files therefore remain a numerical reference, rather than merely being
+    approximately equivalent after a coordinate conversion.
     """
     snapshots = np.asarray(snapshot_frame_ant_range, dtype=np.complex64)
     if snapshots.ndim != 4:

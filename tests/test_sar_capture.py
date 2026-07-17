@@ -3,13 +3,21 @@ from __future__ import annotations
 import queue
 import threading
 import json
+import math
 import struct
 from pathlib import Path
 
 import pytest
 
 import main_refactory
-from sar_capture import CaptureError, CaptureSessionManager
+from sar_capture import (
+    CaptureError,
+    CaptureMetadataStore,
+    CaptureSessionManager,
+    normalize_capture_metadata,
+    read_capture_metadata,
+    write_capture_metadata,
+)
 
 
 class Shared:
@@ -60,6 +68,7 @@ def test_capture_header_and_offline_scan_config_include_stage_coordinates(tmp_pa
     assert header.startswith(main_refactory.CAPTURE_HEADER_MAGIC)
     header_len = struct.unpack("<I", header[len(main_refactory.CAPTURE_HEADER_MAGIC) : prefix_len])[0]
     payload = json.loads(header[prefix_len : prefix_len + header_len].decode("utf-8"))
+    assert payload["format"] == "rt_capture_v1"
     assert payload["position"] == 7
     assert payload["capture"]["frames_per_position"] == main_refactory.FRAMES_PER_POSITION
     assert payload["stage"] == {
@@ -125,3 +134,141 @@ def test_manual_yaml_scalar_update_preserves_comments_and_nested_structure(tmp_p
     assert "# cartella acquisizioni" in saved_text
     assert "# flag importante" in saved_text
     assert "x_pitch_m: 0.01 # 10 mm pitch" in saved_text
+
+
+def test_cylindrical_run_updates_only_offline_directory_and_required_frame_count(tmp_path: Path) -> None:
+    config_path = tmp_path / "offline_config.yaml"
+    config_path.write_text(
+        "data:\n  input_dir: logs/old\n"
+        "capture:\n  frames_per_position: 3\n"
+        "scan:\n  x_start: 7\n  x_end: 19\n  x_step: 2\n  x_pitch_m: 0.123\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "logs" / "cylinder"
+    output_dir.mkdir(parents=True)
+
+    main_refactory.configure_offline_cylindrical_scan_for_run(
+        config_path,
+        output_dir=output_dir,
+        frames_per_position=8,
+    )
+
+    saved = main_refactory.yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert saved["data"]["input_dir"] in {"logs/cylinder", "logs\\cylinder"}
+    assert saved["capture"]["frames_per_position"] == 8
+    # I campi ``scan`` sono esclusivamente legacy lineari e non vengono
+    # riscritti dalla finalizzazione di una run rt_capture_v2.
+    assert saved["scan"] == {"x_start": 7, "x_end": 19, "x_step": 2, "x_pitch_m": 0.123}
+
+
+def test_capture_header_v2_cylindrical_preserves_legacy_position_and_derives_world_position() -> None:
+    header = main_refactory._build_capture_file_header(
+        91,
+        capture_id=41,
+        acquisition_index=7,
+        cylindrical={
+            "angle_index": 3,
+            "height_index": 2,
+            "angle_count": 12,
+            "azimuth_rad": float(0.5 * 3.141592653589793),
+            "height_m": 0.4,
+            "radius_m": 2.0,
+            "scene_center_m": [1.0, -2.0, 0.25],
+        },
+    )
+    prefix_len = len(main_refactory.CAPTURE_HEADER_MAGIC) + 4
+    header_len = struct.unpack("<I", header[len(main_refactory.CAPTURE_HEADER_MAGIC) : prefix_len])[0]
+    payload = json.loads(header[prefix_len : prefix_len + header_len].decode("utf-8"))
+
+    assert payload["format"] == "rt_capture_v2"
+    assert payload["capture_id"] == 41
+    assert payload["acquisition_index"] == 7
+    assert payload["position"] == 91  # Legacy only; v2 geometry is cylindrical.
+    assert payload["cylindrical"] == {
+        "angle_index": 3,
+        "height_index": 2,
+        "angle_count": 12,
+        "azimuth_rad": pytest.approx(0.5 * 3.141592653589793),
+        "height_m": 0.4,
+        "radius_m": 2.0,
+        "scene_center_m": [1.0, -2.0, 0.25],
+        "position_m": pytest.approx([1.0, 0.0, 0.65]),
+    }
+
+
+def test_cylindrical_capture_command_and_shared_metadata_are_bound_to_session() -> None:
+    commands: queue.Queue = queue.Queue()
+    cap_id = Shared(10)
+    manager = CaptureSessionManager(
+        cmd_queue=commands,
+        cap_id=cap_id,
+        cap_done_id=Shared(0),
+        cap_result=Shared(0),
+    )
+    cylindrical = {
+        "angle_index": 1,
+        "height_index": 4,
+        "angle_count": 8,
+        "azimuth_rad": 0.25,
+        "height_m": 1.2,
+        "radius_m": 0.9,
+        "scene_center_m": [0.0, 0.0, 0.0],
+    }
+
+    ticket = manager.request(
+        position_id=999,
+        position_mm=12.5,
+        position_microsteps=321,
+        capture_id=44,
+        acquisition_index=6,
+        cylindrical=cylindrical,
+    )
+    command = commands.get_nowait()
+    assert command[0:2] == ("CAPTURE", 44)
+    assert command[2]["capture_id"] == 44
+    assert command[2]["acquisition_index"] == 6
+    assert command[2]["position"] == 999
+    assert command[2]["cylindrical"]["position_m"] == pytest.approx(
+        [0.9 * math.cos(0.25), 0.9 * math.sin(0.25), 1.2]
+    )
+    assert ticket.capture_id == 44
+    assert ticket.acquisition_index == 6
+    assert ticket.position == 999
+
+    store = CaptureMetadataStore(
+        buffer=bytearray(4096),
+        byte_count=Shared(0),
+        session_id=Shared(0),
+        lock=threading.RLock(),
+    )
+    metadata = normalize_capture_metadata(command[1], command[2])
+    write_capture_metadata(store, session_id=11, metadata=metadata)
+    assert read_capture_metadata(store, session_id=10) is None
+    persisted = read_capture_metadata(store, session_id=11)
+    assert persisted is not None
+    assert persisted["capture_id"] == 44
+    assert persisted["acquisition_index"] == 6
+    assert persisted["position"] == 999
+    assert persisted["cylindrical"] == command[2]["cylindrical"]
+
+
+def test_cylindrical_metadata_requires_regular_positive_radius_and_wrapped_azimuth() -> None:
+    common = {
+        "angle_index": 0,
+        "height_index": 0,
+        "angle_count": 1,
+        "height_m": 0.0,
+        "scene_center_m": [0.0, 0.0, 0.0],
+    }
+    with pytest.raises(CaptureError, match="strictly positive"):
+        main_refactory._build_capture_file_header(
+            1,
+            cylindrical={**common, "azimuth_rad": 0.0, "radius_m": 0.0},
+        )
+    with pytest.raises(CaptureError, match=r"\[0, 2\*pi\)"):
+        main_refactory._build_capture_file_header(
+            1,
+            cylindrical={**common, "azimuth_rad": 2.0 * 3.141592653589793, "radius_m": 1.0},
+        )
+    with pytest.raises(CaptureError, match="capture_id"):
+        normalize_capture_metadata(-1, {"cylindrical": {**common, "azimuth_rad": 0.0, "radius_m": 1.0}})

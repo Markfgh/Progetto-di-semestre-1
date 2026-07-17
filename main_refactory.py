@@ -17,8 +17,23 @@ import re
 import struct
 from datetime import datetime
 
-from sar_capture import CaptureError, CaptureSessionManager
-from sar_scan import SarScanCoordinator, ScanError, ScanPlan
+from sar_capture import (
+    CaptureError,
+    CaptureMetadataStore,
+    CaptureSessionManager,
+    normalize_capture_metadata,
+    normalize_cylindrical_metadata,
+    read_capture_metadata,
+    write_capture_metadata,
+)
+from sar_scan import (
+    CylindricalScanCoordinator,
+    CylindricalScanPlan,
+    RotaryAxis,
+    SarScanCoordinator,
+    ScanError,
+    ScanPlan,
+)
 
 try:
     # Il backend non crea una finestra: la GUI standalone viene istanziata solo
@@ -613,6 +628,7 @@ FRAMES_PER_POSITION = int(sar_cfg.get("frames_per_position", 8))
 # Binary header prepended to each capture_pos*.bin:
 # [8-byte magic][4-byte little-endian header_len][header_json_utf8]
 CAPTURE_HEADER_MAGIC = b"RTPBIN1\x00"
+CAPTURE_METADATA_BUFFER_BYTES = 16 * 1024
 
 
 def _build_capture_file_header(
@@ -620,9 +636,13 @@ def _build_capture_file_header(
     *,
     carriage_position_mm: float | None = None,
     carriage_microsteps: int | None = None,
+    capture_id: int | None = None,
+    acquisition_index: int | None = None,
+    cylindrical: dict | None = None,
 ) -> bytes:
+    cylindrical_v2 = None if cylindrical is None else normalize_cylindrical_metadata(cylindrical)
     header = {
-        "format": "rt_capture_v1",
+        "format": "rt_capture_v2" if cylindrical_v2 is not None else "rt_capture_v1",
         "position": int(pos_id),
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "radar": {
@@ -640,6 +660,18 @@ def _build_capture_file_header(
             "frames_per_position": int(FRAMES_PER_POSITION),
         },
     }
+    if cylindrical_v2 is not None:
+        header["capture_id"] = int(pos_id if capture_id is None else capture_id)
+        if int(header["capture_id"]) < 0:
+            raise ValueError("capture_id must be non-negative")
+        header["acquisition_index"] = int(
+            header["capture_id"] if acquisition_index is None else acquisition_index
+        )
+        if int(header["acquisition_index"]) < 0:
+            raise ValueError("acquisition_index must be non-negative")
+        # ``position`` resta deliberatamente un campo legacy: per v2 la
+        # geometria arriva esclusivamente da questo blocco cylindrical.
+        header["cylindrical"] = cylindrical_v2
     if carriage_position_mm is not None or carriage_microsteps is not None:
         stage: dict[str, float | int | str] = {"reference": "phidget_home_min"}
         if carriage_position_mm is not None and np.isfinite(float(carriage_position_mm)):
@@ -897,6 +929,43 @@ def configure_offline_scan_for_run(
     return float(pitch_m * 1000.0)
 
 
+def configure_offline_cylindrical_scan_for_run(
+    path: Path,
+    *,
+    output_dir: Path,
+    frames_per_position: int | None = None,
+) -> None:
+    """Punta l'offline a una run v2 senza toccare i parametri lineari.
+
+    Il reader v2 deriva la geometria esclusivamente dagli header
+    ``rt_capture_v2``. Perciò aggiornare ``scan.x_*`` sarebbe non solo
+    superfluo, ma anche fuorviante: questa funzione modifica solo directory e
+    numero di frame che servono a riaprire la nuova run.
+    """
+
+    with path.open("r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle) or {}
+    if not isinstance(raw, dict):
+        raise ValueError("offline_config.yaml must contain a YAML mapping")
+    data = raw.get("data")
+    if not isinstance(data, dict):
+        raise ValueError("offline_config.yaml.data must contain a mapping")
+    scalar_updates: dict[tuple[str, str], object] = {}
+    try:
+        relative_output = output_dir.resolve().relative_to(path.parent.resolve())
+        scalar_updates[("data", "input_dir")] = str(relative_output)
+    except Exception:
+        scalar_updates[("data", "input_dir")] = str(output_dir.resolve())
+    if frames_per_position is not None:
+        if int(frames_per_position) <= 0:
+            raise ValueError("frames_per_position must be greater than zero")
+        capture = raw.get("capture")
+        if not isinstance(capture, dict):
+            raise ValueError("offline_config.yaml.capture must contain a mapping")
+        scalar_updates[("capture", "frames_per_position")] = int(frames_per_position)
+    _update_top_level_yaml_scalars(path, scalar_updates)
+
+
 # ----------------------------
 # FUNZIONI DI ELABORAZIONE
 # ----------------------------
@@ -916,8 +985,7 @@ def radar_rx(
     cap_pos_id: Synchronized,
     cap_id: Synchronized,
     cap_saved: Synchronized,
-    cap_position_mm: Synchronized,
-    cap_position_microsteps: Synchronized,
+    capture_metadata: CaptureMetadataStore,
     cap_cancel_id: Synchronized,
     cap_done_id: Synchronized,
     cap_result: Synchronized,
@@ -950,9 +1018,10 @@ def radar_rx(
       - se non ci sono slot liberi: drop (no block), ma manteniamo l'allineamento consumando i byte
 
     Capture:
-      - trigger via cmd_queue ("CAPTURE", pos_id, metadata)
+      - trigger via cmd_queue ("CAPTURE", capture_id, metadata)
       - dopo settling_delay_s: cap_active=1 e RX tagga slot_pos_id
-      - il logger salva X frame validi per pos_id (puÃ² perdere frame, quindi dura piÃ¹ a lungo se necessario)
+      - il logger salva X frame validi per capture_id (puÃ² perdere frame, quindi dura piÃ¹ a lungo se necessario)
+      - metadata è un blob JSON atomico associato al session ``cap_id``
     """
     PC_IP = "192.168.33.30"
     PORT = 4098
@@ -1019,6 +1088,32 @@ def radar_rx(
         except Exception:
             pass
 
+    def _next_capture_session_id() -> int:
+        """Calcola un nuovo session ID senza pubblicarlo ancora al logger."""
+        with cap_id.get_lock():
+            next_cap_id = (int(cap_id.value) + 1) & 0xFFFFFFFF
+        # Zero è riservato a "nessuna sessione" nel protocollo logger.
+        return 1 if next_cap_id == 0 else int(next_cap_id)
+
+    def _publish_capture_setup_failure(capture_file_id: int, session_id: int) -> None:
+        """Sblocca il chiamante anche se il metadata non è pubblicabile."""
+        with cap_saved.get_lock():
+            cap_saved.value = 0
+        with cap_pos_id.get_lock():
+            cap_pos_id.value = int(capture_file_id)
+        with cap_cancel_id.get_lock():
+            cap_cancel_id.value = 0
+        with cap_result.get_lock():
+            cap_result.value = -1
+        with cap_done_id.get_lock():
+            cap_done_id.value = int(session_id)
+        # Pubblicare cap_id per ultimo evita che il manager/logger osservino
+        # una sessione per cui non sia già disponibile un esito terminale.
+        with cap_id.get_lock():
+            cap_id.value = int(session_id)
+        with publish_lock:
+            cap_active.value = 0
+
     def _poll_commands(now_perf: float) -> None:
         nonlocal pending, pending_start_t, pending_pos_id
         while True:
@@ -1053,18 +1148,19 @@ def radar_rx(
                         cap_cancel_id.value = int(cancelled_id)
                 continue
             if cmd_type == "CAPTURE":
-                pending_pos_id = int(cmd[1])
-                metadata = cmd[2] if len(cmd) >= 3 and isinstance(cmd[2], dict) else {}
+                capture_file_id = int(cmd[1])
+                metadata_raw = cmd[2] if len(cmd) >= 3 and isinstance(cmd[2], dict) else {}
                 try:
-                    position_mm = metadata.get("carriage_position_mm", None)
-                    position_mm = float(position_mm) if position_mm is not None else float("nan")
-                except (TypeError, ValueError):
-                    position_mm = float("nan")
-                try:
-                    position_microsteps = metadata.get("carriage_microsteps", None)
-                    position_microsteps = int(position_microsteps) if position_microsteps is not None else -1
-                except (TypeError, ValueError):
-                    position_microsteps = -1
+                    metadata = normalize_capture_metadata(capture_file_id, metadata_raw)
+                    next_cap_id = _next_capture_session_id()
+                    # Il blob è completo e legato al session ID prima di
+                    # rendere visibile il nuovo cap_id al logger.
+                    write_capture_metadata(capture_metadata, next_cap_id, metadata)
+                except CaptureError:
+                    _publish_capture_setup_failure(capture_file_id, _next_capture_session_id())
+                    continue
+
+                pending_pos_id = int(capture_file_id)
                 pending_start_t = now_perf + max(0.0, float(settling_delay_s))
                 pending = True
 
@@ -1073,17 +1169,11 @@ def radar_rx(
                     cap_saved.value = 0
                 with cap_pos_id.get_lock():
                     cap_pos_id.value = pending_pos_id
-                with cap_position_mm.get_lock():
-                    cap_position_mm.value = float(position_mm)
-                with cap_position_microsteps.get_lock():
-                    cap_position_microsteps.value = int(position_microsteps)
 
-                # bump cap_id (unique capture session)
+                # Pubblica la sessione solo dopo la scrittura atomica del
+                # metadata condiviso (vedi write_capture_metadata sopra).
                 with cap_id.get_lock():
-                    next_cap_id = (int(cap_id.value) + 1) & 0xFFFFFFFF
-                    # Zero e' riservato a "nessuna sessione" nel protocollo
-                    # con il logger, quindi lo saltiamo al wrap uint32.
-                    cap_id.value = 1 if next_cap_id == 0 else next_cap_id
+                    cap_id.value = int(next_cap_id)
                 with cap_cancel_id.get_lock():
                     cap_cancel_id.value = 0
                 with cap_result.get_lock():
@@ -1400,8 +1490,8 @@ def logger_worker(
     cap_pos_id: Synchronized,
     cap_id: Synchronized,
     cap_saved: Synchronized,
-    cap_position_mm: Synchronized,
-    cap_position_microsteps: Synchronized,
+    cap_position_mm: Synchronized | None,
+    cap_position_microsteps: Synchronized | None,
     cap_cancel_id: Synchronized,
     cap_done_id: Synchronized,
     cap_result: Synchronized,
@@ -1411,6 +1501,7 @@ def logger_worker(
     frames_per_position: int,
     block_frames: int = 16,
     ready_evt=None,
+    capture_metadata: CaptureMetadataStore | None = None,
 ):
     """
     Logger capture-only (reworked for performance):
@@ -1420,6 +1511,10 @@ def logger_worker(
       - salva SOLO frame validi (slot_ok==1) e SOLO quando cap_active==1
       - deve arrivare a frames_per_position frame completi per la posizione corrente.
         Se perde frame (ring overwrite / race), semplicemente continua finchÃ© non raggiunge X.
+
+    ``cap_position_mm`` e ``cap_position_microsteps`` sono mantenuti solo per
+    compatibilità con invocatori legacy. La pipeline corrente usa invece
+    ``capture_metadata`` (blob JSON atomico associato al session ID).
     """
     def _current_output_dir() -> Path:
         """Legge la run selezionata dalla GUI prima di aprire ogni file."""
@@ -1488,30 +1583,50 @@ def logger_worker(
         file_cap_id = None
         return closed_cap_id, io_ok
 
-    def _open_file(pos_id: int, session_id: int):
+    def _open_file(capture_file_id: int, session_id: int):
         nonlocal fbin, buf, buf_used, saved_local, pos_local, file_cap_id
         _close_file()
-        pos_local = int(pos_id)
+        if capture_metadata is not None:
+            metadata = read_capture_metadata(capture_metadata, int(session_id))
+            if metadata is None:
+                raise RuntimeError(f"missing capture metadata for session {int(session_id)}")
+        else:
+            # Compatibilità transitoria per chiamanti diretti del worker (ad
+            # esempio test legacy). Il percorso di produzione non usa questi
+            # Value scollegati.
+            legacy_raw: dict[str, object] = {}
+            if cap_position_mm is not None:
+                try:
+                    legacy_raw["carriage_position_mm"] = float(cap_position_mm.value)
+                except Exception:
+                    pass
+            if cap_position_microsteps is not None:
+                try:
+                    legacy_raw["carriage_microsteps"] = int(cap_position_microsteps.value)
+                except Exception:
+                    pass
+            metadata = normalize_capture_metadata(int(capture_file_id), legacy_raw)
+        header_blob = _build_capture_file_header(
+            int(metadata["position"]),
+            capture_id=int(metadata["capture_id"]),
+            acquisition_index=int(metadata["acquisition_index"]),
+            cylindrical=metadata.get("cylindrical"),
+            carriage_position_mm=metadata.get("carriage_position_mm"),
+            carriage_microsteps=metadata.get("carriage_microsteps"),
+        )
+        p = _current_output_dir() / f"capture_pos{int(capture_file_id)}.bin"
+        opened_file = open(p, "wb", buffering=1024 * 1024)
+        try:
+            opened_file.write(header_blob)
+        except Exception:
+            opened_file.close()
+            raise
+        fbin = opened_file
+        pos_local = int(capture_file_id)
         file_cap_id = int(session_id)
         saved_local = 0
         buf_used = 0
         buf = bytearray(BYTES_PER_FRAME * int(block_frames))
-        p = _current_output_dir() / f"capture_pos{pos_local}.bin"
-        fbin = open(p, "wb", buffering=1024 * 1024)
-        try:
-            position_mm_raw = float(cap_position_mm.value)
-        except Exception:
-            position_mm_raw = float("nan")
-        try:
-            position_steps_raw = int(cap_position_microsteps.value)
-        except Exception:
-            position_steps_raw = -1
-        header_blob = _build_capture_file_header(
-            pos_local,
-            carriage_position_mm=position_mm_raw if np.isfinite(position_mm_raw) else None,
-            carriage_microsteps=position_steps_raw if position_steps_raw >= 0 else None,
-        )
-        fbin.write(header_blob)
         if log_bytes is not None:
             with log_bytes.get_lock():
                 log_bytes.value += int(len(header_blob))
@@ -1589,6 +1704,7 @@ def logger_worker(
             capid = int(cap_id.value)
             posid = int(cap_pos_id.value)
             cancelled_id = int(cap_cancel_id.value)
+            completed_id = int(cap_done_id.value)
     
             # Detect a new CAPTURE click (cap_id increments in RX when GUI sends CAPTURE)
             if capid != last_seen_cap_id:
@@ -1602,6 +1718,13 @@ def logger_worker(
     
             # Start logging only when capture is ACTIVE (set by RX) and we have a pending click
             if fbin is None:
+                # RX può pubblicare un esito immediato se il metadata non è
+                # serializzabile o non entra nel blob condiviso.
+                if pending_cap_id is not None and int(completed_id) == int(pending_cap_id):
+                    pending_cap_id = None
+                    pending_pos_id = None
+                    time.sleep(0.002)
+                    continue
                 if pending_cap_id is not None and int(cancelled_id) == int(pending_cap_id):
                     _stop_capture_and_release_logger_slots()
                     _mark_capture_finished(int(pending_cap_id), -1)
@@ -1612,7 +1735,15 @@ def logger_worker(
                 if pending_cap_id is None or int(cap_active.value) != 1:
                     time.sleep(0.002)
                     continue
-                _open_file(int(pending_pos_id), int(pending_cap_id))
+                try:
+                    _open_file(int(pending_pos_id), int(pending_cap_id))
+                except Exception:
+                    _stop_capture_and_release_logger_slots()
+                    _mark_capture_finished(int(pending_cap_id), -1)
+                    pending_cap_id = None
+                    pending_pos_id = None
+                    time.sleep(0.002)
+                    continue
                 pending_cap_id = None
                 pending_pos_id = None
 
@@ -1672,7 +1803,14 @@ def logger_worker(
         closed_id, _close_ok = _close_file()
         _mark_capture_finished(closed_id, -1)
 
-def main():
+def main(*, rotary_axis: RotaryAxis | None = None):
+    """Avvia la GUI principale.
+
+    ``rotary_axis`` è opzionale perché il repository non contiene il driver
+    dell'asse rotativo. Un'integrazione hardware reale lo passa esplicitamente
+    come adapter :class:`sar_scan.RotaryAxis`; senza adapter la GUI conserva la
+    scansione lineare e rende indisponibile l'avvio cilindrico.
+    """
     shutdown_state = {
         "in_progress": False,
         "done": False,
@@ -1688,6 +1826,7 @@ def main():
         "mmwave_bridge": None,
         "motor_controller": None,
         "sar_scan": None,
+        "cylindrical_scan": None,
     }
     mmwave_auto_rearm_armed = False
 
@@ -1714,13 +1853,14 @@ def main():
         try:
             mmwave_auto_rearm_armed = False
 
-            scan = shutdown_resources.get("sar_scan")
-            if scan is not None:
-                try:
-                    scan.cancel()
-                    scan.join(timeout=0.5)
-                except Exception:
-                    pass
+            for scan_key in ("sar_scan", "cylindrical_scan"):
+                scan = shutdown_resources.get(scan_key)
+                if scan is not None:
+                    try:
+                        scan.cancel()
+                        scan.join(timeout=0.5)
+                    except Exception:
+                        pass
 
             motor_controller = shutdown_resources.get("motor_controller")
             if motor_controller is not None:
@@ -1776,6 +1916,7 @@ def main():
             shutdown_resources["mmwave_bridge"] = None
             shutdown_resources["motor_controller"] = None
             shutdown_resources["sar_scan"] = None
+            shutdown_resources["cylindrical_scan"] = None
 
             if shutdown_state["dpg_context_created"] and not shutdown_state["dpg_context_destroyed"]:
                 try:
@@ -1824,8 +1965,14 @@ def main():
     cap_pos_id = _track_mp_ref(Value("i", 0))   # current position id (from GUI)
     cap_id = _track_mp_ref(Value("I", 0))       # increments each CAPTURE command
     cap_saved = _track_mp_ref(Value("i", 0))    # frames saved for current position
-    cap_position_mm = _track_mp_ref(Value("d", float("nan")))
-    cap_position_microsteps = _track_mp_ref(Value("q", -1))
+    # Un solo blob JSON protetto da lock evita che logger e RX associno al
+    # medesimo cap_id una combinazione parziale di metadata scollegati.
+    capture_metadata = CaptureMetadataStore(
+        buffer=_track_mp_ref(RawArray("B", CAPTURE_METADATA_BUFFER_BYTES)),
+        byte_count=_track_mp_ref(Value("I", 0)),
+        session_id=_track_mp_ref(Value("I", 0)),
+        lock=_track_mp_ref(mp.Lock()),
+    )
     cap_cancel_id = _track_mp_ref(Value("I", 0))
     # Il logger pubblica questo ID solo dopo close+flush: è il segnale usato
     # dalla scansione prima di comandare il movimento successivo.
@@ -1986,8 +2133,7 @@ def main():
             cap_pos_id,
             cap_id,
             cap_saved,
-            cap_position_mm,
-            cap_position_microsteps,
+            capture_metadata,
             cap_cancel_id,
             cap_done_id,
             cap_result,
@@ -2018,8 +2164,8 @@ def main():
             cap_pos_id,
             cap_id,
             cap_saved,
-            cap_position_mm,
-            cap_position_microsteps,
+            None,  # deprecated cap_position_mm; production uses capture_metadata
+            None,  # deprecated cap_position_microsteps
             cap_cancel_id,
             cap_done_id,
             cap_result,
@@ -2029,6 +2175,7 @@ def main():
             FRAMES_PER_POSITION,
             16,  # block_frames
             logger_ready_evt,
+            capture_metadata,
         ),
     )
     _track_process(p_log)
@@ -2146,6 +2293,37 @@ def main():
             stop_motion=stepper_controller.stop,
         )
         shutdown_resources["sar_scan"] = sar_scan
+
+    cylindrical_scan = None
+    rotary_error = ""
+    if rotary_axis is None:
+        rotary_error = (
+            "Rotary axis unavailable: pass a sar_scan.RotaryAxis adapter to main()."
+        )
+    elif stepper_controller is None:
+        rotary_error = "Vertical Phidget unavailable."
+    else:
+        # Il Phidget 1063 esistente resta l'asse verticale. Il suo HOME è il
+        # riferimento z=0 della prima fase, quindi mm<->m è una conversione
+        # meccanica diretta e non un sistema di calibrazione.
+        cylindrical_scan = CylindricalScanCoordinator(
+            begin_vertical_scan=stepper_controller.begin_external_scan,
+            finish_vertical_scan=stepper_controller.finish_external_scan,
+            get_vertical_microsteps=stepper_controller.position_microsteps,
+            height_m_from_microsteps=lambda steps: (
+                stepper_controller.config.mechanics.mm_from_microsteps(steps) / 1000.0
+            ),
+            microsteps_from_height_m=lambda height_m: (
+                stepper_controller.config.mechanics.microsteps_from_mm(float(height_m) * 1000.0)
+            ),
+            move_vertical_to_microsteps=stepper_controller.move_absolute_microsteps_and_wait,
+            stop_vertical=stepper_controller.stop,
+            rotary_axis=rotary_axis,
+            request_capture=capture_sessions.request,
+            wait_capture=capture_sessions.wait,
+            cancel_capture=capture_sessions.cancel,
+        )
+        shutdown_resources["cylindrical_scan"] = cylindrical_scan
 
     def _create_offline_runtime():
         """Build an isolated offline runtime from the persisted configuration."""
@@ -2327,6 +2505,13 @@ def main():
     TXT_RUN_DIR_TAG = "txt_sar_run_dir"
     IN_MOTOR_JOG_TAG = "in_motor_jog_mm"
     IN_SCAN_POSITIONS_TAG = "in_sar_scan_positions"
+    COMBO_SCAN_MODE_TAG = "combo_sar_scan_mode"
+    IN_CYL_ANGLES_TAG = "in_cylindrical_angles_per_turn"
+    IN_CYL_RADIUS_TAG = "in_cylindrical_radius_m"
+    IN_CYL_HEIGHTS_TAG = "in_cylindrical_height_count"
+    IN_CYL_VERTICAL_STEP_TAG = "in_cylindrical_vertical_step_m"
+    IN_CYL_ANGULAR_SETTLING_TAG = "in_cylindrical_angular_settling_s"
+    IN_CYL_VERTICAL_SETTLING_TAG = "in_cylindrical_vertical_settling_s"
     BTN_CAPTURE_TAG = "btn_capture_frame"
     BTN_NEW_SESSION_TAG = "btn_new_sar_session"
     BTN_SCAN_START_TAG = "btn_sar_scan_start"
@@ -3060,7 +3245,8 @@ def main():
     # La configurazione offline della run viene confermata soltanto dopo il
     # completamento di tutti i file. Su cancel/failure rimane quindi puntata
     # all'ultima acquisizione completa.
-    scan_pending_run: dict[str, int | None] = {
+    scan_pending_run: dict[str, int | str | None] = {
+        "mode": None,
         "start_position_id": None,
         "positions": None,
     }
@@ -3068,6 +3254,30 @@ def main():
     def _set_scan_status(text: str) -> None:
         if dpg.does_item_exist(TXT_SCAN_STATUS_TAG):
             dpg.set_value(TXT_SCAN_STATUS_TAG, str(text))
+
+    def _selected_scan_mode() -> str:
+        if dpg.does_item_exist(COMBO_SCAN_MODE_TAG):
+            return "cylindrical" if str(dpg.get_value(COMBO_SCAN_MODE_TAG)) == "cylindrical" else "linear"
+        return "linear"
+
+    def _scan_for_mode(mode: str):
+        return cylindrical_scan if str(mode) == "cylindrical" else sar_scan
+
+    def _any_scan_active() -> bool:
+        return bool(
+            (sar_scan is not None and sar_scan.active)
+            or (cylindrical_scan is not None and cylindrical_scan.active)
+        )
+
+    def _active_or_pending_scan():
+        if sar_scan is not None and sar_scan.active:
+            return sar_scan
+        if cylindrical_scan is not None and cylindrical_scan.active:
+            return cylindrical_scan
+        pending_mode = scan_pending_run.get("mode")
+        if pending_mode in {"linear", "cylindrical"}:
+            return _scan_for_mode(str(pending_mode))
+        return _scan_for_mode(_selected_scan_mode())
 
     def _update_scan_pitch_label(pitch_mm: float | None = None, error: str = "") -> None:
         if not dpg.does_item_exist(TXT_SCAN_PITCH_TAG):
@@ -3095,7 +3305,7 @@ def main():
             return None, None
 
     def _on_capture():
-        if sar_scan is not None and sar_scan.active:
+        if _any_scan_active():
             _set_scan_status("Manual capture is disabled during a SAR scan.")
             return
         try:
@@ -3116,10 +3326,10 @@ def main():
         if capture_sessions.inflight:
             _set_scan_status("Wait for the current capture to complete or be cancelled.")
             return
-        if sar_scan is not None and sar_scan.active:
+        if _any_scan_active():
             _set_scan_status("A session cannot be changed during a SAR scan.")
             return
-        if scan_pending_run["start_position_id"] is not None:
+        if scan_pending_run["mode"] is not None:
             _set_scan_status("Wait for the previous scan offline finalization.")
             return
         try:
@@ -3145,7 +3355,7 @@ def main():
     def _on_motor_disconnect() -> None:
         if stepper_controller is None:
             return
-        if sar_scan is not None and sar_scan.active:
+        if _any_scan_active():
             _set_scan_status("Cancel the SAR scan before disconnecting the carriage.")
             return
         if capture_sessions.inflight:
@@ -3175,8 +3385,9 @@ def main():
             stepper_controller.log(f"Jog did not start: {exc}")
 
     def _on_motor_stop() -> None:
-        if sar_scan is not None and sar_scan.active:
-            sar_scan.cancel()
+        active_scan = _active_or_pending_scan()
+        if active_scan is not None and active_scan.active:
+            active_scan.cancel()
             return
         if capture_sessions.inflight:
             capture_sessions.cancel()
@@ -3189,13 +3400,19 @@ def main():
                 stepper_controller.log(f"STOP failed: {exc}")
 
     def _on_start_sar_scan() -> None:
-        if sar_scan is None or stepper_controller is None:
-            _set_scan_status(f"Scan unavailable: {stepper_error or 'Phidget not configured'}")
+        mode = _selected_scan_mode()
+        selected_scan = _scan_for_mode(mode)
+        if selected_scan is None or stepper_controller is None:
+            unavailable = rotary_error if mode == "cylindrical" else stepper_error
+            _set_scan_status(f"Scan unavailable: {unavailable or 'Phidget not configured'}")
             return
         if capture_sessions.inflight:
             _set_scan_status("Wait for the current capture to complete or be cancelled.")
             return
-        if scan_pending_run["start_position_id"] is not None:
+        if _any_scan_active():
+            _set_scan_status("A SAR scan is already active.")
+            return
+        if scan_pending_run["mode"] is not None:
             _set_scan_status("Wait for the previous scan offline finalization.")
             return
         try:
@@ -3217,50 +3434,102 @@ def main():
                 udp_idle_s = max(0.0, time.time() - float(rx_last_packet_time_s.value))
             if received_packets <= 0 or udp_idle_s > 2.0:
                 raise ScanError("Streaming is enabled but UDP is inactive: wait for radar data before scanning.")
-            n_positions = int(dpg.get_value(IN_SCAN_POSITIONS_TAG))
-            start_id, _default_positions, pitch_mm = read_offline_scan_settings(offline_scan_config_path)
-            _update_scan_pitch_label(pitch_mm)
-            if n_positions <= 0:
-                raise ScanError("The number of positions must be greater than zero.")
-            existing = [
-                out_dir / f"capture_pos{position_id}.bin"
-                for position_id in range(start_id, start_id + n_positions)
-                if (out_dir / f"capture_pos{position_id}.bin").exists()
-            ]
-            if existing:
-                raise ScanError(
-                    "The current run already contains captures (start a new session to avoid overwriting them)."
+            if mode == "linear":
+                n_positions = int(dpg.get_value(IN_SCAN_POSITIONS_TAG))
+                start_id, _default_positions, pitch_mm = read_offline_scan_settings(offline_scan_config_path)
+                _update_scan_pitch_label(pitch_mm)
+                if n_positions <= 0:
+                    raise ScanError("The number of positions must be greater than zero.")
+                existing = [
+                    out_dir / f"capture_pos{position_id}.bin"
+                    for position_id in range(start_id, start_id + n_positions)
+                    if (out_dir / f"capture_pos{position_id}.bin").exists()
+                ]
+                if existing:
+                    raise ScanError(
+                        "The current run already contains captures (start a new session to avoid overwriting them)."
+                    )
+                with sar_pos_counter.get_lock():
+                    sar_pos_counter.value = int(start_id) - 1
+                plan = ScanPlan(
+                    positions=n_positions,
+                    pitch_mm=float(pitch_mm),
+                    start_position_id=int(start_id),
+                    # radar_rx applica già SETTLING_DELAY_S dopo che il carrello è
+                    # fermo; non duplicare inutilmente l'attesa qui.
+                    settling_seconds=0.0,
+                    motion_timeout_seconds=max(1.0, float(sar_cfg.get("scan_motion_timeout_s", 120.0))),
+                    capture_timeout_seconds=max(1.0, float(sar_cfg.get("scan_capture_timeout_s", 120.0))),
                 )
-            with sar_pos_counter.get_lock():
-                sar_pos_counter.value = int(start_id) - 1
-            plan = ScanPlan(
-                positions=n_positions,
-                pitch_mm=float(pitch_mm),
-                start_position_id=int(start_id),
-                # radar_rx applica già SETTLING_DELAY_S dopo che il carrello è
-                # fermo; non duplicare inutilmente l'attesa qui.
-                settling_seconds=0.0,
-                motion_timeout_seconds=max(1.0, float(sar_cfg.get("scan_motion_timeout_s", 120.0))),
-                capture_timeout_seconds=max(1.0, float(sar_cfg.get("scan_capture_timeout_s", 120.0))),
-            )
-            sar_scan.start(plan)
-            scan_pending_run.update(
-                {
-                    "start_position_id": int(start_id),
-                    "positions": int(n_positions),
-                }
-            )
-            _set_scan_status(
-                f"Scan started: {n_positions} positions, pitch {pitch_mm:.6f} mm"
-            )
+                sar_scan.start(plan)
+                scan_pending_run.update(
+                    {
+                        "mode": "linear",
+                        "start_position_id": int(start_id),
+                        "positions": int(n_positions),
+                    }
+                )
+                _set_scan_status(
+                    f"Linear scan started: {n_positions} positions, pitch {pitch_mm:.6f} mm"
+                )
+            else:
+                if cylindrical_scan is None:
+                    raise ScanError(rotary_error or "Rotary axis unavailable.")
+                angles_per_turn = int(dpg.get_value(IN_CYL_ANGLES_TAG))
+                radius_m = float(dpg.get_value(IN_CYL_RADIUS_TAG))
+                height_count = int(dpg.get_value(IN_CYL_HEIGHTS_TAG))
+                vertical_step_m = float(dpg.get_value(IN_CYL_VERTICAL_STEP_TAG))
+                angular_settling_s = float(dpg.get_value(IN_CYL_ANGULAR_SETTLING_TAG))
+                vertical_settling_s = float(dpg.get_value(IN_CYL_VERTICAL_SETTLING_TAG))
+                # Non rendere l'asse verticale una seconda sorgente di
+                # geometria: la quota iniziale è la posizione fisica HOME
+                # corrente, in metri, e ``scene_center`` resta l'origine
+                # fissa della prima fase.
+                start_steps = int(stepper_controller.position_microsteps())
+                initial_height_m = float(
+                    stepper_controller.config.mechanics.mm_from_microsteps(start_steps) / 1000.0
+                )
+                plan = CylindricalScanPlan(
+                    angles_per_turn=angles_per_turn,
+                    radius_m=radius_m,
+                    initial_height_m=initial_height_m,
+                    height_count=height_count,
+                    vertical_step_m=vertical_step_m,
+                    scene_center_m=(0.0, 0.0, 0.0),
+                    start_capture_id=1,
+                    angular_settling_seconds=angular_settling_s,
+                    vertical_settling_seconds=vertical_settling_s,
+                    motion_timeout_seconds=max(1.0, float(sar_cfg.get("scan_motion_timeout_s", 120.0))),
+                    capture_timeout_seconds=max(1.0, float(sar_cfg.get("scan_capture_timeout_s", 120.0))),
+                )
+                plan.validate()
+                existing = list(out_dir.glob("capture_pos*.bin"))
+                if existing:
+                    raise ScanError(
+                        "The current run already contains captures (start a new session for a cylindrical scan)."
+                    )
+                with sar_pos_counter.get_lock():
+                    sar_pos_counter.value = 0
+                cylindrical_scan.start(plan)
+                scan_pending_run.update(
+                    {
+                        "mode": "cylindrical",
+                        "start_position_id": int(plan.start_capture_id),
+                        "positions": int(plan.total_captures),
+                    }
+                )
+                _set_scan_status(
+                    f"Cylindrical scan started: {height_count} turns × {angles_per_turn} angles"
+                )
         except Exception as exc:
             _set_scan_status(f"Scan did not start: {exc}")
 
     def _on_cancel_sar_scan() -> None:
-        if sar_scan is None or not sar_scan.active:
+        active_scan = _active_or_pending_scan()
+        if active_scan is None or not active_scan.active:
             _set_scan_status("No SAR scan is active.")
             return
-        sar_scan.cancel()
+        active_scan.cancel()
         _set_scan_status("Scan cancellation requested...")
 
     motor_log_lines: list[str] = []
@@ -3277,6 +3546,14 @@ def main():
             "Scansione SAR interrotta": "SAR scan interrupted",
             "Errore chiusura scansione": "Scan finalization error",
             "Scansione SAR completata": "SAR scan completed",
+            "Preparazione scansione cilindrica": "Preparing cylindrical scan",
+            "Annullamento scansione cilindrica...": "Cancelling cylindrical scan...",
+            "Scansione cilindrica annullata": "Cylindrical scan cancelled",
+            "Scansione cilindrica interrotta": "Cylindrical scan interrupted",
+            "Errore chiusura scansione cilindrica": "Cylindrical scan finalization error",
+            "Scansione cilindrica completata": "Cylindrical scan completed",
+            "Assestamento asse verticale": "Vertical-axis settling",
+            "Assestamento asse rotativo": "Rotary-axis settling",
             "Scansione annullata.": "Scan cancelled.",
         }
         text = translations.get(text, text)
@@ -3322,15 +3599,28 @@ def main():
         """Aggiorna i controlli dal thread GUI e restituisce lo stato scan."""
         state = "idle"
         active = False
-        if sar_scan is not None:
-            status = sar_scan.status()
+        active_or_pending_scan = _active_or_pending_scan()
+        if active_or_pending_scan is not None:
+            status = active_or_pending_scan.status()
             state = str(status.state)
-            active = sar_scan.active
+            active = active_or_pending_scan.active
             detail = _english_scan_message(str(status.message))
             if status.position_id is not None:
                 detail += f" | id={int(status.position_id)}"
             if status.position_mm is not None:
                 detail += f" | x={float(status.position_mm):.4f} mm"
+            if status.capture_id is not None:
+                detail += f" | capture_id={int(status.capture_id)}"
+            if status.acquisition_index is not None:
+                detail += f" | acquisition={int(status.acquisition_index)}"
+            if status.height_index is not None:
+                detail += f" | h={int(status.height_index)}"
+            if status.angle_index is not None:
+                detail += f" | angle={int(status.angle_index)}"
+            if status.azimuth_rad is not None:
+                detail += f" | az={float(status.azimuth_rad):.5f} rad"
+            if status.height_m is not None:
+                detail += f" | z={float(status.height_m):.4f} m"
             if status.total:
                 detail += f" | {int(status.completed)}/{int(status.total)}"
             if status.error:
@@ -3342,6 +3632,11 @@ def main():
                     sar_pos_counter.value = int(status.position_id)
                 if dpg.does_item_exist(TXT_POS_TAG):
                     dpg.set_value(TXT_POS_TAG, f"Scan: position ID {int(status.position_id)}")
+            elif state == "capturing" and status.capture_id is not None:
+                with sar_pos_counter.get_lock():
+                    sar_pos_counter.value = int(status.capture_id)
+                if dpg.does_item_exist(TXT_POS_TAG):
+                    dpg.set_value(TXT_POS_TAG, f"Scan: capture ID {int(status.capture_id)}")
 
         busy_capture = bool(capture_sessions.inflight)
         if dpg.does_item_exist(TXT_CAPTURE_STATUS_TAG):
@@ -3360,10 +3655,14 @@ def main():
         if dpg.does_item_exist(BTN_NEW_SESSION_TAG):
             dpg.configure_item(
                 BTN_NEW_SESSION_TAG,
-                enabled=not active and not busy_capture and scan_pending_run["start_position_id"] is None,
+                enabled=not active and not busy_capture and scan_pending_run["mode"] is None,
             )
         if dpg.does_item_exist(BTN_SCAN_START_TAG):
-            dpg.configure_item(BTN_SCAN_START_TAG, enabled=sar_scan is not None and not active and not busy_capture)
+            selected_scan = _scan_for_mode(_selected_scan_mode())
+            dpg.configure_item(
+                BTN_SCAN_START_TAG,
+                enabled=selected_scan is not None and not active and not busy_capture,
+            )
         if dpg.does_item_exist(BTN_SCAN_CANCEL_TAG):
             dpg.configure_item(BTN_SCAN_CANCEL_TAG, enabled=active)
         return state
@@ -4060,8 +4359,8 @@ def main():
 
     def _offline_tuning_locked_by_scan() -> bool:
         return bool(
-            (sar_scan is not None and sar_scan.active)
-            or scan_pending_run["start_position_id"] is not None
+            _any_scan_active()
+            or scan_pending_run["mode"] is not None
         )
 
     def _refresh_offline_memory_estimate(cfg_source: dict | None = None) -> str:
@@ -4679,6 +4978,14 @@ def main():
                         )
                         dpg.add_separator()
                         dpg.add_text("2. Automatic scan", color=(210, 210, 210))
+                        dpg.add_text("Scan mode", color=(210, 210, 210))
+                        dpg.add_combo(
+                            ["linear", "cylindrical"],
+                            default_value="linear",
+                            tag=COMBO_SCAN_MODE_TAG,
+                            width=CTRL_W,
+                        )
+                        dpg.add_text("Linear parameters", color=(190, 190, 190))
                         pitch_label = (
                             f"Pitch da offline_config: {scan_pitch_mm_default:.6f} mm"
                             if np.isfinite(scan_pitch_mm_default)
@@ -4694,6 +5001,66 @@ def main():
                             min_clamped=True,
                             width=CTRL_W,
                         )
+                        with dpg.collapsing_header(label="Regular cylindrical parameters", default_open=False):
+                            dpg.add_text(
+                                "Initial height is the current vertical HOME position; scene centre is [0, 0, 0].",
+                                wrap=CTRL_W,
+                                color=(190, 190, 190),
+                            )
+                            if cylindrical_scan is None:
+                                dpg.add_text(
+                                    rotary_error or "Rotary axis unavailable.",
+                                    wrap=CTRL_W,
+                                    color=(255, 150, 120),
+                                )
+                            dpg.add_input_int(
+                                label="Angles / turn",
+                                tag=IN_CYL_ANGLES_TAG,
+                                default_value=180,
+                                min_value=1,
+                                min_clamped=True,
+                                width=CTRL_W,
+                            )
+                            dpg.add_input_float(
+                                label="Radius [m]",
+                                tag=IN_CYL_RADIUS_TAG,
+                                default_value=1.0,
+                                min_value=0.001,
+                                min_clamped=True,
+                                width=CTRL_W,
+                            )
+                            dpg.add_input_int(
+                                label="Heights",
+                                tag=IN_CYL_HEIGHTS_TAG,
+                                default_value=2,
+                                min_value=1,
+                                min_clamped=True,
+                                width=CTRL_W,
+                            )
+                            dpg.add_input_float(
+                                label="Vertical step [m]",
+                                tag=IN_CYL_VERTICAL_STEP_TAG,
+                                default_value=0.05,
+                                min_value=0.000001,
+                                min_clamped=True,
+                                width=CTRL_W,
+                            )
+                            dpg.add_input_float(
+                                label="Angular settling [s]",
+                                tag=IN_CYL_ANGULAR_SETTLING_TAG,
+                                default_value=0.0,
+                                min_value=0.0,
+                                min_clamped=True,
+                                width=CTRL_W,
+                            )
+                            dpg.add_input_float(
+                                label="Vertical settling [s]",
+                                tag=IN_CYL_VERTICAL_SETTLING_TAG,
+                                default_value=0.0,
+                                min_value=0.0,
+                                min_clamped=True,
+                                width=CTRL_W,
+                            )
                         dpg.add_button(label="START SCAN", tag=BTN_SCAN_START_TAG, callback=_on_start_sar_scan, width=CTRL_W, height=38)
                         dpg.add_button(label="CANCEL SCAN", tag=BTN_SCAN_CANCEL_TAG, callback=_on_cancel_sar_scan, width=CTRL_W, height=30)
                         dpg.add_text("Scan status: ready", tag=TXT_SCAN_STATUS_TAG, wrap=CTRL_W, color=(190, 220, 190))
@@ -5451,23 +5818,33 @@ def main():
                     # precedente termina, questo ramo viene ritentato.
                     _set_scan_status("Scan completed: waiting for the previous offline recalculation...")
                 else:
+                    mode = scan_pending_run["mode"]
                     start_id = scan_pending_run["start_position_id"]
                     positions = scan_pending_run["positions"]
-                    if start_id is None or positions is None:
+                    if mode is None or start_id is None or positions is None:
                         _set_scan_status("SAR scan completed.")
                         last_scan_terminal_state = "completed"
                     else:
                         try:
                             # Solo ora tutti i file sono chiusi con successo:
-                            # conferma directory/range della nuova run.
-                            pitch_mm = configure_offline_scan_for_run(
-                                offline_scan_config_path,
-                                output_dir=out_dir,
-                                start_position_id=int(start_id),
-                                positions=int(positions),
-                                frames_per_position=FRAMES_PER_POSITION,
-                            )
-                            _update_scan_pitch_label(pitch_mm)
+                            # conferma la directory della nuova run. La
+                            # geometria cilindrica è già interamente negli
+                            # header v2, quindi non si modifica scan.x_*.
+                            if mode == "cylindrical":
+                                configure_offline_cylindrical_scan_for_run(
+                                    offline_scan_config_path,
+                                    output_dir=out_dir,
+                                    frames_per_position=FRAMES_PER_POSITION,
+                                )
+                            else:
+                                pitch_mm = configure_offline_scan_for_run(
+                                    offline_scan_config_path,
+                                    output_dir=out_dir,
+                                    start_position_id=int(start_id),
+                                    positions=int(positions),
+                                    frames_per_position=FRAMES_PER_POSITION,
+                                )
+                                _update_scan_pitch_label(pitch_mm)
                             if not _read_offline_tuning_config():
                                 raise RuntimeError("impossibile rileggere offline_config.yaml")
                             reload_started = _on_apply_offline_tuning(
@@ -5475,18 +5852,24 @@ def main():
                                 allow_scan_finalize=True,
                             )
                             if reload_started:
-                                scan_pending_run.update({"start_position_id": None, "positions": None})
+                                scan_pending_run.update(
+                                    {"mode": None, "start_position_id": None, "positions": None}
+                                )
                                 _set_scan_status("Scan completed: offline reload started.")
                                 last_scan_terminal_state = "completed"
                         except Exception as exc:
                             # I file restano validi; sblocca il tuning manuale
                             # e comunica chiaramente il solo errore offline.
-                            scan_pending_run.update({"start_position_id": None, "positions": None})
+                            scan_pending_run.update(
+                                {"mode": None, "start_position_id": None, "positions": None}
+                            )
                             _set_scan_status(f"Scan completed; offline reload did not start: {exc}")
                             last_scan_terminal_state = "completed"
             elif scan_state_now in {"cancelled", "failed"}:
                 # Non puntare l'offline a un insieme di file parziale.
-                scan_pending_run.update({"start_position_id": None, "positions": None})
+                scan_pending_run.update(
+                    {"mode": None, "start_position_id": None, "positions": None}
+                )
                 last_scan_terminal_state = scan_state_now
             else:
                 last_scan_terminal_state = scan_state_now

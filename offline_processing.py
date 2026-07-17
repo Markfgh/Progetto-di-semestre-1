@@ -6,7 +6,7 @@ import re
 import json
 import struct
 import time
-from typing import Any
+from typing import Any, Mapping
 import multiprocessing as mp
 import queue as pyqueue
 from multiprocessing import Process, Queue
@@ -40,6 +40,7 @@ from realtime_dsp import (
     window_type_normalize,
 )
 from offline_dsp import (
+    back_projection_power_mimo_geometry as _back_projection_power_mimo_geometry,
     back_projection_image_mimo as _back_projection_image_mimo,
     build_mimo_geometry as _build_mimo_geometry,
     phase_sign_normalize as _phase_sign_normalize,
@@ -47,6 +48,12 @@ from offline_dsp import (
     prepare_mimo_snapshots as _prepare_mimo_snapshots,
     prepare_synthetic_aperture_data as _prepare_synthetic_aperture_data,
     synthetic_aperture_uniform_spacing_lambda as _synthetic_aperture_uniform_spacing_lambda,
+)
+from sar_geometry import (
+    CylindricalCapture,
+    default_iwr1443_2tx4rx_geometry,
+    transform_element_coordinates,
+    xy_plane_voxel_grid,
 )
 from shutdown_utils import cleanup_processes, close_queues
 
@@ -60,9 +67,12 @@ _RECONSTRUCTION_ALGORITHMS = {"backprojection", "synthetic_range_angle"}
 @dataclass(frozen=True)
 class OfflineSARConfig:
     input_dir: Path
-    x_start: int
-    x_end: int
-    x_step: int
+    # ``scan.*`` describes only the legacy linear run.  A v2 cylindrical
+    # acquisition is completely ordered by its header metadata and may omit
+    # this block from offline_config.yaml.
+    x_start: int | None
+    x_end: int | None
+    x_step: int | None
     frames_per_position: int | None = None
 
     @classmethod
@@ -84,9 +94,23 @@ class OfflineSARConfig:
         if not input_dir_path.is_absolute():
             input_dir_path = (cfg_path.parent / input_dir_path).resolve()
 
-        x_start = _to_int("scan.x_start", scan_cfg.get("x_start"))
-        x_end = _to_int("scan.x_end", scan_cfg.get("x_end"))
-        x_step = _to_int("scan.x_step", _pick(scan_cfg.get("x_step"), 1))
+        x_start_raw = scan_cfg.get("x_start")
+        x_end_raw = scan_cfg.get("x_end")
+        x_step_raw = scan_cfg.get("x_step")
+        has_linear_scan = x_start_raw is not None or x_end_raw is not None or x_step_raw is not None
+        if has_linear_scan:
+            if x_start_raw is None or x_end_raw is None:
+                raise ValueError(
+                    "scan.x_start e scan.x_end sono entrambi obbligatori "
+                    "quando è presente la configurazione scan lineare"
+                )
+            x_start = _to_int("scan.x_start", x_start_raw)
+            x_end = _to_int("scan.x_end", x_end_raw)
+            x_step = _to_int("scan.x_step", _pick(x_step_raw, 1))
+        else:
+            x_start = None
+            x_end = None
+            x_step = None
 
         frames_per_position_raw = cap_cfg.get("frames_per_position")
         frames_per_position = None if frames_per_position_raw is None else _to_int(
@@ -94,9 +118,9 @@ class OfflineSARConfig:
             frames_per_position_raw,
         )
 
-        if x_step <= 0:
+        if x_step is not None and x_step <= 0:
             raise ValueError("scan.x_step deve essere > 0")
-        if x_end < x_start:
+        if x_start is not None and x_end is not None and x_end < x_start:
             raise ValueError("scan.x_end deve essere >= scan.x_start")
         if frames_per_position is not None and frames_per_position <= 0:
             raise ValueError("capture.frames_per_position deve essere > 0")
@@ -122,6 +146,57 @@ class SARStreamLayout:
     chirps: int
     rx: int
     tx: int
+    # ``positions`` remains the legacy public field.  It contains the linear
+    # position IDs for v1 and the capture IDs for v2.  New code must use the
+    # explicit fields below instead of assigning a geometric meaning to it.
+    geometry_mode: str = "legacy_linear"
+    capture_ids: np.ndarray | None = None
+    acquisition_indices: np.ndarray | None = None
+    cylindrical_captures: tuple[CylindricalCapture, ...] = ()
+
+
+@dataclass(frozen=True)
+class _CaptureFileRecord:
+    """Validated capture-file identity used only by :class:`SARReader`."""
+
+    path: Path
+    format: str
+    position_legacy: int
+    capture_id: int
+    acquisition_index: int | None
+    cylindrical: CylindricalCapture | None
+
+
+def cylindrical_capture_world_coordinates(
+    layout: SARStreamLayout,
+    *,
+    fc_hz: float,
+    c_m_s: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return physical TX/RX world coordinates for a regular v2 cylinder.
+
+    The IWR1443 2 TX × 4 RX local geometry is already calibrated and fixed.
+    This helper performs only the rigid body-to-world transform specified by
+    the capture headers; it never estimates or applies a calibration.
+    """
+    if str(layout.geometry_mode) != "cylindrical_regular":
+        raise ValueError("layout non cilindrico: richiesto geometry_mode='cylindrical_regular'")
+    if int(layout.tx) != 2 or int(layout.rx) != 4:
+        raise ValueError(
+            "La geometria cilindrica di questa fase richiede la ULA fisica 2 TX × 4 RX"
+        )
+    captures = tuple(layout.cylindrical_captures)
+    if len(captures) != int(layout.positions.size):
+        raise ValueError("metadata cylindrical non coerente con il numero di catture")
+    array_geometry = default_iwr1443_2tx4rx_geometry(
+        fc_hz=float(fc_hz),
+        c_m_s=float(c_m_s),
+    )
+    tx_global, rx_global = transform_element_coordinates(captures, array_geometry)
+    return (
+        np.asarray(tx_global, dtype=np.float32),
+        np.asarray(rx_global, dtype=np.float32),
+    )
 
 
 @dataclass(frozen=True)
@@ -158,6 +233,22 @@ class OfflineMapBounds:
     y_max_m: float
 
 
+@dataclass(frozen=True)
+class CylindricalPlane:
+    """Fixed-height world XY plane used by the circular offline preview.
+
+    It is deliberately separate from ``OfflineMapBounds``: the latter keeps
+    the historical forward-looking linear-SAR convention (``y >= 0``), while
+    a circular world plane legitimately spans both signs of Y.
+    """
+
+    x_min_m: float
+    x_max_m: float
+    y_min_m: float
+    y_max_m: float
+    z_m: float
+
+
 class SARReader:
     """Validate and stream SAR capture files one position at a time."""
 
@@ -176,10 +267,63 @@ class SARReader:
     def describe_stream(self) -> SARStreamLayout:
         """Validate the configured run without loading capture payloads."""
         source_dir = self._resolve_source_dir(self.config.input_dir)
-        pos_files = self._scan_position_files(source_dir)
-        expected_positions = list(range(self.config.x_start, self.config.x_end + 1, self.config.x_step))
-        self._validate_positions(pos_files, expected_positions)
-        samples, chirps, rx, tx, frames_per_pos_hdr = self._derive_capture_layout(pos_files)
+        records = self._scan_capture_records(source_dir)
+        formats = {record.format for record in records}
+        if len(formats) != 1:
+            raise ValueError(
+                "La stessa directory non può mescolare header rt_capture_v1 e rt_capture_v2"
+            )
+
+        format_name = next(iter(formats))
+        if format_name == "rt_capture_v1":
+            if (
+                self.config.x_start is None
+                or self.config.x_end is None
+                or self.config.x_step is None
+            ):
+                raise ValueError(
+                    "scan.x_start, scan.x_end e scan.x_step sono obbligatori "
+                    "per le catture lineari rt_capture_v1"
+                )
+            expected_positions = list(
+                range(
+                    int(self.config.x_start),
+                    int(self.config.x_end) + 1,
+                    int(self.config.x_step),
+                )
+            )
+            pos_files = [(record.position_legacy, record.path) for record in records]
+            self._validate_positions(pos_files, expected_positions)
+            record_by_position = {record.position_legacy: record for record in records}
+            ordered_records = [record_by_position[int(pos)] for pos in expected_positions]
+            positions = np.asarray(expected_positions, dtype=np.int32)
+            capture_ids = positions.copy()
+            acquisition_indices = np.arange(positions.size, dtype=np.int32)
+            geometry_mode = "legacy_linear"
+            cylindrical_captures: tuple[CylindricalCapture, ...] = ()
+        elif format_name == "rt_capture_v2":
+            ordered_records = self._validate_regular_cylindrical_records(records)
+            positions = np.asarray(
+                [record.capture_id for record in ordered_records],
+                dtype=np.int32,
+            )
+            capture_ids = positions.copy()
+            acquisition_indices = np.asarray(
+                [int(record.acquisition_index) for record in ordered_records],
+                dtype=np.int32,
+            )
+            geometry_mode = "cylindrical_regular"
+            cylindrical_captures = tuple(
+                record.cylindrical for record in ordered_records if record.cylindrical is not None
+            )
+            if len(cylindrical_captures) != len(ordered_records):
+                raise RuntimeError("Header v2 senza metadata cylindrical validato")
+        else:  # Defensive: _read_capture_header_metadata already restricts this.
+            raise RuntimeError(f"Formato cattura inatteso: {format_name!r}")
+
+        samples, chirps, rx, tx, frames_per_pos_hdr = self._derive_capture_layout(
+            [(record.capture_id, record.path) for record in ordered_records]
+        )
 
         bytes_per_frame = int(chirps) * int(samples) * int(rx) * 4
         i16_per_frame = bytes_per_frame // 2
@@ -187,11 +331,15 @@ class SARReader:
         if frames_expected is None:
             frames_expected = frames_per_pos_hdr
 
-        pos_to_file = {int(pos): path for pos, path in pos_files}
         ordered_files: list[Path] = []
         actual_frames_ref: int | None = None
-        for pos in expected_positions:
-            path = pos_to_file[int(pos)]
+        for record in ordered_records:
+            path = record.path
+            capture_label = (
+                f"Cattura {record.capture_id}"
+                if geometry_mode == "cylindrical_regular"
+                else f"Posizione {record.position_legacy}"
+            )
             file_size = int(path.stat().st_size)
             data_offset = int(self._detect_capture_data_offset(path, file_size))
             payload_size = int(file_size - data_offset)
@@ -205,14 +353,14 @@ class SARReader:
                 raise ValueError(f"{path.name}: nessun frame nel payload (offset={data_offset})")
             if frames_expected is not None and n_frames != int(frames_expected):
                 raise ValueError(
-                    f"Posizione {pos}: n_frames={n_frames}, "
+                    f"{capture_label}: n_frames={n_frames}, "
                     f"atteso frames_per_position={int(frames_expected)}"
                 )
             if actual_frames_ref is None:
                 actual_frames_ref = int(n_frames)
             elif int(n_frames) != int(actual_frames_ref):
                 raise ValueError(
-                    f"Posizione {pos}: n_frames={n_frames}, atteso {actual_frames_ref} "
+                    f"{capture_label}: n_frames={n_frames}, atteso {actual_frames_ref} "
                     "(tutti i file devono avere uguale numero di frame)"
                 )
             ordered_files.append(path)
@@ -221,7 +369,7 @@ class SARReader:
             raise RuntimeError("Nessun dato configurato")
         return SARStreamLayout(
             source_dir=source_dir,
-            positions=np.asarray(expected_positions, dtype=np.int32),
+            positions=positions,
             files=tuple(ordered_files),
             n_frames_per_position=int(actual_frames_ref),
             bytes_per_frame=int(bytes_per_frame),
@@ -230,6 +378,10 @@ class SARReader:
             chirps=int(chirps),
             rx=int(rx),
             tx=int(tx),
+            geometry_mode=geometry_mode,
+            capture_ids=capture_ids,
+            acquisition_indices=acquisition_indices,
+            cylindrical_captures=cylindrical_captures,
         )
 
     def iter_iq_positions(self, layout: SARStreamLayout):
@@ -322,12 +474,7 @@ class SARReader:
 
     def _extract_position_from_header(self, path: Path) -> int:
         meta = self._read_capture_header_metadata(path)
-        if "position" not in meta:
-            raise ValueError(f"{path.name}: header senza campo obbligatorio 'position'")
-        try:
-            return int(meta["position"])
-        except Exception as e:
-            raise ValueError(f"{path.name}: campo header 'position' non valido ({meta['position']!r})") from e
+        return self._position_legacy_from_metadata(path, meta)
 
     def _read_capture_header_metadata(self, path: Path) -> dict:
         file_size = path.stat().st_size
@@ -372,9 +519,10 @@ class SARReader:
         if not isinstance(meta, dict):
             raise ValueError(f"{path.name}: header JSON deve essere un oggetto")
         fmt = str(meta.get("format", ""))
-        if fmt != "rt_capture_v1":
+        if fmt not in {"rt_capture_v1", "rt_capture_v2"}:
             raise ValueError(
-                f"{path.name}: header format non supportato ({fmt!r}), atteso 'rt_capture_v1'"
+                f"{path.name}: header format non supportato ({fmt!r}), "
+                "attesi 'rt_capture_v1' o 'rt_capture_v2'"
             )
         if "position" not in meta:
             raise ValueError(f"{path.name}: header senza campo obbligatorio 'position'")
@@ -476,37 +624,242 @@ class SARReader:
             raise RuntimeError("Impossibile derivare capture layout dai file .bin")
         return samples_ref, chirps_ref, rx_ref, tx_ref, frames_per_pos_ref
 
-    def _scan_position_files(self, source_dir: Path) -> list[tuple[int, Path]]:
-        pos_files: list[tuple[int, Path]] = []
-        for p in source_dir.glob("*.bin"):
-            match = _CAPTURE_FILE_RE.match(p.name)
-            pos_from_name = int(match.group(1)) if match is not None else None
-            try:
-                pos_from_header = self._extract_position_from_header(p)
-            except ValueError:
-                # Skip files not in current capture format.
-                continue
+    @staticmethod
+    def _position_legacy_from_metadata(path: Path, meta: Mapping[str, Any]) -> int:
+        """Read the legacy ``position`` field without assigning it v2 geometry."""
+        if "position" not in meta:
+            raise ValueError(f"{path.name}: header senza campo obbligatorio 'position'")
+        try:
+            return int(meta["position"])
+        except Exception as exc:
+            raise ValueError(
+                f"{path.name}: campo header 'position' non valido ({meta['position']!r})"
+            ) from exc
 
-            if pos_from_name is not None and pos_from_header is not None and pos_from_name != pos_from_header:
-                raise ValueError(
-                    f"{p.name}: posizione incoerente (nome={pos_from_name}, header={pos_from_header})"
-                )
-
-            pos = pos_from_header
-            pos_files.append((int(pos), p))
-
-        if not pos_files:
-            raise FileNotFoundError(
-                f"Nessun file di capture valido trovato in {source_dir} "
-                f"(richiesto header {_CAPTURE_HEADER_MAGIC!r} con format='rt_capture_v1')"
+    def _capture_record_from_header(self, path: Path, meta: Mapping[str, Any]) -> _CaptureFileRecord:
+        """Turn one accepted v1/v2 header into an immutable reader record."""
+        format_name = str(meta.get("format", ""))
+        position_legacy = self._position_legacy_from_metadata(path, meta)
+        if format_name == "rt_capture_v1":
+            return _CaptureFileRecord(
+                path=path,
+                format=format_name,
+                position_legacy=position_legacy,
+                capture_id=position_legacy,
+                acquisition_index=None,
+                cylindrical=None,
             )
 
-        pos_files.sort(key=lambda t: t[0])
+        if format_name != "rt_capture_v2":
+            raise ValueError(f"{path.name}: formato header non gestito ({format_name!r})")
+        cylindrical_raw = meta.get("cylindrical")
+        if not isinstance(cylindrical_raw, Mapping):
+            raise ValueError(f"{path.name}: header v2 senza oggetto obbligatorio 'cylindrical'")
+        if "capture_id" not in meta or "acquisition_index" not in meta:
+            raise ValueError(
+                f"{path.name}: header v2 richiede 'capture_id' e 'acquisition_index'"
+            )
+
+        cylindrical_metadata = dict(cylindrical_raw)
+        for key in ("capture_id", "acquisition_index"):
+            if key in cylindrical_metadata and cylindrical_metadata[key] != meta[key]:
+                raise ValueError(
+                    f"{path.name}: {key} incoerente tra header v2 e blocco cylindrical"
+                )
+            cylindrical_metadata[key] = meta[key]
+        try:
+            cylindrical = CylindricalCapture.from_dict(cylindrical_metadata)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{path.name}: metadata cylindrical non valido: {exc}") from exc
+
+        return _CaptureFileRecord(
+            path=path,
+            format=format_name,
+            position_legacy=position_legacy,
+            capture_id=cylindrical.capture_id,
+            acquisition_index=cylindrical.acquisition_index,
+            cylindrical=cylindrical,
+        )
+
+    def _scan_capture_records(self, source_dir: Path) -> list[_CaptureFileRecord]:
+        """Discover valid RTP capture files while retaining their header version."""
+        records: list[_CaptureFileRecord] = []
+        for path in sorted(source_dir.glob("*.bin"), key=lambda item: item.name):
+            try:
+                metadata = self._read_capture_header_metadata(path)
+                record = self._capture_record_from_header(path, metadata)
+            except ValueError:
+                # The capture directory historically may contain unrelated .bin
+                # files.  Keep the v1 behaviour of ignoring non-capture files,
+                # but never hide a malformed file that claims the capture
+                # filename convention.
+                if _CAPTURE_FILE_RE.match(path.name) is not None:
+                    raise
+                continue
+
+            name_match = _CAPTURE_FILE_RE.match(path.name)
+            if name_match is not None:
+                file_id = int(name_match.group(1))
+                header_id = (
+                    record.capture_id
+                    if record.format == "rt_capture_v2"
+                    else record.position_legacy
+                )
+                if file_id != header_id:
+                    field_name = "capture_id" if record.format == "rt_capture_v2" else "posizione"
+                    raise ValueError(
+                        f"{path.name}: {field_name} incoerente "
+                        f"(nome={file_id}, header={header_id})"
+                    )
+            records.append(record)
+
+        if not records:
+            raise FileNotFoundError(
+                f"Nessun file di capture valido trovato in {source_dir} "
+                f"(richiesto header {_CAPTURE_HEADER_MAGIC!r} con format='rt_capture_v1' o 'rt_capture_v2')"
+            )
+        return records
+
+    def _scan_position_files(self, source_dir: Path) -> list[tuple[int, Path]]:
+        """Compatibility helper for callers that still inspect v1 positions."""
+        pos_files = [
+            (record.position_legacy, record.path)
+            for record in self._scan_capture_records(source_dir)
+            if record.format == "rt_capture_v1"
+        ]
+        pos_files.sort(key=lambda item: item[0])
         pos_ids = [pos for pos, _ in pos_files]
         if len(pos_ids) != len(set(pos_ids)):
             raise ValueError(f"Posizioni duplicate trovate in {source_dir}: {pos_ids}")
-
         return pos_files
+
+    @staticmethod
+    def _validate_regular_cylindrical_records(
+        records: list[_CaptureFileRecord],
+    ) -> list[_CaptureFileRecord]:
+        """Validate the single-turn-per-height cylindrical acquisition contract.
+
+        A v2 run has a contiguous temporal sequence.  For a fixed
+        ``angle_count``, temporal item ``i`` must be exactly
+        ``height_index=i//angle_count, angle_index=i%angle_count``.  This
+        excludes arbitrary paths, multiple turns at one height, incomplete
+        turns, and unwrapped angular metadata by construction.
+        """
+        if not records:
+            raise RuntimeError("Nessuna cattura cilindrica da validare")
+        captures: list[CylindricalCapture] = []
+        for record in records:
+            if record.format != "rt_capture_v2" or record.cylindrical is None:
+                raise ValueError("La scansione cilindrica richiede solo header rt_capture_v2")
+            captures.append(record.cylindrical)
+
+        capture_ids = [capture.capture_id for capture in captures]
+        if len(capture_ids) != len(set(capture_ids)):
+            raise ValueError(f"capture_id duplicati nella scansione v2: {capture_ids}")
+        acquisition_indices = [capture.acquisition_index for capture in captures]
+        if len(acquisition_indices) != len(set(acquisition_indices)):
+            raise ValueError(
+                f"acquisition_index duplicati nella scansione v2: {acquisition_indices}"
+            )
+
+        ordered = sorted(records, key=lambda record: int(record.acquisition_index))
+        ordered_captures = [record.cylindrical for record in ordered]
+        if any(capture is None for capture in ordered_captures):
+            raise RuntimeError("Cattura cilindrica mancante dopo la validazione")
+        captures_ordered = [capture for capture in ordered_captures if capture is not None]
+        expected_indices = list(range(len(captures_ordered)))
+        actual_indices = [capture.acquisition_index for capture in captures_ordered]
+        if actual_indices != expected_indices:
+            raise ValueError(
+                "acquisition_index v2 deve essere contiguo e iniziare da zero "
+                f"(trovato {actual_indices})"
+            )
+
+        angle_counts = {capture.angle_count for capture in captures_ordered}
+        if len(angle_counts) != 1:
+            raise ValueError("angle_count deve essere costante nella scansione cilindrica")
+        angle_count = next(iter(angle_counts))
+        if len(captures_ordered) % angle_count != 0:
+            raise ValueError(
+                "La scansione cilindrica contiene un giro incompleto: "
+                f"{len(captures_ordered)} catture per angle_count={angle_count}"
+            )
+
+        reference_radius = captures_ordered[0].radius_m
+        reference_center = captures_ordered[0].scene_center_m
+        azimuth_by_angle: dict[int, float] = {}
+        height_by_index: dict[int, float] = {}
+        for acquisition_index, capture in enumerate(captures_ordered):
+            expected_height_index = acquisition_index // angle_count
+            expected_angle_index = acquisition_index % angle_count
+            if (
+                capture.height_index != expected_height_index
+                or capture.angle_index != expected_angle_index
+            ):
+                raise ValueError(
+                    "Sequenza cilindrica non regolare: "
+                    f"acquisition_index={capture.acquisition_index} richiede "
+                    f"height_index={expected_height_index}, angle_index={expected_angle_index}; "
+                    f"trovati height_index={capture.height_index}, angle_index={capture.angle_index}"
+                )
+            if not np.isclose(capture.radius_m, reference_radius, rtol=0.0, atol=1e-12):
+                raise ValueError("radius_m deve rimanere costante nella scansione cilindrica")
+            if not np.allclose(capture.scene_center_m, reference_center, rtol=0.0, atol=1e-12):
+                raise ValueError("scene_center_m deve rimanere costante nella scansione cilindrica")
+
+            previous_azimuth = azimuth_by_angle.setdefault(capture.angle_index, capture.azimuth_rad)
+            if not np.isclose(capture.azimuth_rad, previous_azimuth, rtol=0.0, atol=1e-12):
+                raise ValueError(
+                    "azimuth_rad deve essere uguale per lo stesso angle_index a ogni quota"
+                )
+            previous_height = height_by_index.setdefault(capture.height_index, capture.height_m)
+            if not np.isclose(capture.height_m, previous_height, rtol=0.0, atol=1e-12):
+                raise ValueError(
+                    "height_m deve rimanere costante durante ogni giro completo"
+                )
+
+        # The mechanical path is a single regular 360-degree turn.  A common
+        # starting azimuth is allowed, but every angle index must advance by
+        # one fixed signed step of 2*pi/angle_count and the wrapped values
+        # must repeat at each height.  This intentionally rejects arbitrary
+        # or unwrapped paths while allowing either mechanical direction.
+        azimuth_zero = azimuth_by_angle[0]
+        angular_step = (2.0 * np.pi) / float(angle_count)
+        if angle_count <= 1:
+            direction = 1.0
+        else:
+            observed_step = float(
+                ((azimuth_by_angle[1] - azimuth_zero + np.pi) % (2.0 * np.pi)) - np.pi
+            )
+            if np.isclose(observed_step, angular_step, rtol=0.0, atol=1e-10):
+                direction = 1.0
+            elif np.isclose(observed_step, -angular_step, rtol=0.0, atol=1e-10):
+                direction = -1.0
+            else:
+                raise ValueError(
+                    "azimuth_rad non descrive passi regolari di 2*pi/angle_count"
+                )
+        for angle_index in range(angle_count):
+            expected = float(
+                (azimuth_zero + direction * float(angle_index) * angular_step) % (2.0 * np.pi)
+            )
+            observed = float(azimuth_by_angle[angle_index])
+            wrapped_error = float(((observed - expected + np.pi) % (2.0 * np.pi)) - np.pi)
+            if not np.isclose(wrapped_error, 0.0, rtol=0.0, atol=1e-10):
+                raise ValueError(
+                    "azimuth_rad non descrive passi regolari di 2*pi/angle_count"
+                )
+
+        declared_height_counts = {capture.height_count for capture in captures_ordered}
+        if len(declared_height_counts) > 1:
+            raise ValueError("height_count deve essere coerente nella scansione cilindrica")
+        declared_height_count = next(iter(declared_height_counts))
+        n_heights = len(captures_ordered) // angle_count
+        if declared_height_count is not None and declared_height_count != n_heights:
+            raise ValueError(
+                f"height_count={declared_height_count} non coerente con le {n_heights} quote presenti"
+            )
+        return ordered
 
     def _validate_positions(
         self,
@@ -1169,6 +1522,67 @@ def offline_map_bounds_from_yaml_dict(
     )
 
 
+def cylindrical_plane_from_yaml_dict(cfg: Mapping[str, Any]) -> CylindricalPlane | None:
+    """Read the optional circular-SAR world plane from ``offline_config``.
+
+    YAML shape::
+
+        reconstruction:
+          cylindrical_plane:
+            x_min_m: -1.0
+            x_max_m:  1.0
+            y_min_m: -1.0
+            y_max_m:  1.0
+            z_m: 0.0
+
+    If the block is absent, the reader derives a conservative square from the
+    capture's fixed radius and scene center.  No 3-D renderer is configured
+    here; volumes are constructed explicitly with ``xyz_volume_voxel_grid``.
+    """
+    reconstruction = cfg.get("reconstruction", {}) or {}
+    if not isinstance(reconstruction, Mapping):
+        raise ValueError("offline_config: reconstruction deve essere un oggetto")
+    raw = reconstruction.get("cylindrical_plane")
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise ValueError("offline_config: reconstruction.cylindrical_plane deve essere un oggetto")
+    required = ("x_min_m", "x_max_m", "y_min_m", "y_max_m", "z_m")
+    missing = [key for key in required if raw.get(key) is None]
+    if missing:
+        raise ValueError(
+            "offline_config: reconstruction.cylindrical_plane senza campi: "
+            + ", ".join(missing)
+        )
+    values = {
+        key: _to_float(f"offline_config: reconstruction.cylindrical_plane.{key}", raw[key])
+        for key in required
+    }
+    if not all(np.isfinite(value) for value in values.values()):
+        raise ValueError("offline_config: reconstruction.cylindrical_plane deve contenere valori finiti")
+    if values["x_max_m"] <= values["x_min_m"]:
+        raise ValueError("offline_config: cylindrical_plane.x_max_m deve essere > x_min_m")
+    if values["y_max_m"] <= values["y_min_m"]:
+        raise ValueError("offline_config: cylindrical_plane.y_max_m deve essere > y_min_m")
+    return CylindricalPlane(**values)
+
+
+def _default_cylindrical_plane(captures: tuple[CylindricalCapture, ...]) -> CylindricalPlane:
+    """Derive a neutral XY plane centred on a regular cylindrical scan."""
+    if not captures:
+        raise ValueError("impossibile derivare il piano: nessuna cattura cilindrica")
+    first = captures[0]
+    center = first.scene_center_m
+    radius = float(first.radius_m)
+    return CylindricalPlane(
+        x_min_m=float(center[0] - radius),
+        x_max_m=float(center[0] + radius),
+        y_min_m=float(center[1] - radius),
+        y_max_m=float(center[1] + radius),
+        z_m=float(center[2]),
+    )
+
+
 def _read_bp_runtime_cfg(offline_config_path: str | Path, fallback_capture_cfg: str | Path) -> dict[str, Any]:
     cfg = _load_yaml_file(Path(offline_config_path))
     fallback_cfg = _load_yaml_file(Path(fallback_capture_cfg))
@@ -1201,6 +1615,7 @@ def _read_bp_runtime_cfg(offline_config_path: str | Path, fallback_capture_cfg: 
         "map_bounds": offline_map_bounds_from_yaml_dict(cfg, fallback_cfg),
         "range_angle": _read_offline_sar_range_angle_cfg(cfg, fallback_cfg),
         "background_reference": background_reference,
+        "cylindrical_plane": cylindrical_plane_from_yaml_dict(cfg),
     }
 
 
@@ -1530,6 +1945,40 @@ def _validate_background_reference_layout(
         raise ValueError(
             "Scansione background non compatibile: posizioni diverse dalla scansione target"
         )
+    if str(target.geometry_mode) != str(reference.geometry_mode):
+        raise ValueError(
+            "Scansione background non compatibile: geometria v1/v2 diversa dalla scansione target"
+        )
+    if str(target.geometry_mode) == "cylindrical_regular":
+        if len(target.cylindrical_captures) != len(reference.cylindrical_captures):
+            raise ValueError(
+                "Scansione background non compatibile: numero di pose cilindriche diverso"
+            )
+        for index, (target_capture, reference_capture) in enumerate(
+            zip(target.cylindrical_captures, reference.cylindrical_captures)
+        ):
+            target_values = target_capture.to_dict()
+            reference_values = reference_capture.to_dict()
+            if (
+                target_values["capture_id"] != reference_values["capture_id"]
+                or target_values["acquisition_index"] != reference_values["acquisition_index"]
+                or target_values["angle_index"] != reference_values["angle_index"]
+                or target_values["height_index"] != reference_values["height_index"]
+                or target_values["angle_count"] != reference_values["angle_count"]
+                or not np.isclose(target_values["azimuth_rad"], reference_values["azimuth_rad"], rtol=0.0, atol=1e-12)
+                or not np.isclose(target_values["height_m"], reference_values["height_m"], rtol=0.0, atol=1e-12)
+                or not np.isclose(target_values["radius_m"], reference_values["radius_m"], rtol=0.0, atol=1e-12)
+                or not np.allclose(
+                    target_values["scene_center_m"],
+                    reference_values["scene_center_m"],
+                    rtol=0.0,
+                    atol=1e-12,
+                )
+            ):
+                raise ValueError(
+                    "Scansione background non compatibile: posa cilindrica diversa "
+                    f"alla cattura {index}"
+                )
 
     mismatches: list[str] = []
     for field in ("samples", "chirps", "rx", "tx"):
@@ -1710,16 +2159,45 @@ def _offline_reader_worker(
             },
         )
 
-        mimo_geometry = _resolve_offline_mimo_geometry(
-            fallback_capture_cfg,
-            tx_i=int(stream_layout.tx),
-            rx_i=int(stream_layout.rx),
-            tx_offsets_override_m=bp_runtime_cfg.get("tx_offsets_m"),
-            rx_offsets_override_m=bp_runtime_cfg.get("rx_offsets_m"),
-        )
-        warning = mimo_geometry.get("warning", None)
-        if warning:
-            print(str(warning))
+        geometry_mode = str(stream_layout.geometry_mode)
+        bp_tx_global_m: np.ndarray | None = None
+        bp_rx_global_m: np.ndarray | None = None
+        cylindrical_plane: CylindricalPlane | None = None
+        mimo_geometry: dict[str, Any] | None = None
+        if geometry_mode == "cylindrical_regular":
+            if algorithm != "backprojection":
+                raise ValueError(
+                    "La geometria cilindrica regolare supporta solo reconstruction.algorithm='backprojection'"
+                )
+            fallback_cfg = _load_yaml_file(Path(fallback_capture_cfg))
+            radar_cfg = fallback_cfg.get("radar", {}) or {}
+            geometry_c_m_s = _to_float("radar.c", _pick(radar_cfg.get("c"), 3e8), 3e8)
+            geometry_fc_hz = _to_float("radar.fc", radar_cfg.get("fc"))
+            bp_tx_global_m, bp_rx_global_m = cylindrical_capture_world_coordinates(
+                stream_layout,
+                fc_hz=float(geometry_fc_hz),
+                c_m_s=float(geometry_c_m_s),
+            )
+            cylindrical_plane = bp_runtime_cfg.get("cylindrical_plane")
+            if cylindrical_plane is None:
+                cylindrical_plane = _default_cylindrical_plane(
+                    tuple(stream_layout.cylindrical_captures)
+                )
+            geometry_source = "fixed_precalibrated_iwr1443_2tx4rx_world"
+        elif geometry_mode == "legacy_linear":
+            mimo_geometry = _resolve_offline_mimo_geometry(
+                fallback_capture_cfg,
+                tx_i=int(stream_layout.tx),
+                rx_i=int(stream_layout.rx),
+                tx_offsets_override_m=bp_runtime_cfg.get("tx_offsets_m"),
+                rx_offsets_override_m=bp_runtime_cfg.get("rx_offsets_m"),
+            )
+            warning = mimo_geometry.get("warning", None)
+            if warning:
+                print(str(warning))
+            geometry_source = str(mimo_geometry["geometry_source"])
+        else:
+            raise ValueError(f"geometry_mode offline non supportato: {geometry_mode!r}")
 
         for warning in range_angle_cfg.filter_warnings:
             print(f"[OFFLINE WARN] {warning}")
@@ -1830,9 +2308,24 @@ def _offline_reader_worker(
             "range_fft_shape": tuple(int(x) for x in range_fft.shape),
             "range_fft_dtype": "complex64",
             "positions": stream_layout.positions.astype(np.int32, copy=False),
-            "x_start_cfg": int(reader.config.x_start),
-            "x_end_cfg": int(reader.config.x_end),
+            "x_start_cfg": (
+                None if reader.config.x_start is None else int(reader.config.x_start)
+            ),
+            "x_end_cfg": (
+                None if reader.config.x_end is None else int(reader.config.x_end)
+            ),
             "algorithm": str(algorithm),
+            "geometry_mode": geometry_mode,
+            "capture_ids": (
+                stream_layout.positions.astype(np.int32, copy=False)
+                if stream_layout.capture_ids is None
+                else stream_layout.capture_ids.astype(np.int32, copy=False)
+            ),
+            "acquisition_indices": (
+                None
+                if stream_layout.acquisition_indices is None
+                else stream_layout.acquisition_indices.astype(np.int32, copy=False)
+            ),
             "range_angle_cfg": range_angle_cfg,
             "nfft_range": int(nfft_range),
             "range_input_samples": int(range_input_samples),
@@ -1848,9 +2341,17 @@ def _offline_reader_worker(
             ),
             "background_reference_scale": float(background_reference.scale),
         }
-        msg["bp_x_tx_ant_m"] = np.asarray(mimo_geometry["x_tx_ant_m"], dtype=np.float32)
-        msg["bp_x_rx_ant_m"] = np.asarray(mimo_geometry["x_rx_ant_m"], dtype=np.float32)
-        msg["bp_geometry_source"] = str(mimo_geometry["geometry_source"])
+        if geometry_mode == "cylindrical_regular":
+            assert bp_tx_global_m is not None and bp_rx_global_m is not None
+            assert cylindrical_plane is not None
+            msg["bp_tx_global_m"] = bp_tx_global_m
+            msg["bp_rx_global_m"] = bp_rx_global_m
+            msg["cylindrical_plane"] = cylindrical_plane
+        else:
+            assert mimo_geometry is not None
+            msg["bp_x_tx_ant_m"] = np.asarray(mimo_geometry["x_tx_ant_m"], dtype=np.float32)
+            msg["bp_x_rx_ant_m"] = np.asarray(mimo_geometry["x_rx_ant_m"], dtype=np.float32)
+        msg["bp_geometry_source"] = geometry_source
         _queue_put_latest(reader_to_dsp_q, msg)
         shm_cleanup_transferred = True
         _queue_put_latest(
@@ -1868,7 +2369,8 @@ def _offline_reader_worker(
                 "range_input_samples": int(range_input_samples),
                 "range_samples_used": int(range_samples_used),
                 "range_angle_nfft_angle": int(range_angle_cfg.nfft_angle),
-                "geometry_source": str(mimo_geometry["geometry_source"]),
+                "geometry_mode": geometry_mode,
+                "geometry_source": geometry_source,
                 "background_reference_enabled": bool(background_reference.enabled),
                 "background_reference_dir": (
                     None if reference_layout is None else str(reference_layout.source_dir)
@@ -1998,16 +2500,47 @@ def _offline_dsp_worker(
         background_reference_frames = max(0, int(_pick(init_msg.get("background_reference_frames"), 0)))
         background_reference_scale = float(_pick(init_msg.get("background_reference_scale"), 1.0))
 
-        bp_window_stages = _offline_backprojection_windows_enabled(range_angle_cfg)
+        # A BP aperture is a Cartesian product of poses and physical MIMO
+        # channels.  Do not apply the historical flattened position×antenna
+        # window here: the generalized kernel owns separate pose/channel
+        # weights (uniform by default).  Range and zero-Doppler processing are
+        # intentionally unchanged.
+        bp_window_stages: tuple[str, ...] = ()
 
         tx_i = max(1, int(_pick(init_msg.get("tx"), 2)))
         rx_i = max(1, int(_pick(init_msg.get("rx"), 4)))
-        x_tx_ant_m = np.asarray(init_msg.get("bp_x_tx_ant_m"), dtype=np.float32).reshape(-1)
-        x_rx_ant_m = np.asarray(init_msg.get("bp_x_rx_ant_m"), dtype=np.float32).reshape(-1)
+        geometry_mode = str(_pick(init_msg.get("geometry_mode"), "legacy_linear"))
         geometry_source = str(_pick(init_msg.get("bp_geometry_source"), "unknown"))
         n_ant_data = int(range_fft_data.shape[2])
-        if x_tx_ant_m.size != n_ant_data or x_rx_ant_m.size != n_ant_data:
-            raise ValueError("bp_x_tx_ant_m/bp_x_rx_ant_m size != asse antenna range_fft")
+        cylindrical_plane: CylindricalPlane | None = None
+        tx_global_m: np.ndarray | None = None
+        rx_global_m: np.ndarray | None = None
+        if geometry_mode == "cylindrical_regular":
+            if algorithm != "backprojection":
+                raise ValueError(
+                    "La ricostruzione cilindrica supporta solo l'algoritmo backprojection"
+                )
+            tx_global_m = np.asarray(init_msg.get("bp_tx_global_m"), dtype=np.float32)
+            rx_global_m = np.asarray(init_msg.get("bp_rx_global_m"), dtype=np.float32)
+            expected_geometry_shape = (int(positions.size), int(n_ant_data), 3)
+            if tx_global_m.shape != expected_geometry_shape or rx_global_m.shape != expected_geometry_shape:
+                raise ValueError(
+                    "bp_tx_global_m/bp_rx_global_m non coerenti con gli snapshot: "
+                    f"atteso {expected_geometry_shape}, trovate {tx_global_m.shape}/{rx_global_m.shape}"
+                )
+            plane_raw = init_msg.get("cylindrical_plane")
+            if not isinstance(plane_raw, CylindricalPlane):
+                raise ValueError("cylindrical_plane mancante o non valida per la ricostruzione circular SAR")
+            cylindrical_plane = plane_raw
+            x_tx_ant_m = np.empty(0, dtype=np.float32)
+            x_rx_ant_m = np.empty(0, dtype=np.float32)
+        elif geometry_mode == "legacy_linear":
+            x_tx_ant_m = np.asarray(init_msg.get("bp_x_tx_ant_m"), dtype=np.float32).reshape(-1)
+            x_rx_ant_m = np.asarray(init_msg.get("bp_x_rx_ant_m"), dtype=np.float32).reshape(-1)
+            if x_tx_ant_m.size != n_ant_data or x_rx_ant_m.size != n_ant_data:
+                raise ValueError("bp_x_tx_ant_m/bp_x_rx_ant_m size != asse antenna range_fft")
+        else:
+            raise ValueError(f"geometry_mode non supportato nel DSP offline: {geometry_mode!r}")
         n_ant_used = int(n_ant_data)
         n_bins_total = int(range_fft_data.shape[-1])
         dr_m = float(c_m_s) * float(fs_hz) / (2.0 * float(slope_hz_s) * float(nfft_range))
@@ -2050,6 +2583,7 @@ def _offline_dsp_worker(
                 "range_input_samples": int(range_input_samples),
                 "range_samples_used": int(range_samples_used),
                 "virtual_antennas": int(n_ant_used),
+                "geometry_mode": geometry_mode,
                 "geometry_source": str(geometry_source),
                 "doppler_bins_used": 1,
                 "range_angle_use_realtime_filters": bool(range_angle_cfg.use_realtime_filters),
@@ -2061,6 +2595,17 @@ def _offline_dsp_worker(
                 "background_reference_dir": background_reference_dir,
                 "background_reference_frames": int(background_reference_frames),
                 "background_reference_scale": float(background_reference_scale),
+                "cylindrical_plane": (
+                    None
+                    if cylindrical_plane is None
+                    else {
+                        "x_min_m": float(cylindrical_plane.x_min_m),
+                        "x_max_m": float(cylindrical_plane.x_max_m),
+                        "y_min_m": float(cylindrical_plane.y_min_m),
+                        "y_max_m": float(cylindrical_plane.y_max_m),
+                        "z_m": float(cylindrical_plane.z_m),
+                    }
+                ),
                 **_viewport_status_fields(applied_viewport, fallback_used=False),
             },
         )
@@ -2131,138 +2676,193 @@ def _offline_dsp_worker(
             )
             if dirty or job_key != last_job_key or got_cmd:
                 t0 = time.perf_counter()
-                sel_mask = (positions >= int(x_start)) & (positions <= int(x_end))
-                if not np.any(sel_mask):
-                    sel_mask[:] = True
-                sel_idx = np.where(sel_mask)[0]
-                sel_key = tuple(int(v) for v in sel_idx.tolist())
                 frame_meta: dict[str, Any] = {}
-                x_pos_m_sel = x_pos_m_full[sel_idx]
-                # This bounds both reconstruction paths to the active ROI.
-                # For BP it includes the selected SAR/MIMO sensor positions;
-                # for synthetic range-angle it is a conservative range slice.
-                viewport_max_bin = _backprojection_viewport_max_bin(
-                    applied_viewport,
-                    x_pos_m=x_pos_m_sel,
-                    x_tx_ant_m=x_tx_ant_m,
-                    x_rx_ant_m=x_rx_ant_m,
-                    dr_m=float(dr_m),
-                    available_bins=int(n_bins_total),
-                )
-                if algorithm == "synthetic_range_angle":
-                    selected_positions = positions[sel_idx].astype(np.int32, copy=False)
-                    range_fft_sel = range_fft_data[sel_idx, :, :, :viewport_max_bin]
-                    n_pos_sel, n_frames_sel, n_ant_sel, _n_bins_sel = range_fft_sel.shape
-                    if int(n_ant_sel) != int(tx_i) * int(rx_i):
-                        raise ValueError(
-                            f"asse antenna synthetic={n_ant_sel} non coerente con tx/rx={tx_i}/{rx_i}"
-                        )
-                    mvdr_elements = int(n_pos_sel) * int(n_ant_sel)
-                    if (
-                        str(range_angle_cfg.angle_processing.mode) == "mvdr"
-                        and int(n_frames_sel) < int(mvdr_elements)
-                    ):
-                        raise ValueError(
-                            "MVDR offline sottodeterminato: "
-                            f"snapshot={n_frames_sel}, elementi={mvdr_elements}. "
-                            "Seleziona meno posizioni (con 8 frame usare una sola posizione), "
-                            "aumenta frames_per_position oppure usa Bartlett/backprojection."
-                        )
-                    synthetic_projection_lut_key = (
-                        str(algorithm),
-                        sel_key,
-                        int(range_angle_cfg.nfft_angle),
-                        str(range_angle_cfg.projection.projection_interp),
-                        display_viewport_signature(applied_viewport),
+                if geometry_mode == "cylindrical_regular":
+                    # A valid v2 run is exactly one full turn per height.
+                    # Selecting arbitrary capture-ID subsets would violate
+                    # that acquisition contract, so circular BP always uses
+                    # every pose in acquisition order.
+                    sel_idx = np.arange(int(positions.size), dtype=np.intp)
+                    sel_key = tuple(int(value) for value in sel_idx.tolist())
+                    assert cylindrical_plane is not None
+                    assert tx_global_m is not None and rx_global_m is not None
+                    grid_key = (
+                        "cylindrical_plane",
+                        float(cylindrical_plane.x_min_m),
+                        float(cylindrical_plane.x_max_m),
+                        float(cylindrical_plane.y_min_m),
+                        float(cylindrical_plane.y_max_m),
+                        float(cylindrical_plane.z_m),
+                        int(gui_h),
+                        int(gui_w),
                     )
-                    if (
-                        synthetic_projection_lut_cache_key == synthetic_projection_lut_key
-                        and synthetic_projection_lut_cache is not None
-                    ):
-                        projection_lut = synthetic_projection_lut_cache
-                    else:
-                        projection_lut = None
-                    img_db, frame_meta = _compute_synthetic_range_angle_image(
-                        range_fft_sel,
-                        selected_positions=selected_positions,
-                        x_pitch_m=float(x_pitch_m),
-                        tx_i=int(tx_i),
-                        rx_i=int(rx_i),
-                        x_tx_ant_m=x_tx_ant_m,
-                        x_rx_ant_m=x_rx_ant_m,
-                        range_angle_cfg=range_angle_cfg,
-                        c_m_s=float(c_m_s),
-                        fs_hz=float(fs_hz),
-                        slope_hz_s=float(slope_hz_s),
-                        fc_hz=float(fc_hz),
-                        fft_workers=int(fft_workers),
-                        nfft_range=int(nfft_range),
-                        gui_h=int(gui_h),
-                        gui_w=int(gui_w),
-                        viewport=applied_viewport,
-                        projection_lut=projection_lut,
-                    )
-                    synthetic_projection_lut_cache = frame_meta.pop("projection_lut", None)
-                    synthetic_projection_lut_cache_key = synthetic_projection_lut_key
-                    doppler_bins_used = 1
-                else:
-                    grid_key = display_viewport_signature(applied_viewport)
                     if grid_cache_key == grid_key and grid_cache is not None:
-                        x_grid, y_grid = grid_cache
+                        voxel_xyz = grid_cache
                     else:
                         x_axis = np.linspace(
-                            float(applied_viewport.x_min_m),
-                            float(applied_viewport.x_max_m),
+                            float(cylindrical_plane.x_min_m),
+                            float(cylindrical_plane.x_max_m),
                             int(gui_w),
                             dtype=np.float32,
                         )
                         y_axis = np.linspace(
-                            float(applied_viewport.y_min_m),
-                            float(applied_viewport.y_max_m),
+                            float(cylindrical_plane.y_min_m),
+                            float(cylindrical_plane.y_max_m),
                             int(gui_h),
                             dtype=np.float32,
                         )
-                        x_grid, y_grid = np.meshgrid(x_axis, y_axis)
+                        voxel_xyz = xy_plane_voxel_grid(
+                            x_axis,
+                            y_axis,
+                            z_m=float(cylindrical_plane.z_m),
+                        ).astype(np.float32, copy=False)
                         grid_cache_key = grid_key
-                        grid_cache = (x_grid, y_grid)
+                        grid_cache = voxel_xyz
 
-                    range_fft_sel = range_fft_data[sel_idx, :, :, :viewport_max_bin]
-                    _n_pos_sel, _n_frames_sel, n_ant_sel, _n_bins_sel = range_fft_sel.shape
-                    if int(n_ant_sel) != int(tx_i) * int(rx_i):
-                        raise ValueError(f"asse antenna mimo={n_ant_sel} non coerente con tx/rx={tx_i}/{rx_i}")
-                    prepared_key = (
-                        sel_key,
-                        int(viewport_max_bin),
-                        int(tx_i),
-                        int(rx_i),
-                        bp_window_stages,
-                    )
-                    if prepared_cache_key == prepared_key and prepared_cache is not None:
-                        prepared = prepared_cache
-                    else:
-                        prepared = _apply_offline_backprojection_aperture_window(
-                            np.asarray(range_fft_sel, dtype=np.complex64),
-                            window_type=str(range_angle_cfg.window_angle),
-                            enabled=bool(range_angle_cfg.use_realtime_filters),
-                        )
-                        prepared_cache_key = prepared_key
-                        prepared_cache = prepared
-
-                    img_db = _back_projection_image_mimo(
-                        prepared,
-                        x_pos_m_sel,
-                        x_tx_ant_m,
-                        x_rx_ant_m,
-                        x_grid,
-                        y_grid,
-                        dr_m=dr_m,
-                        fc_hz=fc_hz,
-                        c_m_s=c_m_s,
-                        max_bin=viewport_max_bin,
-                        phase_sign=phase_sign_i,
+                    viewport_max_bin = int(n_bins_total)
+                    range_fft_sel = np.asarray(range_fft_data[sel_idx, :, :, :viewport_max_bin], dtype=np.complex64)
+                    power = _back_projection_power_mimo_geometry(
+                        range_fft_sel,
+                        tx_global_m[sel_idx],
+                        rx_global_m[sel_idx],
+                        voxel_xyz,
+                        dr_m=float(dr_m),
+                        fc_hz=float(fc_hz),
+                        c_m_s=float(c_m_s),
+                        max_bin=int(viewport_max_bin),
+                        phase_sign=int(phase_sign_i),
                         chunk_size=16384,
                     )
+                    img_db = _power_image_to_db(power)
+                    frame_meta["cylindrical_plane"] = cylindrical_plane
                     doppler_bins_used = 1
+                else:
+                    sel_mask = (positions >= int(x_start)) & (positions <= int(x_end))
+                    if not np.any(sel_mask):
+                        sel_mask[:] = True
+                    sel_idx = np.where(sel_mask)[0]
+                    sel_key = tuple(int(v) for v in sel_idx.tolist())
+                    x_pos_m_sel = x_pos_m_full[sel_idx]
+                    # This bounds both legacy reconstruction paths to the active ROI.
+                    # For BP it includes the selected SAR/MIMO sensor positions;
+                    # for synthetic range-angle it is a conservative range slice.
+                    viewport_max_bin = _backprojection_viewport_max_bin(
+                        applied_viewport,
+                        x_pos_m=x_pos_m_sel,
+                        x_tx_ant_m=x_tx_ant_m,
+                        x_rx_ant_m=x_rx_ant_m,
+                        dr_m=float(dr_m),
+                        available_bins=int(n_bins_total),
+                    )
+                    if algorithm == "synthetic_range_angle":
+                        selected_positions = positions[sel_idx].astype(np.int32, copy=False)
+                        range_fft_sel = range_fft_data[sel_idx, :, :, :viewport_max_bin]
+                        n_pos_sel, n_frames_sel, n_ant_sel, _n_bins_sel = range_fft_sel.shape
+                        if int(n_ant_sel) != int(tx_i) * int(rx_i):
+                            raise ValueError(
+                                f"asse antenna synthetic={n_ant_sel} non coerente con tx/rx={tx_i}/{rx_i}"
+                            )
+                        mvdr_elements = int(n_pos_sel) * int(n_ant_sel)
+                        if (
+                            str(range_angle_cfg.angle_processing.mode) == "mvdr"
+                            and int(n_frames_sel) < int(mvdr_elements)
+                        ):
+                            raise ValueError(
+                                "MVDR offline sottodeterminato: "
+                                f"snapshot={n_frames_sel}, elementi={mvdr_elements}. "
+                                "Seleziona meno posizioni (con 8 frame usare una sola posizione), "
+                                "aumenta frames_per_position oppure usa Bartlett/backprojection."
+                            )
+                        synthetic_projection_lut_key = (
+                            str(algorithm),
+                            sel_key,
+                            int(range_angle_cfg.nfft_angle),
+                            str(range_angle_cfg.projection.projection_interp),
+                            display_viewport_signature(applied_viewport),
+                        )
+                        if (
+                            synthetic_projection_lut_cache_key == synthetic_projection_lut_key
+                            and synthetic_projection_lut_cache is not None
+                        ):
+                            projection_lut = synthetic_projection_lut_cache
+                        else:
+                            projection_lut = None
+                        img_db, frame_meta = _compute_synthetic_range_angle_image(
+                            range_fft_sel,
+                            selected_positions=selected_positions,
+                            x_pitch_m=float(x_pitch_m),
+                            tx_i=int(tx_i),
+                            rx_i=int(rx_i),
+                            x_tx_ant_m=x_tx_ant_m,
+                            x_rx_ant_m=x_rx_ant_m,
+                            range_angle_cfg=range_angle_cfg,
+                            c_m_s=float(c_m_s),
+                            fs_hz=float(fs_hz),
+                            slope_hz_s=float(slope_hz_s),
+                            fc_hz=float(fc_hz),
+                            fft_workers=int(fft_workers),
+                            nfft_range=int(nfft_range),
+                            gui_h=int(gui_h),
+                            gui_w=int(gui_w),
+                            viewport=applied_viewport,
+                            projection_lut=projection_lut,
+                        )
+                        synthetic_projection_lut_cache = frame_meta.pop("projection_lut", None)
+                        synthetic_projection_lut_cache_key = synthetic_projection_lut_key
+                        doppler_bins_used = 1
+                    else:
+                        grid_key = display_viewport_signature(applied_viewport)
+                        if grid_cache_key == grid_key and grid_cache is not None:
+                            x_grid, y_grid = grid_cache
+                        else:
+                            x_axis = np.linspace(
+                                float(applied_viewport.x_min_m),
+                                float(applied_viewport.x_max_m),
+                                int(gui_w),
+                                dtype=np.float32,
+                            )
+                            y_axis = np.linspace(
+                                float(applied_viewport.y_min_m),
+                                float(applied_viewport.y_max_m),
+                                int(gui_h),
+                                dtype=np.float32,
+                            )
+                            x_grid, y_grid = np.meshgrid(x_axis, y_axis)
+                            grid_cache_key = grid_key
+                            grid_cache = (x_grid, y_grid)
+
+                        range_fft_sel = range_fft_data[sel_idx, :, :, :viewport_max_bin]
+                        _n_pos_sel, _n_frames_sel, n_ant_sel, _n_bins_sel = range_fft_sel.shape
+                        if int(n_ant_sel) != int(tx_i) * int(rx_i):
+                            raise ValueError(f"asse antenna mimo={n_ant_sel} non coerente con tx/rx={tx_i}/{rx_i}")
+                        prepared_key = (
+                            sel_key,
+                            int(viewport_max_bin),
+                            int(tx_i),
+                            int(rx_i),
+                        )
+                        if prepared_cache_key == prepared_key and prepared_cache is not None:
+                            prepared = prepared_cache
+                        else:
+                            prepared = np.asarray(range_fft_sel, dtype=np.complex64)
+                            prepared_cache_key = prepared_key
+                            prepared_cache = prepared
+
+                        img_db = _back_projection_image_mimo(
+                            prepared,
+                            x_pos_m_sel,
+                            x_tx_ant_m,
+                            x_rx_ant_m,
+                            x_grid,
+                            y_grid,
+                            dr_m=dr_m,
+                            fc_hz=fc_hz,
+                            c_m_s=c_m_s,
+                            max_bin=viewport_max_bin,
+                            phase_sign=phase_sign_i,
+                            chunk_size=16384,
+                        )
+                        doppler_bins_used = 1
 
                 with gui_lock:
                     prev_idx = int(gui_latest_idx.value)
@@ -2303,6 +2903,7 @@ def _offline_dsp_worker(
                         "x_start": int(x_start),
                         "x_end": int(x_end),
                         "n_pos_used": int(sel_idx.size),
+                        "geometry_mode": geometry_mode,
                         "geometry_source": str(geometry_source),
                         "doppler_bins_used": int(doppler_bins_used),
                         "bp_range_bins_used": int(viewport_max_bin),
@@ -2332,6 +2933,17 @@ def _offline_dsp_worker(
                         "background_reference_dir": background_reference_dir,
                         "background_reference_frames": int(background_reference_frames),
                         "background_reference_scale": float(background_reference_scale),
+                        "cylindrical_plane": (
+                            None
+                            if cylindrical_plane is None
+                            else {
+                                "x_min_m": float(cylindrical_plane.x_min_m),
+                                "x_max_m": float(cylindrical_plane.x_max_m),
+                                "y_min_m": float(cylindrical_plane.y_min_m),
+                                "y_max_m": float(cylindrical_plane.y_max_m),
+                                "z_m": float(cylindrical_plane.z_m),
+                            }
+                        ),
                         "elapsed_ms": float((t1 - t0) * 1000.0),
                         **_viewport_status_fields(applied_viewport, fallback_used=False),
                     },

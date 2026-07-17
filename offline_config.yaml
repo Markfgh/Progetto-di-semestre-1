@@ -24,6 +24,15 @@ reconstruction:
     x_max_m: 25.0
     y_min_m: 0.0
     y_max_m: 50.0
+  # Optional fixed-world plane for rt_capture_v2 regular circular/cylindrical
+  # scans.  Unlike legacy map_bounds, Y may be negative.  If omitted, the
+  # offline reader derives a square from scene_center_m and radius_m.
+  # cylindrical_plane:
+  #   x_min_m: -1.0
+  #   x_max_m: 1.0
+  #   y_min_m: -1.0
+  #   y_max_m: 1.0
+  #   z_m: 0.0
 
 bp:
   phase_sign: 1
@@ -44,8 +53,10 @@ offline_background:
   scale: 1.0
 
 offline_sar_range_angle:
-  # Le tre finestre sono condivise anche dal ramo backprojection MIMO-SAR:
-  # range=fast-time, doppler=loop prima del bin zero, angle=apertura posizioni×antenne.
+  # range=fast-time e doppler=loop prima del bin zero. window_angle è usata
+  # solo dal ramo synthetic_range_angle: la BP MIMO-SAR usa pesi separati
+  # pose/canale, uniformi in questa prima fase, e non appiattisce più
+  # posizione×antenna per applicare una finestra.
   use_realtime_filters: true
   # Dimensioni FFT offline, indipendenti dal realtime.
   # Valore < input: usa/tronca i primi campioni range o una sotto-apertura angolare centrata.
