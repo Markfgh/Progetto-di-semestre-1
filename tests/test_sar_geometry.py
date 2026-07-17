@@ -10,6 +10,8 @@ from sar_geometry import (
     default_iwr1443_2tx4rx_geometry,
     transform_element_coordinates,
     xy_plane_voxel_grid,
+    xz_plane_voxel_grid,
+    yz_plane_voxel_grid,
     xyz_volume_voxel_grid,
 )
 
@@ -111,11 +113,17 @@ def test_metadata_round_trip_and_strict_cylindrical_bounds() -> None:
         _capture(azimuth_rad=2.0 * np.pi)
 
 
-def test_fixed_xy_and_xyz_grids_have_explicit_world_axis_order() -> None:
+def test_fixed_xy_xz_yz_and_xyz_grids_have_explicit_world_axis_order() -> None:
     plane = xy_plane_voxel_grid([-1.0, 2.0], [3.0, 5.0, 7.0], z_m=0.25)
+    xz_plane = xz_plane_voxel_grid([-1.0, 2.0], [-0.5, 0.25], y_m=7.0)
+    yz_plane = yz_plane_voxel_grid([3.0, 5.0, 7.0], [-0.5, 0.25], x_m=-1.0)
     volume = xyz_volume_voxel_grid([-1.0, 2.0], [3.0, 5.0, 7.0], [-0.5, 0.25])
 
     assert plane.shape == (3, 2, 3)
     np.testing.assert_allclose(plane[2, 1], [2.0, 7.0, 0.25])
+    assert xz_plane.shape == (2, 2, 3)
+    np.testing.assert_allclose(xz_plane[1, 1], [2.0, 7.0, 0.25])
+    assert yz_plane.shape == (2, 3, 3)
+    np.testing.assert_allclose(yz_plane[1, 2], [-1.0, 7.0, 0.25])
     assert volume.shape == (2, 3, 2, 3)
     np.testing.assert_allclose(volume[1, 2, 1], [2.0, 7.0, 0.25])

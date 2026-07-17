@@ -12,6 +12,9 @@ import yaml
 
 from offline_processing import (
     CylindricalPlane,
+    CylindricalSection,
+    CylindricalView,
+    CylindricalViewBounds,
     OfflineBPRuntime,
     SARReader,
     _backprojection_viewport_max_bin,
@@ -20,7 +23,10 @@ from offline_processing import (
     _subtract_reference_background,
     _viewport_from_cmd_payload,
     cylindrical_capture_world_coordinates,
+    cylindrical_run_summary,
+    cylindrical_view_from_yaml_dict,
     offline_map_bounds_from_yaml_dict,
+    resolve_cylindrical_view,
 )
 from realtime_dsp import build_display_viewport
 
@@ -233,6 +239,50 @@ def test_read_bp_runtime_cfg_parses_signed_cylindrical_plane_separately_from_leg
     assert isinstance(plane, CylindricalPlane)
     assert plane.y_min_m == pytest.approx(-2.0)
     assert plane.z_m == pytest.approx(0.35)
+
+
+def test_cylindrical_view_config_parses_signed_xyz_bounds_and_section() -> None:
+    view = cylindrical_view_from_yaml_dict(
+        {
+            "reconstruction": {
+                "cylindrical_view": {
+                    "bounds": {
+                        "x_min_m": -1.0,
+                        "x_max_m": 1.5,
+                        "y_min_m": -2.0,
+                        "y_max_m": 2.0,
+                        "z_min_m": 0.1,
+                        "z_max_m": 0.9,
+                    },
+                    "section": {"plane": "xz", "coordinate_m": -0.25},
+                }
+            }
+        }
+    )
+
+    assert isinstance(view, CylindricalView)
+    assert view.section == CylindricalSection(plane="xz", coordinate_m=-0.25)
+    assert view.bounds.y_min_m == pytest.approx(-2.0)
+    assert view.bounds.z_max_m == pytest.approx(0.9)
+
+
+def test_cylindrical_view_rejects_vertical_section_without_z_bounds() -> None:
+    with pytest.raises(ValueError, match="z_min_m/z_max_m"):
+        cylindrical_view_from_yaml_dict(
+            {
+                "reconstruction": {
+                    "cylindrical_view": {
+                        "bounds": {
+                            "x_min_m": -1.0,
+                            "x_max_m": 1.0,
+                            "y_min_m": -1.0,
+                            "y_max_m": 1.0,
+                        },
+                        "section": {"plane": "xz", "coordinate_m": 0.0},
+                    }
+                }
+            }
+        )
 
 
 @pytest.mark.parametrize(
@@ -603,6 +653,93 @@ def test_stream_reader_orders_regular_cylindrical_v2_by_acquisition_index(
     np.testing.assert_allclose(rx_global_m[0, :, 2], 0.5)
 
 
+def test_v2_summary_distinguishes_circular_from_multi_height_cylinder(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_summary"
+    run_dir.mkdir()
+    for acquisition_index in range(8):
+        _write_capture_v2(
+            run_dir / f"capture_pos{400 + acquisition_index}.bin",
+            capture_id=400 + acquisition_index,
+            acquisition_index=acquisition_index,
+            angle_index=acquisition_index % 4,
+            height_index=acquisition_index // 4,
+            azimuth_rad=float(acquisition_index % 4) * 0.5 * np.pi,
+            height_m=0.25 * float(acquisition_index // 4),
+            height_count=2,
+        )
+    offline_cfg = tmp_path / "offline_config.yaml"
+    _write_yaml(
+        offline_cfg,
+        {
+            "data": {"input_dir": str(run_dir)},
+            # The v2 reader (and therefore the GUI memory estimator that
+            # delegates to it) must include every capture, not this legacy
+            # subset.
+            "scan": {"x_start": 999, "x_end": 999, "x_step": 1},
+        },
+    )
+
+    layout = SARReader(offline_cfg).describe_stream()
+    assert layout.positions.size == 8
+    summary = cylindrical_run_summary(layout)
+    assert summary.kind == "cylindrical"
+    assert summary.angle_count == 4
+    assert summary.height_count == 2
+    assert summary.height_m_values == pytest.approx((0.0, 0.25))
+    assert summary.world_z_values_m == pytest.approx((0.5, 0.75))
+
+    view = resolve_cylindrical_view(
+        configured_view=CylindricalView(
+            bounds=CylindricalViewBounds(-0.5, 0.5, -0.5, 0.5, 0.5, 0.75),
+            section=CylindricalSection("xz", 0.0),
+        ),
+        legacy_plane=None,
+        captures=tuple(layout.cylindrical_captures),
+    )
+    assert view.section.plane == "xz"
+
+
+def test_v2_single_height_rejects_vertical_sections_but_accepts_xy(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_circular_summary"
+    run_dir.mkdir()
+    for acquisition_index in range(4):
+        _write_capture_v2(
+            run_dir / f"capture_pos{500 + acquisition_index}.bin",
+            capture_id=500 + acquisition_index,
+            acquisition_index=acquisition_index,
+            angle_index=acquisition_index,
+            height_index=0,
+            azimuth_rad=float(acquisition_index) * 0.5 * np.pi,
+            height_m=0.2,
+            height_count=1,
+        )
+    offline_cfg = tmp_path / "offline_config.yaml"
+    _write_yaml(offline_cfg, {"data": {"input_dir": str(run_dir)}})
+    layout = SARReader(offline_cfg).describe_stream()
+    summary = cylindrical_run_summary(layout)
+    assert summary.kind == "circular"
+    assert summary.has_vertical_resolution is False
+
+    xy_view = resolve_cylindrical_view(
+        configured_view=CylindricalView(
+            bounds=CylindricalViewBounds(-0.5, 0.5, -0.5, 0.5),
+            section=CylindricalSection("xy", 0.7),
+        ),
+        legacy_plane=None,
+        captures=tuple(layout.cylindrical_captures),
+    )
+    assert xy_view.section.plane == "xy"
+    with pytest.raises(ValueError, match="almeno due quote"):
+        resolve_cylindrical_view(
+            configured_view=CylindricalView(
+                bounds=CylindricalViewBounds(-0.5, 0.5, -0.5, 0.5, 0.5, 0.9),
+                section=CylindricalSection("yz", 0.0),
+            ),
+            legacy_plane=None,
+            captures=tuple(layout.cylindrical_captures),
+        )
+
+
 def test_stream_reader_rejects_non_regular_cylindrical_v2_sequence(tmp_path: Path) -> None:
     run_dir = tmp_path / "run_bad_cylinder"
     run_dir.mkdir()
@@ -801,6 +938,9 @@ def test_offline_runtime_uses_v2_world_geometry_for_circular_plane(tmp_path: Pat
         ready = runtime.start(timeout_s=8.0)
         assert ready["geometry_mode"] == "cylindrical_regular"
         assert ready["cylindrical_plane"]["y_min_m"] == pytest.approx(-0.25)
+        assert ready["applied_viewport_y_min_m"] == pytest.approx(-0.25)
+        assert ready["cylindrical_summary"]["kind"] == "circular"
+        assert ready["cylindrical_view"]["section"]["plane"] == "xy"
         frame = None
         deadline = time.monotonic() + 8.0
         while time.monotonic() < deadline and frame is None:
@@ -813,6 +953,83 @@ def test_offline_runtime_uses_v2_world_geometry_for_circular_plane(tmp_path: Pat
         assert np.all(np.isfinite(image))
         assert info["geometry_mode"] == "cylindrical_regular"
         assert info["n_pos_used"] == 4
+    finally:
+        runtime.stop()
+
+
+def test_offline_runtime_switches_between_multi_height_vertical_sections(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_cylinder_sections"
+    run_dir.mkdir()
+    for acquisition_index in range(8):
+        _write_capture_v2(
+            run_dir / f"capture_pos{700 + acquisition_index}.bin",
+            capture_id=700 + acquisition_index,
+            acquisition_index=acquisition_index,
+            angle_index=acquisition_index % 4,
+            height_index=acquisition_index // 4,
+            azimuth_rad=float(acquisition_index % 4) * 0.5 * np.pi,
+            height_m=0.35 * float(acquisition_index // 4),
+            height_count=2,
+        )
+    offline_cfg = tmp_path / "offline_config.yaml"
+    fallback_cfg = tmp_path / "Config.yaml"
+    _write_yaml(
+        offline_cfg,
+        {
+            "data": {"input_dir": str(run_dir)},
+            "capture": {"frames_per_position": 2},
+            "reconstruction": {
+                "algorithm": "backprojection",
+                "cylindrical_view": {
+                    "bounds": {
+                        "x_min_m": -0.25,
+                        "x_max_m": 0.25,
+                        "y_min_m": -0.2,
+                        "y_max_m": 0.2,
+                        "z_min_m": 0.5,
+                        "z_max_m": 0.85,
+                    },
+                    "section": {"plane": "xz", "coordinate_m": 0.0},
+                },
+            },
+            "bp": {},
+        },
+    )
+    fallback_payload = _fallback_capture_cfg()
+    fallback_payload["capture"].update({"samples": 8, "chirps": 4})
+    fallback_payload["fft"] = {"workers": 1}
+    _write_yaml(fallback_cfg, fallback_payload)
+    runtime = OfflineBPRuntime(
+        offline_config_path=offline_cfg,
+        fallback_capture_cfg=fallback_cfg,
+        c_m_s=3.0e8,
+        fs_hz=10.0e6,
+        slope_hz_s=14.967e12,
+        fc_hz=77.0e9,
+        nfft_range=8,
+        image_h=8,
+        image_w=8,
+    )
+    try:
+        ready = runtime.start(timeout_s=8.0)
+        assert ready["cylindrical_summary"]["kind"] == "cylindrical"
+        assert ready["cylindrical_view"]["section"]["plane"] == "xz"
+        assert ready["cylindrical_view"]["axes"] == ["X", "Z"]
+        runtime.update_params(cylindrical_section=CylindricalSection("yz", 0.0))
+        frame = None
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            candidate = runtime.poll_frame()
+            if candidate is not None and candidate[1].get("cylindrical_view", {}).get("section", {}).get("plane") == "yz":
+                frame = candidate
+                break
+            time.sleep(0.03)
+        assert frame is not None, runtime.last_error
+        image, info = frame
+        assert image.shape == (8, 8)
+        assert info["cylindrical_view"]["section"]["plane"] == "yz"
+        assert info["cylindrical_view"]["axes"] == ["Y", "Z"]
+        assert info["applied_viewport_y_min_m"] == pytest.approx(0.5)
     finally:
         runtime.stop()
 

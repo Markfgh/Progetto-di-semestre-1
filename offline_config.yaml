@@ -33,6 +33,21 @@ reconstruction:
   #   y_min_m: -1.0
   #   y_max_m: 1.0
   #   z_m: 0.0
+  # Preferred rt_capture_v2 section-view configuration.  X/Y/Z are world
+  # bounds; ``plane`` selects XY, XZ or YZ and coordinate_m is the fixed
+  # world coordinate of that plane.  It is materialised by Save Configuration
+  # after inspecting a v2 run, so bounds default from its actual headers.
+  # cylindrical_view:
+  #   bounds:
+  #     x_min_m: -1.0
+  #     x_max_m: 1.0
+  #     y_min_m: -1.0
+  #     y_max_m: 1.0
+  #     z_min_m: 0.0
+  #     z_max_m: 0.3
+  #   section:
+  #     plane: "xy"
+  #     coordinate_m: 0.15
 
 bp:
   phase_sign: 1

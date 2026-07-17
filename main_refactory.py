@@ -382,7 +382,20 @@ def _apply_process_affinity(label: str, pid: int, cpus, enabled: bool) -> None:
         print(f"[AFF WARN] {label} fallback failed ({e})")
 
 
-from offline_processing import OfflineBPRuntime, offline_map_bounds_from_yaml_dict
+from offline_processing import (
+    CylindricalSection,
+    CylindricalView,
+    OfflineBPRuntime,
+    OfflineSARConfig,
+    SARReader,
+    cylindrical_plane_from_yaml_dict,
+    cylindrical_run_summary,
+    cylindrical_section_axis_labels,
+    cylindrical_view_from_yaml_dict,
+    cylindrical_view_to_dict,
+    offline_map_bounds_from_yaml_dict,
+    resolve_cylindrical_view,
+)
 from mmwave_studio_bridge import DCA1000Config, MmwaveStudioBridge, MmwaveStudioError, RadarConnectionConfig
 from shutdown_utils import cleanup_processes, close_queues
 from realtime_dsp import (
@@ -861,9 +874,35 @@ def _update_existing_yaml_scalar_paths(
 
     missing = sorted(set(updates) - updated)
     if missing:
-        raise ValueError(
-            "Missing YAML tuning keys (file not modified): " + ", ".join(missing)
-        )
+        # A v1 configuration legitimately lacks the newer v2 section-view
+        # branch.  This is the one schema-upgrade path where preserving every
+        # comment is less important than atomically materialising the exact
+        # requested mapping.  Subsequent saves remain scalar-only and keep
+        # the original layout/comments as before.
+        try:
+            migrated = yaml.safe_load(original) or {}
+            if not isinstance(migrated, dict):
+                raise ValueError("la radice YAML deve essere una mappa")
+            for yaml_path, value in updates.items():
+                node = migrated
+                parts = yaml_path.split(".")
+                for part in parts[:-1]:
+                    child = node.get(part)
+                    if not isinstance(child, dict):
+                        child = {}
+                        node[part] = child
+                    node = child
+                node[parts[-1]] = value
+            rendered = yaml.safe_dump(migrated, sort_keys=False, allow_unicode=True)
+        except Exception as exc:
+            raise ValueError(
+                "Missing YAML tuning keys (file not modified): " + ", ".join(missing)
+            ) from exc
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        with tmp_path.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(rendered)
+        tmp_path.replace(path)
+        return
 
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     with tmp_path.open("w", encoding="utf-8", newline="") as handle:
@@ -2546,6 +2585,13 @@ def main(*, rotary_axis: RotaryAxis | None = None):
     PROC_IMG_SERIES_TAG = "proc_img_series"
     PROC_IN_XSTART = "proc_in_xstart"
     PROC_IN_XEND = "proc_in_xend"
+    PROC_GRP_LEGACY_BP_CONTROL = "proc_grp_legacy_bp_control"
+    PROC_GRP_CYLINDRICAL_SECTION = "proc_grp_cylindrical_section"
+    PROC_COMBO_CYL_SECTION = "proc_combo_cylindrical_section"
+    PROC_IN_CYL_SECTION_COORD = "proc_in_cylindrical_section_coordinate"
+    PROC_COMBO_CYL_HEIGHT = "proc_combo_cylindrical_height"
+    PROC_TXT_CYL_SECTION_HINT = "proc_txt_cylindrical_section_hint"
+    PROC_TXT_CYL_RUN_INFO = "proc_txt_cylindrical_run_info"
     PROC_BTN_LOAD_OFFLINE = "proc_btn_load_offline"
     PROC_TXT_MEMORY_ESTIMATE = "proc_txt_memory_estimate"
     PROC_IN_VMIN = "proc_in_vmin"
@@ -2560,6 +2606,12 @@ def main(*, rotary_axis: RotaryAxis | None = None):
     PROC_CMAP_NUM_FMT = "%+6.1f"
     TXT_OFFLINE_TUNING_STATUS_TAG = "txt_offline_tuning_status"
     TXT_OFFLINE_TUNING_INFO_TAG = "txt_offline_tuning_info"
+    BTN_OFFLINE_INSPECT_RUN = "btn_offline_inspect_run"
+    TXT_OFFLINE_RUN_FORMAT = "txt_offline_run_format"
+    OFFLINE_TUNING_GRP_LEGACY_SCAN = "offline_tuning_grp_legacy_scan"
+    OFFLINE_TUNING_GRP_LEGACY_RECON = "offline_tuning_grp_legacy_reconstruction"
+    OFFLINE_TUNING_GRP_LEGACY_MAP = "offline_tuning_grp_legacy_map"
+    OFFLINE_TUNING_GRP_CYLINDRICAL_VIEW = "offline_tuning_grp_cylindrical_view"
     CMAP_SCALE_TAG = "cmap_scale"
     CMAP_NUM_FMT = "%+6.1f"
     CMAP_VELOCITY_NUM_FMT = "%+5.2f"
@@ -2687,66 +2739,21 @@ def main(*, rotary_axis: RotaryAxis | None = None):
     def _estimate_offline_memory(cfg_source: dict | None = None) -> dict:
         """Estimate offline allocations using file sizes only; never read capture payloads."""
         source = cfg_source if isinstance(cfg_source, dict) else {}
-        data_cfg = source.get("data", {}) or {}
-        scan_cfg = source.get("scan", {}) or {}
         fft_cfg = source.get("offline_sar_range_angle", {}) or {}
-        input_raw = str(data_cfg.get("input_dir", "logs")).strip() or "logs"
-        input_path = Path(input_raw)
-        if not input_path.is_absolute():
-            input_path = offline_config_boot_path.parent / input_path
-        if not input_path.exists():
-            raise FileNotFoundError(f"input folder not found: {input_path}")
-        source_dir = input_path
-        direct_files = list(source_dir.glob("capture_pos*.bin"))
-        if not direct_files:
-            run_dirs = sorted(
-                (path for path in source_dir.glob("run_*") if path.is_dir()),
-                key=lambda path: path.name,
-                reverse=True,
-            )
-            source_dir = next(
-                (path for path in run_dirs if any(path.glob("capture_pos*.bin"))),
-                source_dir,
-            )
-
-        x_start_est = int(scan_cfg.get("x_start", 1))
-        x_end_est = int(scan_cfg.get("x_end", x_start_est))
-        x_step_est = max(1, int(scan_cfg.get("x_step", 1)))
-        expected_ids = set(range(x_start_est, x_end_est + 1, x_step_est))
-        selected_files: list[Path] = []
-        for path in source_dir.glob("capture_pos*.bin"):
-            match = re.match(r"^capture_pos(-?\d+)\.bin$", path.name)
-            if match is not None and int(match.group(1)) in expected_ids:
-                selected_files.append(path)
-        if not selected_files:
-            raise FileNotFoundError(f"no configured capture files found in {source_dir}")
-
+        reader_cfg = OfflineSARConfig.from_mapping(
+            source,
+            base_dir=offline_config_boot_path.parent,
+        )
+        layout = SARReader(config=reader_cfg).describe_stream()
+        source_dir = layout.source_dir
+        selected_files = list(layout.files)
         capture_bytes = sum(int(path.stat().st_size) for path in selected_files)
         max_position_bytes = max(int(path.stat().st_size) for path in selected_files)
-        samples_input = max(1, int(SAMPLES))
-        chirps_input = max(1, int(CHIRPS))
-        rx_input = max(1, int(RX))
-        tx_input = max(1, int(TX))
-        frames_input = max(1, int(FRAMES_PER_POSITION))
-        try:
-            with selected_files[0].open("rb") as handle:
-                prefix = handle.read(12)
-                if len(prefix) == 12 and prefix[:8] == b"RTPBIN1\x00":
-                    header_len = int(struct.unpack("<I", prefix[8:12])[0])
-                    header_payload = json.loads(handle.read(header_len).decode("utf-8"))
-                    capture_header = (header_payload.get("capture", {}) or {})
-                    samples_input = max(1, int(capture_header.get("samples", samples_input)))
-                    chirps_input = max(1, int(capture_header.get("chirps", chirps_input)))
-                    rx_input = max(1, int(capture_header.get("rx", rx_input)))
-                    tx_input = max(1, int(capture_header.get("tx", tx_input)))
-                    frames_input = max(
-                        1,
-                        int(capture_header.get("frames_per_position", capture_header.get("x_frames", frames_input))),
-                    )
-        except Exception:
-            # The actual loader will perform strict validation. The estimate
-            # can safely fall back to Config.yaml without touching payloads.
-            samples_input = max(1, int(SAMPLES))
+        samples_input = max(1, int(layout.samples))
+        chirps_input = max(1, int(layout.chirps))
+        rx_input = max(1, int(layout.rx))
+        tx_input = max(1, int(layout.tx))
+        frames_input = max(1, int(layout.n_frames_per_position))
         nfft_range_est = max(1, int(fft_cfg.get("nfft_range", NFFT_RANGE)))
         # Streaming pipeline: only one capture payload and its complex64
         # conversion are resident while the compact zero-Doppler snapshot cube
@@ -2965,6 +2972,7 @@ def main(*, rotary_axis: RotaryAxis | None = None):
     off_ui_pending = {
         "x_start": int(off_x_start),
         "x_end": int(off_x_end),
+        "cylindrical_section": None,
         "vmin": float(off_vmin),
         "vmax": float(off_vmax),
         "norm_enabled": bool(off_norm_enabled),
@@ -2974,6 +2982,14 @@ def main(*, rotary_axis: RotaryAxis | None = None):
     }
     offline_summary_state = f"ERROR: {offline_error}" if offline_error else ""
     offline_last_calculation_ms: float | None = None
+    # Updated from header-only inspection and then confirmed by the offline
+    # runtime.  The header is authoritative: no manual v1/v2 selector exists.
+    offline_run_view: dict[str, object] = {
+        "format": "unknown",
+        "geometry_mode": None,
+        "summary": None,
+        "view": None,
+    }
 
     def _render_offline_summary(
         *,
@@ -4151,6 +4167,121 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             if dpg.does_item_exist(tag):
                 dpg.set_value(tag, value)
 
+    def _offline_world_section_viewport(
+        x_min_m: float,
+        x_max_m: float,
+        y_min_m: float,
+        y_max_m: float,
+        *,
+        seq: int,
+        home: DisplayViewport | None = None,
+    ) -> DisplayViewport:
+        x0, x1 = sorted((float(x_min_m), float(x_max_m)))
+        y0, y1 = sorted((float(y_min_m), float(y_max_m)))
+        if x1 <= x0 or y1 <= y0:
+            raise ValueError("World section viewport requires positive extents")
+        if home is None:
+            zoom = 1.0
+        else:
+            zoom = max(
+                (float(home.x_max_m) - float(home.x_min_m)) / (x1 - x0),
+                (float(home.y_max_m) - float(home.y_min_m)) / (y1 - y0),
+                1.0,
+            )
+        return DisplayViewport(
+            x_min_m=x0,
+            x_max_m=x1,
+            y_min_m=y0,
+            y_max_m=y1,
+            range_min_bin_f=0.0,
+            range_max_bin_f=0.0,
+            angle_min_deg=0.0,
+            angle_max_deg=0.0,
+            zoom_level=float(zoom),
+            seq=int(seq),
+        )
+
+    def _cylindrical_section_home_viewport(view_dict: dict, *, seq: int) -> DisplayViewport:
+        bounds = view_dict.get("bounds", {})
+        section = view_dict.get("section", {})
+        plane = str(section.get("plane", "xy"))
+        if plane == "xy":
+            values = (bounds["x_min_m"], bounds["x_max_m"], bounds["y_min_m"], bounds["y_max_m"])
+        elif plane == "xz":
+            values = (bounds["x_min_m"], bounds["x_max_m"], bounds["z_min_m"], bounds["z_max_m"])
+        else:
+            values = (bounds["y_min_m"], bounds["y_max_m"], bounds["z_min_m"], bounds["z_max_m"])
+        return _offline_world_section_viewport(*[float(value) for value in values], seq=int(seq))
+
+    def _on_cylindrical_section_changed(sender=None, app_data=None):
+        nonlocal off_home_viewport_current, off_requested_viewport_current, off_ui_dirty, off_ui_dirty_t
+        if not _offline_is_v2():
+            return
+        view_dict = offline_run_view.get("view")
+        summary = offline_run_view.get("summary")
+        if not isinstance(view_dict, dict) or not isinstance(summary, dict):
+            return
+        try:
+            plane = str(dpg.get_value(PROC_COMBO_CYL_SECTION)).strip().lower()
+            coordinate = float(dpg.get_value(PROC_IN_CYL_SECTION_COORD))
+        except (TypeError, ValueError):
+            return
+        if plane not in {"xy", "xz", "yz"}:
+            return
+        if plane != "xy" and not bool(summary.get("has_vertical_resolution", False)):
+            plane = "xy"
+        bounds = view_dict.get("bounds", {})
+        try:
+            if plane == "xy" and bounds.get("z_min_m") is not None:
+                coordinate = max(float(bounds["z_min_m"]), min(float(bounds["z_max_m"]), coordinate))
+            elif plane == "xz":
+                coordinate = max(float(bounds["y_min_m"]), min(float(bounds["y_max_m"]), coordinate))
+            elif plane == "yz":
+                coordinate = max(float(bounds["x_min_m"]), min(float(bounds["x_max_m"]), coordinate))
+        except (KeyError, TypeError, ValueError):
+            return
+        updated_view = dict(view_dict)
+        updated_view["section"] = {"plane": plane, "coordinate_m": float(coordinate)}
+        updated_view["axes"] = list({"xy": ("X", "Y"), "xz": ("X", "Z"), "yz": ("Y", "Z")}[plane])
+        offline_run_view["view"] = updated_view
+        _set_cylindrical_view_widgets(
+            CylindricalView(
+                bounds=cylindrical_view_from_yaml_dict(
+                    {"reconstruction": {"cylindrical_view": updated_view}}
+                ).bounds,
+                section=CylindricalSection(plane=plane, coordinate_m=coordinate),
+            )
+        )
+        off_home_viewport_current = _cylindrical_section_home_viewport(
+            updated_view,
+            seq=int(off_requested_viewport_current.seq) + 1,
+        )
+        off_requested_viewport_current = off_home_viewport_current
+        off_ui_pending["cylindrical_section"] = CylindricalSection(plane=plane, coordinate_m=coordinate)
+        off_ui_pending["reset_view"] = True
+        off_ui_pending["reconstruct"] = True
+        off_ui_pending["display_refresh"] = False
+        off_ui_dirty = True
+        off_ui_dirty_t = time.perf_counter()
+        _apply_offline_geometry_controls()
+        _render_offline_summary(state=f"Cylindrical {plane.upper()} section queued")
+
+    def _on_cylindrical_height_selected(sender=None, app_data=None):
+        if not _offline_is_v2():
+            return
+        values = offline_run_view.get("height_world_z_values")
+        items = offline_run_view.get("height_items")
+        try:
+            index = list(items).index(str(app_data))
+            z_value = float(list(values)[index])
+        except (TypeError, ValueError, AttributeError):
+            return
+        if dpg.does_item_exist(PROC_COMBO_CYL_SECTION):
+            dpg.set_value(PROC_COMBO_CYL_SECTION, "xy")
+        if dpg.does_item_exist(PROC_IN_CYL_SECTION_COORD):
+            dpg.set_value(PROC_IN_CYL_SECTION_COORD, z_value)
+        _on_cylindrical_section_changed()
+
     def _apply_offline_display_zoom(sender=None, app_data=None):
         """Reconstruct the requested offline ROI on the fixed offline grid."""
         nonlocal off_requested_viewport_current, off_ui_dirty, off_ui_dirty_t
@@ -4176,7 +4307,11 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             (float(home.x_max_m) - float(home.x_min_m)) / float(max(1, offline_gui_w)),
             1e-6,
         )
-        min_y_span = max(float(dr_plot), 1e-6)
+        min_y_span = (
+            max((float(home.y_max_m) - float(home.y_min_m)) / float(max(1, offline_gui_h)), 1e-6)
+            if _offline_is_v2()
+            else max(float(dr_plot), 1e-6)
+        )
         if x1 <= x0:
             x1 = min(float(home.x_max_m), x0 + min_x_span)
             if x1 <= x0:
@@ -4186,15 +4321,25 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             if y1 <= y0:
                 y0 = max(float(home.y_min_m), y1 - min_y_span)
 
-        off_requested_viewport_current = build_display_viewport(
-            x_min_m=float(x0),
-            x_max_m=float(x1),
-            y_min_m=float(y0),
-            y_max_m=float(y1),
-            dr_m=float(dr_plot),
-            seq=int(off_requested_viewport_current.seq) + 1,
-            home_viewport=home,
-        )
+        if _offline_is_v2():
+            off_requested_viewport_current = _offline_world_section_viewport(
+                float(x0),
+                float(x1),
+                float(y0),
+                float(y1),
+                seq=int(off_requested_viewport_current.seq) + 1,
+                home=home,
+            )
+        else:
+            off_requested_viewport_current = build_display_viewport(
+                x_min_m=float(x0),
+                x_max_m=float(x1),
+                y_min_m=float(y0),
+                y_max_m=float(y1),
+                dr_m=float(dr_plot),
+                seq=int(off_requested_viewport_current.seq) + 1,
+                home_viewport=home,
+            )
         # The offline DSP worker uses this viewport to build its x/y grid, so
         # this is a real back-projection request rather than a plot crop.
         off_ui_pending["reset_view"] = False
@@ -4210,7 +4355,8 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         if dpg.does_item_exist(PROC_TXT_ZOOM_STATUS):
             dpg.set_value(
                 PROC_TXT_ZOOM_STATUS,
-                f"ROI: X [{x0:.3f}, {x1:.3f}] m | Y [{y0:.3f}, {y1:.3f}] m\n"
+                f"ROI: {dpg.get_item_configuration(PROC_XAXIS_TAG).get('label', 'X')} [{x0:.3f}, {x1:.3f}] m | "
+                f"{dpg.get_item_configuration(PROC_YAXIS_TAG).get('label', 'Y')} [{y0:.3f}, {y1:.3f}] m\n"
                 f"Backprojection queued on {offline_gui_w}x{offline_gui_h} grid.",
             )
 
@@ -4246,30 +4392,36 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         try:
             vmin = float(dpg.get_value(PROC_IN_VMIN))
             vmax = float(dpg.get_value(PROC_IN_VMAX))
-            x_start = int(dpg.get_value(PROC_IN_XSTART))
-            x_end = int(dpg.get_value(PROC_IN_XEND))
         except (TypeError, ValueError):
             return
-
-        x_start_cl = max(off_pos_min, min(off_pos_max, x_start))
-        x_end_cl = max(off_pos_min, min(off_pos_max, x_end))
-        if x_end_cl < x_start_cl:
-            x_start_cl, x_end_cl = x_end_cl, x_start_cl
+        if _offline_is_v2():
+            x_start_cl = int(off_ui_pending.get("x_start", off_x_start))
+            x_end_cl = int(off_ui_pending.get("x_end", off_x_end))
+            reconstruction_changed = False
+        else:
+            try:
+                x_start = int(dpg.get_value(PROC_IN_XSTART))
+                x_end = int(dpg.get_value(PROC_IN_XEND))
+            except (TypeError, ValueError):
+                return
+            x_start_cl = max(off_pos_min, min(off_pos_max, x_start))
+            x_end_cl = max(off_pos_min, min(off_pos_max, x_end))
+            if x_end_cl < x_start_cl:
+                x_start_cl, x_end_cl = x_end_cl, x_start_cl
+            if x_start_cl != x_start:
+                dpg.set_value(PROC_IN_XSTART, x_start_cl)
+            if x_end_cl != x_end:
+                dpg.set_value(PROC_IN_XEND, x_end_cl)
+            prev_x_start = int(off_ui_pending.get("x_start", x_start_cl))
+            prev_x_end = int(off_ui_pending.get("x_end", x_end_cl))
+            reconstruction_changed = bool(
+                prev_x_start != int(x_start_cl)
+                or prev_x_end != int(x_end_cl)
+            )
 
         if vmax <= vmin:
             vmax = vmin + 1.0
 
-        if x_start_cl != x_start:
-            dpg.set_value(PROC_IN_XSTART, x_start_cl)
-        if x_end_cl != x_end:
-            dpg.set_value(PROC_IN_XEND, x_end_cl)
-
-        prev_x_start = int(off_ui_pending.get("x_start", x_start_cl))
-        prev_x_end = int(off_ui_pending.get("x_end", x_end_cl))
-        reconstruction_changed = bool(
-            prev_x_start != int(x_start_cl)
-            or prev_x_end != int(x_end_cl)
-        )
         off_ui_pending["vmin"] = float(vmin)
         off_ui_pending["vmax"] = float(vmax)
         off_ui_pending["x_start"] = int(x_start_cl)
@@ -4297,18 +4449,26 @@ def main(*, rotary_axis: RotaryAxis | None = None):
     OFFLINE_TUNING_ALGORITHMS = ["synthetic_range_angle", "backprojection"]
 
     OFFLINE_TUNING_FIELD_SPECS = [
-        {"section": "Data and scan", "path": "data.input_dir", "label": "Input folder", "kind": "text", "default": "logs"},
-        {"section": "Data and scan", "path": "data.startup_timeout_s", "label": "Startup timeout (s)", "kind": "int", "default": 300, "min": 1, "max": 3600, "step": 30},
-        {"section": "Data and scan", "path": "scan.x_start", "label": "Start position", "kind": "int", "default": 1, "step": 1},
-        {"section": "Data and scan", "path": "scan.x_end", "label": "End position", "kind": "int", "default": 1, "step": 1},
-        {"section": "Data and scan", "path": "scan.x_step", "label": "Position step", "kind": "int", "default": 1, "min": 1, "step": 1},
-        {"section": "Data and scan", "path": "scan.x_pitch_m", "label": "X pitch (m)", "kind": "float", "default": 0.01, "min": 0.000001, "step": 0.001, "format": "%.6f"},
-        {"section": "Reconstruction", "path": "reconstruction.algorithm", "label": "Algorithm", "kind": "combo", "items": OFFLINE_TUNING_ALGORITHMS, "default": "synthetic_range_angle"},
-        {"section": "Reconstruction", "path": "bp.phase_sign", "label": "Phase sign", "kind": "combo", "items": ["-1", "1"], "default": "-1"},
-        {"section": "Map reconstruction bounds", "path": "reconstruction.map_bounds.x_min_m", "label": "Map X min (m)", "kind": "float", "default": -25.0, "step": 0.5},
-        {"section": "Map reconstruction bounds", "path": "reconstruction.map_bounds.x_max_m", "label": "Map X max (m)", "kind": "float", "default": 25.0, "step": 0.5},
-        {"section": "Map reconstruction bounds", "path": "reconstruction.map_bounds.y_min_m", "label": "Map Y (range) min (m)", "kind": "float", "default": 0.0, "min": 0.0, "step": 0.5},
-        {"section": "Map reconstruction bounds", "path": "reconstruction.map_bounds.y_max_m", "label": "Map Y (range) max (m)", "kind": "float", "default": 50.0, "min": 0.0, "step": 0.5},
+        {"section": "Data and scan", "path": "data.input_dir", "label": "Input folder", "kind": "text", "default": "logs", "mode": "shared"},
+        {"section": "Data and scan", "path": "data.startup_timeout_s", "label": "Startup timeout (s)", "kind": "int", "default": 300, "min": 1, "max": 3600, "step": 30, "mode": "shared"},
+        {"section": "Data and scan", "path": "scan.x_start", "label": "Start position", "kind": "int", "default": 1, "step": 1, "mode": "legacy"},
+        {"section": "Data and scan", "path": "scan.x_end", "label": "End position", "kind": "int", "default": 1, "step": 1, "mode": "legacy"},
+        {"section": "Data and scan", "path": "scan.x_step", "label": "Position step", "kind": "int", "default": 1, "min": 1, "step": 1, "mode": "legacy"},
+        {"section": "Data and scan", "path": "scan.x_pitch_m", "label": "X pitch (m)", "kind": "float", "default": 0.01, "min": 0.000001, "step": 0.001, "format": "%.6f", "mode": "legacy"},
+        {"section": "Reconstruction", "path": "reconstruction.algorithm", "label": "Algorithm", "kind": "combo", "items": OFFLINE_TUNING_ALGORITHMS, "default": "synthetic_range_angle", "mode": "legacy"},
+        {"section": "Reconstruction", "path": "bp.phase_sign", "label": "Phase sign", "kind": "combo", "items": ["-1", "1"], "default": "-1", "mode": "shared"},
+        {"section": "Map reconstruction bounds", "path": "reconstruction.map_bounds.x_min_m", "label": "Map X min (m)", "kind": "float", "default": -25.0, "step": 0.5, "mode": "legacy"},
+        {"section": "Map reconstruction bounds", "path": "reconstruction.map_bounds.x_max_m", "label": "Map X max (m)", "kind": "float", "default": 25.0, "step": 0.5, "mode": "legacy"},
+        {"section": "Map reconstruction bounds", "path": "reconstruction.map_bounds.y_min_m", "label": "Map Y (range) min (m)", "kind": "float", "default": 0.0, "min": 0.0, "step": 0.5, "mode": "legacy"},
+        {"section": "Map reconstruction bounds", "path": "reconstruction.map_bounds.y_max_m", "label": "Map Y (range) max (m)", "kind": "float", "default": 50.0, "min": 0.0, "step": 0.5, "mode": "legacy"},
+        {"section": "Cylindrical v2 view", "path": "reconstruction.cylindrical_view.bounds.x_min_m", "label": "X min (m)", "kind": "float", "default": -1.0, "step": 0.05, "mode": "v2"},
+        {"section": "Cylindrical v2 view", "path": "reconstruction.cylindrical_view.bounds.x_max_m", "label": "X max (m)", "kind": "float", "default": 1.0, "step": 0.05, "mode": "v2"},
+        {"section": "Cylindrical v2 view", "path": "reconstruction.cylindrical_view.bounds.y_min_m", "label": "Y min (m)", "kind": "float", "default": -1.0, "step": 0.05, "mode": "v2"},
+        {"section": "Cylindrical v2 view", "path": "reconstruction.cylindrical_view.bounds.y_max_m", "label": "Y max (m)", "kind": "float", "default": 1.0, "step": 0.05, "mode": "v2"},
+        {"section": "Cylindrical v2 view", "path": "reconstruction.cylindrical_view.bounds.z_min_m", "label": "Z min (m)", "kind": "float", "default": 0.0, "step": 0.05, "mode": "v2"},
+        {"section": "Cylindrical v2 view", "path": "reconstruction.cylindrical_view.bounds.z_max_m", "label": "Z max (m)", "kind": "float", "default": 1.0, "step": 0.05, "mode": "v2"},
+        {"section": "Cylindrical v2 view", "path": "reconstruction.cylindrical_view.section.plane", "label": "Default section", "kind": "combo", "items": ["xy", "xz", "yz"], "default": "xy", "mode": "v2"},
+        {"section": "Cylindrical v2 view", "path": "reconstruction.cylindrical_view.section.coordinate_m", "label": "Section coordinate (m)", "kind": "float", "default": 0.0, "step": 0.05, "mode": "v2"},
         {"section": "Offline reference background", "path": "offline_background.enabled", "label": "Subtract empty-scene reference", "kind": "bool", "default": False},
         {"section": "Offline reference background", "path": "offline_background.reference_dir", "label": "Empty-scene folder", "kind": "text", "default": ""},
         {"section": "Offline reference background", "path": "offline_background.scale", "label": "Reference scale", "kind": "float", "default": 1.0, "min": 0.0, "step": 0.01},
@@ -4357,6 +4517,210 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         if dpg.does_item_exist(TXT_OFFLINE_TUNING_STATUS_TAG):
             dpg.set_value(TXT_OFFLINE_TUNING_STATUS_TAG, str(message))
 
+    def _offline_is_v2() -> bool:
+        return str(offline_run_view.get("geometry_mode") or "") == "cylindrical_regular"
+
+    def _offline_tuning_snapshot(*, materialize_v2: bool = False) -> dict:
+        base = yaml.safe_load(yaml.safe_dump(offline_tuning_cfg, sort_keys=False)) or {}
+        if not isinstance(base, dict):
+            base = {}
+        missing = object()
+        for spec in OFFLINE_TUNING_FIELD_SPECS:
+            tag = _offline_tune_tag(spec["path"])
+            current = _offline_cfg_path_get(base, spec["path"], missing)
+            if spec.get("mode") == "v2" and current is missing and not materialize_v2:
+                continue
+            if dpg.does_item_exist(tag):
+                value = _offline_tuning_widget_value(spec)
+            else:
+                value = spec.get("default") if current is missing else current
+            _offline_cfg_path_set(base, spec["path"], value)
+        return base
+
+    def _set_cylindrical_view_widgets(view: CylindricalView) -> None:
+        values = {
+            "reconstruction.cylindrical_view.bounds.x_min_m": view.bounds.x_min_m,
+            "reconstruction.cylindrical_view.bounds.x_max_m": view.bounds.x_max_m,
+            "reconstruction.cylindrical_view.bounds.y_min_m": view.bounds.y_min_m,
+            "reconstruction.cylindrical_view.bounds.y_max_m": view.bounds.y_max_m,
+            "reconstruction.cylindrical_view.bounds.z_min_m": (
+                0.0 if view.bounds.z_min_m is None else view.bounds.z_min_m
+            ),
+            "reconstruction.cylindrical_view.bounds.z_max_m": (
+                0.0 if view.bounds.z_max_m is None else view.bounds.z_max_m
+            ),
+            "reconstruction.cylindrical_view.section.plane": view.section.plane,
+            "reconstruction.cylindrical_view.section.coordinate_m": view.section.coordinate_m,
+        }
+        for path, value in values.items():
+            tag = _offline_tune_tag(path)
+            if dpg.does_item_exist(tag):
+                dpg.set_value(tag, value)
+
+    def _apply_offline_geometry_controls() -> None:
+        """Show controls compatible with the header-detected offline format."""
+        is_v2 = _offline_is_v2()
+        for tag in (
+            OFFLINE_TUNING_GRP_LEGACY_SCAN,
+            OFFLINE_TUNING_GRP_LEGACY_RECON,
+            OFFLINE_TUNING_GRP_LEGACY_MAP,
+            PROC_GRP_LEGACY_BP_CONTROL,
+        ):
+            if dpg.does_item_exist(tag):
+                dpg.configure_item(tag, show=not is_v2)
+        for tag in (OFFLINE_TUNING_GRP_CYLINDRICAL_VIEW, PROC_GRP_CYLINDRICAL_SECTION):
+            if dpg.does_item_exist(tag):
+                dpg.configure_item(tag, show=is_v2)
+
+        if not is_v2:
+            if dpg.does_item_exist(PROC_XAXIS_TAG):
+                dpg.configure_item(PROC_XAXIS_TAG, label="X (m)")
+            if dpg.does_item_exist(PROC_YAXIS_TAG):
+                dpg.configure_item(PROC_YAXIS_TAG, label="Y (m)")
+            for tag, label in (
+                (PROC_IN_ZOOM_XMIN, "X min (m)"),
+                (PROC_IN_ZOOM_XMAX, "X max (m)"),
+                (PROC_IN_ZOOM_YMIN, "Y min (m)"),
+                (PROC_IN_ZOOM_YMAX, "Y max (m)"),
+            ):
+                if dpg.does_item_exist(tag):
+                    dpg.configure_item(tag, label=label)
+            if dpg.does_item_exist(TXT_OFFLINE_RUN_FORMAT):
+                if str(offline_run_view.get("format")) == "rt_capture_v1":
+                    dpg.set_value(TXT_OFFLINE_RUN_FORMAT, "Format: rt_capture_v1 / legacy linear")
+                else:
+                    dpg.set_value(TXT_OFFLINE_RUN_FORMAT, "Format: not inspected")
+            return
+
+        summary = offline_run_view.get("summary")
+        view_dict = offline_run_view.get("view")
+        if not isinstance(summary, dict) or not isinstance(view_dict, dict):
+            return
+        section = view_dict.get("section", {})
+        plane = str(section.get("plane", "xy"))
+        vertical_available = bool(summary.get("has_vertical_resolution", False))
+        allowed_planes = ["xy", "xz", "yz"] if vertical_available else ["xy"]
+        if plane not in allowed_planes:
+            plane = "xy"
+        if dpg.does_item_exist(PROC_COMBO_CYL_SECTION):
+            dpg.configure_item(PROC_COMBO_CYL_SECTION, items=allowed_planes)
+            dpg.set_value(PROC_COMBO_CYL_SECTION, plane)
+        axes = {
+            "xy": ("X", "Y", "Z"),
+            "xz": ("X", "Z", "Y"),
+            "yz": ("Y", "Z", "X"),
+        }[plane]
+        if dpg.does_item_exist(PROC_XAXIS_TAG):
+            dpg.configure_item(PROC_XAXIS_TAG, label=f"{axes[0]} (m)")
+        if dpg.does_item_exist(PROC_YAXIS_TAG):
+            dpg.configure_item(PROC_YAXIS_TAG, label=f"{axes[1]} (m)")
+        for tag, label in (
+            (PROC_IN_ZOOM_XMIN, f"{axes[0]} min (m)"),
+            (PROC_IN_ZOOM_XMAX, f"{axes[0]} max (m)"),
+            (PROC_IN_ZOOM_YMIN, f"{axes[1]} min (m)"),
+            (PROC_IN_ZOOM_YMAX, f"{axes[1]} max (m)"),
+        ):
+            if dpg.does_item_exist(tag):
+                dpg.configure_item(tag, label=label)
+        if dpg.does_item_exist(PROC_IN_CYL_SECTION_COORD):
+            dpg.configure_item(PROC_IN_CYL_SECTION_COORD, label=f"{axes[2]} section (m)")
+            dpg.set_value(PROC_IN_CYL_SECTION_COORD, float(section.get("coordinate_m", 0.0)))
+        height_values = [float(value) for value in summary.get("height_m_values", [])]
+        world_z_values = [float(value) for value in summary.get("world_z_values_m", [])]
+        height_items = [
+            f"h={height:.6g} m | Z={z_value:.6g} m"
+            for height, z_value in zip(height_values, world_z_values)
+        ]
+        offline_run_view["height_items"] = height_items
+        offline_run_view["height_world_z_values"] = world_z_values
+        if dpg.does_item_exist(PROC_COMBO_CYL_HEIGHT):
+            dpg.configure_item(PROC_COMBO_CYL_HEIGHT, items=height_items, enabled=bool(height_items))
+            if height_items and not str(dpg.get_value(PROC_COMBO_CYL_HEIGHT)) in height_items:
+                dpg.set_value(PROC_COMBO_CYL_HEIGHT, height_items[0])
+        hint = (
+            "XY uses a world Z section. XZ/YZ use all heights."
+            if vertical_available
+            else "Only XY is available: XZ/YZ require at least two acquired heights."
+        )
+        if dpg.does_item_exist(PROC_TXT_CYL_SECTION_HINT):
+            dpg.set_value(PROC_TXT_CYL_SECTION_HINT, hint)
+        if dpg.does_item_exist(TXT_OFFLINE_RUN_FORMAT):
+            dpg.set_value(
+                TXT_OFFLINE_RUN_FORMAT,
+                f"Format: rt_capture_v2 / {summary.get('kind')} | "
+                f"{summary.get('height_count')} heights x {summary.get('angle_count')} angles",
+            )
+        if dpg.does_item_exist(PROC_TXT_CYL_RUN_INFO):
+            center = summary.get("scene_center_m", [0.0, 0.0, 0.0])
+            dpg.set_value(
+                PROC_TXT_CYL_RUN_INFO,
+                f"{summary.get('capture_count')} captures | r={float(summary.get('radius_m', 0.0)):.4g} m | "
+                f"center=({float(center[0]):.4g}, {float(center[1]):.4g}, {float(center[2]):.4g}) m",
+            )
+
+    def _inspect_offline_run(sender=None, app_data=None) -> bool:
+        """Inspect headers only and apply the corresponding offline GUI mode."""
+        try:
+            snapshot = _offline_tuning_snapshot(materialize_v2=_offline_is_v2())
+            reader_cfg = OfflineSARConfig.from_mapping(
+                snapshot,
+                base_dir=offline_config_path.parent,
+            )
+            layout = SARReader(config=reader_cfg).describe_stream()
+            if str(layout.geometry_mode) == "cylindrical_regular":
+                summary = cylindrical_run_summary(layout)
+                configured_view = cylindrical_view_from_yaml_dict(snapshot)
+                legacy_plane = cylindrical_plane_from_yaml_dict(snapshot)
+                view = resolve_cylindrical_view(
+                    configured_view=configured_view,
+                    legacy_plane=legacy_plane,
+                    captures=tuple(layout.cylindrical_captures),
+                )
+                offline_run_view.update(
+                    {
+                        "format": "rt_capture_v2",
+                        "geometry_mode": "cylindrical_regular",
+                        "summary": {
+                            "kind": summary.kind,
+                            "capture_count": summary.capture_count,
+                            "angle_count": summary.angle_count,
+                            "height_count": summary.height_count,
+                            "radius_m": summary.radius_m,
+                            "scene_center_m": list(summary.scene_center_m),
+                            "height_m_values": list(summary.height_m_values),
+                            "world_z_values_m": list(summary.world_z_values_m),
+                            "has_vertical_resolution": summary.has_vertical_resolution,
+                        },
+                        "view": cylindrical_view_to_dict(view),
+                    }
+                )
+                _set_cylindrical_view_widgets(view)
+                algorithm_tag = _offline_tune_tag("reconstruction.algorithm")
+                if dpg.does_item_exist(algorithm_tag):
+                    dpg.set_value(algorithm_tag, "backprojection")
+                message = f"Detected rt_capture_v2 {summary.kind}: {summary.height_count} heights x {summary.angle_count} angles"
+            else:
+                offline_run_view.update(
+                    {
+                        "format": "rt_capture_v1",
+                        "geometry_mode": "legacy_linear",
+                        "summary": None,
+                        "view": None,
+                    }
+                )
+                message = f"Detected rt_capture_v1 linear run: {int(layout.positions.size)} positions"
+            _apply_offline_geometry_controls()
+            _refresh_offline_memory_estimate(snapshot)
+            _set_offline_tuning_status(message)
+            return True
+        except Exception as exc:
+            offline_run_view.update(
+                {"format": "unknown", "geometry_mode": None, "summary": None, "view": None}
+            )
+            _apply_offline_geometry_controls()
+            _set_offline_tuning_status(f"Run inspection error: {exc}")
+            return False
+
     def _offline_tuning_locked_by_scan() -> bool:
         return bool(
             _any_scan_active()
@@ -4384,6 +4748,9 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             if not isinstance(loaded, dict):
                 raise ValueError("la radice YAML deve essere una mappa")
             offline_tuning_cfg = loaded
+            offline_run_view.update(
+                {"format": "unknown", "geometry_mode": None, "summary": None, "view": None}
+            )
             for spec in OFFLINE_TUNING_FIELD_SPECS:
                 tag = _offline_tune_tag(spec["path"])
                 if not dpg.does_item_exist(tag):
@@ -4400,6 +4767,7 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             except (TypeError, ValueError):
                 _update_scan_pitch_label(error="invalid scan.x_pitch_m")
             _refresh_offline_memory_estimate(offline_tuning_cfg)
+            _apply_offline_geometry_controls()
             _set_offline_tuning_status("Offline configuration loaded")
             return True
         except Exception as exc:
@@ -4435,11 +4803,8 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         return float(value_f)
 
     def _collect_offline_tuning_config() -> dict:
-        base = yaml.safe_load(yaml.safe_dump(offline_tuning_cfg, sort_keys=False)) or {}
-        if not isinstance(base, dict):
-            base = {}
-        for spec in OFFLINE_TUNING_FIELD_SPECS:
-            _offline_cfg_path_set(base, spec["path"], _offline_tuning_widget_value(spec))
+        is_v2 = _offline_is_v2()
+        base = _offline_tuning_snapshot(materialize_v2=is_v2)
 
         if not str(_offline_cfg_path_get(base, "data.input_dir", "")).strip():
             raise ValueError("Input folder is required")
@@ -4449,11 +4814,33 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             _offline_cfg_path_get(base, "offline_background.reference_dir", "")
         ).strip():
             raise ValueError("Empty-scene folder is required when offline reference background is enabled")
-        if int(_offline_cfg_path_get(base, "scan.x_end")) < int(_offline_cfg_path_get(base, "scan.x_start")):
-            raise ValueError("End position must be greater than or equal to start position")
-        if float(_offline_cfg_path_get(base, "scan.x_pitch_m")) <= 0.0:
-            raise ValueError("Il pitch X deve essere > 0")
-        offline_map_bounds_from_yaml_dict(base, cfg)
+        if is_v2:
+            _offline_cfg_path_set(base, "reconstruction.algorithm", "backprojection")
+            summary = offline_run_view.get("summary")
+            if not isinstance(summary, dict):
+                raise ValueError("Run v2 must be inspected before saving its view configuration")
+            if not bool(summary.get("has_vertical_resolution", False)):
+                bounds_node = _offline_cfg_path_get(base, "reconstruction.cylindrical_view.bounds", {})
+                if isinstance(bounds_node, dict):
+                    # A single-height circular scan has no Z aperture.  Keep
+                    # its XY section coordinate, but omit meaningless Z
+                    # volume bounds from the persisted configuration.
+                    bounds_node.pop("z_min_m", None)
+                    bounds_node.pop("z_max_m", None)
+            v2_view = cylindrical_view_from_yaml_dict(base)
+            if v2_view is None:
+                raise ValueError("Cylindrical v2 view configuration is required after run inspection")
+            if bool(summary.get("has_vertical_resolution", False)):
+                if not v2_view.bounds.has_z_bounds:
+                    raise ValueError("Z bounds are required for a multi-height cylindrical run")
+            elif v2_view.section.plane != "xy":
+                raise ValueError("XZ/YZ sections require at least two acquired heights")
+        else:
+            if int(_offline_cfg_path_get(base, "scan.x_end")) < int(_offline_cfg_path_get(base, "scan.x_start")):
+                raise ValueError("End position must be greater than or equal to start position")
+            if float(_offline_cfg_path_get(base, "scan.x_pitch_m")) <= 0.0:
+                raise ValueError("Il pitch X deve essere > 0")
+            offline_map_bounds_from_yaml_dict(base, cfg)
         return base
 
     def _save_offline_tuning_config(*, allow_scan_finalize: bool = False) -> dict | None:
@@ -4463,9 +4850,11 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             return None
         try:
             saved_cfg = _collect_offline_tuning_config()
+            missing_value = object()
             tuning_updates = {
                 str(spec["path"]): _offline_cfg_path_get(saved_cfg, str(spec["path"]))
                 for spec in OFFLINE_TUNING_FIELD_SPECS
+                if _offline_cfg_path_get(saved_cfg, str(spec["path"]), missing_value) is not missing_value
             }
             pitch_mm = float(_offline_cfg_path_get(saved_cfg, "scan.x_pitch_m")) * 1000.0
             pitch_comment_value = f"{pitch_mm:.6f}".rstrip("0").rstrip(".")
@@ -4493,7 +4882,9 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         if _offline_tuning_locked_by_scan():
             _set_offline_tuning_status("Reload is locked during SAR scan/finalization")
             return False
-        _read_offline_tuning_config()
+        if not _read_offline_tuning_config():
+            return False
+        return _inspect_offline_run()
 
     def _on_apply_offline_tuning(
         sender=None,
@@ -4510,6 +4901,8 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             if bool(offline_reload_state["running"]):
                 _set_offline_tuning_status("Offline recalculation already in progress")
                 return False
+        if save_config and not _inspect_offline_run():
+            return False
         if save_config and _save_offline_tuning_config(allow_scan_finalize=allow_scan_finalize) is None:
             return False
 
@@ -4581,6 +4974,8 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         # tuning edits remain local until Save/Save and Recalculate is chosen.
         if not _read_offline_tuning_config():
             return False
+        if not _inspect_offline_run():
+            return False
         return _on_apply_offline_tuning(save_config=False)
 
     def _add_offline_tuning_widget(spec: dict, width: int = 300) -> None:
@@ -4602,9 +4997,9 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         else:
             dpg.add_input_float(label=spec["label"], tag=tag, default_value=float(default), step=float(spec.get("step", 0.1)), width=width, min_value=float(spec.get("min", 0.0)), max_value=float(spec.get("max", 0.0)), min_clamped=("min" in spec), max_clamped=("max" in spec), format=spec.get("format", "%.3f"))
 
-    def _add_offline_tuning_section(section: str) -> None:
+    def _add_offline_tuning_section(section: str, *, mode: str | None = None) -> None:
         for spec in OFFLINE_TUNING_FIELD_SPECS:
-            if spec["section"] == section:
+            if spec["section"] == section and (mode is None or spec.get("mode") == mode):
                 _add_offline_tuning_widget(spec)
 
     STATS_KEY_W = 16
@@ -5552,28 +5947,59 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                             color=(180, 210, 255),
                         )
                         dpg.add_spacer(height=14)
-                        dpg.add_text("OFFLINE BP CONTROL", color=(255, 200, 0))
-                        dpg.add_separator()
-                        dpg.add_input_int(
-                            label="x_start",
-                            tag=PROC_IN_XSTART,
-                            default_value=int(off_x_start),
-                            step=1,
-                            step_fast=4,
-                            width=220,
-                            callback=_apply_offline_params,
-                            on_enter=False,
-                        )
-                        dpg.add_input_int(
-                            label="x_end",
-                            tag=PROC_IN_XEND,
-                            default_value=int(off_x_end),
-                            step=1,
-                            step_fast=4,
-                            width=220,
-                            callback=_apply_offline_params,
-                            on_enter=False,
-                        )
+                        with dpg.group(tag=PROC_GRP_CYLINDRICAL_SECTION, show=False):
+                            dpg.add_text("CYLINDRICAL V2 SECTION", color=(255, 200, 0))
+                            dpg.add_separator()
+                            dpg.add_text("", tag=PROC_TXT_CYL_RUN_INFO, wrap=300, color=(180, 210, 255))
+                            dpg.add_combo(
+                                ["xy"],
+                                label="Section plane",
+                                tag=PROC_COMBO_CYL_SECTION,
+                                default_value="xy",
+                                width=220,
+                                callback=_on_cylindrical_section_changed,
+                            )
+                            dpg.add_input_float(
+                                label="Z section (m)",
+                                tag=PROC_IN_CYL_SECTION_COORD,
+                                default_value=0.0,
+                                step=0.05,
+                                width=220,
+                                callback=_on_cylindrical_section_changed,
+                                on_enter=True,
+                            )
+                            dpg.add_combo(
+                                [],
+                                label="Acquired height (XY)",
+                                tag=PROC_COMBO_CYL_HEIGHT,
+                                width=220,
+                                callback=_on_cylindrical_height_selected,
+                            )
+                            dpg.add_text("", tag=PROC_TXT_CYL_SECTION_HINT, wrap=300, color=(180, 210, 255))
+                            dpg.add_spacer(height=10)
+                        with dpg.group(tag=PROC_GRP_LEGACY_BP_CONTROL):
+                            dpg.add_text("OFFLINE BP CONTROL", color=(255, 200, 0))
+                            dpg.add_separator()
+                            dpg.add_input_int(
+                                label="x_start",
+                                tag=PROC_IN_XSTART,
+                                default_value=int(off_x_start),
+                                step=1,
+                                step_fast=4,
+                                width=220,
+                                callback=_apply_offline_params,
+                                on_enter=False,
+                            )
+                            dpg.add_input_int(
+                                label="x_end",
+                                tag=PROC_IN_XEND,
+                                default_value=int(off_x_end),
+                                step=1,
+                                step_fast=4,
+                                width=220,
+                                callback=_apply_offline_params,
+                                on_enter=False,
+                            )
 
                 with dpg.table_cell():
                     with dpg.plot(tag=PROC_HEAT_PLOT_TAG, width=-1, height=-1, equal_aspects=True):
@@ -5632,9 +6058,11 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             dpg.add_separator()
             with dpg.group(horizontal=True):
                 dpg.add_button(label="Reload from File", callback=_on_reload_offline_tuning, width=160)
+                dpg.add_button(label="Inspect run", tag=BTN_OFFLINE_INSPECT_RUN, callback=_inspect_offline_run, width=140)
                 dpg.add_button(label="Save Configuration", callback=_on_save_offline_tuning, width=180)
                 dpg.add_button(label="Save and Recalculate Offline", callback=_on_apply_offline_tuning, width=230)
             dpg.add_text("Ready", tag=TXT_OFFLINE_TUNING_STATUS_TAG, wrap=-1)
+            dpg.add_text("Format: not inspected", tag=TXT_OFFLINE_RUN_FORMAT, wrap=-1, color=(255, 210, 120))
             dpg.add_text(
                 "Offline runtime not loaded.\n" + offline_memory_estimate_text,
                 tag=TXT_OFFLINE_TUNING_INFO_TAG,
@@ -5645,18 +6073,26 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             with dpg.tab_bar(tag="offline_tuning_subtabbar"):
                 with dpg.tab(label="Data"):
                     with dpg.child_window(width=-1, height=-1, border=False):
-                        _add_offline_tuning_section("Data and scan")
+                        _add_offline_tuning_section("Data and scan", mode="shared")
+                        with dpg.group(tag=OFFLINE_TUNING_GRP_LEGACY_SCAN):
+                            _add_offline_tuning_section("Data and scan", mode="legacy")
                 with dpg.tab(label="Reconstruction"):
                     with dpg.child_window(width=-1, height=-1, border=False):
-                        _add_offline_tuning_section("Reconstruction")
+                        _add_offline_tuning_section("Reconstruction", mode="shared")
+                        with dpg.group(tag=OFFLINE_TUNING_GRP_LEGACY_RECON):
+                            _add_offline_tuning_section("Reconstruction", mode="legacy")
+                        with dpg.group(tag=OFFLINE_TUNING_GRP_CYLINDRICAL_VIEW, show=False):
+                            dpg.add_text("World bounds and default v2 section. Geometry remains in capture headers.", wrap=-1)
+                            _add_offline_tuning_section("Cylindrical v2 view", mode="v2")
                 with dpg.tab(label="Map"):
                     with dpg.child_window(width=-1, height=-1, border=False):
-                        dpg.add_text(
-                            "Defines the full physical rectangle available to offline reconstruction. "
-                            "Full map reconstructs this rectangle; Apply ROI reconstructs a contained section on the same fixed image grid.",
-                            wrap=-1,
-                        )
-                        _add_offline_tuning_section("Map reconstruction bounds")
+                        with dpg.group(tag=OFFLINE_TUNING_GRP_LEGACY_MAP):
+                            dpg.add_text(
+                                "Defines the full physical rectangle available to offline reconstruction. "
+                                "Full map reconstructs this rectangle; Apply ROI reconstructs a contained section on the same fixed image grid.",
+                                wrap=-1,
+                            )
+                            _add_offline_tuning_section("Map reconstruction bounds", mode="legacy")
                 with dpg.tab(label="FFT"):
                     with dpg.child_window(width=-1, height=-1, border=False):
                         dpg.add_text(
@@ -5688,6 +6124,7 @@ def main(*, rotary_axis: RotaryAxis | None = None):
     _update_fft_scale_input_labels(fft_mode_db)
     # Applicazione parametri DOPO creazione items
     _apply_params()
+    _apply_offline_geometry_controls()
     if dpg.does_item_exist(PROC_XAXIS_TAG) and dpg.does_item_exist(PROC_YAXIS_TAG):
         dpg.set_axis_limits(
             PROC_XAXIS_TAG,
@@ -5890,15 +6327,38 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                 offline_runtime = reload_runtime
                 shutdown_resources["offline_runtime"] = offline_runtime
                 offline_info = dict(reload_info or offline_runtime.last_info)
-                off_map_bounds_current = offline_runtime.map_bounds
-                off_home_viewport_current = build_display_viewport(
-                    x_min_m=float(off_map_bounds_current.x_min_m),
-                    x_max_m=float(off_map_bounds_current.x_max_m),
-                    y_min_m=float(off_map_bounds_current.y_min_m),
-                    y_max_m=float(off_map_bounds_current.y_max_m),
-                    dr_m=float(dr_plot),
-                    seq=int(off_requested_viewport_current.seq) + 1,
-                )
+                if str(offline_info.get("geometry_mode", "")) == "cylindrical_regular":
+                    runtime_view = offline_info.get("cylindrical_view")
+                    runtime_summary = offline_info.get("cylindrical_summary")
+                    if not isinstance(runtime_view, dict) or not isinstance(runtime_summary, dict):
+                        raise RuntimeError("runtime v2 senza metadata della sezione cilindrica")
+                    offline_run_view.update(
+                        {
+                            "format": "rt_capture_v2",
+                            "geometry_mode": "cylindrical_regular",
+                            "summary": runtime_summary,
+                            "view": runtime_view,
+                        }
+                    )
+                    off_home_viewport_current = _cylindrical_section_home_viewport(
+                        runtime_view,
+                        seq=int(off_requested_viewport_current.seq) + 1,
+                    )
+                    _apply_offline_geometry_controls()
+                else:
+                    offline_run_view.update(
+                        {"format": "rt_capture_v1", "geometry_mode": "legacy_linear", "summary": None, "view": None}
+                    )
+                    off_map_bounds_current = offline_runtime.map_bounds
+                    off_home_viewport_current = build_display_viewport(
+                        x_min_m=float(off_map_bounds_current.x_min_m),
+                        x_max_m=float(off_map_bounds_current.x_max_m),
+                        y_min_m=float(off_map_bounds_current.y_min_m),
+                        y_max_m=float(off_map_bounds_current.y_max_m),
+                        dr_m=float(dr_plot),
+                        seq=int(off_requested_viewport_current.seq) + 1,
+                    )
+                    _apply_offline_geometry_controls()
                 off_requested_viewport_current = off_home_viewport_current
                 off_pos_min = int(offline_info.get("pos_min", 0))
                 off_pos_max = int(offline_info.get("pos_max", off_pos_min))
@@ -5917,10 +6377,10 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                 off_ui_dirty_t = now - 1.0
                 if dpg.does_item_exist(PROC_IN_XSTART):
                     dpg.set_value(PROC_IN_XSTART, int(off_x_start))
-                    dpg.configure_item(PROC_IN_XSTART, enabled=True)
+                    dpg.configure_item(PROC_IN_XSTART, enabled=not _offline_is_v2())
                 if dpg.does_item_exist(PROC_IN_XEND):
                     dpg.set_value(PROC_IN_XEND, int(off_x_end))
-                    dpg.configure_item(PROC_IN_XEND, enabled=True)
+                    dpg.configure_item(PROC_IN_XEND, enabled=not _offline_is_v2())
                 if dpg.does_item_exist(PROC_BTN_LOAD_OFFLINE):
                     dpg.configure_item(
                         PROC_BTN_LOAD_OFFLINE,
@@ -6181,11 +6641,21 @@ def main(*, rotary_axis: RotaryAxis | None = None):
 
                 if offline_runtime is not None and reconstruct_offline:
                     try:
-                        offline_runtime.update_params(
-                            x_start=int(off_ui_pending["x_start"]),
-                            x_end=int(off_ui_pending["x_end"]),
-                            viewport=off_requested_viewport_current,
-                        )
+                        if _offline_is_v2():
+                            section = off_ui_pending.get("cylindrical_section")
+                            offline_runtime.update_params(
+                                viewport=off_requested_viewport_current,
+                                cylindrical_section=(
+                                    section if isinstance(section, CylindricalSection) else None
+                                ),
+                            )
+                            off_ui_pending["cylindrical_section"] = None
+                        else:
+                            offline_runtime.update_params(
+                                x_start=int(off_ui_pending["x_start"]),
+                                x_end=int(off_ui_pending["x_end"]),
+                                viewport=off_requested_viewport_current,
+                            )
                     except Exception as e:
                         _render_offline_summary(state=f"Offline update error: {e}")
 
@@ -6201,6 +6671,19 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                     proc_frame[:, :] = frame_db
                     offline_frame_valid = True
                     refresh_offline_display = True
+                    if str(info.get("geometry_mode", "")) == "cylindrical_regular":
+                        frame_view = info.get("cylindrical_view")
+                        frame_summary = info.get("cylindrical_summary")
+                        if isinstance(frame_view, dict) and isinstance(frame_summary, dict):
+                            offline_run_view.update(
+                                {
+                                    "format": "rt_capture_v2",
+                                    "geometry_mode": "cylindrical_regular",
+                                    "summary": frame_summary,
+                                    "view": frame_view,
+                                }
+                            )
+                            _apply_offline_geometry_controls()
                     try:
                         off_applied_meta_current = AppliedViewportMeta(
                             x_min_m=float(info.get("applied_viewport_x_min_m", off_applied_meta_current.x_min_m)),
@@ -6220,11 +6703,22 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                     except Exception:
                         pass
                     algorithm_text = str(info.get("algorithm", "backprojection"))
-                    _render_offline_summary(
-                        state=(
+                    if str(info.get("geometry_mode", "")) == "cylindrical_regular":
+                        summary = info.get("cylindrical_summary") or {}
+                        section = (info.get("cylindrical_view") or {}).get("section", {})
+                        status_text = (
+                            f"Offline {algorithm_text}: {summary.get('kind', 'v2')} "
+                            f"{summary.get('capture_count', info.get('n_pos_used', 'n/a'))} captures | "
+                            f"{str(section.get('plane', 'xy')).upper()} @ "
+                            f"{section.get('coordinate_m', 'n/a')} m"
+                        )
+                    else:
+                        status_text = (
                             f"Offline {algorithm_text}: positions {info.get('x_start')} - "
                             f"{info.get('x_end')} ({info.get('n_pos_used', 'n/a')} used)"
-                        ),
+                        )
+                    _render_offline_summary(
+                        state=status_text,
                         calculation_ms=float(info.get("elapsed_ms", 0.0)),
                     )
                 elif offline_runtime.last_error:

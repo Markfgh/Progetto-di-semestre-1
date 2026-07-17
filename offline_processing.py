@@ -54,6 +54,8 @@ from sar_geometry import (
     default_iwr1443_2tx4rx_geometry,
     transform_element_coordinates,
     xy_plane_voxel_grid,
+    xz_plane_voxel_grid,
+    yz_plane_voxel_grid,
 )
 from shutdown_utils import cleanup_processes, close_queues
 
@@ -82,6 +84,19 @@ class OfflineSARConfig:
     ) -> "OfflineSARConfig":
         cfg_path = Path(config_path)
         cfg = _load_yaml_file(cfg_path)
+        return cls.from_mapping(cfg, base_dir=cfg_path.parent)
+
+    @classmethod
+    def from_mapping(
+        cls,
+        cfg: Mapping[str, Any],
+        *,
+        base_dir: str | Path = ".",
+    ) -> "OfflineSARConfig":
+        """Build a config from in-memory GUI values without a temporary YAML."""
+        if not isinstance(cfg, Mapping):
+            raise ValueError("offline_config: la radice YAML deve essere una mappa")
+        base_path = Path(base_dir)
 
         data_cfg = cfg.get("data", {}) or {}
         scan_cfg = cfg.get("scan", {}) or {}
@@ -92,7 +107,7 @@ class OfflineSARConfig:
             raise ValueError("offline_config.yaml: manca data.input_dir")
         input_dir_path = Path(str(input_dir))
         if not input_dir_path.is_absolute():
-            input_dir_path = (cfg_path.parent / input_dir_path).resolve()
+            input_dir_path = (base_path / input_dir_path).resolve()
 
         x_start_raw = scan_cfg.get("x_start")
         x_end_raw = scan_cfg.get("x_end")
@@ -247,6 +262,138 @@ class CylindricalPlane:
     y_min_m: float
     y_max_m: float
     z_m: float
+
+
+_CYLINDRICAL_SECTION_PLANES = {"xy", "xz", "yz"}
+
+
+@dataclass(frozen=True)
+class CylindricalViewBounds:
+    """World bounds available to a regular cylindrical-SAR section view.
+
+    X/Y bounds are always required.  Z bounds are optional only for a
+    single-height circular capture, where vertical sections are forbidden.
+    """
+
+    x_min_m: float
+    x_max_m: float
+    y_min_m: float
+    y_max_m: float
+    z_min_m: float | None = None
+    z_max_m: float | None = None
+
+    def __post_init__(self) -> None:
+        values = {
+            "x_min_m": self.x_min_m,
+            "x_max_m": self.x_max_m,
+            "y_min_m": self.y_min_m,
+            "y_max_m": self.y_max_m,
+        }
+        normalized: dict[str, float] = {}
+        for name, value in values.items():
+            normalized[name] = _to_float(f"cylindrical view bounds.{name}", value)
+        if normalized["x_max_m"] <= normalized["x_min_m"]:
+            raise ValueError("cylindrical view bounds.x_max_m deve essere > x_min_m")
+        if normalized["y_max_m"] <= normalized["y_min_m"]:
+            raise ValueError("cylindrical view bounds.y_max_m deve essere > y_min_m")
+
+        has_z_min = self.z_min_m is not None
+        has_z_max = self.z_max_m is not None
+        if has_z_min != has_z_max:
+            raise ValueError("cylindrical view bounds richiede entrambi z_min_m e z_max_m")
+        if has_z_min:
+            z_min = _to_float("cylindrical view bounds.z_min_m", self.z_min_m)
+            z_max = _to_float("cylindrical view bounds.z_max_m", self.z_max_m)
+            if z_max <= z_min:
+                raise ValueError("cylindrical view bounds.z_max_m deve essere > z_min_m")
+        else:
+            z_min = None
+            z_max = None
+
+        for name, value in normalized.items():
+            object.__setattr__(self, name, float(value))
+        object.__setattr__(self, "z_min_m", z_min)
+        object.__setattr__(self, "z_max_m", z_max)
+
+    @property
+    def has_z_bounds(self) -> bool:
+        return self.z_min_m is not None and self.z_max_m is not None
+
+
+@dataclass(frozen=True)
+class CylindricalSection:
+    """One oriented, fixed-coordinate 2-D world section."""
+
+    plane: str = "xy"
+    coordinate_m: float = 0.0
+
+    def __post_init__(self) -> None:
+        plane = str(self.plane).strip().lower()
+        if plane not in _CYLINDRICAL_SECTION_PLANES:
+            raise ValueError("cylindrical section.plane deve essere 'xy', 'xz' o 'yz'")
+        coordinate = _to_float("cylindrical section.coordinate_m", self.coordinate_m)
+        object.__setattr__(self, "plane", plane)
+        object.__setattr__(self, "coordinate_m", float(coordinate))
+
+
+@dataclass(frozen=True)
+class CylindricalView:
+    """Configured bounds and active plane for a v2 circular/cylindrical run."""
+
+    bounds: CylindricalViewBounds
+    section: CylindricalSection
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.bounds, CylindricalViewBounds):
+            raise TypeError("cylindrical view.bounds deve essere CylindricalViewBounds")
+        if not isinstance(self.section, CylindricalSection):
+            raise TypeError("cylindrical view.section deve essere CylindricalSection")
+
+
+@dataclass(frozen=True)
+class CylindricalRunSummary:
+    """Header-derived topology and geometry exposed to the offline UI."""
+
+    kind: str
+    capture_count: int
+    angle_count: int
+    height_count: int
+    radius_m: float
+    scene_center_m: tuple[float, float, float]
+    height_m_values: tuple[float, ...]
+    world_z_values_m: tuple[float, ...]
+
+    @property
+    def has_vertical_resolution(self) -> bool:
+        return self.height_count >= 2
+
+
+def cylindrical_run_summary(layout: SARStreamLayout) -> CylindricalRunSummary:
+    """Summarize a validated regular v2 run without reading its IQ payload."""
+    if str(layout.geometry_mode) != "cylindrical_regular":
+        raise ValueError("richiesta sintesi cilindrica per una run non v2")
+    captures = tuple(layout.cylindrical_captures)
+    if not captures:
+        raise ValueError("nessuna cattura cilindrica nella run v2")
+    first = captures[0]
+    by_height: dict[int, CylindricalCapture] = {}
+    for capture in captures:
+        by_height.setdefault(int(capture.height_index), capture)
+    ordered_heights = tuple(by_height[index] for index in sorted(by_height))
+    height_values = tuple(float(capture.height_m) for capture in ordered_heights)
+    center = tuple(float(value) for value in first.scene_center_m.tolist())
+    world_z_values = tuple(float(center[2] + height) for height in height_values)
+    height_count = len(ordered_heights)
+    return CylindricalRunSummary(
+        kind="cylindrical" if height_count >= 2 else "circular",
+        capture_count=int(len(captures)),
+        angle_count=int(first.angle_count),
+        height_count=int(height_count),
+        radius_m=float(first.radius_m),
+        scene_center_m=center,
+        height_m_values=height_values,
+        world_z_values_m=world_z_values,
+    )
 
 
 class SARReader:
@@ -1025,6 +1172,101 @@ def _viewport_from_cmd_payload(
     )
 
 
+def _build_cylindrical_section_viewport(
+    *,
+    x_min_m: float,
+    x_max_m: float,
+    y_min_m: float,
+    y_max_m: float,
+    seq: int = 0,
+    home_viewport: DisplayViewport | None = None,
+) -> DisplayViewport:
+    """Build a generic signed-world viewport for v2 section reconstruction.
+
+    ``DisplayViewport`` is shared with the legacy range/angle display, whose
+    builder correctly clamps range to ``y >= 0``.  Cylindrical world Y and Z
+    coordinates are signed, so v2 must construct its metadata without that
+    linear-SAR assumption.
+    """
+    values = (x_min_m, x_max_m, y_min_m, y_max_m)
+    if not all(np.isfinite(float(value)) for value in values):
+        raise ValueError("viewport cilindrico contiene coordinate non finite")
+    x0, x1 = sorted((float(x_min_m), float(x_max_m)))
+    y0, y1 = sorted((float(y_min_m), float(y_max_m)))
+    if x1 <= x0 or y1 <= y0:
+        raise ValueError("viewport cilindrico richiede estensioni positive su entrambi gli assi")
+    if home_viewport is None:
+        zoom_level = 1.0
+    else:
+        home_width = max(1e-12, float(home_viewport.x_max_m - home_viewport.x_min_m))
+        home_height = max(1e-12, float(home_viewport.y_max_m - home_viewport.y_min_m))
+        zoom_level = max(home_width / (x1 - x0), home_height / (y1 - y0), 1.0)
+    return DisplayViewport(
+        x_min_m=x0,
+        x_max_m=x1,
+        y_min_m=y0,
+        y_max_m=y1,
+        # These fields are diagnostic-only for a v2 Cartesian section.
+        range_min_bin_f=0.0,
+        range_max_bin_f=0.0,
+        angle_min_deg=0.0,
+        angle_max_deg=0.0,
+        zoom_level=float(zoom_level),
+        seq=int(seq),
+    )
+
+
+def _cylindrical_viewport_from_cmd_payload(
+    payload: Any,
+    *,
+    home_viewport: DisplayViewport,
+    output_width: int,
+    output_height: int,
+) -> DisplayViewport | None:
+    """Clamp a v2 ROI to signed world bounds without range-axis semantics."""
+    if not isinstance(payload, Mapping):
+        return None
+    try:
+        x0 = float(payload.get("x_min_m"))
+        x1 = float(payload.get("x_max_m"))
+        y0 = float(payload.get("y_min_m"))
+        y1 = float(payload.get("y_max_m"))
+    except (TypeError, ValueError):
+        return None
+    if not all(np.isfinite(value) for value in (x0, x1, y0, y1)):
+        return None
+    home_x0, home_x1 = float(home_viewport.x_min_m), float(home_viewport.x_max_m)
+    home_y0, home_y1 = float(home_viewport.y_min_m), float(home_viewport.y_max_m)
+    x0, x1 = sorted((x0, x1))
+    y0, y1 = sorted((y0, y1))
+    x0 = max(home_x0, min(home_x1, x0))
+    x1 = max(home_x0, min(home_x1, x1))
+    y0 = max(home_y0, min(home_y1, y0))
+    y1 = max(home_y0, min(home_y1, y1))
+    min_x = max((home_x1 - home_x0) / float(max(1, int(output_width))), 1e-9)
+    min_y = max((home_y1 - home_y0) / float(max(1, int(output_height))), 1e-9)
+    if x1 <= x0:
+        x1 = min(home_x1, x0 + min_x)
+        if x1 <= x0:
+            x0 = max(home_x0, x1 - min_x)
+    if y1 <= y0:
+        y1 = min(home_y1, y0 + min_y)
+        if y1 <= y0:
+            y0 = max(home_y0, y1 - min_y)
+    try:
+        seq = int(payload.get("seq", int(home_viewport.seq) + 1))
+    except (TypeError, ValueError):
+        seq = int(home_viewport.seq) + 1
+    return _build_cylindrical_section_viewport(
+        x_min_m=x0,
+        x_max_m=x1,
+        y_min_m=y0,
+        y_max_m=y1,
+        seq=seq,
+        home_viewport=home_viewport,
+    )
+
+
 def _backprojection_viewport_max_bin(
     viewport: DisplayViewport,
     *,
@@ -1567,6 +1809,81 @@ def cylindrical_plane_from_yaml_dict(cfg: Mapping[str, Any]) -> CylindricalPlane
     return CylindricalPlane(**values)
 
 
+def cylindrical_view_from_yaml_dict(cfg: Mapping[str, Any]) -> CylindricalView | None:
+    """Read the extended v2 section-view configuration from ``offline_config``.
+
+    ``bounds.z_*`` is intentionally optional here: a legacy circular run can
+    display XY only, while a regular multi-height run gets header-derived
+    bounds until the user saves an explicit ``cylindrical_view`` block.
+    """
+    reconstruction = cfg.get("reconstruction", {}) or {}
+    if not isinstance(reconstruction, Mapping):
+        raise ValueError("offline_config: reconstruction deve essere un oggetto")
+    raw = reconstruction.get("cylindrical_view")
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise ValueError("offline_config: reconstruction.cylindrical_view deve essere un oggetto")
+    raw_bounds = raw.get("bounds")
+    if not isinstance(raw_bounds, Mapping):
+        raise ValueError("offline_config: reconstruction.cylindrical_view.bounds deve essere un oggetto")
+    required_xy = ("x_min_m", "x_max_m", "y_min_m", "y_max_m")
+    missing = [key for key in required_xy if raw_bounds.get(key) is None]
+    if missing:
+        raise ValueError(
+            "offline_config: reconstruction.cylindrical_view.bounds senza campi: "
+            + ", ".join(missing)
+        )
+    z_min_raw = raw_bounds.get("z_min_m")
+    z_max_raw = raw_bounds.get("z_max_m")
+    bounds = CylindricalViewBounds(
+        x_min_m=_to_float(
+            "offline_config: reconstruction.cylindrical_view.bounds.x_min_m",
+            raw_bounds["x_min_m"],
+        ),
+        x_max_m=_to_float(
+            "offline_config: reconstruction.cylindrical_view.bounds.x_max_m",
+            raw_bounds["x_max_m"],
+        ),
+        y_min_m=_to_float(
+            "offline_config: reconstruction.cylindrical_view.bounds.y_min_m",
+            raw_bounds["y_min_m"],
+        ),
+        y_max_m=_to_float(
+            "offline_config: reconstruction.cylindrical_view.bounds.y_max_m",
+            raw_bounds["y_max_m"],
+        ),
+        z_min_m=(
+            None
+            if z_min_raw is None
+            else _to_float("offline_config: reconstruction.cylindrical_view.bounds.z_min_m", z_min_raw)
+        ),
+        z_max_m=(
+            None
+            if z_max_raw is None
+            else _to_float("offline_config: reconstruction.cylindrical_view.bounds.z_max_m", z_max_raw)
+        ),
+    )
+    raw_section = raw.get("section", {}) or {}
+    if not isinstance(raw_section, Mapping):
+        raise ValueError("offline_config: reconstruction.cylindrical_view.section deve essere un oggetto")
+    plane = str(_pick(raw_section.get("plane"), "xy"))
+    coordinate_raw = _pick(raw_section.get("coordinate_m"), 0.0)
+    section = CylindricalSection(
+        plane=plane,
+        coordinate_m=_to_float(
+            "offline_config: reconstruction.cylindrical_view.section.coordinate_m",
+            coordinate_raw,
+        ),
+    )
+    if section.plane != "xy" and not bounds.has_z_bounds:
+        raise ValueError(
+            "offline_config: reconstruction.cylindrical_view.bounds.z_min_m/z_max_m "
+            "sono obbligatori per una sezione verticale"
+        )
+    return CylindricalView(bounds=bounds, section=section)
+
+
 def _default_cylindrical_plane(captures: tuple[CylindricalCapture, ...]) -> CylindricalPlane:
     """Derive a neutral XY plane centred on a regular cylindrical scan."""
     if not captures:
@@ -1581,6 +1898,182 @@ def _default_cylindrical_plane(captures: tuple[CylindricalCapture, ...]) -> Cyli
         y_max_m=float(center[1] + radius),
         z_m=float(center[2]),
     )
+
+
+def _default_cylindrical_view(captures: tuple[CylindricalCapture, ...]) -> CylindricalView:
+    """Derive safe world bounds and a horizontal section from v2 metadata."""
+    if not captures:
+        raise ValueError("impossibile derivare la vista: nessuna cattura cilindrica")
+    first = captures[0]
+    center = first.scene_center_m
+    radius = float(first.radius_m)
+    by_height: dict[int, CylindricalCapture] = {}
+    for capture in captures:
+        by_height.setdefault(int(capture.height_index), capture)
+    ordered = tuple(by_height[index] for index in sorted(by_height))
+    world_z = tuple(float(first.scene_center_m[2] + capture.height_m) for capture in ordered)
+    has_vertical_resolution = len(world_z) >= 2
+    if has_vertical_resolution:
+        z_min_m = float(min(world_z))
+        z_max_m = float(max(world_z))
+        section_z = float(0.5 * (z_min_m + z_max_m))
+    else:
+        z_min_m = None
+        z_max_m = None
+        section_z = float(world_z[0])
+    return CylindricalView(
+        bounds=CylindricalViewBounds(
+            x_min_m=float(center[0] - radius),
+            x_max_m=float(center[0] + radius),
+            y_min_m=float(center[1] - radius),
+            y_max_m=float(center[1] + radius),
+            z_min_m=z_min_m,
+            z_max_m=z_max_m,
+        ),
+        section=CylindricalSection(plane="xy", coordinate_m=section_z),
+    )
+
+
+def resolve_cylindrical_view(
+    *,
+    configured_view: CylindricalView | None,
+    legacy_plane: CylindricalPlane | None,
+    captures: tuple[CylindricalCapture, ...],
+) -> CylindricalView:
+    """Resolve v2 configuration while retaining old XY-only plane files."""
+    default_view = _default_cylindrical_view(captures)
+    height_count = len({int(capture.height_index) for capture in captures})
+    if configured_view is not None:
+        bounds = configured_view.bounds
+        if not bounds.has_z_bounds and default_view.bounds.has_z_bounds:
+            bounds = replace(
+                bounds,
+                z_min_m=default_view.bounds.z_min_m,
+                z_max_m=default_view.bounds.z_max_m,
+            )
+        view = CylindricalView(bounds=bounds, section=configured_view.section)
+    elif legacy_plane is not None:
+        bounds = CylindricalViewBounds(
+            x_min_m=float(legacy_plane.x_min_m),
+            x_max_m=float(legacy_plane.x_max_m),
+            y_min_m=float(legacy_plane.y_min_m),
+            y_max_m=float(legacy_plane.y_max_m),
+            z_min_m=default_view.bounds.z_min_m,
+            z_max_m=default_view.bounds.z_max_m,
+        )
+        view = CylindricalView(
+            bounds=bounds,
+            section=CylindricalSection(plane="xy", coordinate_m=float(legacy_plane.z_m)),
+        )
+    else:
+        view = default_view
+
+    if view.section.plane != "xy" and height_count < 2:
+        raise ValueError("le sezioni XZ/YZ richiedono almeno due quote della scansione cilindrica")
+    if view.section.plane != "xy" and not view.bounds.has_z_bounds:
+        raise ValueError("le sezioni XZ/YZ richiedono bounds Z nella configurazione cilindrica")
+    return view
+
+
+def cylindrical_section_axis_labels(section: CylindricalSection) -> tuple[str, str]:
+    """Return horizontal and vertical world-axis labels for a section."""
+    if section.plane == "xy":
+        return ("X", "Y")
+    if section.plane == "xz":
+        return ("X", "Z")
+    if section.plane == "yz":
+        return ("Y", "Z")
+    raise ValueError(f"sezione cilindrica non supportata: {section.plane!r}")
+
+
+def cylindrical_section_bounds(
+    view: CylindricalView,
+    *,
+    section: CylindricalSection | None = None,
+) -> tuple[float, float, float, float]:
+    """Return horizontal/vertical viewport bounds for the active 2-D section."""
+    active = view.section if section is None else section
+    bounds = view.bounds
+    if active.plane == "xy":
+        return (bounds.x_min_m, bounds.x_max_m, bounds.y_min_m, bounds.y_max_m)
+    if not bounds.has_z_bounds:
+        raise ValueError("sezione verticale richiesta senza bounds Z")
+    assert bounds.z_min_m is not None and bounds.z_max_m is not None
+    if active.plane == "xz":
+        return (bounds.x_min_m, bounds.x_max_m, bounds.z_min_m, bounds.z_max_m)
+    if active.plane == "yz":
+        return (bounds.y_min_m, bounds.y_max_m, bounds.z_min_m, bounds.z_max_m)
+    raise ValueError(f"sezione cilindrica non supportata: {active.plane!r}")
+
+
+def validate_cylindrical_section(
+    view: CylindricalView,
+    summary: CylindricalRunSummary,
+    section: CylindricalSection,
+) -> CylindricalSection:
+    """Validate that a requested section is supported by the acquired run."""
+    if section.plane != "xy" and not summary.has_vertical_resolution:
+        raise ValueError("le sezioni XZ/YZ richiedono almeno due quote della scansione cilindrica")
+    bounds = view.bounds
+    if section.plane == "xy":
+        if bounds.has_z_bounds:
+            assert bounds.z_min_m is not None and bounds.z_max_m is not None
+            if not bounds.z_min_m <= section.coordinate_m <= bounds.z_max_m:
+                raise ValueError("la quota Z della sezione XY deve rientrare nei bounds cilindrici")
+    elif section.plane == "xz":
+        if not bounds.y_min_m <= section.coordinate_m <= bounds.y_max_m:
+            raise ValueError("la coordinata Y della sezione XZ deve rientrare nei bounds cilindrici")
+    elif section.plane == "yz":
+        if not bounds.x_min_m <= section.coordinate_m <= bounds.x_max_m:
+            raise ValueError("la coordinata X della sezione YZ deve rientrare nei bounds cilindrici")
+    return section
+
+
+def cylindrical_view_to_dict(view: CylindricalView) -> dict[str, Any]:
+    """Return JSON/process-message-safe v2 view metadata."""
+    return {
+        "bounds": {
+            "x_min_m": float(view.bounds.x_min_m),
+            "x_max_m": float(view.bounds.x_max_m),
+            "y_min_m": float(view.bounds.y_min_m),
+            "y_max_m": float(view.bounds.y_max_m),
+            "z_min_m": None if view.bounds.z_min_m is None else float(view.bounds.z_min_m),
+            "z_max_m": None if view.bounds.z_max_m is None else float(view.bounds.z_max_m),
+        },
+        "section": {
+            "plane": str(view.section.plane),
+            "coordinate_m": float(view.section.coordinate_m),
+        },
+        "axes": list(cylindrical_section_axis_labels(view.section)),
+    }
+
+
+def cylindrical_xy_plane_if_active(view: CylindricalView) -> CylindricalPlane | None:
+    """Expose the active section through the pre-v2-view XY compatibility type."""
+    if view.section.plane != "xy":
+        return None
+    return CylindricalPlane(
+        x_min_m=float(view.bounds.x_min_m),
+        x_max_m=float(view.bounds.x_max_m),
+        y_min_m=float(view.bounds.y_min_m),
+        y_max_m=float(view.bounds.y_max_m),
+        z_m=float(view.section.coordinate_m),
+    )
+
+
+def cylindrical_run_summary_to_dict(summary: CylindricalRunSummary) -> dict[str, Any]:
+    """Return process-message-safe metadata for the offline GUI."""
+    return {
+        "kind": str(summary.kind),
+        "capture_count": int(summary.capture_count),
+        "angle_count": int(summary.angle_count),
+        "height_count": int(summary.height_count),
+        "radius_m": float(summary.radius_m),
+        "scene_center_m": [float(value) for value in summary.scene_center_m],
+        "height_m_values": [float(value) for value in summary.height_m_values],
+        "world_z_values_m": [float(value) for value in summary.world_z_values_m],
+        "has_vertical_resolution": bool(summary.has_vertical_resolution),
+    }
 
 
 def _read_bp_runtime_cfg(offline_config_path: str | Path, fallback_capture_cfg: str | Path) -> dict[str, Any]:
@@ -1616,6 +2109,7 @@ def _read_bp_runtime_cfg(offline_config_path: str | Path, fallback_capture_cfg: 
         "range_angle": _read_offline_sar_range_angle_cfg(cfg, fallback_cfg),
         "background_reference": background_reference,
         "cylindrical_plane": cylindrical_plane_from_yaml_dict(cfg),
+        "cylindrical_view": cylindrical_view_from_yaml_dict(cfg),
     }
 
 
@@ -2163,12 +2657,16 @@ def _offline_reader_worker(
         bp_tx_global_m: np.ndarray | None = None
         bp_rx_global_m: np.ndarray | None = None
         cylindrical_plane: CylindricalPlane | None = None
+        cylindrical_view: CylindricalView | None = None
+        cylindrical_summary: CylindricalRunSummary | None = None
         mimo_geometry: dict[str, Any] | None = None
         if geometry_mode == "cylindrical_regular":
             if algorithm != "backprojection":
-                raise ValueError(
-                    "La geometria cilindrica regolare supporta solo reconstruction.algorithm='backprojection'"
+                print(
+                    "[OFFLINE WARN] rt_capture_v2 richiede backprojection: "
+                    f"forzo reconstruction.algorithm='backprojection' (config era {algorithm!r})"
                 )
+                algorithm = "backprojection"
             fallback_cfg = _load_yaml_file(Path(fallback_capture_cfg))
             radar_cfg = fallback_cfg.get("radar", {}) or {}
             geometry_c_m_s = _to_float("radar.c", _pick(radar_cfg.get("c"), 3e8), 3e8)
@@ -2178,10 +2676,30 @@ def _offline_reader_worker(
                 fc_hz=float(geometry_fc_hz),
                 c_m_s=float(geometry_c_m_s),
             )
-            cylindrical_plane = bp_runtime_cfg.get("cylindrical_plane")
-            if cylindrical_plane is None:
-                cylindrical_plane = _default_cylindrical_plane(
-                    tuple(stream_layout.cylindrical_captures)
+            captures = tuple(stream_layout.cylindrical_captures)
+            cylindrical_summary = cylindrical_run_summary(stream_layout)
+            cylindrical_view = resolve_cylindrical_view(
+                configured_view=bp_runtime_cfg.get("cylindrical_view"),
+                legacy_plane=bp_runtime_cfg.get("cylindrical_plane"),
+                captures=captures,
+            )
+            # Preserve the legacy status field while new consumers use the
+            # complete section view.  It always denotes an XY plane.
+            legacy_plane = bp_runtime_cfg.get("cylindrical_plane")
+            if isinstance(legacy_plane, CylindricalPlane):
+                cylindrical_plane = legacy_plane
+            else:
+                default_xy = _default_cylindrical_plane(captures)
+                cylindrical_plane = CylindricalPlane(
+                    x_min_m=float(cylindrical_view.bounds.x_min_m),
+                    x_max_m=float(cylindrical_view.bounds.x_max_m),
+                    y_min_m=float(cylindrical_view.bounds.y_min_m),
+                    y_max_m=float(cylindrical_view.bounds.y_max_m),
+                    z_m=float(
+                        cylindrical_view.section.coordinate_m
+                        if cylindrical_view.section.plane == "xy"
+                        else default_xy.z_m
+                    ),
                 )
             geometry_source = "fixed_precalibrated_iwr1443_2tx4rx_world"
         elif geometry_mode == "legacy_linear":
@@ -2344,9 +2862,12 @@ def _offline_reader_worker(
         if geometry_mode == "cylindrical_regular":
             assert bp_tx_global_m is not None and bp_rx_global_m is not None
             assert cylindrical_plane is not None
+            assert cylindrical_view is not None and cylindrical_summary is not None
             msg["bp_tx_global_m"] = bp_tx_global_m
             msg["bp_rx_global_m"] = bp_rx_global_m
             msg["cylindrical_plane"] = cylindrical_plane
+            msg["cylindrical_view"] = cylindrical_view
+            msg["cylindrical_summary"] = cylindrical_summary
         else:
             assert mimo_geometry is not None
             msg["bp_x_tx_ant_m"] = np.asarray(mimo_geometry["x_tx_ant_m"], dtype=np.float32)
@@ -2379,6 +2900,16 @@ def _offline_reader_worker(
                     0 if reference_layout is None else int(reference_layout.n_frames_per_position)
                 ),
                 "background_reference_scale": float(background_reference.scale),
+                "cylindrical_view": (
+                    None
+                    if cylindrical_view is None
+                    else cylindrical_view_to_dict(cylindrical_view)
+                ),
+                "cylindrical_summary": (
+                    None
+                    if cylindrical_summary is None
+                    else cylindrical_run_summary_to_dict(cylindrical_summary)
+                ),
             },
         )
     except Exception as exc:
@@ -2513,6 +3044,8 @@ def _offline_dsp_worker(
         geometry_source = str(_pick(init_msg.get("bp_geometry_source"), "unknown"))
         n_ant_data = int(range_fft_data.shape[2])
         cylindrical_plane: CylindricalPlane | None = None
+        cylindrical_view: CylindricalView | None = None
+        cylindrical_summary: CylindricalRunSummary | None = None
         tx_global_m: np.ndarray | None = None
         rx_global_m: np.ndarray | None = None
         if geometry_mode == "cylindrical_regular":
@@ -2532,6 +3065,14 @@ def _offline_dsp_worker(
             if not isinstance(plane_raw, CylindricalPlane):
                 raise ValueError("cylindrical_plane mancante o non valida per la ricostruzione circular SAR")
             cylindrical_plane = plane_raw
+            view_raw = init_msg.get("cylindrical_view")
+            summary_raw = init_msg.get("cylindrical_summary")
+            if not isinstance(view_raw, CylindricalView):
+                raise ValueError("cylindrical_view mancante o non valida per la ricostruzione v2")
+            if not isinstance(summary_raw, CylindricalRunSummary):
+                raise ValueError("cylindrical_summary mancante o non valida per la ricostruzione v2")
+            cylindrical_view = view_raw
+            cylindrical_summary = summary_raw
             x_tx_ant_m = np.empty(0, dtype=np.float32)
             x_rx_ant_m = np.empty(0, dtype=np.float32)
         elif geometry_mode == "legacy_linear":
@@ -2544,14 +3085,27 @@ def _offline_dsp_worker(
         n_ant_used = int(n_ant_data)
         n_bins_total = int(range_fft_data.shape[-1])
         dr_m = float(c_m_s) * float(fs_hz) / (2.0 * float(slope_hz_s) * float(nfft_range))
-        home_viewport = build_display_viewport(
-            x_min_m=float(map_bounds.x_min_m),
-            x_max_m=float(map_bounds.x_max_m),
-            y_min_m=float(map_bounds.y_min_m),
-            y_max_m=float(map_bounds.y_max_m),
-            dr_m=float(dr_m),
-            seq=0,
-        )
+        if geometry_mode == "cylindrical_regular":
+            assert cylindrical_view is not None
+            section_x_min, section_x_max, section_y_min, section_y_max = cylindrical_section_bounds(
+                cylindrical_view
+            )
+            home_viewport = _build_cylindrical_section_viewport(
+                x_min_m=float(section_x_min),
+                x_max_m=float(section_x_max),
+                y_min_m=float(section_y_min),
+                y_max_m=float(section_y_max),
+                seq=0,
+            )
+        else:
+            home_viewport = build_display_viewport(
+                x_min_m=float(map_bounds.x_min_m),
+                x_max_m=float(map_bounds.x_max_m),
+                y_min_m=float(map_bounds.y_min_m),
+                y_max_m=float(map_bounds.y_max_m),
+                dr_m=float(dr_m),
+                seq=0,
+            )
         applied_viewport = home_viewport
 
         pos_f = positions.astype(np.float32, copy=False)
@@ -2606,6 +3160,16 @@ def _offline_dsp_worker(
                         "z_m": float(cylindrical_plane.z_m),
                     }
                 ),
+                "cylindrical_view": (
+                    None
+                    if cylindrical_view is None
+                    else cylindrical_view_to_dict(cylindrical_view)
+                ),
+                "cylindrical_summary": (
+                    None
+                    if cylindrical_summary is None
+                    else cylindrical_run_summary_to_dict(cylindrical_summary)
+                ),
                 **_viewport_status_fields(applied_viewport, fallback_used=False),
             },
         )
@@ -2645,22 +3209,53 @@ def _offline_dsp_worker(
                 if cmd_type != "update":
                     continue
 
-                x_start_new = _pick(cmd.get("x_start"), x_start)
-                x_end_new = _pick(cmd.get("x_end"), x_end)
-                try:
-                    x_start = max(pos_min, min(pos_max, int(x_start_new)))
-                    x_end = max(pos_min, min(pos_max, int(x_end_new)))
-                except Exception:
-                    pass
-                if x_end < x_start:
-                    x_start, x_end = x_end, x_start
-                viewport_new = _viewport_from_cmd_payload(
-                    cmd.get("viewport"),
-                    home_viewport=home_viewport,
-                    output_width=int(gui_w),
-                    output_height=int(gui_h),
-                    dr_m=float(dr_m),
-                )
+                if geometry_mode == "cylindrical_regular":
+                    assert cylindrical_view is not None and cylindrical_summary is not None
+                    section_raw = cmd.get("cylindrical_section")
+                    if section_raw is not None:
+                        if not isinstance(section_raw, CylindricalSection):
+                            raise ValueError("cylindrical_section non valida nel comando runtime")
+                        validate_cylindrical_section(cylindrical_view, cylindrical_summary, section_raw)
+                        cylindrical_view = replace(cylindrical_view, section=section_raw)
+                        section_x_min, section_x_max, section_y_min, section_y_max = cylindrical_section_bounds(
+                            cylindrical_view
+                        )
+                        home_viewport = _build_cylindrical_section_viewport(
+                            x_min_m=float(section_x_min),
+                            x_max_m=float(section_x_max),
+                            y_min_m=float(section_y_min),
+                            y_max_m=float(section_y_max),
+                            seq=int(applied_viewport.seq) + 1,
+                        )
+                        # A changed orientation has a different physical
+                        # domain; default to its full configured section.
+                        applied_viewport = home_viewport
+                        cylindrical_plane = cylindrical_xy_plane_if_active(cylindrical_view)
+                else:
+                    x_start_new = _pick(cmd.get("x_start"), x_start)
+                    x_end_new = _pick(cmd.get("x_end"), x_end)
+                    try:
+                        x_start = max(pos_min, min(pos_max, int(x_start_new)))
+                        x_end = max(pos_min, min(pos_max, int(x_end_new)))
+                    except Exception:
+                        pass
+                    if x_end < x_start:
+                        x_start, x_end = x_end, x_start
+                if geometry_mode == "cylindrical_regular":
+                    viewport_new = _cylindrical_viewport_from_cmd_payload(
+                        cmd.get("viewport"),
+                        home_viewport=home_viewport,
+                        output_width=int(gui_w),
+                        output_height=int(gui_h),
+                    )
+                else:
+                    viewport_new = _viewport_from_cmd_payload(
+                        cmd.get("viewport"),
+                        home_viewport=home_viewport,
+                        output_width=int(gui_w),
+                        output_height=int(gui_h),
+                        dr_m=float(dr_m),
+                    )
                 if viewport_new is not None:
                     applied_viewport = viewport_new
                 dirty = True
@@ -2672,6 +3267,11 @@ def _offline_dsp_worker(
                 str(algorithm),
                 int(x_start),
                 int(x_end),
+                (
+                    None
+                    if cylindrical_view is None
+                    else (str(cylindrical_view.section.plane), float(cylindrical_view.section.coordinate_m))
+                ),
                 display_viewport_signature(applied_viewport),
             )
             if dirty or job_key != last_job_key or got_cmd:
@@ -2684,38 +3284,50 @@ def _offline_dsp_worker(
                     # every pose in acquisition order.
                     sel_idx = np.arange(int(positions.size), dtype=np.intp)
                     sel_key = tuple(int(value) for value in sel_idx.tolist())
-                    assert cylindrical_plane is not None
+                    assert cylindrical_view is not None
                     assert tx_global_m is not None and rx_global_m is not None
                     grid_key = (
-                        "cylindrical_plane",
-                        float(cylindrical_plane.x_min_m),
-                        float(cylindrical_plane.x_max_m),
-                        float(cylindrical_plane.y_min_m),
-                        float(cylindrical_plane.y_max_m),
-                        float(cylindrical_plane.z_m),
+                        "cylindrical_section",
+                        str(cylindrical_view.section.plane),
+                        float(cylindrical_view.section.coordinate_m),
+                        display_viewport_signature(applied_viewport),
                         int(gui_h),
                         int(gui_w),
                     )
                     if grid_cache_key == grid_key and grid_cache is not None:
                         voxel_xyz = grid_cache
                     else:
-                        x_axis = np.linspace(
-                            float(cylindrical_plane.x_min_m),
-                            float(cylindrical_plane.x_max_m),
+                        horizontal_axis = np.linspace(
+                            float(applied_viewport.x_min_m),
+                            float(applied_viewport.x_max_m),
                             int(gui_w),
                             dtype=np.float32,
                         )
-                        y_axis = np.linspace(
-                            float(cylindrical_plane.y_min_m),
-                            float(cylindrical_plane.y_max_m),
+                        vertical_axis = np.linspace(
+                            float(applied_viewport.y_min_m),
+                            float(applied_viewport.y_max_m),
                             int(gui_h),
                             dtype=np.float32,
                         )
-                        voxel_xyz = xy_plane_voxel_grid(
-                            x_axis,
-                            y_axis,
-                            z_m=float(cylindrical_plane.z_m),
-                        ).astype(np.float32, copy=False)
+                        if cylindrical_view.section.plane == "xy":
+                            voxel_xyz = xy_plane_voxel_grid(
+                                horizontal_axis,
+                                vertical_axis,
+                                z_m=float(cylindrical_view.section.coordinate_m),
+                            )
+                        elif cylindrical_view.section.plane == "xz":
+                            voxel_xyz = xz_plane_voxel_grid(
+                                horizontal_axis,
+                                vertical_axis,
+                                y_m=float(cylindrical_view.section.coordinate_m),
+                            )
+                        else:
+                            voxel_xyz = yz_plane_voxel_grid(
+                                horizontal_axis,
+                                vertical_axis,
+                                x_m=float(cylindrical_view.section.coordinate_m),
+                            )
+                        voxel_xyz = voxel_xyz.astype(np.float32, copy=False)
                         grid_cache_key = grid_key
                         grid_cache = voxel_xyz
 
@@ -2734,7 +3346,7 @@ def _offline_dsp_worker(
                         chunk_size=16384,
                     )
                     img_db = _power_image_to_db(power)
-                    frame_meta["cylindrical_plane"] = cylindrical_plane
+                    frame_meta["cylindrical_view"] = cylindrical_view
                     doppler_bins_used = 1
                 else:
                     sel_mask = (positions >= int(x_start)) & (positions <= int(x_end))
@@ -2943,6 +3555,16 @@ def _offline_dsp_worker(
                                 "y_max_m": float(cylindrical_plane.y_max_m),
                                 "z_m": float(cylindrical_plane.z_m),
                             }
+                        ),
+                        "cylindrical_view": (
+                            None
+                            if cylindrical_view is None
+                            else cylindrical_view_to_dict(cylindrical_view)
+                        ),
+                        "cylindrical_summary": (
+                            None
+                            if cylindrical_summary is None
+                            else cylindrical_run_summary_to_dict(cylindrical_summary)
                         ),
                         "elapsed_ms": float((t1 - t0) * 1000.0),
                         **_viewport_status_fields(applied_viewport, fallback_used=False),
@@ -3220,6 +3842,7 @@ class OfflineBPRuntime:
         x_start: int | None = None,
         x_end: int | None = None,
         viewport: DisplayViewport | None = None,
+        cylindrical_section: CylindricalSection | None = None,
     ) -> None:
         if not self._started or self._cmd_q is None:
             return
@@ -3228,6 +3851,7 @@ class OfflineBPRuntime:
             "x_start": x_start,
             "x_end": x_end,
             "viewport": _viewport_to_cmd_payload(viewport),
+            "cylindrical_section": cylindrical_section,
         }
         self._put_latest_cmd(cmd)
 

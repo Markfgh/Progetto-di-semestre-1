@@ -478,6 +478,50 @@ def xy_plane_voxel_grid(
     return out
 
 
+def xz_plane_voxel_grid(
+    x_axis_m: Any,
+    z_axis_m: Any,
+    *,
+    y_m: float,
+) -> np.ndarray:
+    """Build a fixed-Y XZ reconstruction grid with shape ``[Z, X, 3]``.
+
+    Rows follow the vertical world ``Z`` axis and columns follow world ``X``.
+    The function only creates voxel coordinates for the generalized bistatic
+    backprojection kernel; it never creates a volumetric reconstruction.
+    """
+    x_axis = _axis_1d(x_axis_m, field_name="x_axis_m")
+    z_axis = _axis_1d(z_axis_m, field_name="z_axis_m")
+    y_value = _finite_scalar(y_m, field_name="y_m")
+    x_grid, z_grid = np.meshgrid(x_axis, z_axis, indexing="xy")
+    out = np.empty(x_grid.shape + (3,), dtype=np.float64)
+    out[..., 0] = x_grid
+    out[..., 1] = y_value
+    out[..., 2] = z_grid
+    return out
+
+
+def yz_plane_voxel_grid(
+    y_axis_m: Any,
+    z_axis_m: Any,
+    *,
+    x_m: float,
+) -> np.ndarray:
+    """Build a fixed-X YZ reconstruction grid with shape ``[Z, Y, 3]``.
+
+    Rows follow the vertical world ``Z`` axis and columns follow world ``Y``.
+    """
+    y_axis = _axis_1d(y_axis_m, field_name="y_axis_m")
+    z_axis = _axis_1d(z_axis_m, field_name="z_axis_m")
+    x_value = _finite_scalar(x_m, field_name="x_m")
+    y_grid, z_grid = np.meshgrid(y_axis, z_axis, indexing="xy")
+    out = np.empty(y_grid.shape + (3,), dtype=np.float64)
+    out[..., 0] = x_value
+    out[..., 1] = y_grid
+    out[..., 2] = z_grid
+    return out
+
+
 def xyz_volume_voxel_grid(
     x_axis_m: Any,
     y_axis_m: Any,
@@ -506,5 +550,7 @@ __all__ = [
     "default_iwr1443_2tx4rx_geometry",
     "transform_element_coordinates",
     "xy_plane_voxel_grid",
+    "xz_plane_voxel_grid",
+    "yz_plane_voxel_grid",
     "xyz_volume_voxel_grid",
 ]

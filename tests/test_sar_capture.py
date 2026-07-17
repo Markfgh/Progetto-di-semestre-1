@@ -136,6 +136,40 @@ def test_manual_yaml_scalar_update_preserves_comments_and_nested_structure(tmp_p
     assert "x_pitch_m: 0.01 # 10 mm pitch" in saved_text
 
 
+def test_yaml_scalar_update_materializes_v2_view_without_removing_legacy_plane(tmp_path: Path) -> None:
+    config_path = tmp_path / "offline_config.yaml"
+    config_path.write_text(
+        "data:\n  input_dir: logs\n"
+        "reconstruction:\n"
+        "  cylindrical_plane:\n"
+        "    x_min_m: -1.0\n    x_max_m: 1.0\n"
+        "    y_min_m: -1.0\n    y_max_m: 1.0\n    z_m: 0.2\n",
+        encoding="utf-8",
+    )
+
+    main_refactory._update_existing_yaml_scalar_paths(
+        config_path,
+        {
+            "data.input_dir": "logs/run_v2",
+            "reconstruction.cylindrical_view.bounds.x_min_m": -0.5,
+            "reconstruction.cylindrical_view.bounds.x_max_m": 0.5,
+            "reconstruction.cylindrical_view.bounds.y_min_m": -0.4,
+            "reconstruction.cylindrical_view.bounds.y_max_m": 0.4,
+            "reconstruction.cylindrical_view.section.plane": "xy",
+            "reconstruction.cylindrical_view.section.coordinate_m": 0.2,
+        },
+    )
+
+    saved = main_refactory.yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert saved["data"]["input_dir"] == "logs/run_v2"
+    assert saved["reconstruction"]["cylindrical_plane"]["z_m"] == pytest.approx(0.2)
+    assert saved["reconstruction"]["cylindrical_view"]["bounds"]["y_min_m"] == pytest.approx(-0.4)
+    assert saved["reconstruction"]["cylindrical_view"]["section"] == {
+        "plane": "xy",
+        "coordinate_m": 0.2,
+    }
+
+
 def test_cylindrical_run_updates_only_offline_directory_and_required_frame_count(tmp_path: Path) -> None:
     config_path = tmp_path / "offline_config.yaml"
     config_path.write_text(
