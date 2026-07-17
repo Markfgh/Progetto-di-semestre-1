@@ -2,41 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import time
-import warnings
-from typing import Any, Literal
+from typing import Any
 
 import numpy as np
-
-AvgMode = Literal["none", "loop", "frame", "both"]
-BpMode = Literal["sar_only", "mimo_sar"]
-MotionMode = Literal["static_zero_doppler"]
-
-_AVG_MODES = {"none", "loop", "frame", "both"}
-_BP_MODES = {"sar_only", "mimo_sar"}
-_MOTION_MODES = {"static_zero_doppler"}
-
-
-@dataclass(frozen=True)
-class MimoBackProjectionPlanEntry:
-    pos_i: int
-    ant_i: int
-    valid_idx: np.ndarray
-    bin_float: np.ndarray
-    coherent_phase: np.ndarray
-
-
-@dataclass(frozen=True)
-class MimoBackProjectionPlan:
-    image_shape: tuple[int, int]
-    n_pos: int
-    n_ant: int
-    max_bin_eff: int
-    dr_m: float
-    fc_hz: float
-    c_m_s: float
-    phase_sign: int
-    entries: tuple[MimoBackProjectionPlanEntry, ...]
-
 
 @dataclass(frozen=True)
 class SyntheticApertureData:
@@ -44,30 +12,6 @@ class SyntheticApertureData:
     x_position_m: np.ndarray
     x_phase_center_m: np.ndarray
     x_element_m: np.ndarray
-
-
-def avg_mode_normalize(mode: str | None) -> AvgMode:
-    mode_s = str(mode or "both").strip().lower()
-    if mode_s not in _AVG_MODES:
-        return "both"
-    return mode_s  # type: ignore[return-value]
-
-
-def bp_mode_normalize(mode: str | None) -> BpMode:
-    mode_s = str(mode or "sar_only").strip().lower()
-    if mode_s not in _BP_MODES:
-        return "sar_only"
-    return mode_s  # type: ignore[return-value]
-
-
-def motion_mode_normalize(mode: str | None) -> MotionMode:
-    mode_s = str(mode or "static_zero_doppler").strip().lower()
-    if mode_s not in _MOTION_MODES:
-        raise ValueError(
-            "motion_mode non valido per mimo_sar: "
-            f"{mode!r}. Valore supportato: 'static_zero_doppler'."
-        )
-    return mode_s  # type: ignore[return-value]
 
 
 def phase_sign_normalize(value: Any, *, field_name: str = "phase_sign") -> int:
@@ -80,83 +24,12 @@ def phase_sign_normalize(value: Any, *, field_name: str = "phase_sign") -> int:
     return int(phase_sign_i)
 
 
-def _image_to_db(img_lin: np.ndarray) -> np.ndarray:
-    out = np.asarray(img_lin, dtype=np.float32).copy()
-    np.add(out, np.float32(1e-6), out=out)
-    np.log10(out, out=out)
-    out *= np.float32(20.0)
-    return out.astype(np.float32, copy=False)
-
-
 def power_image_to_db(img_power: np.ndarray) -> np.ndarray:
     out = np.asarray(img_power, dtype=np.float32).copy()
     np.add(out, np.float32(1e-12), out=out)
     np.log10(out, out=out)
     out *= np.float32(10.0)
     return out.astype(np.float32, copy=False)
-
-
-def build_virtual_array_x_offsets(
-    virtual_antennas: int,
-    *,
-    pitch_m: float,
-    use_virtual_antennas: bool = True,
-) -> np.ndarray:
-    """Deprecated legacy phase-center helper.
-
-    MIMO-SAR processing uses the physical bistatic TX/RX geometry from
-    build_mimo_geometry(); this helper is kept only for older SAR-only callers.
-    """
-    warnings.warn(
-        "build_virtual_array_x_offsets is deprecated for MIMO-SAR; use build_mimo_geometry "
-        "and phase centers 0.5 * (x_tx + x_rx) instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    n_ant = int(virtual_antennas)
-    if n_ant <= 0:
-        raise ValueError(f"virtual_antennas deve essere > 0, trovato: {virtual_antennas!r}")
-    if not bool(use_virtual_antennas):
-        return np.zeros(n_ant, dtype=np.float32)
-
-    pitch = float(pitch_m)
-    if pitch <= 0.0:
-        raise ValueError(f"pitch_m deve essere > 0, trovato: {pitch_m!r}")
-
-    idx = np.arange(n_ant, dtype=np.float32) - np.float32(0.5 * (n_ant - 1))
-    return (idx * np.float32(pitch)).astype(np.float32, copy=False)
-
-
-def reduce_avg_mode(range_fft: np.ndarray, avg_mode: AvgMode) -> np.ndarray:
-    if range_fft.ndim == 4:
-        if avg_mode == "both":
-            out = range_fft.mean(axis=(1, 2), dtype=np.complex64)
-            return out[:, np.newaxis, :].astype(np.complex64, copy=False)
-        if avg_mode == "frame":
-            out = range_fft.mean(axis=1, dtype=np.complex64)
-            return out.astype(np.complex64, copy=False)
-        if avg_mode == "loop":
-            out = range_fft.mean(axis=2, dtype=np.complex64)
-            return out.astype(np.complex64, copy=False)
-
-        n_pos, n_frames, n_loops, n_bins = range_fft.shape
-        return range_fft.reshape(n_pos, n_frames * n_loops, n_bins)
-
-    if range_fft.ndim == 5:
-        if avg_mode == "both":
-            out = range_fft.mean(axis=(1, 2), dtype=np.complex64)
-            return out[:, np.newaxis, :, :].astype(np.complex64, copy=False)
-        if avg_mode == "frame":
-            out = range_fft.mean(axis=1, dtype=np.complex64)
-            return out.astype(np.complex64, copy=False)
-        if avg_mode == "loop":
-            out = range_fft.mean(axis=2, dtype=np.complex64)
-            return out.astype(np.complex64, copy=False)
-
-        n_pos, n_frames, n_loops, n_ant, n_bins = range_fft.shape
-        return range_fft.reshape(n_pos, n_frames * n_loops, n_ant, n_bins)
-
-    raise ValueError(f"range_fft shape non valido: {range_fft.shape!r}")
 
 
 def _parse_offsets(
@@ -302,144 +175,9 @@ def _build_doppler_window(window_doppler: np.ndarray | None, n_loops: int) -> np
     return win.astype(np.float32, copy=False)
 
 
-def _build_doppler_bin_cycles_axis(n_doppler: int, *, doppler_fft_shift: bool = True) -> np.ndarray:
-    n_doppler_i = max(1, int(n_doppler))
-    doppler_cycles = np.fft.fftfreq(n_doppler_i, d=1.0).astype(np.float32, copy=False)
-    if doppler_fft_shift:
-        doppler_cycles = np.fft.fftshift(doppler_cycles)
-    return doppler_cycles.astype(np.float32, copy=False)
-
-
-def _apply_tdm_post_fft_compensation(doppler_cube: np.ndarray, n_tx: int) -> np.ndarray:
-    """Compensate per-TX TDM phase after the loop FFT.
-
-    This keeps static energy at zero-Doppler and only aligns TX phases for each
-    already-estimated Doppler bin. Input shape: [pos, frames, doppler, tx, rx, bins].
-    """
-    n_doppler = int(doppler_cube.shape[2])
-    n_tx_i = int(n_tx)
-    if n_doppler <= 0 or n_tx_i <= 1:
-        return doppler_cube.astype(np.complex64, copy=False)
-
-    out = np.asarray(doppler_cube, dtype=np.complex64)
-    doppler_cycles = _build_doppler_bin_cycles_axis(n_doppler, doppler_fft_shift=True)
-    tx_delay_in_loops = (np.arange(n_tx_i, dtype=np.float32) / np.float32(n_tx_i)).astype(
-        np.float32,
-        copy=False,
-    )
-    phase = np.exp(
-        (-1j * np.float32(2.0 * np.pi))
-        * doppler_cycles[:, None].astype(np.float64, copy=False)
-        * tx_delay_in_loops[None, :].astype(np.float64, copy=False)
-    ).astype(np.complex64, copy=False)
-    phase[:, 0] = np.complex64(1.0 + 0.0j)
-    out *= phase.reshape(1, 1, n_doppler, n_tx_i, 1, 1)
-    return out.astype(np.complex64, copy=False)
-
-
-def build_mimo_back_projection_plan(
-    x_pos_m: np.ndarray,
-    x_tx_ant_m: np.ndarray,
-    x_rx_ant_m: np.ndarray,
-    x_grid: np.ndarray,
-    y_grid: np.ndarray,
-    *,
-    dr_m: float,
-    fc_hz: float,
-    c_m_s: float,
-    max_bin: int,
-    phase_sign: int = -1,
-) -> MimoBackProjectionPlan:
-    if x_pos_m.ndim != 1:
-        raise ValueError(f"x_pos_m shape non valido: {x_pos_m.shape!r}")
-    if x_tx_ant_m.ndim != 1 or x_rx_ant_m.ndim != 1:
-        raise ValueError("x_tx_ant_m e x_rx_ant_m devono essere vettori 1D")
-    if x_tx_ant_m.size != x_rx_ant_m.size:
-        raise ValueError("x_tx_ant_m e x_rx_ant_m devono avere stessa size")
-    if x_grid.shape != y_grid.shape:
-        raise ValueError("x_grid e y_grid devono avere stessa shape")
-    if float(dr_m) <= 0.0:
-        raise ValueError("dr_m deve essere > 0")
-
-    phase_sign_i = phase_sign_normalize(phase_sign, field_name="phase_sign")
-    n_pos = int(x_pos_m.size)
-    n_ant = int(x_tx_ant_m.size)
-    max_bin_eff = max(0, int(max_bin))
-    if n_pos <= 0:
-        raise ValueError("Nessuna posizione selezionata per back projection")
-    if n_ant <= 0:
-        raise ValueError("Nessuna antenna selezionata per back projection")
-    if max_bin_eff < 2:
-        return MimoBackProjectionPlan(
-            image_shape=tuple(int(v) for v in x_grid.shape),
-            n_pos=n_pos,
-            n_ant=n_ant,
-            max_bin_eff=max_bin_eff,
-            dr_m=float(dr_m),
-            fc_hz=float(fc_hz),
-            c_m_s=float(c_m_s),
-            phase_sign=int(phase_sign_i),
-            entries=(),
-        )
-
-    x_flat = x_grid.reshape(-1).astype(np.float32, copy=False)
-    y_flat = y_grid.reshape(-1).astype(np.float32, copy=False)
-    y_sq = (y_flat * y_flat).astype(np.float32, copy=False)
-    k = np.float32((2.0 * np.pi * float(fc_hz)) / float(c_m_s))
-    phase_scale = np.float32(float(phase_sign_i)) * k
-    inv_dr = np.float32(1.0 / float(dr_m))
-    entries: list[MimoBackProjectionPlanEntry] = []
-
-    for pos_i in range(n_pos):
-        x_pos = np.float32(x_pos_m[pos_i])
-        for ant_i in range(n_ant):
-            x_tx = x_pos + np.float32(x_tx_ant_m[ant_i])
-            x_rx = x_pos + np.float32(x_rx_ant_m[ant_i])
-
-            dx_tx = x_flat - x_tx
-            dx_rx = x_flat - x_rx
-            r_tx = np.sqrt(dx_tx * dx_tx + y_sq).astype(np.float32, copy=False)
-            r_rx = np.sqrt(dx_rx * dx_rx + y_sq).astype(np.float32, copy=False)
-            r_total = (r_tx + r_rx).astype(np.float32, copy=False)
-            b = (np.float32(0.5) * r_total * inv_dr).astype(np.float32, copy=False)
-
-            valid = np.isfinite(b) & (b >= 0.0) & (b < np.float32(max_bin_eff - 1))
-            valid_idx = np.flatnonzero(valid)
-            if valid_idx.size == 0:
-                continue
-
-            b_valid = b[valid_idx].astype(np.float32, copy=True)
-            phase_valid = np.exp(1j * (phase_scale * r_total[valid_idx])).astype(
-                np.complex64,
-                copy=False,
-            )
-            entries.append(
-                MimoBackProjectionPlanEntry(
-                    pos_i=int(pos_i),
-                    ant_i=int(ant_i),
-                    valid_idx=valid_idx.astype(np.int32, copy=False),
-                    bin_float=b_valid,
-                    coherent_phase=phase_valid,
-                )
-            )
-
-    return MimoBackProjectionPlan(
-        image_shape=tuple(int(v) for v in x_grid.shape),
-        n_pos=n_pos,
-        n_ant=n_ant,
-        max_bin_eff=max_bin_eff,
-        dr_m=float(dr_m),
-        fc_hz=float(fc_hz),
-        c_m_s=float(c_m_s),
-        phase_sign=int(phase_sign_i),
-        entries=tuple(entries),
-    )
-
-
 def prepare_mimo_snapshots(
     raw_range_fft: np.ndarray,
     n_tx: int,
-    motion_mode: MotionMode,
     window_doppler: np.ndarray | None = None,
     log_info: bool = True,
 ) -> np.ndarray:
@@ -460,7 +198,6 @@ def prepare_mimo_snapshots(
     if int(n_tx_eff) != n_tx_i:
         raise ValueError(f"raw_range_fft asse tx={n_tx_eff}, atteso n_tx={n_tx_i}")
 
-    motion_mode_normalize(motion_mode)
     win = _build_doppler_window(window_doppler, int(n_loops))
     t0 = time.perf_counter()
 
@@ -486,7 +223,7 @@ def prepare_mimo_snapshots(
     if bool(log_info):
         print(
             "[OFFLINE INFO] prepare_mimo_snapshots "
-            "motion_mode=static_zero_doppler doppler_bins_used=1 "
+            "doppler_bins_used=1 "
             f"prep_ms={float(prep_ms):.1f} est_bp_snapshots={est_bp_snapshots}"
         )
     return out
@@ -506,16 +243,13 @@ def back_projection_power_mimo_frames(
     max_bin: int,
     phase_sign: int = -1,
     chunk_size: int = 16384,
-    coherent_sum: bool = True,
 ) -> np.ndarray:
-    """Backproject every frame while computing bistatic geometry only once.
+    """Coherently backproject every frame while computing geometry only once.
 
     Input shape is ``[position, frame, antenna, range_bin]``.  ``x_grid`` and
     ``y_grid`` may have any common two-dimensional shape: their shape is the
     output image resolution and is independent of ``max_bin`` and the FFT
-    length that produced the snapshots.  The legacy path called the
-    single-frame implementation repeatedly and retained a very large geometry
-    plan.  This bounded-memory implementation keeps only one complex image
+    length that produced the snapshots. This bounded-memory implementation keeps only one complex image
     accumulator per frame and reuses each geometry chunk across those frames.
     """
     snapshots = np.asarray(snapshot_frame_ant_range, dtype=np.complex64)
@@ -548,12 +282,7 @@ def back_projection_power_mimo_frames(
     phase_scale = np.float32(float(phase_sign_i)) * k
     inv_dr = np.float32(1.0 / float(dr_m))
     chunk_n = max(1, int(chunk_size))
-    coherent = bool(coherent_sum)
-
-    if coherent:
-        frame_acc = np.zeros((n_frames, int(x_flat.size)), dtype=np.complex64)
-    else:
-        total_power = np.zeros(int(x_flat.size), dtype=np.float32)
+    frame_acc = np.zeros((n_frames, int(x_flat.size)), dtype=np.complex64)
 
     for pos_i in range(n_pos):
         x_pos = np.float32(x_pos_m[pos_i])
@@ -576,30 +305,21 @@ def back_projection_power_mimo_frames(
                 if idx.size == 0:
                     continue
                 bins = b[idx]
-                phase = None
-                if coherent:
-                    phase = np.exp(1j * (phase_scale * r_total[idx])).astype(np.complex64, copy=False)
+                phase = np.exp(1j * (phase_scale * r_total[idx])).astype(np.complex64, copy=False)
                 for frame_i in range(n_frames):
                     interp = _interp_cubic_complex(
                         snapshots[pos_i, frame_i, ant_i],
                         bins,
                         max_bin_eff,
                     )
-                    if coherent:
-                        frame_acc[frame_i, idx] += interp * phase
-                    else:
-                        total_power[idx] += (
-                            interp.real.astype(np.float32, copy=False) ** np.float32(2.0)
-                            + interp.imag.astype(np.float32, copy=False) ** np.float32(2.0)
-                        )
+                    frame_acc[frame_i, idx] += interp * phase
 
-    if coherent:
-        total_power = np.sum(
-            frame_acc.real.astype(np.float32, copy=False) ** np.float32(2.0)
-            + frame_acc.imag.astype(np.float32, copy=False) ** np.float32(2.0),
-            axis=0,
-            dtype=np.float32,
-        )
+    total_power = np.sum(
+        frame_acc.real.astype(np.float32, copy=False) ** np.float32(2.0)
+        + frame_acc.imag.astype(np.float32, copy=False) ** np.float32(2.0),
+        axis=0,
+        dtype=np.float32,
+    )
     return total_power.reshape(x_grid.shape).astype(np.float32, copy=False)
 
 
@@ -685,231 +405,6 @@ def synthetic_aperture_uniform_spacing_lambda(
     return float(ref)
 
 
-def back_projection_image(
-    range_fft_sel: np.ndarray,
-    x_pos_m: np.ndarray,
-    x_grid: np.ndarray,
-    y_grid: np.ndarray,
-    *,
-    dr_m: float,
-    fc_hz: float,
-    c_m_s: float,
-    max_bin: int,
-    phase_sign: int = -1,
-    chunk_size: int = 16384,
-) -> np.ndarray:
-    if range_fft_sel.ndim != 3:
-        raise ValueError(f"range_fft_sel shape non valido: {range_fft_sel.shape!r}")
-    if x_pos_m.ndim != 1:
-        raise ValueError(f"x_pos_m shape non valido: {x_pos_m.shape!r}")
-    if x_grid.shape != y_grid.shape:
-        raise ValueError("x_grid e y_grid devono avere stessa shape")
-    if float(dr_m) <= 0.0:
-        raise ValueError("dr_m deve essere > 0")
-    phase_sign_i = phase_sign_normalize(phase_sign, field_name="phase_sign")
-
-    n_pos = int(range_fft_sel.shape[0])
-    if n_pos <= 0:
-        raise ValueError("Nessuna posizione selezionata per back projection")
-    if x_pos_m.size != n_pos:
-        raise ValueError("x_pos_m size != numero posizioni range_fft_sel")
-
-    x_flat = x_grid.reshape(-1).astype(np.float32, copy=False)
-    y_flat = y_grid.reshape(-1).astype(np.float32, copy=False)
-    y_sq = (y_flat * y_flat).astype(np.float32, copy=False)
-    img_flat = np.zeros(x_flat.shape[0], dtype=np.complex64)
-    k = np.float32((4.0 * np.pi * float(fc_hz)) / float(c_m_s))
-    phase_scale = np.float32(float(phase_sign_i)) * k
-    inv_dr = np.float32(1.0 / float(dr_m))
-    n_bins_avail = int(range_fft_sel.shape[2])
-    max_bin_eff = max(0, min(int(max_bin), n_bins_avail))
-    if max_bin_eff < 2:
-        img_mag = np.abs(img_flat).reshape(x_grid.shape).astype(np.float32, copy=False)
-        return _image_to_db(img_mag)
-    chunk_n = max(1, int(chunk_size))
-
-    for pos_i in range(n_pos):
-        dx = x_flat - np.float32(x_pos_m[pos_i])
-        rr = np.sqrt(dx * dx + y_sq).astype(np.float32, copy=False)
-        b = rr * inv_dr
-        valid = np.isfinite(b) & (b >= 0.0) & (b < np.float32(max_bin_eff - 1))
-        valid_idx = np.flatnonzero(valid)
-        if valid_idx.size == 0:
-            continue
-
-        spec = range_fft_sel[pos_i]
-        if spec.ndim != 2 or spec.shape[0] <= 0:
-            continue
-        s_mean = spec.mean(axis=0, dtype=np.complex64)
-        max_bin_local = min(int(s_mean.size), int(max_bin_eff))
-        if max_bin_local < 2:
-            continue
-
-        for start in range(0, int(valid_idx.size), chunk_n):
-            idx = valid_idx[start : start + chunk_n]
-            if idx.size == 0:
-                continue
-            s_interp = _interp_cubic_complex(s_mean, b[idx], max_bin_local)
-            phase = np.exp(1j * (phase_scale * rr[idx])).astype(np.complex64, copy=False)
-            img_flat[idx] += s_interp * phase
-
-    img_mag = np.abs(img_flat).reshape(x_grid.shape).astype(np.float32, copy=False)
-    return _image_to_db(img_mag)
-
-
-def back_projection_power_mimo_snapshot(
-    snapshot_ant_range: np.ndarray,
-    x_pos_m: np.ndarray,
-    x_tx_ant_m: np.ndarray,
-    x_rx_ant_m: np.ndarray,
-    x_grid: np.ndarray,
-    y_grid: np.ndarray,
-    *,
-    dr_m: float,
-    fc_hz: float,
-    c_m_s: float,
-    max_bin: int,
-    phase_sign: int = -1,
-    chunk_size: int = 16384,
-    coherent_sum: bool = True,
-    bp_plan: MimoBackProjectionPlan | None = None,
-) -> np.ndarray:
-    if snapshot_ant_range.ndim != 3:
-        raise ValueError(f"snapshot_ant_range shape non valido: {snapshot_ant_range.shape!r}")
-    if x_pos_m.ndim != 1:
-        raise ValueError(f"x_pos_m shape non valido: {x_pos_m.shape!r}")
-    if x_tx_ant_m.ndim != 1 or x_rx_ant_m.ndim != 1:
-        raise ValueError("x_tx_ant_m e x_rx_ant_m devono essere vettori 1D")
-    if x_grid.shape != y_grid.shape:
-        raise ValueError("x_grid e y_grid devono avere stessa shape")
-    if float(dr_m) <= 0.0:
-        raise ValueError("dr_m deve essere > 0")
-    phase_sign_i = phase_sign_normalize(phase_sign, field_name="phase_sign")
-
-    n_pos, n_ant, n_bins_avail = snapshot_ant_range.shape
-    if n_pos <= 0:
-        raise ValueError("Nessuna posizione selezionata per back projection")
-    if x_pos_m.size != n_pos:
-        raise ValueError("x_pos_m size != numero posizioni snapshot_ant_range")
-    if x_tx_ant_m.size != n_ant or x_rx_ant_m.size != n_ant:
-        raise ValueError("x_tx_ant_m/x_rx_ant_m size != numero antenne snapshot_ant_range")
-
-    x_flat = x_grid.reshape(-1).astype(np.float32, copy=False)
-    y_flat = y_grid.reshape(-1).astype(np.float32, copy=False)
-    y_sq = (y_flat * y_flat).astype(np.float32, copy=False)
-    k = np.float32((2.0 * np.pi * float(fc_hz)) / float(c_m_s))
-    phase_scale = np.float32(float(phase_sign_i)) * k
-    inv_dr = np.float32(1.0 / float(dr_m))
-    max_bin_eff = max(0, min(int(max_bin), int(n_bins_avail)))
-    if max_bin_eff < 2:
-        return np.zeros_like(x_grid, dtype=np.float32)
-    chunk_n = max(1, int(chunk_size))
-    coherent = bool(coherent_sum)
-
-    if coherent:
-        img_flat_c = np.zeros(x_flat.shape[0], dtype=np.complex64)
-    else:
-        img_flat_f = np.zeros(x_flat.shape[0], dtype=np.float32)
-
-    if (
-        bp_plan is not None
-        and tuple(int(v) for v in bp_plan.image_shape) == tuple(int(v) for v in x_grid.shape)
-        and int(bp_plan.n_pos) == int(n_pos)
-        and int(bp_plan.n_ant) == int(n_ant)
-        and int(bp_plan.max_bin_eff) == int(max_bin_eff)
-        and int(bp_plan.phase_sign) == int(phase_sign_i)
-        and np.isclose(float(bp_plan.dr_m), float(dr_m), rtol=0.0, atol=1e-12)
-        and np.isclose(float(bp_plan.fc_hz), float(fc_hz), rtol=0.0, atol=1e-3)
-        and np.isclose(float(bp_plan.c_m_s), float(c_m_s), rtol=0.0, atol=1e-3)
-    ):
-        for entry in bp_plan.entries:
-            pos_i = int(entry.pos_i)
-            ant_i = int(entry.ant_i)
-            if pos_i < 0 or pos_i >= n_pos or ant_i < 0 or ant_i >= n_ant:
-                continue
-            spec = snapshot_ant_range[pos_i, ant_i]
-            if int(spec.size) < int(max_bin_eff):
-                continue
-
-            valid_idx = np.asarray(entry.valid_idx, dtype=np.int32)
-            b_valid = np.asarray(entry.bin_float, dtype=np.float32)
-            if valid_idx.size != b_valid.size:
-                continue
-            phase_valid = np.asarray(entry.coherent_phase, dtype=np.complex64)
-            if coherent and phase_valid.size != b_valid.size:
-                continue
-
-            for start in range(0, int(valid_idx.size), chunk_n):
-                stop = start + chunk_n
-                idx = valid_idx[start:stop]
-                if idx.size == 0:
-                    continue
-                s_interp = _interp_cubic_complex(spec, b_valid[start:stop], max_bin_eff)
-                if coherent:
-                    img_flat_c[idx] += s_interp * phase_valid[start:stop]
-                else:
-                    img_flat_f[idx] += (
-                        s_interp.real.astype(np.float32, copy=False) ** np.float32(2.0)
-                        + s_interp.imag.astype(np.float32, copy=False) ** np.float32(2.0)
-                    )
-
-        if coherent:
-            img_lin = (
-                img_flat_c.real.astype(np.float32, copy=False) ** np.float32(2.0)
-                + img_flat_c.imag.astype(np.float32, copy=False) ** np.float32(2.0)
-            )
-        else:
-            img_lin = img_flat_f.astype(np.float32, copy=False)
-        return img_lin.reshape(x_grid.shape).astype(np.float32, copy=False)
-
-    for pos_i in range(n_pos):
-        x_pos = np.float32(x_pos_m[pos_i])
-        for ant_i in range(n_ant):
-            x_tx = x_pos + np.float32(x_tx_ant_m[ant_i])
-            x_rx = x_pos + np.float32(x_rx_ant_m[ant_i])
-
-            dx_tx = x_flat - x_tx
-            dx_rx = x_flat - x_rx
-            r_tx = np.sqrt(dx_tx * dx_tx + y_sq).astype(np.float32, copy=False)
-            r_rx = np.sqrt(dx_rx * dx_rx + y_sq).astype(np.float32, copy=False)
-            r_total = (r_tx + r_rx).astype(np.float32, copy=False)
-            r_eq = (np.float32(0.5) * r_total).astype(np.float32, copy=False)
-            b = r_eq * inv_dr
-
-            valid = np.isfinite(b) & (b >= 0.0) & (b < np.float32(max_bin_eff - 1))
-            valid_idx = np.flatnonzero(valid)
-            if valid_idx.size == 0:
-                continue
-
-            spec = snapshot_ant_range[pos_i, ant_i]
-            max_bin_local = min(int(spec.size), int(max_bin_eff))
-            if max_bin_local < 2:
-                continue
-
-            for start in range(0, int(valid_idx.size), chunk_n):
-                idx = valid_idx[start : start + chunk_n]
-                if idx.size == 0:
-                    continue
-                s_interp = _interp_cubic_complex(spec, b[idx], max_bin_local)
-                if coherent:
-                    phase = np.exp(1j * (phase_scale * r_total[idx])).astype(np.complex64, copy=False)
-                    img_flat_c[idx] += s_interp * phase
-                else:
-                    img_flat_f[idx] += (
-                        s_interp.real.astype(np.float32, copy=False) ** np.float32(2.0)
-                        + s_interp.imag.astype(np.float32, copy=False) ** np.float32(2.0)
-                    )
-
-    if coherent:
-        img_lin = (
-            img_flat_c.real.astype(np.float32, copy=False) ** np.float32(2.0)
-            + img_flat_c.imag.astype(np.float32, copy=False) ** np.float32(2.0)
-        )
-    else:
-        img_lin = img_flat_f.astype(np.float32, copy=False)
-    return img_lin.reshape(x_grid.shape).astype(np.float32, copy=False)
-
-
 def back_projection_image_mimo(
     range_fft_sel: np.ndarray,
     x_pos_m: np.ndarray,
@@ -922,11 +417,8 @@ def back_projection_image_mimo(
     fc_hz: float,
     c_m_s: float,
     max_bin: int,
-    motion_mode: MotionMode,
     phase_sign: int = -1,
     chunk_size: int = 16384,
-    coherent_sum: bool = True,
-    bp_plan: MimoBackProjectionPlan | None = None,
 ) -> np.ndarray:
     """Return a dB image shaped exactly like the supplied spatial grids.
 
@@ -934,49 +426,24 @@ def back_projection_image_mimo(
     the range FFT only supplies the interpolation samples addressed by
     ``max_bin``.
     """
-    motion_mode_normalize(motion_mode)
     if range_fft_sel.ndim != 4:
         raise ValueError(
             "range_fft_sel shape non valido per mimo_sar static_zero_doppler: "
             f"{range_fft_sel.shape!r}; atteso [pos, frame, ant, bin]."
         )
 
-    if bp_plan is None:
-        total_power = back_projection_power_mimo_frames(
-            range_fft_sel,
-            x_pos_m,
-            x_tx_ant_m,
-            x_rx_ant_m,
-            x_grid,
-            y_grid,
-            dr_m=dr_m,
-            fc_hz=fc_hz,
-            c_m_s=c_m_s,
-            max_bin=max_bin,
-            phase_sign=phase_sign,
-            chunk_size=chunk_size,
-            coherent_sum=coherent_sum,
-        )
-    else:
-        # Compatibility path for callers/tests that explicitly provide an old
-        # precomputed plan.  Production offline processing no longer builds it.
-        total_power = np.zeros_like(x_grid, dtype=np.float32)
-        n_frames = int(range_fft_sel.shape[1])
-        for frame_i in range(n_frames):
-            total_power += back_projection_power_mimo_snapshot(
-                range_fft_sel[:, frame_i, :, :],
-                x_pos_m,
-                x_tx_ant_m,
-                x_rx_ant_m,
-                x_grid,
-                y_grid,
-                dr_m=dr_m,
-                fc_hz=fc_hz,
-                c_m_s=c_m_s,
-                max_bin=max_bin,
-                phase_sign=phase_sign,
-                chunk_size=chunk_size,
-                coherent_sum=coherent_sum,
-                bp_plan=bp_plan,
-            )
+    total_power = back_projection_power_mimo_frames(
+        range_fft_sel,
+        x_pos_m,
+        x_tx_ant_m,
+        x_rx_ant_m,
+        x_grid,
+        y_grid,
+        dr_m=dr_m,
+        fc_hz=fc_hz,
+        c_m_s=c_m_s,
+        max_bin=max_bin,
+        phase_sign=phase_sign,
+        chunk_size=chunk_size,
+    )
     return power_image_to_db(total_power)

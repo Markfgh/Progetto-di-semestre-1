@@ -55,8 +55,6 @@ _VALID_DISPLAY_PROJECTION_MODES = {"polar_stretched", "cartesian"}
 _VALID_DISPLAY_PROJECTION_INTERPS = {"nearest", "bilinear"}
 _VALID_DISPLAY_HEATMAP_MODES = {"power_xy", "range_angle_moving"}
 _VALID_DISPLAY_ZOOM_FALLBACK_MODES = {"baseline_projection", "cached_frame"}
-_VALID_DISPLAY_ZOOM_REALTIME_METHODS = {"auto"}
-_VALID_DISPLAY_ZOOM_OFFLINE_METHODS = {"viewport_grid"}
 _VALID_SLOW_TIME_MODES = {"none", "mean_subtraction", "highpass", "doppler_fft"}
 _VALID_THRESHOLD_MODES = {"relative", "absolute", "ca_cfar", "os_cfar"}
 _DISPLAY_ZOOM_OVER_BUDGET_RETRY_S = 0.25
@@ -251,10 +249,6 @@ class DisplayImageResolutions:
 @dataclass(frozen=True)
 class DisplayZoomConfig:
     enabled: bool = False
-    output_width: int = 128
-    output_height: int = 128
-    realtime_method: str = "auto"
-    offline_method: str = "viewport_grid"
     max_zoom_nfft_range: int = 0
     max_zoom_nfft_angle: int = 0
     max_update_hz: float = 15.0
@@ -391,13 +385,6 @@ class Detection:
 
 
 @dataclass(frozen=True)
-class VelocityXYConfig:
-    relative_power_floor_db: float = -20.0
-    median_power_floor_scale: float = 8.0
-    min_dominance_ratio: float = 0.35
-
-
-@dataclass(frozen=True)
 class RangeAngleMovingConfig:
     relative_power_floor_db: float = -12.0
     min_power_db: float = 6.0
@@ -429,7 +416,6 @@ class RealtimeDSPConfig:
     normalize_skip_range_bins: int = 0
     zero_after_range_fft_bins: int = 0
     calibration: CalibrationConfig = CalibrationConfig()
-    velocity_xy: VelocityXYConfig = field(default_factory=VelocityXYConfig)
     range_angle_moving: RangeAngleMovingConfig = field(default_factory=RangeAngleMovingConfig)
     display_zoom: DisplayZoomConfig = field(default_factory=DisplayZoomConfig)
 
@@ -556,12 +542,9 @@ def _mean_selection_from_yaml_dict(dsp: dict[str, Any], key: str, default_axes: 
     )
 
 
-def mean_selections_from_yaml_dict(cfg: dict[str, Any]) -> tuple[MeanSelection, MeanSelection]:
+def mean_before_range_fft_from_yaml_dict(cfg: dict[str, Any]) -> MeanSelection:
     dsp = cfg.get("dsp", {}) or {}
-    return (
-        _mean_selection_from_yaml_dict(dsp, "mean_before_range_fft", ("tx",)),
-        _mean_selection_from_yaml_dict(dsp, "mean_after_range_fft", ("tx",)),
-    )
+    return _mean_selection_from_yaml_dict(dsp, "mean_before_range_fft", ("tx",))
 
 
 def angle_processing_from_yaml_dict(cfg: dict[str, Any]) -> AngleProcessingConfig:
@@ -655,32 +638,9 @@ def display_projection_from_yaml_dict(cfg: dict[str, Any]) -> DisplayProjectionC
 def display_zoom_from_yaml_dict(cfg: dict[str, Any]) -> DisplayZoomConfig:
     block = cfg.get("display_zoom", {}) or {}
     fft_cfg = cfg.get("fft", {}) or {}
-    display_cfg = cfg.get("display", {}) or {}
-    radar_cfg = cfg.get("radar", {}) or {}
 
     base_nfft_range = max(1, _to_int(fft_cfg.get("nfft_range", 128), 128))
     base_nfft_angle = max(1, _to_int(fft_cfg.get("nfft_angle", 128), 128))
-    range_max_display = _to_float(display_cfg.get("range_max_m", display_cfg.get("range_max", 3.0)), 3.0)
-    if not np.isfinite(range_max_display) or range_max_display <= 0.0:
-        range_max_display = 3.0
-    c_m_s = _to_float(radar_cfg.get("c", 3.0e8), 3.0e8)
-    fs_hz = _to_float(radar_cfg.get("fs", 10.0e6), 10.0e6)
-    slope_hz_s = _to_float(radar_cfg.get("slope", 60.0e12), 60.0e12)
-    if not np.isfinite(c_m_s) or c_m_s <= 0.0 or not np.isfinite(fs_hz) or fs_hz <= 0.0 or not np.isfinite(slope_hz_s) or slope_hz_s <= 0.0:
-        dr_m = float(range_max_display / max(1, base_nfft_range // 2))
-    else:
-        dr_m = float(c_m_s * fs_hz / (2.0 * slope_hz_s * base_nfft_range))
-    if not np.isfinite(dr_m) or dr_m <= 0.0:
-        dr_m = float(range_max_display / max(1, base_nfft_range // 2))
-
-    default_height = max(1, min(base_nfft_range // 2, int(np.floor(float(range_max_display) / float(max(dr_m, 1e-9))))))
-    default_width = max(1, base_nfft_angle)
-
-    output_width = max(1, _to_int(block.get("output_width", default_width), default_width))
-    output_height = max(1, _to_int(block.get("output_height", default_height), default_height))
-
-    realtime_method = str(block.get("realtime_method", "auto") or "auto").strip().lower() or "auto"
-    offline_method = str(block.get("offline_method", "viewport_grid") or "viewport_grid").strip().lower() or "viewport_grid"
 
     max_zoom_nfft_range = max(base_nfft_range, _to_int(block.get("max_zoom_nfft_range", base_nfft_range), base_nfft_range))
     max_zoom_nfft_angle = max(base_nfft_angle, _to_int(block.get("max_zoom_nfft_angle", base_nfft_angle), base_nfft_angle))
@@ -699,10 +659,6 @@ def display_zoom_from_yaml_dict(cfg: dict[str, Any]) -> DisplayZoomConfig:
 
     return DisplayZoomConfig(
         enabled=_to_bool(block.get("enabled", False), False),
-        output_width=int(output_width),
-        output_height=int(output_height),
-        realtime_method=str(realtime_method),
-        offline_method=str(offline_method),
         max_zoom_nfft_range=int(max_zoom_nfft_range),
         max_zoom_nfft_angle=int(max_zoom_nfft_angle),
         max_update_hz=float(max_update_hz),
@@ -712,18 +668,8 @@ def display_zoom_from_yaml_dict(cfg: dict[str, Any]) -> DisplayZoomConfig:
 
 
 def display_image_resolutions_from_yaml_dict(cfg: dict[str, Any]) -> DisplayImageResolutions:
-    """Read fixed image grids without coupling them to either FFT size.
-
-    ``display.image_resolution`` is the current public configuration.  The
-    legacy ``display_zoom.output_width/output_height`` pair remains the
-    fallback for both streams so existing configurations retain their raster
-    sizes unchanged.
-    """
-    legacy = display_zoom_from_yaml_dict(cfg)
-    legacy_resolution = DisplayImageResolution(
-        width=max(1, int(legacy.output_width)),
-        height=max(1, int(legacy.output_height)),
-    )
+    """Read fixed image grids without coupling them to either FFT size."""
+    default_resolution = DisplayImageResolution()
     display_cfg = cfg.get("display", {}) or {}
     root = display_cfg.get("image_resolution", {}) if isinstance(display_cfg, dict) else {}
     root = root if isinstance(root, dict) else {}
@@ -732,8 +678,8 @@ def display_image_resolutions_from_yaml_dict(cfg: dict[str, Any]) -> DisplayImag
         block = root.get(name, {})
         block = block if isinstance(block, dict) else {}
         return DisplayImageResolution(
-            width=max(1, _to_int(block.get("width", legacy_resolution.width), legacy_resolution.width)),
-            height=max(1, _to_int(block.get("height", legacy_resolution.height), legacy_resolution.height)),
+            width=max(1, _to_int(block.get("width", default_resolution.width), default_resolution.width)),
+            height=max(1, _to_int(block.get("height", default_resolution.height), default_resolution.height)),
         )
 
     return DisplayImageResolutions(
@@ -796,44 +742,24 @@ def _loop_average_after_background_from_block(block: dict[str, Any]) -> LoopAver
     return LoopAverageConfig(enabled=bool(block.get("enabled", False)))
 
 
-def slow_time_from_yaml_dict(cfg: dict[str, Any]) -> SlowTimeConfig:
-    # Legacy compatibility wrapper: maps to the display branch filters.
-    return display_post_range_fft_filters_from_yaml_dict(cfg).slow_time
-
-
-def background_subtraction_from_yaml_dict(cfg: dict[str, Any]) -> BackgroundSubtractionConfig:
-    # Legacy compatibility wrapper: maps to the display branch filters.
-    return display_post_range_fft_filters_from_yaml_dict(cfg).background_subtraction
-
-
-def loop_average_after_background_from_yaml_dict(cfg: dict[str, Any]) -> LoopAverageConfig:
-    # Legacy compatibility wrapper: maps to the display branch filters.
-    return display_post_range_fft_filters_from_yaml_dict(cfg).loop_average_after_background
-
-
 def display_post_range_fft_filters_from_yaml_dict(cfg: dict[str, Any]) -> PostRangeFftFilterConfig:
     dsp = cfg.get("dsp", {}) or {}
     branch = dsp.get("display_filters", {}) or {}
     return PostRangeFftFilterConfig(
         mean_after_range_fft=_mean_selection_from_yaml_dict(
-            {"mean_after_range_fft": branch.get("mean_after_range_fft", dsp.get("mean_after_range_fft", {}))},
+            {"mean_after_range_fft": branch.get("mean_after_range_fft", {})},
             "mean_after_range_fft",
             ("tx",),
         ),
-        slow_time=_slow_time_from_block(branch.get("slow_time", dsp.get("slow_time", {})) or {}),
-        background_subtraction=_background_subtraction_from_block(
-            branch.get("background_subtraction", dsp.get("background_subtraction", {})) or {}
-        ),
-        loop_average_after_background=_loop_average_after_background_from_block(
-            branch.get("loop_average_after_background", dsp.get("loop_average_after_background", {})) or {}
-        ),
+        slow_time=_slow_time_from_block(branch.get("slow_time", {}) or {}),
+        background_subtraction=_background_subtraction_from_block(branch.get("background_subtraction", {}) or {}),
+        loop_average_after_background=_loop_average_after_background_from_block(branch.get("loop_average_after_background", {}) or {}),
     )
 
 
 def detection_static_post_range_fft_filters_from_yaml_dict(cfg: dict[str, Any]) -> PostRangeFftFilterConfig:
     dsp = cfg.get("dsp", {}) or {}
-    # `detection_filters` is kept as a legacy alias for backward compatibility.
-    branch = dsp.get("detection_static_filters", dsp.get("detection_filters", {})) or {}
+    branch = dsp.get("detection_static_filters", {}) or {}
     return PostRangeFftFilterConfig(
         mean_after_range_fft=_mean_selection_from_yaml_dict(
             {"mean_after_range_fft": branch.get("mean_after_range_fft", {})},
@@ -1011,40 +937,6 @@ def _to_float(value: Any, default: float) -> float:
         return float(default)
 
 
-def velocity_xy_from_yaml_dict(cfg: dict[str, Any]) -> VelocityXYConfig:
-    dsp = cfg.get("dsp", {}) or {}
-    block = dsp.get("velocity_xy", {}) or {}
-    defaults = VelocityXYConfig()
-
-    relative_power_floor_db = _to_float(
-        block.get("relative_power_floor_db", defaults.relative_power_floor_db),
-        defaults.relative_power_floor_db,
-    )
-    if not np.isfinite(relative_power_floor_db):
-        relative_power_floor_db = defaults.relative_power_floor_db
-
-    median_power_floor_scale = _to_float(
-        block.get("median_power_floor_scale", defaults.median_power_floor_scale),
-        defaults.median_power_floor_scale,
-    )
-    if not np.isfinite(median_power_floor_scale) or median_power_floor_scale < 0.0:
-        median_power_floor_scale = defaults.median_power_floor_scale
-
-    min_dominance_ratio = _to_float(
-        block.get("min_dominance_ratio", defaults.min_dominance_ratio),
-        defaults.min_dominance_ratio,
-    )
-    if not np.isfinite(min_dominance_ratio):
-        min_dominance_ratio = defaults.min_dominance_ratio
-    min_dominance_ratio = min(1.0, max(0.0, float(min_dominance_ratio)))
-
-    return VelocityXYConfig(
-        relative_power_floor_db=float(relative_power_floor_db),
-        median_power_floor_scale=float(median_power_floor_scale),
-        min_dominance_ratio=float(min_dominance_ratio),
-    )
-
-
 def range_angle_moving_from_yaml_dict(cfg: dict[str, Any]) -> RangeAngleMovingConfig:
     dsp = cfg.get("dsp", {}) or {}
     block = dsp.get("range_angle_moving", {}) or {}
@@ -1072,27 +964,12 @@ def range_angle_moving_from_yaml_dict(cfg: dict[str, Any]) -> RangeAngleMovingCo
         min_dominance_ratio = defaults.min_dominance_ratio
     min_dominance_ratio = min(1.0, max(0.0, float(min_dominance_ratio)))
 
-    velocity_dead_zone = _to_float(
-        block.get(
-            "velocity_dead_zone",
-            block.get(
-                "velocity_dead_zone_fraction",
-                block.get("dead_zone", defaults.velocity_dead_zone),
-            ),
-        ),
-        defaults.velocity_dead_zone,
-    )
+    velocity_dead_zone = _to_float(block.get("velocity_dead_zone", defaults.velocity_dead_zone), defaults.velocity_dead_zone)
     if not np.isfinite(velocity_dead_zone):
         velocity_dead_zone = defaults.velocity_dead_zone
     velocity_dead_zone = min(0.99, max(0.0, float(velocity_dead_zone)))
 
-    min_opacity = _to_float(
-        block.get(
-            "min_opacity",
-            block.get("opacity_min", defaults.min_opacity),
-        ),
-        defaults.min_opacity,
-    )
+    min_opacity = _to_float(block.get("min_opacity", defaults.min_opacity), defaults.min_opacity)
     if not np.isfinite(min_opacity):
         min_opacity = defaults.min_opacity
     min_opacity = min(1.0, max(0.0, float(min_opacity)))
@@ -1277,7 +1154,7 @@ def build_virtual_array_geometry_from_yaml_dict(
             order_flat = parsed
         except Exception as exc:
             warnings.append(
-                f"antenna.virtual_array_order non valido ({exc}); using legacy tx-major/rx order."
+                f"antenna.virtual_array_order non valido ({exc}); using default tx-major/rx order."
             )
             order_flat = default_order
 
@@ -1412,21 +1289,6 @@ def display_viewport_signature(viewport: DisplayViewport | AppliedViewportMeta |
         doppler_min,
         doppler_max,
     )
-
-
-def display_zoom_method_warnings(display_zoom_cfg: DisplayZoomConfig) -> list[str]:
-    warnings: list[str] = []
-    realtime_method = str(display_zoom_cfg.realtime_method or "auto").strip().lower() or "auto"
-    offline_method = str(display_zoom_cfg.offline_method or "viewport_grid").strip().lower() or "viewport_grid"
-    if realtime_method not in _VALID_DISPLAY_ZOOM_REALTIME_METHODS:
-        warnings.append(
-            f"display_zoom.realtime_method='{realtime_method}' is not implemented; using the realtime 'auto' strategy."
-        )
-    if offline_method not in _VALID_DISPLAY_ZOOM_OFFLINE_METHODS:
-        warnings.append(
-            f"display_zoom.offline_method='{offline_method}' is not implemented; using the offline 'viewport_grid' strategy."
-        )
-    return warnings
 
 
 def build_display_viewport(
@@ -1666,21 +1528,6 @@ def _threshold_mode_from_value(value: Any, default: DetectionThresholdMode = "re
     return mode_raw  # type: ignore[return-value]
 
 
-def _tracking_cfg_value(
-    tracking_block: dict[str, Any],
-    tracker_block: dict[str, Any],
-    *keys: str,
-    default: Any,
-) -> Any:
-    for key in keys:
-        if key in tracking_block:
-            return tracking_block.get(key)
-    for key in keys:
-        if key in tracker_block:
-            return tracker_block.get(key)
-    return default
-
-
 def detection_static_from_yaml_dict(cfg: dict[str, Any]) -> DetectionConfigStatic:
     block = cfg.get("detection_static", {}) or {}
     return DetectionConfigStatic(
@@ -1733,86 +1580,34 @@ def fusion_from_yaml_dict(cfg: dict[str, Any]) -> FusionConfig:
 
 
 def tracking_from_yaml_dict(cfg: dict[str, Any]) -> TrackingConfig:
-    tracking_block = cfg.get("tracking", {}) or {}
-    tracker_block = cfg.get("tracker", {}) or {}
-    dt_s = _to_optional_float(
-        _tracking_cfg_value(
-            tracking_block,
-            tracker_block,
-            "dt_s",
-            "frame_dt_s",
-            default=None,
-        )
-    )
+    block = cfg.get("tracking", {}) or {}
+    dt_s = _to_optional_float(block.get("dt_s"))
     return TrackingConfig(
-        enabled=bool(_tracking_cfg_value(tracking_block, tracker_block, "enabled", default=True)),
+        enabled=bool(block.get("enabled", True)),
         dt_s=None if dt_s is None else max(1e-3, float(dt_s)),
-        max_tracks=max(1, _to_int(_tracking_cfg_value(tracking_block, tracker_block, "max_tracks", default=30), 30)),
+        max_tracks=max(1, _to_int(block.get("max_tracks", 30), 30)),
         min_hits_to_confirm=max(
             1,
-            _to_int(
-                _tracking_cfg_value(
-                    tracking_block,
-                    tracker_block,
-                    "min_hits_to_confirm",
-                    "min_confirmed_hits",
-                    default=3,
-                ),
-                3,
-            ),
+            _to_int(block.get("min_hits_to_confirm", 3), 3),
         ),
         max_missed_tentative=max(
             0,
-            _to_int(
-                _tracking_cfg_value(
-                    tracking_block,
-                    tracker_block,
-                    "max_missed_tentative",
-                    default=2,
-                ),
-                2,
-            ),
+            _to_int(block.get("max_missed_tentative", 2), 2),
         ),
         max_missed_confirmed=max(
             0,
-            _to_int(
-                _tracking_cfg_value(
-                    tracking_block,
-                    tracker_block,
-                    "max_missed_confirmed",
-                    "max_missed_frames",
-                    default=8,
-                ),
-                8,
-            ),
+            _to_int(block.get("max_missed_confirmed", 8), 8),
         ),
         max_track_age=max(
             0,
-            _to_int(
-                _tracking_cfg_value(
-                    tracking_block,
-                    tracker_block,
-                    "max_track_age",
-                    default=0,
-                ),
-                0,
-            ),
+            _to_int(block.get("max_track_age", 0), 0),
         ),
     )
 
 
 def tracker_from_yaml_dict(cfg: dict[str, Any]) -> TrackerConfig:
-    tracking_block = cfg.get("tracking", {}) or {}
-    tracker_block = cfg.get("tracker", {}) or {}
-    model = str(
-        _tracking_cfg_value(
-            tracking_block,
-            tracker_block,
-            "model",
-            default="kalman_cv_2d",
-        )
-        or "kalman_cv_2d"
-    ).strip().lower()
+    block = cfg.get("tracking", {}) or {}
+    model = str(block.get("model", "kalman_cv_2d") or "kalman_cv_2d").strip().lower()
     if model != "kalman_cv_2d":
         print(f"[TRACK WARN] tracking.model={model!r} unsupported; forcing 'kalman_cv_2d'.")
         model = "kalman_cv_2d"
@@ -1820,204 +1615,69 @@ def tracker_from_yaml_dict(cfg: dict[str, Any]) -> TrackerConfig:
         model=model,
         gating_xy_m=max(
             0.0,
-            _to_float(
-                _tracking_cfg_value(tracking_block, tracker_block, "gating_xy_m", default=0.75),
-                0.75,
-            ),
+            _to_float(block.get("gating_xy_m", 0.75), 0.75),
         ),
         gating_doppler_mps=max(
             0.0,
-            _to_float(
-                _tracking_cfg_value(tracking_block, tracker_block, "gating_doppler_mps", default=0.50),
-                0.50,
-            ),
+            _to_float(block.get("gating_doppler_mps", 0.50), 0.50),
         ),
         process_noise_pos=max(
             1e-4,
-            _to_float(
-                _tracking_cfg_value(
-                    tracking_block,
-                    tracker_block,
-                    "process_noise_pos",
-                    "process_noise_xy",
-                    default=0.20,
-                ),
-                0.20,
-            ),
+            _to_float(block.get("process_noise_pos", 0.20), 0.20),
         ),
         process_noise_vel=max(
             1e-4,
-            _to_float(
-                _tracking_cfg_value(
-                    tracking_block,
-                    tracker_block,
-                    "process_noise_vel",
-                    "process_noise_v",
-                    default=1.00,
-                ),
-                1.00,
-            ),
+            _to_float(block.get("process_noise_vel", 1.00), 1.00),
         ),
         measurement_noise_xy=max(
             1e-4,
-            _to_float(
-                _tracking_cfg_value(
-                    tracking_block,
-                    tracker_block,
-                    "measurement_noise_xy",
-                    default=0.25,
-                ),
-                0.25,
-            ),
+            _to_float(block.get("measurement_noise_xy", 0.25), 0.25),
         ),
         moving_speed_threshold_mps=max(
             0.0,
-            _to_float(
-                _tracking_cfg_value(
-                    tracking_block,
-                    tracker_block,
-                    "moving_speed_threshold_mps",
-                    "dynamic_speed_threshold_mps",
-                    default=0.20,
-                ),
-                0.20,
-            ),
+            _to_float(block.get("moving_speed_threshold_mps", 0.20), 0.20),
         ),
         stopped_speed_threshold_mps=max(
             0.0,
-            _to_float(
-                _tracking_cfg_value(
-                    tracking_block,
-                    tracker_block,
-                    "stopped_speed_threshold_mps",
-                    "static_speed_threshold_mps",
-                    default=0.08,
-                ),
-                0.08,
-            ),
+            _to_float(block.get("stopped_speed_threshold_mps", 0.08), 0.08),
         ),
         doppler_moving_threshold_mps=max(
             0.0,
-            _to_float(
-                _tracking_cfg_value(
-                    tracking_block,
-                    tracker_block,
-                    "doppler_moving_threshold_mps",
-                    "doppler_static_threshold_mps",
-                    "dynamic_speed_threshold_mps",
-                    default=0.12,
-                ),
-                0.12,
-            ),
+            _to_float(block.get("doppler_moving_threshold_mps", 0.12), 0.12),
         ),
         motion_confirm_frames_moving=max(
             1,
-            _to_int(
-                _tracking_cfg_value(
-                    tracking_block,
-                    tracker_block,
-                    "motion_confirm_frames_moving",
-                    "classification_confirm_frames",
-                    default=2,
-                ),
-                2,
-            ),
+            _to_int(block.get("motion_confirm_frames_moving", 2), 2),
         ),
         motion_confirm_frames_stopped=max(
             1,
-            _to_int(
-                _tracking_cfg_value(
-                    tracking_block,
-                    tracker_block,
-                    "motion_confirm_frames_stopped",
-                    "classification_confirm_frames",
-                    default=3,
-                ),
-                3,
-            ),
+            _to_int(block.get("motion_confirm_frames_stopped", 3), 3),
         ),
         stopped_memory_s=max(
             0.0,
-            _to_float(
-                _tracking_cfg_value(
-                    tracking_block,
-                    tracker_block,
-                    "stopped_memory_s",
-                    "stopped_hold_s",
-                    "stopped_keepalive_s",
-                    default=3.0,
-                ),
-                3.0,
-            ),
+            _to_float(block.get("stopped_memory_s", 3.0), 3.0),
         ),
         stopped_resume_gate_m=max(
             0.0,
-            _to_float(
-                _tracking_cfg_value(
-                    tracking_block,
-                    tracker_block,
-                    "stopped_resume_gate_m",
-                    "resume_xy_m",
-                    default=0.90,
-                ),
-                0.90,
-            ),
+            _to_float(block.get("stopped_resume_gate_m", 0.90), 0.90),
         ),
         stop_position_alpha=min(
             1.0,
             max(
                 0.0,
-                _to_float(
-                    _tracking_cfg_value(
-                        tracking_block,
-                        tracker_block,
-                        "stop_position_alpha",
-                        default=0.25,
-                    ),
-                    0.25,
-                ),
+                _to_float(block.get("stop_position_alpha", 0.25), 0.25),
             ),
         ),
         birth_min_separation_m=max(
             0.0,
-            _to_float(
-                _tracking_cfg_value(
-                    tracking_block,
-                    tracker_block,
-                    "birth_min_separation_m",
-                    default=0.20,
-                ),
-                0.20,
-            ),
+            _to_float(block.get("birth_min_separation_m", 0.20), 0.20),
         ),
-        use_doppler_in_cost=bool(
-            _tracking_cfg_value(
-                tracking_block,
-                tracker_block,
-                "use_doppler_in_cost",
-                default=True,
-            )
-        ),
+        use_doppler_in_cost=bool(block.get("use_doppler_in_cost", True)),
         history_len=max(
             1,
-            _to_int(
-                _tracking_cfg_value(
-                    tracking_block,
-                    tracker_block,
-                    "history_len",
-                    default=12,
-                ),
-                12,
-            ),
+            _to_int(block.get("history_len", 12), 12),
         ),
-        debug_log=bool(
-            _tracking_cfg_value(
-                tracking_block,
-                tracker_block,
-                "debug_log",
-                default=False,
-            )
-        ),
+        debug_log=bool(block.get("debug_log", False)),
     )
 
 
@@ -2418,8 +2078,6 @@ def _normalize_display_projection_interp(value: Any) -> DisplayProjectionInterp:
 
 def _normalize_display_heatmap_mode(value: Any) -> DisplayHeatmapMode:
     mode_raw = str(value or "power_xy").strip().lower()
-    if mode_raw == "velocity_xy":
-        return "range_angle_moving"
     if mode_raw not in _VALID_DISPLAY_HEATMAP_MODES:
         return "power_xy"
     return mode_raw  # type: ignore[return-value]
@@ -4039,17 +3697,6 @@ def compute_range_angle_moving_velocity_map(
         alpha_ra[reliable] = (max_power[reliable] / np.float32(peak_power)).astype(np.float32, copy=False)
         np.clip(alpha_ra, 0.0, 1.0, out=alpha_ra)
     return velocity_ra, alpha_ra
-
-
-def compute_velocity_angle_map(
-    range_fft_doppler: np.ndarray,
-    **kwargs: Any,
-) -> np.ndarray:
-    """Legacy compatibility wrapper for the former mode-1 velocity map."""
-    velocity_ra, alpha_ra = compute_range_angle_moving_velocity_map(range_fft_doppler, **kwargs)
-    out = velocity_ra.astype(np.float32, copy=True)
-    out[alpha_ra <= np.float32(0.0)] = np.float32(np.nan)
-    return out
 
 
 def detect_moving_targets(
@@ -5788,7 +5435,7 @@ def dsp_worker(
     cfar_numba_cfg = cfar_numba_from_yaml_dict(cfg_dict)
     diagnostics_cfg = dsp_diagnostics_from_yaml_dict(cfg_dict)
     configure_cfar_numba_runtime(cfar_numba_cfg, log=("cfar_numba" in dsp_block))
-    mean_before_range_fft, _ = mean_selections_from_yaml_dict(cfg_dict)
+    mean_before_range_fft = mean_before_range_fft_from_yaml_dict(cfg_dict)
     detection_static_post_range_fft_filters = detection_static_post_range_fft_filters_from_yaml_dict(cfg_dict)
     detection_static_post_range_fft_filters, detection_static_filter_warnings = sanitize_detection_static_post_range_fft_filters(
         detection_static_post_range_fft_filters
@@ -5842,7 +5489,6 @@ def dsp_worker(
         detection_static_filter_warnings
         + detection_moving_filter_warnings
         + display_filter_warnings
-        + display_zoom_method_warnings(display_zoom_cfg)
         + virtual_array_warnings
     ):
         print(f"[DSP WARN] {warn_msg}")
@@ -6156,7 +5802,7 @@ def dsp_worker(
 
         next_cfg_dict = _deep_merge_dict(cfg_dict, cfg_patch)
         next_selection = selection_from_yaml_dict(next_cfg_dict)
-        next_mean_before_range_fft, _ = mean_selections_from_yaml_dict(next_cfg_dict)
+        next_mean_before_range_fft = mean_before_range_fft_from_yaml_dict(next_cfg_dict)
         next_detection_static_filters = detection_static_post_range_fft_filters_from_yaml_dict(next_cfg_dict)
         next_detection_static_filters, detection_static_filter_warnings = sanitize_detection_static_post_range_fft_filters(
             next_detection_static_filters

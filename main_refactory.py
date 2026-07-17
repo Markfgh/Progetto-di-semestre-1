@@ -129,25 +129,7 @@ def _cpu_percent_pid(pid: int, cpu_state: dict) -> float:
 
 
 def _normalize_priority_level(level: str) -> str:
-    level_s = str(level).strip().lower()
-    aliases = {
-        "idle": "idle",
-        "lowest": "idle",
-        "background": "idle",
-        "low": "below_normal",
-        "below": "below_normal",
-        "below_normal": "below_normal",
-        "normal": "normal",
-        "above": "above_normal",
-        "above_normal": "above_normal",
-        "high": "high",
-        "higher": "high",
-        "realtime": "realtime",
-        "real_time": "realtime",
-        "real-time": "realtime",
-        "rt": "realtime",
-    }
-    return aliases.get(level_s, level_s)
+    return str(level).strip().lower()
 
 
 def _set_process_priority(pid: int, level: str):
@@ -385,7 +367,7 @@ def _apply_process_affinity(label: str, pid: int, cpus, enabled: bool) -> None:
         print(f"[AFF WARN] {label} fallback failed ({e})")
 
 
-from offline_processing import OfflineBPRuntime
+from offline_processing import OfflineBPRuntime, offline_map_bounds_from_yaml_dict
 from mmwave_studio_bridge import DCA1000Config, MmwaveStudioBridge, MmwaveStudioError, RadarConnectionConfig
 from shutdown_utils import cleanup_processes, close_queues
 from realtime_dsp import (
@@ -401,7 +383,6 @@ from realtime_dsp import (
     display_image_resolutions_from_yaml_dict,
     display_projection_from_yaml_dict,
     display_viewport_signature,
-    display_zoom_method_warnings,
     display_zoom_from_yaml_dict,
     dsp_worker,
     range_angle_moving_from_yaml_dict,
@@ -452,8 +433,6 @@ RANGE_MAX_PROCESSING = float(resolve_processing_range_max_m(cfg))
 display_projection_cfg = display_projection_from_yaml_dict(cfg)
 display_zoom_cfg = display_zoom_from_yaml_dict(cfg)
 display_image_resolutions_cfg = display_image_resolutions_from_yaml_dict(cfg)
-for warn_msg in display_zoom_method_warnings(display_zoom_cfg):
-    print(f"[DISPLAY WARN] {warn_msg}")
 HEATMAP_CROSSRANGE_MAX_DISPLAY = float(
     resolve_display_crossrange_max_m(
         RANGE_MAX_DISPLAY,
@@ -614,7 +593,7 @@ prio_cfg = proc_cfg.get("priority", {}) or {}
 PRIO_ENABLED = bool(prio_cfg.get("enabled", False))
 PRIO_MAIN = str(prio_cfg.get("main", "normal"))
 PRIO_RX = str(prio_cfg.get("rx", "normal"))
-PRIO_LOG = str(prio_cfg.get("logger", prio_cfg.get("log", "normal")))
+PRIO_LOG = str(prio_cfg.get("logger", "normal"))
 PRIO_DSP = str(prio_cfg.get("dsp", "normal"))
 
 # --- PROCESS AFFINITY ---
@@ -623,12 +602,11 @@ AFF_ENABLED = bool(aff_cfg.get("enabled", False))
 auto_sets = _default_affinity_sets(LOGICAL_CPUS)
 AFF_MAIN = _parse_cpu_set(aff_cfg.get("main", auto_sets["main"]), LOGICAL_CPUS)
 AFF_RX = _parse_cpu_set(aff_cfg.get("rx", auto_sets["rx"]), LOGICAL_CPUS)
-AFF_LOG = _parse_cpu_set(aff_cfg.get("logger", aff_cfg.get("log", auto_sets["log"])), LOGICAL_CPUS)
+AFF_LOG = _parse_cpu_set(aff_cfg.get("logger", auto_sets["log"]), LOGICAL_CPUS)
 AFF_DSP = _parse_cpu_set(aff_cfg.get("dsp", auto_sets["dsp"]), LOGICAL_CPUS)
 
 # --- SAR capture-only parameters ---
 sar_cfg = cfg.get("sar", {}) or {}
-# Backward-compat: if not present, reuse old 'logger.settling_delay_s'
 SETTLING_DELAY_S = float(sar_cfg.get("settling_delay_s", 0.4))
 FRAMES_PER_POSITION = int(sar_cfg.get("frames_per_position", 8))
 
@@ -658,7 +636,7 @@ def _build_capture_file_header(
             "chirps": int(CHIRPS),
             "rx": int(RX),
             "tx": int(TX),
-            "x_frames": int(X_FRAMES),  # batch realtime, mantenuto per compatibilità
+            "x_frames": int(X_FRAMES),  # Realtime batch size.
             "frames_per_position": int(FRAMES_PER_POSITION),
         },
     }
@@ -1308,7 +1286,7 @@ def radar_rx(
                     # forward progression (also handles uint32 wrap-around)
                     seq_gap_pkts = int(delta - 1)
                 else:
-                    # backward packet: small back = reorder, large back = stream restart
+                    # Out-of-order packet: a small jump is reordering; a large one is a stream restart.
                     back = (int(last_seq) - int(seq)) & (U32_MOD - 1)
                     if back <= SEQ_REORDER_MAX_BACK:
                         continue
@@ -2179,8 +2157,6 @@ def main():
             slope_hz_s=float(SLOPE),
             fc_hz=float(FC),
             nfft_range=int(NFFT_RANGE),
-            range_max_m=float(RANGE_MAX_PROCESSING),
-            crossrange_max_m=float(CROSSRANGE_MAX_DISPLAY),
             image_h=int(offline_gui_h),
             image_w=int(offline_gui_w),
         )
@@ -2189,12 +2165,14 @@ def main():
     offline_error = ""
     offline_info = {}
     offline_boot_cfg: dict = {}
+    offline_map_bounds_boot = None
     offline_config_boot_path = Path(__file__).with_name("offline_config.yaml")
     try:
         with offline_config_boot_path.open("r", encoding="utf-8") as handle:
             offline_boot_cfg = yaml.safe_load(handle) or {}
         if not isinstance(offline_boot_cfg, dict):
             raise ValueError("offline_config.yaml must contain a YAML mapping")
+        offline_map_bounds_boot = offline_map_bounds_from_yaml_dict(offline_boot_cfg, cfg)
         scan_boot = offline_boot_cfg.get("scan", {}) or {}
         x_start_boot = int(scan_boot.get("x_start", 1))
         x_end_boot = int(scan_boot.get("x_end", x_start_boot))
@@ -2383,13 +2361,10 @@ def main():
     PROC_IMG_SERIES_TAG = "proc_img_series"
     PROC_IN_XSTART = "proc_in_xstart"
     PROC_IN_XEND = "proc_in_xend"
-    PROC_TXT_STATUS = "proc_txt_status"
     PROC_BTN_LOAD_OFFLINE = "proc_btn_load_offline"
     PROC_TXT_MEMORY_ESTIMATE = "proc_txt_memory_estimate"
     PROC_IN_VMIN = "proc_in_vmin"
     PROC_IN_VMAX = "proc_in_vmax"
-    PROC_IN_RMAX = "proc_in_rmax"
-    PROC_IN_XMAX = "proc_in_xmax"
     PROC_BTN_NORM = "proc_btn_norm"
     PROC_IN_ZOOM_XMIN = "proc_in_zoom_xmin"
     PROC_IN_ZOOM_XMAX = "proc_in_zoom_xmax"
@@ -2656,9 +2631,6 @@ def main():
             return f"Memory estimate unavailable: {exc}"
 
     offline_memory_estimate_text = _format_offline_memory_estimate(offline_boot_cfg)
-    # L'attuale pipeline MIMO-SAR supporta solo questo percorso: non esporre
-    # un selettore GUI per una scelta che non esiste realmente.
-    off_motion_mode = "static_zero_doppler"
     offline_frame_valid = False
     off_norm_enabled = True
     if off_norm_enabled:
@@ -2669,8 +2641,9 @@ def main():
         off_vmax = float(VMAX_RAW)
     if off_vmax <= off_vmin:
         off_vmax = off_vmin + 1.0
-    off_rmax = float(RANGE_MAX_DISPLAY)
-    off_xmax = float(CROSSRANGE_MAX_DISPLAY)
+    if offline_map_bounds_boot is None:
+        offline_map_bounds_boot = offline_map_bounds_from_yaml_dict({}, cfg)
+    off_map_bounds_current = offline_map_bounds_boot
     rt_home_viewport_current = rt_home_viewport
     rt_requested_viewport_current = rt_home_viewport
     rt_applied_meta_current = applied_viewport_meta_from_viewport(
@@ -2679,10 +2652,10 @@ def main():
         frame_seq=0,
     )
     off_home_viewport_current = build_display_viewport(
-        x_min_m=-float(off_xmax),
-        x_max_m=float(off_xmax),
-        y_min_m=0.0,
-        y_max_m=float(off_rmax),
+        x_min_m=float(off_map_bounds_current.x_min_m),
+        x_max_m=float(off_map_bounds_current.x_max_m),
+        y_min_m=float(off_map_bounds_current.y_min_m),
+        y_max_m=float(off_map_bounds_current.y_max_m),
         dr_m=float(dr_plot),
         seq=0,
     )
@@ -2807,22 +2780,37 @@ def main():
     off_ui_pending = {
         "x_start": int(off_x_start),
         "x_end": int(off_x_end),
-        "motion_mode": str(off_motion_mode),
         "vmin": float(off_vmin),
         "vmax": float(off_vmax),
-        "rmax": float(off_rmax),
-        "xmax": float(off_xmax),
         "norm_enabled": bool(off_norm_enabled),
         "reset_view": True,
         "reconstruct": True,
         "display_refresh": True,
     }
-    off_status_text = (
-        "Offline data not loaded. Press LOAD / CALCULATE OFFLINE when needed.\n"
-        + offline_memory_estimate_text
-    )
-    if offline_error:
-        off_status_text = f"ERROR: {offline_error}"
+    offline_summary_state = f"ERROR: {offline_error}" if offline_error else ""
+    offline_last_calculation_ms: float | None = None
+
+    def _render_offline_summary(
+        *,
+        state: str | None = None,
+        calculation_ms: float | None = None,
+    ) -> None:
+        """Render the one yellow offline summary without duplicate status text."""
+        nonlocal offline_summary_state, offline_last_calculation_ms
+        if state is not None:
+            offline_summary_state = str(state).strip()
+        if calculation_ms is not None:
+            elapsed = float(calculation_ms)
+            offline_last_calculation_ms = elapsed if np.isfinite(elapsed) and elapsed >= 0.0 else None
+
+        lines: list[str] = []
+        if offline_summary_state:
+            lines.append(offline_summary_state)
+        if offline_last_calculation_ms is not None:
+            lines.append(f"Last reconstruction: {offline_last_calculation_ms:.1f} ms")
+        lines.append(offline_memory_estimate_text)
+        if dpg.does_item_exist(PROC_TXT_MEMORY_ESTIMATE):
+            dpg.set_value(PROC_TXT_MEMORY_ESTIMATE, "\n".join(lines))
 
     def _on_main_tab_changed(sender=None, app_data=None):
         nonlocal off_texture_upload_requested
@@ -3278,7 +3266,7 @@ def main():
     motor_log_lines: list[str] = []
 
     def _english_scan_message(message: str) -> str:
-        """Translate the coordinator's legacy Italian status for the English GUI."""
+        """Translate the coordinator's Italian status for the English GUI."""
         text = str(message)
         translations = {
             "Pronto": "Ready",
@@ -3915,6 +3903,7 @@ def main():
         off_ui_pending["display_refresh"] = False
         off_ui_dirty = True
         off_ui_dirty_t = time.perf_counter()
+        _render_offline_summary(state="Offline ROI reconstruction queued")
         _write_offline_zoom_inputs(off_requested_viewport_current)
         if dpg.does_item_exist(PROC_XAXIS_TAG) and dpg.does_item_exist(PROC_YAXIS_TAG):
             dpg.set_axis_limits(PROC_XAXIS_TAG, float(x0), float(x1))
@@ -3933,6 +3922,7 @@ def main():
         off_ui_pending["display_refresh"] = False
         off_ui_dirty = True
         off_ui_dirty_t = time.perf_counter()
+        _render_offline_summary(state="Offline full-map reconstruction queued")
         _write_offline_zoom_inputs(off_home_viewport_current)
         if dpg.does_item_exist(PROC_XAXIS_TAG) and dpg.does_item_exist(PROC_YAXIS_TAG):
             dpg.set_axis_limits(
@@ -3952,82 +3942,50 @@ def main():
             )
 
     def _apply_offline_params(sender=None, app_data=None):
-        nonlocal off_ui_dirty, off_ui_dirty_t, off_ui_pending, off_status_text
+        nonlocal off_ui_dirty, off_ui_dirty_t, off_ui_pending
 
         try:
             vmin = float(dpg.get_value(PROC_IN_VMIN))
             vmax = float(dpg.get_value(PROC_IN_VMAX))
-            rmax = float(dpg.get_value(PROC_IN_RMAX))
-            xmax = float(dpg.get_value(PROC_IN_XMAX))
             x_start = int(dpg.get_value(PROC_IN_XSTART))
             x_end = int(dpg.get_value(PROC_IN_XEND))
         except (TypeError, ValueError):
             return
-
-        motion_mode = "static_zero_doppler"
 
         x_start_cl = max(off_pos_min, min(off_pos_max, x_start))
         x_end_cl = max(off_pos_min, min(off_pos_max, x_end))
         if x_end_cl < x_start_cl:
             x_start_cl, x_end_cl = x_end_cl, x_start_cl
 
-        rmax_cl = max(0.0, min(rmax, RMAX_HARD_MAX))
-        xmax_cl = max(0.0, min(xmax, HEATMAP_XMAX_HARD_MAX))
-
         if vmax <= vmin:
             vmax = vmin + 1.0
 
-        if rmax_cl != rmax:
-            dpg.set_value(PROC_IN_RMAX, rmax_cl)
-        if xmax_cl != xmax:
-            dpg.set_value(PROC_IN_XMAX, xmax_cl)
         if x_start_cl != x_start:
             dpg.set_value(PROC_IN_XSTART, x_start_cl)
         if x_end_cl != x_end:
             dpg.set_value(PROC_IN_XEND, x_end_cl)
 
-        prev_off_rmax = float(off_ui_pending.get("rmax", rmax_cl))
-        prev_off_xmax = float(off_ui_pending.get("xmax", xmax_cl))
         prev_x_start = int(off_ui_pending.get("x_start", x_start_cl))
         prev_x_end = int(off_ui_pending.get("x_end", x_end_cl))
-        prev_motion_mode = str(off_ui_pending.get("motion_mode", motion_mode))
         reconstruction_changed = bool(
             prev_x_start != int(x_start_cl)
             or prev_x_end != int(x_end_cl)
-            or prev_motion_mode != str(motion_mode)
-            or abs(float(prev_off_rmax) - float(rmax_cl)) > 1e-6
-            or abs(float(prev_off_xmax) - float(xmax_cl)) > 1e-6
         )
         off_ui_pending["vmin"] = float(vmin)
         off_ui_pending["vmax"] = float(vmax)
-        off_ui_pending["rmax"] = float(rmax_cl)
-        off_ui_pending["xmax"] = float(xmax_cl)
         off_ui_pending["x_start"] = int(x_start_cl)
         off_ui_pending["x_end"] = int(x_end_cl)
-        off_ui_pending["motion_mode"] = str(motion_mode)
         off_ui_pending["reconstruct"] = bool(
             off_ui_pending.get("reconstruct", False) or reconstruction_changed
         )
         off_ui_pending["display_refresh"] = True
-        off_ui_pending["reset_view"] = bool(
-            off_ui_pending.get("reset_view", False)
-            or abs(float(prev_off_rmax) - float(rmax_cl)) > 1e-6
-            or abs(float(prev_off_xmax) - float(xmax_cl)) > 1e-6
-        )
         if bool(off_ui_pending.get("reconstruct", False)):
             update_label = "Offline reconstruction update pending"
         elif offline_frame_valid:
             update_label = "Offline display updated from cached matrix"
         else:
             update_label = "No valid offline result; load/recalculate first"
-        off_status_text = (
-            f"{update_label}\n"
-            f"SAR positions: {x_start_cl} - {x_end_cl}\n"
-            f"Motion mode: {motion_mode}\n"
-            f"Image scale: {vmin:.1f} - {vmax:.1f} dB"
-        )
-        if dpg.does_item_exist(PROC_TXT_STATUS):
-            dpg.set_value(PROC_TXT_STATUS, off_status_text)
+        _render_offline_summary(state=update_label)
         off_ui_dirty = True
         off_ui_dirty_t = time.perf_counter()
 
@@ -4035,22 +3993,26 @@ def main():
     # realtime tuning, these settings are consumed while the offline reader is
     # built and cannot be changed safely through its live command queue.
     OFFLINE_TUNING_WINDOWS = ["none", "rectangular", "hanning", "hamming", "blackman"]
-    OFFLINE_TUNING_BG_MODES = ["ema", "running_mean", "window_mean", "frozen"]
     OFFLINE_TUNING_ANGLE_MODES = ["fft", "bartlett", "mvdr"]
     OFFLINE_TUNING_AGGREGATIONS = ["frame_loop", "frame", "loop", "none"]
     OFFLINE_TUNING_ALGORITHMS = ["synthetic_range_angle", "backprojection"]
-    OFFLINE_TUNING_BP_MODES = ["mimo_sar", "sar_only"]
 
     OFFLINE_TUNING_FIELD_SPECS = [
         {"section": "Data and scan", "path": "data.input_dir", "label": "Input folder", "kind": "text", "default": "logs"},
+        {"section": "Data and scan", "path": "data.startup_timeout_s", "label": "Startup timeout (s)", "kind": "int", "default": 300, "min": 1, "max": 3600, "step": 30},
         {"section": "Data and scan", "path": "scan.x_start", "label": "Start position", "kind": "int", "default": 1, "step": 1},
         {"section": "Data and scan", "path": "scan.x_end", "label": "End position", "kind": "int", "default": 1, "step": 1},
         {"section": "Data and scan", "path": "scan.x_step", "label": "Position step", "kind": "int", "default": 1, "min": 1, "step": 1},
         {"section": "Data and scan", "path": "scan.x_pitch_m", "label": "X pitch (m)", "kind": "float", "default": 0.01, "min": 0.000001, "step": 0.001, "format": "%.6f"},
         {"section": "Reconstruction", "path": "reconstruction.algorithm", "label": "Algorithm", "kind": "combo", "items": OFFLINE_TUNING_ALGORITHMS, "default": "synthetic_range_angle"},
-        {"section": "Reconstruction", "path": "bp.mode", "label": "BP mode", "kind": "combo", "items": OFFLINE_TUNING_BP_MODES, "default": "mimo_sar"},
         {"section": "Reconstruction", "path": "bp.phase_sign", "label": "Phase sign", "kind": "combo", "items": ["-1", "1"], "default": "-1"},
-        {"section": "Reconstruction", "path": "bp.coherent_sum", "label": "Coherent sum", "kind": "bool", "default": True},
+        {"section": "Map reconstruction bounds", "path": "reconstruction.map_bounds.x_min_m", "label": "Map X min (m)", "kind": "float", "default": -25.0, "step": 0.5},
+        {"section": "Map reconstruction bounds", "path": "reconstruction.map_bounds.x_max_m", "label": "Map X max (m)", "kind": "float", "default": 25.0, "step": 0.5},
+        {"section": "Map reconstruction bounds", "path": "reconstruction.map_bounds.y_min_m", "label": "Map Y (range) min (m)", "kind": "float", "default": 0.0, "min": 0.0, "step": 0.5},
+        {"section": "Map reconstruction bounds", "path": "reconstruction.map_bounds.y_max_m", "label": "Map Y (range) max (m)", "kind": "float", "default": 50.0, "min": 0.0, "step": 0.5},
+        {"section": "Offline reference background", "path": "offline_background.enabled", "label": "Subtract empty-scene reference", "kind": "bool", "default": False},
+        {"section": "Offline reference background", "path": "offline_background.reference_dir", "label": "Empty-scene folder", "kind": "text", "default": ""},
+        {"section": "Offline reference background", "path": "offline_background.scale", "label": "Reference scale", "kind": "float", "default": 1.0, "min": 0.0, "step": 0.01},
         {"section": "FFT sizing", "path": "offline_sar_range_angle.nfft_range", "label": "Range FFT bins", "kind": "int", "default": 1024, "min": 1, "step": 64},
         {"section": "FFT sizing", "path": "offline_sar_range_angle.nfft_angle", "label": "Angle FFT bins", "kind": "int", "default": 2048, "min": 1, "step": 64},
         {"section": "Shared windows", "path": "offline_sar_range_angle.use_realtime_filters", "label": "Enable preprocessing", "kind": "bool", "default": True},
@@ -4059,12 +4021,6 @@ def main():
         {"section": "Shared windows", "path": "offline_sar_range_angle.window_angle", "label": "Aperture window", "kind": "combo", "items": OFFLINE_TUNING_WINDOWS, "default": "hanning"},
         {"section": "Range-angle filters", "path": "offline_sar_range_angle.zero_after_range_fft_bins", "label": "Zero initial bins", "kind": "int", "default": 0, "min": 0, "step": 1},
         {"section": "Range-angle filters", "path": "offline_sar_range_angle.mean_after_range_fft.enabled", "label": "Mean after Range FFT", "kind": "bool", "default": False},
-        {"section": "Background", "path": "offline_sar_range_angle.background_subtraction.enabled", "label": "Enable background subtraction", "kind": "bool", "default": False},
-        {"section": "Background", "path": "offline_sar_range_angle.background_subtraction.mode", "label": "Mode", "kind": "combo", "items": OFFLINE_TUNING_BG_MODES, "default": "frozen"},
-        {"section": "Background", "path": "offline_sar_range_angle.background_subtraction.alpha", "label": "Alpha", "kind": "float", "default": 0.02, "min": 0.0, "max": 1.0, "step": 0.01},
-        {"section": "Background", "path": "offline_sar_range_angle.background_subtraction.init_frames", "label": "Initial frames", "kind": "int", "default": 40, "min": 1, "step": 1},
-        {"section": "Background", "path": "offline_sar_range_angle.background_subtraction.window_frames", "label": "Frame window", "kind": "int", "default": 40, "min": 1, "step": 1},
-        {"section": "Background", "path": "offline_sar_range_angle.background_subtraction.clamp_positive_only", "label": "Keep positive values only", "kind": "bool", "default": False},
         {"section": "Angle estimation", "path": "offline_sar_range_angle.angle_processing.mode", "label": "Method", "kind": "combo", "items": OFFLINE_TUNING_ANGLE_MODES, "default": "bartlett"},
         {"section": "Angle estimation", "path": "offline_sar_range_angle.angle_processing.mvdr_diagonal_loading", "label": "MVDR loading", "kind": "float", "default": 0.02, "min": 0.0, "step": 0.005},
         {"section": "Angle estimation", "path": "offline_sar_range_angle.angle_processing.aggregation", "label": "Aggregation", "kind": "combo", "items": OFFLINE_TUNING_AGGREGATIONS, "default": "frame_loop"},
@@ -4109,18 +4065,11 @@ def main():
         )
 
     def _refresh_offline_memory_estimate(cfg_source: dict | None = None) -> str:
-        nonlocal offline_memory_estimate_text, off_status_text
+        nonlocal offline_memory_estimate_text
         source = cfg_source if isinstance(cfg_source, dict) else offline_tuning_cfg
         offline_memory_estimate_text = _format_offline_memory_estimate(source)
-        if dpg.does_item_exist(PROC_TXT_MEMORY_ESTIMATE):
-            dpg.set_value(PROC_TXT_MEMORY_ESTIMATE, offline_memory_estimate_text)
+        _render_offline_summary()
         if offline_runtime is None and not bool(offline_reload_state.get("running")):
-            off_status_text = (
-                "Offline data not loaded. Press LOAD / CALCULATE OFFLINE when needed.\n"
-                + offline_memory_estimate_text
-            )
-            if dpg.does_item_exist(PROC_TXT_STATUS):
-                dpg.set_value(PROC_TXT_STATUS, off_status_text)
             if dpg.does_item_exist(TXT_OFFLINE_TUNING_INFO_TAG):
                 dpg.set_value(
                     TXT_OFFLINE_TUNING_INFO_TAG,
@@ -4195,14 +4144,17 @@ def main():
 
         if not str(_offline_cfg_path_get(base, "data.input_dir", "")).strip():
             raise ValueError("Input folder is required")
+        if int(_offline_cfg_path_get(base, "data.startup_timeout_s", 300)) <= 0:
+            raise ValueError("Startup timeout must be greater than zero")
+        if bool(_offline_cfg_path_get(base, "offline_background.enabled", False)) and not str(
+            _offline_cfg_path_get(base, "offline_background.reference_dir", "")
+        ).strip():
+            raise ValueError("Empty-scene folder is required when offline reference background is enabled")
         if int(_offline_cfg_path_get(base, "scan.x_end")) < int(_offline_cfg_path_get(base, "scan.x_start")):
             raise ValueError("End position must be greater than or equal to start position")
         if float(_offline_cfg_path_get(base, "scan.x_pitch_m")) <= 0.0:
             raise ValueError("Il pitch X deve essere > 0")
-        algorithm = _offline_cfg_path_get(base, "reconstruction.algorithm")
-        bp_mode = _offline_cfg_path_get(base, "bp.mode")
-        if algorithm == "synthetic_range_angle" and bp_mode != "mimo_sar":
-            raise ValueError("synthetic_range_angle requires mimo_sar BP mode")
+        offline_map_bounds_from_yaml_dict(base, cfg)
         return base
 
     def _save_offline_tuning_config(*, allow_scan_finalize: bool = False) -> dict | None:
@@ -4251,7 +4203,7 @@ def main():
         save_config: bool = True,
         allow_scan_finalize: bool = False,
     ) -> bool:
-        nonlocal offline_runtime, off_status_text
+        nonlocal offline_runtime
         if _offline_tuning_locked_by_scan() and not allow_scan_finalize:
             _set_offline_tuning_status("Recalculation is locked during SAR scan/finalization")
             return False
@@ -4271,10 +4223,8 @@ def main():
         with offline_reload_lock:
             offline_reload_state.update({"running": True, "runtime": None, "info": None, "error": ""})
         _set_offline_tuning_status("Reloading data and recalculating offline...")
-        estimate_text = _refresh_offline_memory_estimate(offline_tuning_cfg)
-        off_status_text = "Offline load/calculation in progress...\n" + estimate_text
-        if dpg.does_item_exist(PROC_TXT_STATUS):
-            dpg.set_value(PROC_TXT_STATUS, off_status_text)
+        _refresh_offline_memory_estimate(offline_tuning_cfg)
+        _render_offline_summary(state="Offline load/calculation in progress")
         if dpg.does_item_exist(PROC_BTN_LOAD_OFFLINE):
             dpg.configure_item(PROC_BTN_LOAD_OFFLINE, label="LOADING OFFLINE...", enabled=False)
         for tag in (PROC_IN_XSTART, PROC_IN_XEND):
@@ -4294,7 +4244,10 @@ def main():
                 # Register immediately so application shutdown can stop a
                 # runtime that is still reading/transforming offline data.
                 shutdown_resources["offline_runtime"] = new_runtime
-                info = new_runtime.start(timeout_s=300.0)
+                startup_timeout_s = float(
+                    _offline_cfg_path_get(offline_tuning_cfg, "data.startup_timeout_s", 300)
+                )
+                info = new_runtime.start(timeout_s=startup_timeout_s)
                 if shutdown_state["in_progress"] or shutdown_state["done"]:
                     new_runtime.stop()
                     with offline_reload_lock:
@@ -5171,32 +5124,6 @@ def main():
                             callback=_apply_offline_params,
                             on_enter=False,
                         )
-                        dpg.add_input_float(
-                            label="Rmax (m)",
-                            tag=PROC_IN_RMAX,
-                            default_value=float(off_rmax),
-                            step=0.5,
-                            width=220,
-                            min_value=0.0,
-                            max_value=RMAX_HARD_MAX,
-                            min_clamped=True,
-                            max_clamped=True,
-                            callback=_apply_offline_params,
-                            on_enter=False,
-                        )
-                        dpg.add_input_float(
-                            label="Xmax (m)",
-                            tag=PROC_IN_XMAX,
-                            default_value=float(off_xmax),
-                            step=0.5,
-                            width=220,
-                            min_value=0.0,
-                            max_value=XMAX_HARD_MAX,
-                            min_clamped=True,
-                            max_clamped=True,
-                            callback=_apply_offline_params,
-                            on_enter=False,
-                        )
                         dpg.add_spacer(height=8)
                         dpg.add_button(
                             label=_norm_toggle_label(bool(off_ui_pending.get("norm_enabled", True))),
@@ -5206,7 +5133,7 @@ def main():
                             height=32,
                         )
                         dpg.add_spacer(height=14)
-                        dpg.add_text("OFFLINE ROI BACKPROJECTION", color=(255, 200, 0))
+                        dpg.add_text("OFFLINE ROI RECONSTRUCTION", color=(255, 200, 0))
                         dpg.add_separator()
                         dpg.add_input_float(
                             label="X min (m)",
@@ -5242,7 +5169,7 @@ def main():
                         )
                         with dpg.group(horizontal=True):
                             dpg.add_button(
-                                label="Apply zoom",
+                                label="Apply ROI",
                                 callback=_apply_offline_display_zoom,
                                 width=140,
                             )
@@ -5280,13 +5207,6 @@ def main():
                             callback=_apply_offline_params,
                             on_enter=False,
                         )
-                        dpg.add_text(
-                            "Motion mode: static_zero_doppler (fixed)",
-                            wrap=300,
-                            color=(190, 190, 190),
-                        )
-                        dpg.add_separator()
-                        dpg.add_text(off_status_text, tag=PROC_TXT_STATUS, wrap=300)
 
                 with dpg.table_cell():
                     with dpg.plot(tag=PROC_HEAT_PLOT_TAG, width=-1, height=-1, equal_aspects=True):
@@ -5362,6 +5282,14 @@ def main():
                 with dpg.tab(label="Reconstruction"):
                     with dpg.child_window(width=-1, height=-1, border=False):
                         _add_offline_tuning_section("Reconstruction")
+                with dpg.tab(label="Map"):
+                    with dpg.child_window(width=-1, height=-1, border=False):
+                        dpg.add_text(
+                            "Defines the full physical rectangle available to offline reconstruction. "
+                            "Full map reconstructs this rectangle; Apply ROI reconstructs a contained section on the same fixed image grid.",
+                            wrap=-1,
+                        )
+                        _add_offline_tuning_section("Map reconstruction bounds")
                 with dpg.tab(label="FFT"):
                     with dpg.child_window(width=-1, height=-1, border=False):
                         dpg.add_text(
@@ -5378,7 +5306,11 @@ def main():
                         _add_offline_tuning_section("Range-angle filters")
                 with dpg.tab(label="Background"):
                     with dpg.child_window(width=-1, height=-1, border=False):
-                        _add_offline_tuning_section("Background")
+                        dpg.add_text(
+                            "Subtract a separate empty-scene acquisition before reconstruction.",
+                            wrap=-1,
+                        )
+                        _add_offline_tuning_section("Offline reference background")
                 with dpg.tab(label="Angle"):
                     with dpg.child_window(width=-1, height=-1, border=False):
                         _add_offline_tuning_section("Angle estimation")
@@ -5390,8 +5322,16 @@ def main():
     # Applicazione parametri DOPO creazione items
     _apply_params()
     if dpg.does_item_exist(PROC_XAXIS_TAG) and dpg.does_item_exist(PROC_YAXIS_TAG):
-        dpg.set_axis_limits(PROC_XAXIS_TAG, -float(off_xmax), +float(off_xmax))
-        dpg.set_axis_limits(PROC_YAXIS_TAG, 0.0, float(off_rmax))
+        dpg.set_axis_limits(
+            PROC_XAXIS_TAG,
+            float(off_home_viewport_current.x_min_m),
+            float(off_home_viewport_current.x_max_m),
+        )
+        dpg.set_axis_limits(
+            PROC_YAXIS_TAG,
+            float(off_home_viewport_current.y_min_m),
+            float(off_home_viewport_current.y_max_m),
+        )
     if dpg.does_item_exist(PROC_CMAP_SCALE_TAG):
         dpg.configure_item(
             PROC_CMAP_SCALE_TAG,
@@ -5567,6 +5507,16 @@ def main():
                 offline_runtime = reload_runtime
                 shutdown_resources["offline_runtime"] = offline_runtime
                 offline_info = dict(reload_info or offline_runtime.last_info)
+                off_map_bounds_current = offline_runtime.map_bounds
+                off_home_viewport_current = build_display_viewport(
+                    x_min_m=float(off_map_bounds_current.x_min_m),
+                    x_max_m=float(off_map_bounds_current.x_max_m),
+                    y_min_m=float(off_map_bounds_current.y_min_m),
+                    y_max_m=float(off_map_bounds_current.y_max_m),
+                    dr_m=float(dr_plot),
+                    seq=int(off_requested_viewport_current.seq) + 1,
+                )
+                off_requested_viewport_current = off_home_viewport_current
                 off_pos_min = int(offline_info.get("pos_min", 0))
                 off_pos_max = int(offline_info.get("pos_max", off_pos_min))
                 if off_pos_max < off_pos_min:
@@ -5578,7 +5528,6 @@ def main():
                 off_ui_pending.update({
                     "x_start": int(off_x_start),
                     "x_end": int(off_x_end),
-                    "motion_mode": "static_zero_doppler",
                     "reset_view": True,
                 })
                 off_ui_dirty = True
@@ -5608,9 +5557,7 @@ def main():
                         label="RETRY LOAD / CALCULATE OFFLINE",
                         enabled=True,
                     )
-                off_status_text = f"Offline load/calculation error:\n{reload_error}\n{offline_memory_estimate_text}"
-                if dpg.does_item_exist(PROC_TXT_STATUS):
-                    dpg.set_value(PROC_TXT_STATUS, off_status_text)
+                _render_offline_summary(state=f"Offline load/calculation error: {reload_error}")
                 _set_offline_tuning_status(f"Offline recalculation error: {reload_error}")
 
             if dpg.does_item_exist(TXT_OFFLINE_TUNING_INFO_TAG):
@@ -5624,8 +5571,7 @@ def main():
                         loading_info = {}
                     loading_phase = str(loading_info.get("phase", "starting offline workers"))
                     loading_text = f"Offline load/calculation in progress: {loading_phase}\n{offline_memory_estimate_text}"
-                    if dpg.does_item_exist(PROC_TXT_STATUS):
-                        dpg.set_value(PROC_TXT_STATUS, loading_text)
+                    _render_offline_summary(state=f"Offline loading: {loading_phase}")
                     dpg.set_value(
                         TXT_OFFLINE_TUNING_INFO_TAG,
                         loading_text,
@@ -5645,11 +5591,19 @@ def main():
                             f"used {info_now.get('angle_elements_used', 'n/a')} -> "
                             f"FFT/grid {info_now.get('nfft_angle_effective', info_now.get('range_angle_nfft_angle', 'n/a'))}"
                         )
+                    if bool(info_now.get("background_reference_enabled", False)):
+                        background_text = (
+                            "Reference background: ON "
+                            f"({info_now.get('background_reference_frames', 'n/a')} frames mean, "
+                            f"scale {info_now.get('background_reference_scale', 'n/a')})"
+                        )
+                    else:
+                        background_text = "Reference background: OFF"
                     dpg.set_value(
                         TXT_OFFLINE_TUNING_INFO_TAG,
-                        f"Algorithm: {info_now.get('algorithm', 'n/a')} | BP: {info_now.get('bp_mode', 'n/a')} | "
+                        f"Algorithm: {info_now.get('algorithm', 'n/a')} | "
                         f"Angle: {info_now.get('angle_mode', info_now.get('range_angle_angle_mode_requested', 'n/a'))} | "
-                        f"Filters: {filters_text}\n"
+                        f"Filters: {filters_text} | {background_text}\n"
                         f"Range: input {range_input} -> used {range_used} -> FFT {range_nfft} | {angle_fft_text}",
                     )
 
@@ -5791,8 +5745,6 @@ def main():
                 off_ui_dirty_t = now
                 off_vmin = float(off_ui_pending["vmin"])
                 off_vmax = float(off_ui_pending["vmax"])
-                off_rmax = max(0.0, min(float(off_ui_pending["rmax"]), RMAX_HARD_MAX))
-                off_xmax = max(0.0, min(float(off_ui_pending["xmax"]), XMAX_HARD_MAX))
                 off_norm_enabled = bool(off_ui_pending.get("norm_enabled", True))
                 reset_offline_view = bool(off_ui_pending.get("reset_view", False))
                 reconstruct_offline = bool(off_ui_pending.get("reconstruct", False))
@@ -5806,35 +5758,31 @@ def main():
 
                 off_ui_pending["vmin"] = float(off_vmin)
                 off_ui_pending["vmax"] = float(off_vmax)
-                off_ui_pending["rmax"] = float(off_rmax)
-                off_ui_pending["xmax"] = float(off_xmax)
                 off_ui_pending["norm_enabled"] = bool(off_norm_enabled)
                 if reset_offline_view:
-                    off_requested_viewport_current = build_display_viewport(
-                        x_min_m=-float(off_xmax),
-                        x_max_m=float(off_xmax),
-                        y_min_m=0.0,
-                        y_max_m=float(off_rmax),
-                        dr_m=float(dr_plot),
-                        seq=int(off_requested_viewport_current.seq) + 1,
-                        home_viewport=off_home_viewport_current,
-                    )
+                    off_requested_viewport_current = off_home_viewport_current
 
-                if dpg.does_item_exist(PROC_IN_RMAX):
-                    dpg.set_value(PROC_IN_RMAX, off_rmax)
-                if dpg.does_item_exist(PROC_IN_XMAX):
-                    dpg.set_value(PROC_IN_XMAX, off_xmax)
                 if dpg.does_item_exist(PROC_BTN_NORM):
                     dpg.configure_item(PROC_BTN_NORM, label=_norm_toggle_label(off_norm_enabled))
                 if reset_offline_view and dpg.does_item_exist(PROC_XAXIS_TAG) and dpg.does_item_exist(PROC_YAXIS_TAG):
-                    dpg.set_axis_limits(PROC_XAXIS_TAG, -float(off_xmax), +float(off_xmax))
-                    dpg.set_axis_limits(PROC_YAXIS_TAG, 0.0, float(off_rmax))
+                    dpg.set_axis_limits(
+                        PROC_XAXIS_TAG,
+                        float(off_home_viewport_current.x_min_m),
+                        float(off_home_viewport_current.x_max_m),
+                    )
+                    dpg.set_axis_limits(
+                        PROC_YAXIS_TAG,
+                        float(off_home_viewport_current.y_min_m),
+                        float(off_home_viewport_current.y_max_m),
+                    )
                     _write_offline_zoom_inputs(off_requested_viewport_current)
                     if dpg.does_item_exist(PROC_TXT_ZOOM_STATUS):
                         dpg.set_value(
                             PROC_TXT_ZOOM_STATUS,
-                            f"ROI: X [{-float(off_xmax):.3f}, {float(off_xmax):.3f}] m | "
-                            f"Y [0.000, {float(off_rmax):.3f}] m\n"
+                            f"Full map: X [{off_home_viewport_current.x_min_m:.3f}, "
+                            f"{off_home_viewport_current.x_max_m:.3f}] m | "
+                            f"Y [{off_home_viewport_current.y_min_m:.3f}, "
+                            f"{off_home_viewport_current.y_max_m:.3f}] m\n"
                             f"Backprojection queued on {offline_gui_w}x{offline_gui_h} grid.",
                         )
                 off_ui_pending["reset_view"] = False
@@ -5853,17 +5801,14 @@ def main():
                         offline_runtime.update_params(
                             x_start=int(off_ui_pending["x_start"]),
                             x_end=int(off_ui_pending["x_end"]),
-                            motion_mode=str(off_ui_pending["motion_mode"]),
                             viewport=off_requested_viewport_current,
                         )
                     except Exception as e:
-                        off_status_text = f"Offline update error:\n{e}"
-                        if dpg.does_item_exist(PROC_TXT_STATUS):
-                            dpg.set_value(PROC_TXT_STATUS, off_status_text)
+                        _render_offline_summary(state=f"Offline update error: {e}")
 
             # The manual offline ROI controls submit a new viewport to the DSP
             # worker.  Direct plot pan/zoom remains a display-only interaction
-            # until the user confirms it through "Apply zoom".
+            # until the user confirms it through "Apply ROI".
 
             # --- OFFLINE FRAME update (double-buffer latest-wins) ---
             if offline_runtime is not None:
@@ -5891,36 +5836,16 @@ def main():
                         _configure_image_bounds(PROC_IMG_SERIES_TAG, off_applied_meta_current)
                     except Exception:
                         pass
-                    zoom_status = "safety fallback" if bool(info.get("fallback_used", False)) else "ok"
-                    bp_windows = tuple(str(item) for item in info.get("bp_window_stages", ()) or ())
-                    bp_windows_text = ", ".join(bp_windows) if bp_windows else "none"
                     algorithm_text = str(info.get("algorithm", "backprojection"))
-                    if algorithm_text == "backprojection":
-                        angle_fft_status = "Angle FFT: n/a for backprojection"
-                    else:
-                        angle_fft_status = (
-                            f"Angle input/used/NFFT: {info.get('angle_input_elements', 'n/a')}/"
-                            f"{info.get('angle_elements_used', 'n/a')}/"
-                            f"{info.get('nfft_angle_effective', info.get('range_angle_nfft_angle', 'n/a'))}"
-                        )
-                    off_status_text = (
-                        "Offline processing completed\n"
-                        f"SAR positions: {info.get('x_start')} - {info.get('x_end')} "
-                        f"({info.get('n_pos_used', 'n/a')} used)\n"
-                        f"Algorithm: {algorithm_text}\n"
-                        f"Angle: {info.get('angle_mode', info.get('angle_mode_requested', 'n/a'))} | "
-                        f"Range input/used/NFFT: {info.get('range_input_samples', 'n/a')}/"
-                        f"{info.get('range_samples_used', 'n/a')}/{info.get('nfft_range', 'n/a')} | "
-                        f"{angle_fft_status}\n"
-                        f"Motion mode: {info.get('motion_mode')} | Doppler: {info.get('doppler_bins_used', 'n/a')} bins\n"
-                        f"Processing time: {float(info.get('elapsed_ms', 0.0)):.1f} ms | Zoom: {zoom_status}\n"
-                        f"Geometry: {info.get('geometry_source', 'n/a')}\n"
-                        f"BP windows: {bp_windows_text}"
+                    _render_offline_summary(
+                        state=(
+                            f"Offline {algorithm_text}: positions {info.get('x_start')} - "
+                            f"{info.get('x_end')} ({info.get('n_pos_used', 'n/a')} used)"
+                        ),
+                        calculation_ms=float(info.get("elapsed_ms", 0.0)),
                     )
-                    if dpg.does_item_exist(PROC_TXT_STATUS):
-                        dpg.set_value(PROC_TXT_STATUS, off_status_text)
-                elif offline_runtime.last_error and dpg.does_item_exist(PROC_TXT_STATUS):
-                    dpg.set_value(PROC_TXT_STATUS, f"ERROR: {offline_runtime.last_error}")
+                elif offline_runtime.last_error:
+                    _render_offline_summary(state=f"ERROR: {offline_runtime.last_error}")
 
             if refresh_offline_display:
                 _refresh_offline_texture_from_cached_matrix()

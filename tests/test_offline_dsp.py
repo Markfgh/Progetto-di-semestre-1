@@ -6,12 +6,9 @@ import pytest
 from offline_dsp import (
     _interp_cubic_complex,
     _interp_linear_complex,
-    build_mimo_back_projection_plan,
     back_projection_power_mimo_frames,
-    back_projection_power_mimo_snapshot,
     back_projection_image_mimo,
     build_mimo_geometry,
-    motion_mode_normalize,
     prepare_synthetic_aperture_data,
     prepare_mimo_snapshots,
 )
@@ -95,7 +92,6 @@ def test_bistatic_bp_point_target() -> None:
         fc_hz=float(fc_hz),
         c_m_s=float(c_m_s),
         max_bin=n_bins,
-        motion_mode="static_zero_doppler",
         phase_sign=1,
     )
 
@@ -149,7 +145,6 @@ def test_bistatic_bp_point_target_at_30deg() -> None:
         fc_hz=float(fc_hz),
         c_m_s=float(c_m_s),
         max_bin=n_bins,
-        motion_mode="static_zero_doppler",
         phase_sign=1,
     )
 
@@ -160,101 +155,11 @@ def test_bistatic_bp_point_target_at_30deg() -> None:
     assert float(img_db[target_row, target_col]) >= float(np.mean(img_db, dtype=np.float32)) + 6.0
 
 
-def test_incoherent_mimo_bp_sums_power_not_amplitude() -> None:
-    snapshots = np.zeros((1, 2, 8), dtype=np.complex64)
-    snapshots[0, 0, 3] = np.complex64(3.0 + 0.0j)
-    snapshots[0, 1, 3] = np.complex64(0.0 + 4.0j)
-
-    img_power = back_projection_power_mimo_snapshot(
-        snapshots,
-        np.asarray([0.0], dtype=np.float32),
-        np.asarray([0.0, 0.0], dtype=np.float32),
-        np.asarray([0.0, 0.0], dtype=np.float32),
-        np.asarray([[0.0]], dtype=np.float32),
-        np.asarray([[3.0]], dtype=np.float32),
-        dr_m=1.0,
-        fc_hz=77e9,
-        c_m_s=3e8,
-        max_bin=8,
-        coherent_sum=False,
-    )
-
-    np.testing.assert_allclose(img_power, np.asarray([[25.0]], dtype=np.float32), atol=1e-5, rtol=0.0)
-
-
-def test_mimo_bp_plan_matches_direct_path() -> None:
-    snapshots = np.zeros((2, 2, 16), dtype=np.complex64)
-    snapshots[0, 0, 4] = np.complex64(1.0 + 2.0j)
-    snapshots[0, 1, 5] = np.complex64(0.5 - 0.25j)
-    snapshots[1, 0, 6] = np.complex64(2.0 - 1.0j)
-    snapshots[1, 1, 4] = np.complex64(-0.75 + 0.5j)
-
-    x_pos_m = np.asarray([-0.02, 0.02], dtype=np.float32)
-    x_tx_ant_m = np.asarray([0.0, 0.01], dtype=np.float32)
-    x_rx_ant_m = np.asarray([0.0, 0.015], dtype=np.float32)
-    x_axis = np.linspace(-0.05, 0.05, 7, dtype=np.float32)
-    y_axis = np.linspace(0.15, 0.45, 9, dtype=np.float32)
-    x_grid, y_grid = np.meshgrid(x_axis, y_axis)
-
-    plan = build_mimo_back_projection_plan(
-        x_pos_m,
-        x_tx_ant_m,
-        x_rx_ant_m,
-        x_grid,
-        y_grid,
-        dr_m=0.05,
-        fc_hz=77e9,
-        c_m_s=3e8,
-        max_bin=16,
-        phase_sign=-1,
-    )
-    direct = back_projection_power_mimo_snapshot(
-        snapshots,
-        x_pos_m,
-        x_tx_ant_m,
-        x_rx_ant_m,
-        x_grid,
-        y_grid,
-        dr_m=0.05,
-        fc_hz=77e9,
-        c_m_s=3e8,
-        max_bin=16,
-        phase_sign=-1,
-        coherent_sum=True,
-    )
-    planned = back_projection_power_mimo_snapshot(
-        snapshots,
-        x_pos_m,
-        x_tx_ant_m,
-        x_rx_ant_m,
-        x_grid,
-        y_grid,
-        dr_m=0.05,
-        fc_hz=77e9,
-        c_m_s=3e8,
-        max_bin=16,
-        phase_sign=-1,
-        coherent_sum=True,
-        bp_plan=plan,
-    )
-
-    np.testing.assert_allclose(planned, direct, atol=1e-5, rtol=1e-5)
-
-
-def test_motion_mode_normalize_accepts_static_zero_doppler() -> None:
-    assert motion_mode_normalize("static_zero_doppler") == "static_zero_doppler"
-
-
-def test_motion_mode_normalize_rejects_legacy_all_doppler_incoherent() -> None:
-    with pytest.raises(ValueError, match="static_zero_doppler"):
-        motion_mode_normalize("all_doppler_incoherent")
-
-
 def test_prepare_mimo_snapshots_returns_4d_and_uses_all_virtual_antennas() -> None:
     n_pos, n_frames, n_loops, n_tx, n_rx, n_bins = 2, 3, 8, 2, 4, 16
     raw = np.zeros((n_pos, n_frames, n_loops, n_tx, n_rx, n_bins), dtype=np.complex64)
 
-    prepared = prepare_mimo_snapshots(raw, n_tx=n_tx, motion_mode="static_zero_doppler")
+    prepared = prepare_mimo_snapshots(raw, n_tx=n_tx)
 
     assert prepared.shape == (n_pos, n_frames, n_tx * n_rx, n_bins)
 
@@ -281,17 +186,14 @@ def test_prepare_mimo_snapshots_matches_explicit_zero_doppler_fft(window_name: s
     prepared = prepare_mimo_snapshots(
         raw,
         n_tx=shape[3],
-        motion_mode="static_zero_doppler",
         window_doppler=window,
     )
 
     np.testing.assert_allclose(prepared, explicit, atol=2e-5, rtol=2e-5)
 
 
-@pytest.mark.parametrize("coherent_sum", [True, False])
 @pytest.mark.parametrize("phase_sign", [-1, 1])
-def test_multi_frame_backprojection_matches_legacy_frame_loop(
-    coherent_sum: bool,
+def test_multi_frame_backprojection_matches_single_frame_batches(
     phase_sign: int,
 ) -> None:
     rng = np.random.default_rng(909)
@@ -307,10 +209,10 @@ def test_multi_frame_backprojection_matches_legacy_frame_loop(
         np.linspace(0.2, 0.7, 11, dtype=np.float32),
     )
 
-    legacy = np.zeros_like(x_grid, dtype=np.float32)
+    frame_batches = np.zeros_like(x_grid, dtype=np.float32)
     for frame_i in range(snapshots.shape[1]):
-        legacy += back_projection_power_mimo_snapshot(
-            snapshots[:, frame_i],
+        frame_batches += back_projection_power_mimo_frames(
+            snapshots[:, frame_i : frame_i + 1],
             x_pos_m,
             x_tx_ant_m,
             x_rx_ant_m,
@@ -321,7 +223,6 @@ def test_multi_frame_backprojection_matches_legacy_frame_loop(
             c_m_s=3e8,
             max_bin=24,
             phase_sign=phase_sign,
-            coherent_sum=coherent_sum,
         )
     optimized = back_projection_power_mimo_frames(
         snapshots,
@@ -335,10 +236,9 @@ def test_multi_frame_backprojection_matches_legacy_frame_loop(
         c_m_s=3e8,
         max_bin=24,
         phase_sign=phase_sign,
-        coherent_sum=coherent_sum,
     )
 
-    np.testing.assert_allclose(optimized, legacy, atol=3e-4, rtol=2e-5)
+    np.testing.assert_allclose(optimized, frame_batches, atol=3e-4, rtol=2e-5)
 
 
 def test_prepare_synthetic_aperture_data_flattens_selected_positions_and_antennas() -> None:
@@ -393,7 +293,7 @@ def test_tdm_compensation_static_target_survives_zero_bin() -> None:
     raw = np.zeros((n_pos, n_frames, n_loops, n_tx, n_rx, n_bins), dtype=np.complex64)
     raw[:, :, :, :, :, target_bin] = np.complex64(1.0 + 0.0j)
 
-    zero_bin = prepare_mimo_snapshots(raw, n_tx=n_tx, motion_mode="static_zero_doppler")
+    zero_bin = prepare_mimo_snapshots(raw, n_tx=n_tx)
     assert zero_bin.shape == (n_pos, n_frames, n_tx * n_rx, n_bins)
 
     zero_energy = float(np.sum(np.abs(zero_bin[:, :, :, target_bin]) ** 2, dtype=np.float32))
@@ -416,7 +316,7 @@ def test_tdm_compensation_moving_target_attenuated_in_zero_bin() -> None:
         ).astype(np.complex64, copy=False)
         raw[:, :, :, tx_i, :, target_bin] = phase.reshape(1, 1, n_loops, 1)
 
-    zero_bin = prepare_mimo_snapshots(raw, n_tx=n_tx, motion_mode="static_zero_doppler")
+    zero_bin = prepare_mimo_snapshots(raw, n_tx=n_tx)
 
     zero_energy = float(np.sum(np.abs(zero_bin[:, :, :, target_bin]) ** np.float32(2.0), dtype=np.float32))
     expected_peak_energy = float((n_tx * n_rx) * (n_loops**2))
@@ -445,7 +345,6 @@ def test_back_projection_image_mimo_rejects_5d_input() -> None:
             fc_hz=77e9,
             c_m_s=3e8,
             max_bin=16,
-            motion_mode="static_zero_doppler",
         )
 
 

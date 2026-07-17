@@ -14,7 +14,6 @@ from offline_processing import (
     _apply_offline_backprojection_range_window,
     _select_offline_range_fft_input,
     _apply_offline_sar_range_angle_pre_filters,
-    _apply_offline_sar_range_angle_background,
     _compute_synthetic_range_angle_image,
 )
 
@@ -28,8 +27,6 @@ def _range_angle_cfg(**overrides) -> OfflineSyntheticRangeAngleConfig:
         zero_after_range_fft_bins=0,
         post_range_fft_filters=realtime_dsp.PostRangeFftFilterConfig(
             mean_after_range_fft=realtime_dsp.MeanSelection(enabled=False),
-            background_subtraction=realtime_dsp.BackgroundSubtractionConfig(enabled=False),
-            loop_average_after_background=realtime_dsp.LoopAverageConfig(enabled=False),
         ),
         angle_processing=realtime_dsp.AngleProcessingConfig(mode="fft"),
         nfft_range=64,
@@ -55,35 +52,14 @@ def _geometry() -> tuple[np.ndarray, np.ndarray]:
     return build_mimo_geometry(2, 4, fc_hz=77e9, c_m_s=3e8)
 
 
-def test_offline_frozen_background_uses_warmup_and_excludes_it_from_output() -> None:
-    cube = np.asarray(
-        [
-            [[[1.0 + 0.0j, 2.0 + 0.0j]]],
-            [[[3.0 + 0.0j, 4.0 + 0.0j]]],
-            [[[10.0 + 0.0j, 14.0 + 0.0j]]],
-            [[[12.0 + 0.0j, 16.0 + 0.0j]]],
-        ],
-        dtype=np.complex64,
-    )
-    cfg = realtime_dsp.BackgroundSubtractionConfig(enabled=True, mode="frozen", init_frames=2)
-
-    out = _apply_offline_sar_range_angle_background(cube, bg_cfg=cfg)
-
-    expected_model = cube[:2].mean(axis=0, dtype=np.complex64)
-    np.testing.assert_allclose(out, cube[2:] - expected_model, atol=1e-6, rtol=0.0)
-    assert out.shape[0] == 2
-
-
 def test_offline_pre_filters_ignore_slow_time_even_if_supplied() -> None:
     raw_mimo = np.ones((1, 1, 8, 2, 4, 3), dtype=np.complex64)
     filters_cfg = realtime_dsp.PostRangeFftFilterConfig(
         mean_after_range_fft=realtime_dsp.MeanSelection(enabled=False),
         slow_time=realtime_dsp.SlowTimeConfig(enabled=True, mode="mean_subtraction"),
-        background_subtraction=realtime_dsp.BackgroundSubtractionConfig(enabled=False),
-        loop_average_after_background=realtime_dsp.LoopAverageConfig(enabled=False),
     )
 
-    out = _apply_offline_sar_range_angle_pre_filters(raw_mimo, filters_cfg=filters_cfg, fft_workers=1)
+    out = _apply_offline_sar_range_angle_pre_filters(raw_mimo, filters_cfg=filters_cfg)
 
     np.testing.assert_allclose(out, raw_mimo, atol=0.0, rtol=0.0)
 
@@ -120,32 +96,16 @@ def test_backprojection_aperture_window_uses_position_major_antenna_order() -> N
     np.testing.assert_allclose(out, expected, atol=1e-6, rtol=0.0)
 
 
-def test_offline_frozen_background_returns_empty_when_only_warmup_frames_exist() -> None:
-    cube = np.ones((2, 1, 3, 4), dtype=np.complex64)
-    cfg = realtime_dsp.BackgroundSubtractionConfig(enabled=True, mode="frozen", init_frames=4)
-
-    out = _apply_offline_sar_range_angle_background(cube, bg_cfg=cfg)
-
-    assert out.shape == (0, 1, 3, 4)
-
-
 def test_synthetic_range_angle_uses_one_combined_aperture_and_projects_to_gui(monkeypatch: pytest.MonkeyPatch) -> None:
     x_tx_ant_m, x_rx_ant_m = _geometry()
-    range_fft_sel = np.zeros((4, 2, 3, 8, 6), dtype=np.complex64)
+    range_fft_sel = np.ones((4, 2, 8, 6), dtype=np.complex64)
     selected_positions = np.asarray([0, 1, 2, 3], dtype=np.int32)
     captured: dict[str, object] = {}
-
-    def fake_prepare(raw_mimo, *, n_tx, motion_mode, window_doppler):
-        assert motion_mode == "static_zero_doppler"
-        assert n_tx == 2
-        assert window_doppler is None
-        return np.ones((4, 2, 8, 6), dtype=np.complex64)
 
     def fake_heatmap(virtual_array, **kwargs):
         captured["virtual_array_shape"] = tuple(int(v) for v in virtual_array.shape)
         return np.ones((6, 16), dtype=np.float32)
 
-    monkeypatch.setattr(offline_processing, "_prepare_mimo_snapshots", fake_prepare)
     monkeypatch.setattr(offline_processing, "compute_angle_heatmap", fake_heatmap)
 
     img_db, meta = _compute_synthetic_range_angle_image(
@@ -220,14 +180,10 @@ def test_synthetic_range_angle_applies_window_angle_over_flattened_aperture(monk
     x_tx_ant_m, x_rx_ant_m = _geometry()
     captured: dict[str, np.ndarray] = {}
 
-    def fake_prepare(raw_mimo, *, n_tx, motion_mode, window_doppler):
-        return np.ones((2, 1, 8, 1), dtype=np.complex64)
-
     def fake_heatmap(virtual_array, **kwargs):
         captured["snapshot"] = np.asarray(virtual_array, dtype=np.complex64).copy()
         return np.ones((1, 16), dtype=np.float32)
 
-    monkeypatch.setattr(offline_processing, "_prepare_mimo_snapshots", fake_prepare)
     monkeypatch.setattr(offline_processing, "compute_angle_heatmap", fake_heatmap)
 
     cfg = _range_angle_cfg(
@@ -235,13 +191,11 @@ def test_synthetic_range_angle_applies_window_angle_over_flattened_aperture(monk
         post_range_fft_filters=realtime_dsp.PostRangeFftFilterConfig(
             mean_after_range_fft=realtime_dsp.MeanSelection(enabled=False),
             slow_time=realtime_dsp.SlowTimeConfig(enabled=False),
-            background_subtraction=realtime_dsp.BackgroundSubtractionConfig(enabled=False),
-            loop_average_after_background=realtime_dsp.LoopAverageConfig(enabled=False),
         ),
         window_angle="hanning",
     )
     _compute_synthetic_range_angle_image(
-        np.zeros((2, 1, 2, 8, 1), dtype=np.complex64),
+        np.ones((2, 1, 8, 1), dtype=np.complex64),
         selected_positions=np.asarray([0, 1], dtype=np.int32),
         x_pitch_m=0.1,
         tx_i=2,
@@ -270,12 +224,6 @@ def test_uniform_synthetic_geometry_keeps_fft_mode(monkeypatch: pytest.MonkeyPat
     x_tx_ant_m, x_rx_ant_m = _geometry()
     captured: dict[str, object] = {}
 
-    monkeypatch.setattr(
-        offline_processing,
-        "_prepare_mimo_snapshots",
-        lambda raw_mimo, *, n_tx, motion_mode, window_doppler: np.ones((2, 1, 8, 4), dtype=np.complex64),
-    )
-
     def fake_heatmap(virtual_array, *, angle_cfg, **kwargs):
         captured["mode"] = angle_cfg.mode
         return np.ones((4, 16), dtype=np.float32)
@@ -283,7 +231,7 @@ def test_uniform_synthetic_geometry_keeps_fft_mode(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(offline_processing, "compute_angle_heatmap", fake_heatmap)
 
     _compute_synthetic_range_angle_image(
-        np.zeros((2, 1, 2, 8, 4), dtype=np.complex64),
+        np.ones((2, 1, 8, 4), dtype=np.complex64),
         selected_positions=np.asarray([0, 1], dtype=np.int32),
         x_pitch_m=float(2.0 * (3.0e8 / 77.0e9)),
         tx_i=2,
@@ -324,14 +272,6 @@ def test_measured_motor_pitch_is_uniform_and_angle_fft_supports_padding_and_trun
     n_positions = 194
     captured: list[dict[str, int | str]] = []
 
-    monkeypatch.setattr(
-        offline_processing,
-        "_prepare_mimo_snapshots",
-        lambda raw_mimo, *, n_tx, motion_mode, window_doppler: np.ones(
-            (n_positions, 1, 8, 4), dtype=np.complex64
-        ),
-    )
-
     def fake_heatmap(virtual_array, *, angle_cfg, dsp_cfg, **kwargs):
         captured.append({
             "mode": str(angle_cfg.mode),
@@ -343,7 +283,7 @@ def test_measured_motor_pitch_is_uniform_and_angle_fft_supports_padding_and_trun
     monkeypatch.setattr(offline_processing, "compute_angle_heatmap", fake_heatmap)
 
     _, padded_meta = _compute_synthetic_range_angle_image(
-        np.zeros((n_positions, 1, 2, 8, 4), dtype=np.complex64),
+        np.ones((n_positions, 1, 8, 4), dtype=np.complex64),
         selected_positions=np.arange(1, n_positions + 1, dtype=np.int32),
         x_pitch_m=0.007792000193148851,
         tx_i=2,
@@ -366,7 +306,7 @@ def test_measured_motor_pitch_is_uniform_and_angle_fft_supports_padding_and_trun
     )
 
     _, truncated_meta = _compute_synthetic_range_angle_image(
-        np.zeros((n_positions, 1, 2, 8, 4), dtype=np.complex64),
+        np.ones((n_positions, 1, 8, 4), dtype=np.complex64),
         selected_positions=np.arange(1, n_positions + 1, dtype=np.int32),
         x_pitch_m=0.007792000193148851,
         tx_i=2,
@@ -417,12 +357,6 @@ def test_nonuniform_synthetic_geometry_falls_back_to_bartlett_with_warning(
     x_tx_ant_m, x_rx_ant_m = _geometry()
     captured: dict[str, object] = {}
 
-    monkeypatch.setattr(
-        offline_processing,
-        "_prepare_mimo_snapshots",
-        lambda raw_mimo, *, n_tx, motion_mode, window_doppler: np.ones((2, 1, 8, 4), dtype=np.complex64),
-    )
-
     def fake_heatmap(virtual_array, *, angle_cfg, **kwargs):
         captured["mode"] = angle_cfg.mode
         return np.ones((4, 16), dtype=np.float32)
@@ -430,7 +364,7 @@ def test_nonuniform_synthetic_geometry_falls_back_to_bartlett_with_warning(
     monkeypatch.setattr(offline_processing, "compute_angle_heatmap", fake_heatmap)
 
     _compute_synthetic_range_angle_image(
-        np.zeros((2, 1, 2, 8, 4), dtype=np.complex64),
+        np.ones((2, 1, 8, 4), dtype=np.complex64),
         selected_positions=np.asarray([0, 2], dtype=np.int32),
         x_pitch_m=float(2.0 * (3.0e8 / 77.0e9)),
         tx_i=2,
@@ -459,12 +393,6 @@ def test_bartlett_steering_uses_physical_synthetic_geometry(monkeypatch: pytest.
     wavelength_m = np.float32(3.0e8 / 77.0e9)
     selected_positions = np.asarray([1, 3], dtype=np.int32)
 
-    monkeypatch.setattr(
-        offline_processing,
-        "_prepare_mimo_snapshots",
-        lambda raw_mimo, *, n_tx, motion_mode, window_doppler: np.ones((2, 1, 8, 3), dtype=np.complex64),
-    )
-
     def fake_steering(virtual_ant, nfft_angle, geometry):
         captured["phase_centers_lambda"] = np.asarray(geometry.phase_centers_lambda, dtype=np.float32).copy()
         return np.ones((int(virtual_ant), int(nfft_angle)), dtype=np.complex64)
@@ -477,7 +405,7 @@ def test_bartlett_steering_uses_physical_synthetic_geometry(monkeypatch: pytest.
     )
 
     _compute_synthetic_range_angle_image(
-        np.zeros((2, 1, 2, 8, 3), dtype=np.complex64),
+        np.ones((2, 1, 8, 3), dtype=np.complex64),
         selected_positions=selected_positions,
         x_pitch_m=0.05,
         tx_i=2,
@@ -536,12 +464,6 @@ def test_synthetic_range_angle_heatmap_peaks_at_expected_range_and_angle(
     zero_doppler = np.zeros((4, 1, 8, 16), dtype=np.complex64)
     zero_doppler[:, 0, :, target_bin] = steering.reshape(4, 8)
 
-    monkeypatch.setattr(
-        offline_processing,
-        "_prepare_mimo_snapshots",
-        lambda raw_mimo, *, n_tx, motion_mode, window_doppler: zero_doppler,
-    )
-
     def fake_project(heatmap_lin, **kwargs):
         captured["heatmap"] = np.asarray(heatmap_lin, dtype=np.float32).copy()
         captured["angle_axis_deg"] = np.asarray(kwargs["angle_axis_deg"], dtype=np.float32).copy()
@@ -550,7 +472,7 @@ def test_synthetic_range_angle_heatmap_peaks_at_expected_range_and_angle(
     monkeypatch.setattr(offline_processing, "project_heatmap_for_display", fake_project)
 
     _compute_synthetic_range_angle_image(
-        np.zeros((4, 1, 2, 8, 16), dtype=np.complex64),
+        zero_doppler,
         selected_positions=selected_positions,
         x_pitch_m=x_pitch_m,
         tx_i=2,

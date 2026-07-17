@@ -68,22 +68,7 @@ def test_dsp_releases_slot_only_after_copy(monkeypatch) -> None:
     captured: dict[str, np.ndarray] = {}
 
     monkeypatch.setattr(realtime_dsp, "selection_from_yaml_dict", lambda cfg: realtime_dsp.DspSelection("none", "none", "none"))
-    monkeypatch.setattr(
-        realtime_dsp,
-        "mean_selections_from_yaml_dict",
-        lambda cfg: (realtime_dsp.MeanSelection(enabled=False), realtime_dsp.MeanSelection(enabled=False)),
-    )
-    monkeypatch.setattr(realtime_dsp, "slow_time_from_yaml_dict", lambda cfg: SimpleNamespace(enabled=False, mode="none"))
-    monkeypatch.setattr(
-        realtime_dsp,
-        "background_subtraction_from_yaml_dict",
-        lambda cfg: realtime_dsp.BackgroundSubtractionConfig(enabled=False),
-    )
-    monkeypatch.setattr(
-        realtime_dsp,
-        "loop_average_after_background_from_yaml_dict",
-        lambda cfg: SimpleNamespace(enabled=False),
-    )
+    monkeypatch.setattr(realtime_dsp, "mean_before_range_fft_from_yaml_dict", lambda cfg: realtime_dsp.MeanSelection(enabled=False))
     monkeypatch.setattr(realtime_dsp, "angle_processing_from_yaml_dict", lambda cfg: SimpleNamespace())
     monkeypatch.setattr(realtime_dsp, "heatmap_ema_from_yaml_dict", lambda cfg: SimpleNamespace(enabled=False))
     monkeypatch.setattr(realtime_dsp, "heatmap_spatial_filter_from_yaml_dict", lambda cfg: SimpleNamespace())

@@ -105,7 +105,7 @@ def _run_display_process(
     angle_axis = realtime_dsp.build_angle_axis_deg(dsp_cfg.nfft_angle, geometry=geometry)
     steering = realtime_dsp.build_angle_steering_matrix(dsp_cfg.virtual_ant, dsp_cfg.nfft_angle, geometry=geometry)
     if gui_w is None:
-        gui_w = dsp_cfg.nfft_angle if display_heatmap_mode in {"range_angle_moving", "velocity_xy"} else 65
+        gui_w = dsp_cfg.nfft_angle if display_heatmap_mode == "range_angle_moving" else 65
     gui_heat_views = (
         np.full(gui_h * gui_w, -120.0, dtype=np.float32),
         np.full(gui_h * gui_w, -120.0, dtype=np.float32),
@@ -503,8 +503,6 @@ def test_power_xy_zoom_keeps_fixed_texture_size_and_tracks_applied_viewport() ->
     home_viewport, zoom_viewport = _build_home_and_zoom_viewports(dsp_cfg=dsp_cfg, gui_h=gui_h, gui_w=gui_w)
     zoom_cfg = realtime_dsp.DisplayZoomConfig(
         enabled=True,
-        output_width=gui_w,
-        output_height=gui_h,
         max_zoom_nfft_range=dsp_cfg.nfft_range * 4,
         max_zoom_nfft_angle=dsp_cfg.nfft_angle * 2,
         max_update_hz=0.0,
@@ -550,8 +548,6 @@ def test_display_zoom_over_budget_retries_periodically() -> None:
     home_viewport, zoom_viewport = _build_home_and_zoom_viewports(dsp_cfg=dsp_cfg, gui_h=gui_h, gui_w=gui_w)
     zoom_cfg = realtime_dsp.DisplayZoomConfig(
         enabled=True,
-        output_width=gui_w,
-        output_height=gui_h,
         max_update_hz=15.0,
         dsp_budget_ms=6.0,
     )
@@ -666,8 +662,6 @@ def test_requested_viewport_matching_updated_home_disables_zoom() -> None:
     )
     zoom_cfg = realtime_dsp.DisplayZoomConfig(
         enabled=True,
-        output_width=gui_w,
-        output_height=gui_h,
         max_zoom_nfft_range=dsp_cfg.nfft_range * 4,
         max_zoom_nfft_angle=dsp_cfg.nfft_angle * 2,
         max_update_hz=0.0,
@@ -708,8 +702,6 @@ def test_process_buffer_zoom_args_leave_tracking_detections_unchanged() -> None:
     home_viewport, zoom_viewport = _build_home_and_zoom_viewports(dsp_cfg=dsp_cfg, gui_h=gui_h, gui_w=gui_w)
     zoom_cfg = realtime_dsp.DisplayZoomConfig(
         enabled=True,
-        output_width=gui_w,
-        output_height=gui_h,
         max_zoom_nfft_range=dsp_cfg.nfft_range * 4,
         max_zoom_nfft_angle=dsp_cfg.nfft_angle * 2,
         max_update_hz=0.0,
@@ -816,8 +808,6 @@ def test_process_buffer_zoom_args_leave_tracking_detections_unchanged() -> None:
         display_viewport=home_viewport,
         display_zoom_cfg=realtime_dsp.DisplayZoomConfig(
             enabled=False,
-            output_width=gui_w,
-            output_height=gui_h,
         ),
         display_zoom_runtime=realtime_dsp.DisplayZoomRuntime(home_viewport=home_viewport),
     )

@@ -397,7 +397,7 @@ def test_runtime_config_patch_merges_nested_blocks_without_dropping_siblings() -
     assert base["dsp"]["display_filters"]["background_subtraction"]["alpha"] == 0.02
 
 
-def test_config_parsers_sanitize_invalid_values_and_legacy_aliases() -> None:
+def test_config_parsers_sanitize_invalid_values() -> None:
     cfg = {
         "dsp": {
             "window_range": "not-a-window",
@@ -412,7 +412,7 @@ def test_config_parsers_sanitize_invalid_values_and_legacy_aliases() -> None:
                 "slow_time": {"enabled": True, "mode": "doppler_fft"},
                 "mean_after_range_fft": {"enabled": True, "axes": ["sample", "loop", "loop"]},
             },
-            "detection_filters": {
+            "detection_static_filters": {
                 "background_subtraction": {"enabled": True, "clamp_positive_only": True},
                 "loop_average_after_background": {"enabled": True},
             },
@@ -436,10 +436,10 @@ def test_config_parsers_sanitize_invalid_values_and_legacy_aliases() -> None:
             "merge_range_m": "nan",
         },
         "tracking": {
-            "frame_dt_s": "0.04",
+            "dt_s": "0.04",
             "max_tracks": 0,
-            "min_confirmed_hits": 2,
-            "max_missed_frames": 4,
+            "min_hits_to_confirm": 2,
+            "max_missed_confirmed": 4,
             "model": "unsupported",
             "gating_xy_m": "-2",
         },
@@ -460,17 +460,6 @@ def test_config_parsers_sanitize_invalid_values_and_legacy_aliases() -> None:
     fusion_cfg = realtime_dsp.fusion_from_yaml_dict(cfg)
     tracking_cfg = realtime_dsp.tracking_from_yaml_dict(cfg)
     tracker_cfg = realtime_dsp.tracker_from_yaml_dict(cfg)
-    velocity_xy_cfg = realtime_dsp.velocity_xy_from_yaml_dict(
-        {
-            "dsp": {
-                "velocity_xy": {
-                    "relative_power_floor_db": "nan",
-                    "median_power_floor_scale": -1.0,
-                    "min_dominance_ratio": 2.0,
-                }
-            }
-        }
-    )
     range_angle_moving_cfg = realtime_dsp.range_angle_moving_from_yaml_dict(
         {
             "dsp": {
@@ -498,28 +487,10 @@ def test_config_parsers_sanitize_invalid_values_and_legacy_aliases() -> None:
     assert tracking_cfg.max_missed_confirmed == 4
     assert tracker_cfg.model == "kalman_cv_2d"
     assert tracker_cfg.gating_xy_m == 0.0
-    assert velocity_xy_cfg.relative_power_floor_db == -20.0
-    assert velocity_xy_cfg.median_power_floor_scale == 8.0
-    assert velocity_xy_cfg.min_dominance_ratio == 1.0
     assert range_angle_moving_cfg.relative_power_floor_db == -12.0
     assert range_angle_moving_cfg.min_power_db == 6.0
     assert range_angle_moving_cfg.min_dominance_ratio == 1.0
     assert range_angle_moving_cfg.velocity_dead_zone == 0.08
-
-    velocity_xy_cfg = realtime_dsp.velocity_xy_from_yaml_dict(
-        {
-            "dsp": {
-                "velocity_xy": {
-                    "relative_power_floor_db": -18.0,
-                    "median_power_floor_scale": 5.0,
-                    "min_dominance_ratio": 0.42,
-                }
-            }
-        }
-    )
-    assert velocity_xy_cfg.relative_power_floor_db == -18.0
-    assert velocity_xy_cfg.median_power_floor_scale == 5.0
-    assert velocity_xy_cfg.min_dominance_ratio == 0.42
 
     range_angle_moving_cfg = realtime_dsp.range_angle_moving_from_yaml_dict(
         {
@@ -606,8 +577,6 @@ def test_display_zoom_parser_and_viewport_clamps_are_stable() -> None:
         "display": {"range_max": 4.0},
         "display_zoom": {
             "enabled": "true",
-            "output_width": -10,
-            "output_height": "bad",
             "max_zoom_nfft_range": 16,
             "max_zoom_nfft_angle": 32,
             "max_update_hz": -5.0,
@@ -618,8 +587,6 @@ def test_display_zoom_parser_and_viewport_clamps_are_stable() -> None:
 
     zoom_cfg = realtime_dsp.display_zoom_from_yaml_dict(cfg)
     assert zoom_cfg.enabled
-    assert zoom_cfg.output_width == 1
-    assert zoom_cfg.output_height > 0
     assert zoom_cfg.max_zoom_nfft_range == 64
     assert zoom_cfg.max_zoom_nfft_angle == 128
     assert zoom_cfg.max_update_hz == 15.0
@@ -654,19 +621,17 @@ def test_display_zoom_parser_and_viewport_clamps_are_stable() -> None:
     assert clamped.zoom_level >= 1.0
 
 
-def test_display_image_resolutions_are_independent_and_keep_legacy_fallback() -> None:
-    legacy_cfg = {
-        "radar": {"c": 3.0e8, "fs": 2.0e6, "slope": 30.0e12},
+def test_display_image_resolutions_are_independent_and_validated() -> None:
+    base_cfg = {
         "fft": {"nfft_range": 32768, "nfft_angle": 64},
         "display": {"range_max": 4.0},
-        "display_zoom": {"output_width": 192, "output_height": 96},
     }
-    legacy = realtime_dsp.display_image_resolutions_from_yaml_dict(legacy_cfg)
-    assert legacy.realtime == realtime_dsp.DisplayImageResolution(width=192, height=96)
-    assert legacy.offline == realtime_dsp.DisplayImageResolution(width=192, height=96)
+    defaults = realtime_dsp.display_image_resolutions_from_yaml_dict(base_cfg)
+    assert defaults.realtime == realtime_dsp.DisplayImageResolution(width=128, height=128)
+    assert defaults.offline == realtime_dsp.DisplayImageResolution(width=128, height=128)
 
     explicit_cfg = {
-        **legacy_cfg,
+        **base_cfg,
         "display": {
             "range_max": 4.0,
             "image_resolution": {
@@ -681,29 +646,15 @@ def test_display_image_resolutions_are_independent_and_keep_legacy_fallback() ->
 
     invalid = realtime_dsp.display_image_resolutions_from_yaml_dict(
         {
-            **legacy_cfg,
+            **base_cfg,
             "display": {
                 "range_max": 4.0,
                 "image_resolution": {"realtime": {"width": -7, "height": "not-a-number"}},
             },
         }
     )
-    assert invalid.realtime == realtime_dsp.DisplayImageResolution(width=1, height=96)
-    assert invalid.offline == realtime_dsp.DisplayImageResolution(width=192, height=96)
-
-
-def test_display_zoom_method_warnings_are_explicit_for_unsupported_values() -> None:
-    warnings = realtime_dsp.display_zoom_method_warnings(
-        realtime_dsp.DisplayZoomConfig(
-            enabled=True,
-            realtime_method="fft_zoom",
-            offline_method="adaptive",
-        )
-    )
-
-    assert any("display_zoom.realtime_method='fft_zoom'" in warning for warning in warnings)
-    assert any("display_zoom.offline_method='adaptive'" in warning for warning in warnings)
-    assert realtime_dsp.display_zoom_method_warnings(realtime_dsp.DisplayZoomConfig()) == []
+    assert invalid.realtime == realtime_dsp.DisplayImageResolution(width=1, height=128)
+    assert invalid.offline == realtime_dsp.DisplayImageResolution(width=128, height=128)
 
 
 def test_display_viewport_clamp_expands_to_cover_requested_roi() -> None:

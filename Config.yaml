@@ -41,10 +41,6 @@ display:
 
 display_zoom:
   enabled: true
-  output_width: 256
-  output_height: 256
-  realtime_method: auto
-  offline_method: viewport_grid
   max_zoom_nfft_range: 1024
   max_zoom_nfft_angle: 256
   max_update_hz: 22.0
@@ -85,31 +81,9 @@ dsp:
     axes: [sample] # Options: frame, loop, tx, sample, range_bin, rx.
                    # Suggested for realtime: [sample] (stable DC removal).
 
-  mean_after_range_fft:
-    enabled: false
-    axes: [range_bin] # Usually keep disabled to avoid over-flattening targets.
-
-  slow_time:
-    enabled: false # Legacy/global slow-time filtering.
-    mode: mean_subtraction # Options: none, mean_subtraction, highpass, doppler_fft.
-    highpass_beta: 0.9 # Used only in highpass mode. Typical: 0.85..0.98.
-    doppler_fft_shift: true
-    doppler_zero_notch: false # In doppler_fft mode, can suppress static center line.
-
-  background_subtraction:
-    enabled: true # Legacy/global background subtraction with a single shared background state.
-    mode: frozen # Options: ema, running_mean, window_mean, frozen.
-    alpha: 0.02 # EMA speed: lower=more stable, higher=faster adaptation.
-    init_frames: 40 # Warmup frames before model init.
-    window_frames: 40 # Used by window_mean mode.
-    clamp_positive_only: false # Cleaner display floor, less negative artifacts.
-
-  loop_average_after_background:
-    enabled: false # If true reduces flicker, but can blur dynamics.
-
   display_filters:
     slow_time:
-      enabled: false # Keep disabled to match the legacy/global DSP path.
+      enabled: false
       mode: mean_subtraction # Options: none, mean_subtraction, highpass, doppler_fft.
       highpass_beta: 0.9 # Used only in highpass mode. Typical: 0.85..0.98.
       doppler_fft_shift: true
@@ -120,7 +94,7 @@ dsp:
       axes: [range_bin] # Display-only flattening after range FFT.
 
     background_subtraction:
-      enabled: true # Display heatmap background removal; overrides the legacy/global background_subtraction block above.
+      enabled: true # Display heatmap background removal.
       mode: frozen # Options: ema, running_mean, window_mean, frozen.
       alpha: 0.02
       init_frames: 40
@@ -128,7 +102,7 @@ dsp:
       clamp_positive_only: true
 
     loop_average_after_background:
-      enabled: false # Keep disabled to match the legacy/global DSP path.
+      enabled: false
 
   detection_static_filters:
     mean_after_range_fft:
@@ -216,10 +190,6 @@ tracking:
   use_doppler_in_cost: true # Use doppler in the association cost, not only XY distance.
   history_len: 12 # Number of past positions stored for each track.
   debug_log: false # If true, prints tracker stats and details to the console.
-  # Legacy aliases still accepted by the parser:
-  # min_confirmed_hits, max_missed_frames, process_noise_xy, process_noise_v,
-  # dynamic_speed_threshold_mps, static_speed_threshold_mps, classification_confirm_frames
-
 detection_static:
   enabled: true
   threshold_mode: relative # Options: relative, absolute, ca_cfar, os_cfar.

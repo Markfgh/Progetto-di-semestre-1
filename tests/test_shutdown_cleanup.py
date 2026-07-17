@@ -91,8 +91,6 @@ def _runtime(tmp_path: Path) -> OfflineBPRuntime:
         slope_hz_s=1.0,
         fc_hz=77.0e9,
         nfft_range=4,
-        range_max_m=1.0,
-        crossrange_max_m=1.0,
         image_h=2,
         image_w=2,
     )
@@ -142,6 +140,8 @@ def test_logger_flushes_pending_buffer_on_stop(tmp_path: Path, monkeypatch: pyte
     cap_result = mp.Value("i", 0)
     log_bytes = mp.Value("L", 0)
     stop_evt = threading.Event()
+    out_dir_shared = mp.Array("u", 1024, lock=True)
+    main_refactory._write_shared_text(out_dir_shared, str(tmp_path))
 
     worker = threading.Thread(
         target=main_refactory.logger_worker,
@@ -164,7 +164,7 @@ def test_logger_flushes_pending_buffer_on_stop(tmp_path: Path, monkeypatch: pyte
             "cap_result": cap_result,
             "log_bytes": log_bytes,
             "stop_evt": stop_evt,
-            "out_dir_s": str(tmp_path),
+                "out_dir_shared": out_dir_shared,
             "frames_per_position": 2,
             "block_frames": 4,
         },
@@ -223,6 +223,8 @@ def test_logger_completion_releases_surplus_capture_slots(
     log_bytes = mp.Value("L", 0)
     stop_evt = threading.Event()
     ready_evt = threading.Event()
+    out_dir_shared = mp.Array("u", 1024, lock=True)
+    main_refactory._write_shared_text(out_dir_shared, str(tmp_path))
 
     worker = threading.Thread(
         target=main_refactory.logger_worker,
@@ -245,7 +247,7 @@ def test_logger_completion_releases_surplus_capture_slots(
             "cap_result": cap_result,
             "log_bytes": log_bytes,
             "stop_evt": stop_evt,
-            "out_dir_s": str(tmp_path),
+                "out_dir_shared": out_dir_shared,
             "frames_per_position": 1,
             "block_frames": 4,
             "ready_evt": ready_evt,
@@ -310,6 +312,8 @@ def test_logger_reports_flush_failure_as_capture_failure(
     cap_result = mp.Value("i", 0)
     stop_evt = threading.Event()
     ready_evt = threading.Event()
+    out_dir_shared = mp.Array("u", 1024, lock=True)
+    main_refactory._write_shared_text(out_dir_shared, str(tmp_path))
 
     worker = threading.Thread(
         target=main_refactory.logger_worker,
@@ -332,7 +336,7 @@ def test_logger_reports_flush_failure_as_capture_failure(
             "cap_result": cap_result,
             "log_bytes": mp.Value("L", 0),
             "stop_evt": stop_evt,
-            "out_dir_s": str(tmp_path),
+                "out_dir_shared": out_dir_shared,
             "frames_per_position": 1,
             "block_frames": 4,
             "ready_evt": ready_evt,
