@@ -4498,7 +4498,7 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         {"section": "Shared windows", "path": "offline_sar_range_angle.use_realtime_filters", "label": "Enable preprocessing", "kind": "bool", "default": True},
         {"section": "Shared windows", "path": "offline_sar_range_angle.window_range", "label": "Range window", "kind": "combo", "items": OFFLINE_TUNING_WINDOWS, "default": "hanning"},
         {"section": "Shared windows", "path": "offline_sar_range_angle.window_doppler", "label": "Doppler window", "kind": "combo", "items": OFFLINE_TUNING_WINDOWS, "default": "hanning"},
-        {"section": "Shared windows", "path": "offline_sar_range_angle.window_angle", "label": "Aperture window", "kind": "combo", "items": OFFLINE_TUNING_WINDOWS, "default": "hanning"},
+        {"section": "Shared windows", "path": "offline_sar_range_angle.window_angle", "label": "Angle / aperture (BP)", "kind": "combo", "items": OFFLINE_TUNING_WINDOWS, "default": "hanning"},
         {"section": "Range-angle filters", "path": "offline_sar_range_angle.zero_after_range_fft_bins", "label": "Zero initial bins", "kind": "int", "default": 0, "min": 0, "step": 1},
         {"section": "Range-angle filters", "path": "offline_sar_range_angle.mean_after_range_fft.enabled", "label": "Mean after Range FFT", "kind": "bool", "default": False},
         {"section": "Angle estimation", "path": "offline_sar_range_angle.angle_processing.mode", "label": "Method", "kind": "combo", "items": OFFLINE_TUNING_ANGLE_MODES, "default": "bartlett"},
