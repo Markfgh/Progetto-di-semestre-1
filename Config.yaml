@@ -256,7 +256,7 @@ debug:
   print_top_peaks_angle_max_deg: 90.0 # Optional upper bound for debug angle search.
 
 sar:
-  frames_per_position: 8
+  frames_per_position: 800
   settling_delay_s: 1
   # Timeout usati dal coordinatore della scansione SAR automatica in main.
   scan_motion_timeout_s: 120.0

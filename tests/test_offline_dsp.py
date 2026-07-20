@@ -12,6 +12,7 @@ from offline_dsp import (
     build_mimo_geometry,
     prepare_synthetic_aperture_data,
     prepare_mimo_snapshots,
+    residual_video_phase_sign_normalize,
 )
 from sar_geometry import (
     CylindricalCapture,
@@ -362,6 +363,74 @@ def test_geometry_bp_matches_pre_generalization_linear_reference(phase_sign: int
     # legacy linear reconstructions remain bit-for-bit reproducible.
     np.testing.assert_array_equal(adapter, reference)
     np.testing.assert_allclose(core, reference, atol=3e-4, rtol=2e-5)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("off", 0), ("+", 1), ("-", -1), (0, 0), (1, 1), (-1, -1)],
+)
+def test_residual_video_phase_sign_normalize(value: object, expected: int) -> None:
+    assert residual_video_phase_sign_normalize(value) == expected
+
+
+def test_residual_video_phase_refocuses_matching_fmcw_snapshots() -> None:
+    """The selected RVP sign must restore coherent summation across the aperture."""
+    c_m_s = 3e8
+    fc_hz = 77e9
+    # Deliberately magnified to make this a robust unit test.  The production
+    # slope is much lower, so its expected improvement is subtler.
+    slope_hz_s = 5e15
+    dr_m = 0.1
+    x_pos_m = np.linspace(-0.775, 0.775, 201, dtype=np.float32)
+    x_tx_ant_m = np.zeros(1, dtype=np.float32)
+    x_rx_ant_m = np.zeros(1, dtype=np.float32)
+    target_x = np.float32(15.0)
+    target_y = np.float32(30.0)
+    n_bins = 512
+    snapshots = np.zeros((x_pos_m.size, 1, 1, n_bins), dtype=np.complex64)
+    carrier_scale = (2.0 * np.pi * fc_hz) / c_m_s
+    rvp_scale = np.pi * slope_hz_s / (c_m_s * c_m_s)
+    for pos_i, x_pos in enumerate(x_pos_m):
+        r_total = 2.0 * np.hypot(float(target_x - x_pos), float(target_y))
+        range_bin = 0.5 * r_total / dr_m
+        snapshots[pos_i, 0, 0] = _target_profile(
+            n_bins,
+            range_bin,
+            np.exp(-1j * (carrier_scale * r_total + rvp_scale * r_total * r_total)),
+        )
+
+    x_grid = np.asarray([[target_x]], dtype=np.float32)
+    y_grid = np.asarray([[target_y]], dtype=np.float32)
+    common = dict(
+        dr_m=dr_m,
+        fc_hz=fc_hz,
+        c_m_s=c_m_s,
+        max_bin=n_bins,
+        phase_sign=1,
+        slope_hz_s=slope_hz_s,
+    )
+    uncorrected = back_projection_power_mimo_frames(
+        snapshots,
+        x_pos_m,
+        x_tx_ant_m,
+        x_rx_ant_m,
+        x_grid,
+        y_grid,
+        residual_video_phase="off",
+        **common,
+    )
+    corrected = back_projection_power_mimo_frames(
+        snapshots,
+        x_pos_m,
+        x_tx_ant_m,
+        x_rx_ant_m,
+        x_grid,
+        y_grid,
+        residual_video_phase="+",
+        **common,
+    )
+
+    assert float(corrected[0, 0]) > float(uncorrected[0, 0]) * 20.0
 
 
 def test_geometry_bp_uniform_default_weights_match_explicit_ones() -> None:

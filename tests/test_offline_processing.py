@@ -184,6 +184,22 @@ def test_read_bp_runtime_cfg_mimo_sar_keeps_physical_offset_overrides(tmp_path: 
     np.testing.assert_allclose(runtime["rx_offsets_m"], np.asarray(rx_offsets, dtype=np.float32))
 
 
+@pytest.mark.parametrize(("configured", "expected"), [("off", 0), ("+", 1), ("-", -1)])
+def test_read_bp_runtime_cfg_parses_residual_video_phase(
+    tmp_path: Path,
+    configured: str,
+    expected: int,
+) -> None:
+    offline_cfg = tmp_path / "offline_config.yaml"
+    fallback_cfg = tmp_path / "Config.yaml"
+    _write_yaml(offline_cfg, _offline_reconstruction_cfg(residual_video_phase=configured))
+    _write_yaml(fallback_cfg, _fallback_capture_cfg())
+
+    runtime = _read_bp_runtime_cfg(offline_cfg, fallback_cfg)
+
+    assert runtime["residual_video_phase"] == expected
+
+
 def test_offline_map_bounds_are_loaded_from_reconstruction_config(tmp_path: Path) -> None:
     offline_cfg = tmp_path / "offline_config.yaml"
     fallback_cfg = tmp_path / "Config.yaml"
@@ -575,6 +591,73 @@ def test_stream_reader_validates_without_loading_full_cube(tmp_path: Path) -> No
     assert layout.n_frames_per_position == 2
     assert [pos for pos, _iq in streamed] == [1, 2]
     assert streamed[0][1].shape == (2, 2, 8, 8)
+
+
+def test_stream_reader_uses_requested_prefix_of_available_frames(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_capture(run_dir / "capture_pos1.bin", position=1, frames=3)
+    _write_capture(run_dir / "capture_pos2.bin", position=2, frames=3)
+    offline_cfg = tmp_path / "offline_config.yaml"
+    _write_yaml(
+        offline_cfg,
+        {
+            "data": {"input_dir": str(run_dir)},
+            "capture": {"frames_per_position": 2},
+            "scan": {"x_start": 1, "x_end": 2, "x_step": 1, "x_pitch_m": 0.01},
+        },
+    )
+
+    reader = SARReader(offline_cfg)
+    layout = reader.describe_stream()
+    streamed = list(reader.iter_iq_positions(layout))
+
+    assert layout.available_frames_per_position == 3
+    assert layout.n_frames_per_position == 2
+    assert [iq.shape[0] for _position, iq in streamed] == [2, 2]
+
+
+def test_stream_reader_allows_regular_position_subsampling(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    for position in range(1, 7):
+        _write_capture(run_dir / f"capture_pos{position}.bin", position=position, frames=2)
+    offline_cfg = tmp_path / "offline_config.yaml"
+    _write_yaml(
+        offline_cfg,
+        {
+            "data": {"input_dir": str(run_dir)},
+            "capture": {"frames_per_position": 1},
+            "scan": {"x_start": 2, "x_end": 6, "x_step": 2, "x_pitch_m": 0.01},
+        },
+    )
+
+    layout = SARReader(offline_cfg).describe_stream()
+
+    assert layout.positions.tolist() == [2, 4, 6]
+    assert [path.name for path in layout.files] == [
+        "capture_pos2.bin",
+        "capture_pos4.bin",
+        "capture_pos6.bin",
+    ]
+
+
+def test_stream_reader_rejects_more_frames_than_available(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _write_capture(run_dir / "capture_pos1.bin", position=1, frames=2)
+    offline_cfg = tmp_path / "offline_config.yaml"
+    _write_yaml(
+        offline_cfg,
+        {
+            "data": {"input_dir": str(run_dir)},
+            "capture": {"frames_per_position": 3},
+            "scan": {"x_start": 1, "x_end": 1, "x_step": 1, "x_pitch_m": 0.01},
+        },
+    )
+
+    with pytest.raises(ValueError, match="frames_per_position richiesto=3"):
+        SARReader(offline_cfg).describe_stream()
 
 
 def test_stream_reader_orders_regular_cylindrical_v2_by_acquisition_index(

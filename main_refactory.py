@@ -2748,12 +2748,15 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         source_dir = layout.source_dir
         selected_files = list(layout.files)
         capture_bytes = sum(int(path.stat().st_size) for path in selected_files)
-        max_position_bytes = max(int(path.stat().st_size) for path in selected_files)
         samples_input = max(1, int(layout.samples))
         chirps_input = max(1, int(layout.chirps))
         rx_input = max(1, int(layout.rx))
         tx_input = max(1, int(layout.tx))
         frames_input = max(1, int(layout.n_frames_per_position))
+        # The reader loads only the first configured frames of each file.
+        # Keep the estimate aligned with that bounded read rather than with
+        # the complete capture file stored on disk.
+        max_position_bytes = int(frames_input) * int(layout.bytes_per_frame)
         nfft_range_est = max(1, int(fft_cfg.get("nfft_range", NFFT_RANGE)))
         # Streaming pipeline: only one capture payload and its complex64
         # conversion are resident while the compact zero-Doppler snapshot cube
@@ -2824,6 +2827,10 @@ def main(*, rotary_axis: RotaryAxis | None = None):
 
     offline_memory_estimate_text = _format_offline_memory_estimate(offline_boot_cfg)
     offline_frame_valid = False
+    # A runtime is "ready" after its workers have started, but its first
+    # reconstruction is published later.  Keep these states separate so the
+    # GUI never announces completion before its texture contains that result.
+    offline_recalculation_completion_pending = None
     off_norm_enabled = True
     if off_norm_enabled:
         off_vmin = float(VMIN_NORM)
@@ -2990,6 +2997,10 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         "summary": None,
         "view": None,
     }
+    # Populated by "Inspect run".  The bound is the minimum physical frame
+    # count across the selected capture files, so one value is safe for every
+    # position used by the reconstruction.
+    offline_frame_limit: dict[str, object] = {"available": None, "input_dir": ""}
 
     def _render_offline_summary(
         *,
@@ -3620,29 +3631,33 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             status = active_or_pending_scan.status()
             state = str(status.state)
             active = active_or_pending_scan.active
-            detail = _english_scan_message(str(status.message))
-            if status.position_id is not None:
-                detail += f" | id={int(status.position_id)}"
-            if status.position_mm is not None:
-                detail += f" | x={float(status.position_mm):.4f} mm"
-            if status.capture_id is not None:
-                detail += f" | capture_id={int(status.capture_id)}"
-            if status.acquisition_index is not None:
-                detail += f" | acquisition={int(status.acquisition_index)}"
-            if status.height_index is not None:
-                detail += f" | h={int(status.height_index)}"
-            if status.angle_index is not None:
-                detail += f" | angle={int(status.angle_index)}"
-            if status.azimuth_rad is not None:
-                detail += f" | az={float(status.azimuth_rad):.5f} rad"
-            if status.height_m is not None:
-                detail += f" | z={float(status.height_m):.4f} m"
-            if status.total:
-                detail += f" | {int(status.completed)}/{int(status.total)}"
-            if status.error:
-                detail += f" | ERROR: {_english_scan_message(str(status.error))}"
-            if dpg.does_item_exist(TXT_SCAN_STATUS_TAG):
-                dpg.set_value(TXT_SCAN_STATUS_TAG, detail)
+            # Non sovrascrivere un errore di pre-avvio con lo stato ``idle``.
+            # Prima il callback mostrava "Scan did not start: ...", ma il
+            # frame GUI seguente lo rimpiazzava subito con "Ready".
+            if active or state in {"completed", "cancelled", "failed"}:
+                detail = _english_scan_message(str(status.message))
+                if status.position_id is not None:
+                    detail += f" | id={int(status.position_id)}"
+                if status.position_mm is not None:
+                    detail += f" | x={float(status.position_mm):.4f} mm"
+                if status.capture_id is not None:
+                    detail += f" | capture_id={int(status.capture_id)}"
+                if status.acquisition_index is not None:
+                    detail += f" | acquisition={int(status.acquisition_index)}"
+                if status.height_index is not None:
+                    detail += f" | h={int(status.height_index)}"
+                if status.angle_index is not None:
+                    detail += f" | angle={int(status.angle_index)}"
+                if status.azimuth_rad is not None:
+                    detail += f" | az={float(status.azimuth_rad):.5f} rad"
+                if status.height_m is not None:
+                    detail += f" | z={float(status.height_m):.4f} m"
+                if status.total:
+                    detail += f" | {int(status.completed)}/{int(status.total)}"
+                if status.error:
+                    detail += f" | ERROR: {_english_scan_message(str(status.error))}"
+                if dpg.does_item_exist(TXT_SCAN_STATUS_TAG):
+                    dpg.set_value(TXT_SCAN_STATUS_TAG, detail)
             if state == "capturing" and status.position_id is not None:
                 with sar_pos_counter.get_lock():
                     sar_pos_counter.value = int(status.position_id)
@@ -3677,7 +3692,12 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             selected_scan = _scan_for_mode(_selected_scan_mode())
             dpg.configure_item(
                 BTN_SCAN_START_TAG,
-                enabled=selected_scan is not None and not active and not busy_capture,
+                enabled=(
+                    selected_scan is not None
+                    and not active
+                    and not busy_capture
+                    and scan_pending_run["mode"] is None
+                ),
             )
         if dpg.does_item_exist(BTN_SCAN_CANCEL_TAG):
             dpg.configure_item(BTN_SCAN_CANCEL_TAG, enabled=active)
@@ -4357,7 +4377,7 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                 PROC_TXT_ZOOM_STATUS,
                 f"ROI: {dpg.get_item_configuration(PROC_XAXIS_TAG).get('label', 'X')} [{x0:.3f}, {x1:.3f}] m | "
                 f"{dpg.get_item_configuration(PROC_YAXIS_TAG).get('label', 'Y')} [{y0:.3f}, {y1:.3f}] m\n"
-                f"Backprojection queued on {offline_gui_w}x{offline_gui_h} grid.",
+                f"Offline reconstruction queued on {offline_gui_w}x{offline_gui_h} grid.",
             )
 
     def _reset_offline_display_zoom(sender=None, app_data=None):
@@ -4383,7 +4403,7 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         if dpg.does_item_exist(PROC_TXT_ZOOM_STATUS):
             dpg.set_value(
                 PROC_TXT_ZOOM_STATUS,
-                f"Full-map backprojection queued on {offline_gui_w}x{offline_gui_h} grid.",
+                f"Full-map offline reconstruction queued on {offline_gui_w}x{offline_gui_h} grid.",
             )
 
     def _apply_offline_params(sender=None, app_data=None):
@@ -4451,9 +4471,10 @@ def main(*, rotary_axis: RotaryAxis | None = None):
     OFFLINE_TUNING_FIELD_SPECS = [
         {"section": "Data and scan", "path": "data.input_dir", "label": "Input folder", "kind": "text", "default": "logs", "mode": "shared"},
         {"section": "Data and scan", "path": "data.startup_timeout_s", "label": "Startup timeout (s)", "kind": "int", "default": 300, "min": 1, "max": 3600, "step": 30, "mode": "shared"},
+        {"section": "Data and scan", "path": "capture.frames_per_position", "label": "Frames to use per position", "kind": "int", "default": 8, "min": 1, "step": 1, "mode": "shared"},
         {"section": "Data and scan", "path": "scan.x_start", "label": "Start position", "kind": "int", "default": 1, "step": 1, "mode": "legacy"},
         {"section": "Data and scan", "path": "scan.x_end", "label": "End position", "kind": "int", "default": 1, "step": 1, "mode": "legacy"},
-        {"section": "Data and scan", "path": "scan.x_step", "label": "Position step", "kind": "int", "default": 1, "min": 1, "step": 1, "mode": "legacy"},
+        {"section": "Data and scan", "path": "scan.x_step", "label": "Position step (use every Nth)", "kind": "int", "default": 1, "min": 1, "step": 1, "mode": "legacy"},
         {"section": "Data and scan", "path": "scan.x_pitch_m", "label": "X pitch (m)", "kind": "float", "default": 0.01, "min": 0.000001, "step": 0.001, "format": "%.6f", "mode": "legacy"},
         {"section": "Reconstruction", "path": "reconstruction.algorithm", "label": "Algorithm", "kind": "combo", "items": OFFLINE_TUNING_ALGORITHMS, "default": "synthetic_range_angle", "mode": "legacy"},
         {"section": "Reconstruction", "path": "bp.phase_sign", "label": "Phase sign", "kind": "combo", "items": ["-1", "1"], "default": "-1", "mode": "shared"},
@@ -4512,6 +4533,32 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                 node[part] = child
             node = child
         node[parts[-1]] = value
+
+    def _set_offline_frame_limit(available: int | None, *, input_dir: str = "") -> None:
+        """Reflect the inspected frame capacity in the Data-tab control."""
+        tag = _offline_tune_tag("capture.frames_per_position")
+        available_i = None if available is None else max(1, int(available))
+        offline_frame_limit["available"] = available_i
+        offline_frame_limit["input_dir"] = str(input_dir)
+        if not dpg.does_item_exist(tag):
+            return
+        if available_i is None:
+            dpg.configure_item(
+                tag,
+                label="Frames to use per position",
+                max_clamped=False,
+            )
+            return
+        current = max(1, int(dpg.get_value(tag)))
+        dpg.configure_item(
+            tag,
+            label=f"Frames to use per position (1-{available_i} available)",
+            min_value=1,
+            max_value=available_i,
+            min_clamped=True,
+            max_clamped=True,
+        )
+        dpg.set_value(tag, min(current, available_i))
 
     def _set_offline_tuning_status(message: str) -> None:
         if dpg.does_item_exist(TXT_OFFLINE_TUNING_STATUS_TAG):
@@ -4662,11 +4709,24 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         """Inspect headers only and apply the corresponding offline GUI mode."""
         try:
             snapshot = _offline_tuning_snapshot(materialize_v2=_offline_is_v2())
+            # Inspection must work even when the current control value is
+            # larger than this run.  Read the full header/file capacity first,
+            # then clamp the GUI control to a valid selectable range.
+            inspection_snapshot = yaml.safe_load(yaml.safe_dump(snapshot, sort_keys=False)) or {}
+            capture_cfg = inspection_snapshot.get("capture")
+            if isinstance(capture_cfg, dict):
+                capture_cfg.pop("frames_per_position", None)
             reader_cfg = OfflineSARConfig.from_mapping(
-                snapshot,
+                inspection_snapshot,
                 base_dir=offline_config_path.parent,
             )
             layout = SARReader(config=reader_cfg).describe_stream()
+            available_frames = int(layout.available_frames_per_position)
+            _set_offline_frame_limit(
+                available_frames,
+                input_dir=str(_offline_cfg_path_get(snapshot, "data.input_dir", "")),
+            )
+            snapshot = _offline_tuning_snapshot(materialize_v2=_offline_is_v2())
             if str(layout.geometry_mode) == "cylindrical_regular":
                 summary = cylindrical_run_summary(layout)
                 configured_view = cylindrical_view_from_yaml_dict(snapshot)
@@ -4698,7 +4758,10 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                 algorithm_tag = _offline_tune_tag("reconstruction.algorithm")
                 if dpg.does_item_exist(algorithm_tag):
                     dpg.set_value(algorithm_tag, "backprojection")
-                message = f"Detected rt_capture_v2 {summary.kind}: {summary.height_count} heights x {summary.angle_count} angles"
+                message = (
+                    f"Detected rt_capture_v2 {summary.kind}: {summary.height_count} heights x "
+                    f"{summary.angle_count} angles | {available_frames} frames available per position"
+                )
             else:
                 offline_run_view.update(
                     {
@@ -4708,7 +4771,10 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                         "view": None,
                     }
                 )
-                message = f"Detected rt_capture_v1 linear run: {int(layout.positions.size)} positions"
+                message = (
+                    f"Detected rt_capture_v1 linear run: {int(layout.positions.size)} positions | "
+                    f"{available_frames} frames available per position"
+                )
             _apply_offline_geometry_controls()
             _refresh_offline_memory_estimate(snapshot)
             _set_offline_tuning_status(message)
@@ -4748,6 +4814,7 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             if not isinstance(loaded, dict):
                 raise ValueError("la radice YAML deve essere una mappa")
             offline_tuning_cfg = loaded
+            _set_offline_frame_limit(None)
             offline_run_view.update(
                 {"format": "unknown", "geometry_mode": None, "summary": None, "view": None}
             )
@@ -4810,6 +4877,20 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             raise ValueError("Input folder is required")
         if int(_offline_cfg_path_get(base, "data.startup_timeout_s", 300)) <= 0:
             raise ValueError("Startup timeout must be greater than zero")
+        frames_per_position = int(_offline_cfg_path_get(base, "capture.frames_per_position", 1))
+        if frames_per_position <= 0:
+            raise ValueError("Frames to use per position must be greater than zero")
+        inspected_available = offline_frame_limit.get("available")
+        inspected_input = str(offline_frame_limit.get("input_dir", ""))
+        selected_input = str(_offline_cfg_path_get(base, "data.input_dir", ""))
+        if (
+            inspected_available is not None
+            and inspected_input == selected_input
+            and frames_per_position > int(inspected_available)
+        ):
+            raise ValueError(
+                f"Frames to use per position must be between 1 and {int(inspected_available)} for this run"
+            )
         if bool(_offline_cfg_path_get(base, "offline_background.enabled", False)) and not str(
             _offline_cfg_path_get(base, "offline_background.reference_dir", "")
         ).strip():
@@ -6242,6 +6323,10 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             now = time.perf_counter()
             refresh_offline_display = bool(off_texture_upload_requested)
             off_texture_upload_requested = False
+            # The DSP result is copied before the texture upload.  Defer its
+            # human-readable status and timing until that upload succeeds, so
+            # the reported calculation always corresponds to the image shown.
+            offline_frame_summary_pending = None
 
             _drain_motor_events()
             scan_state_now = _refresh_sar_scan_ui()
@@ -6325,6 +6410,7 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                     offline_reload_state.update({"runtime": None, "info": None, "error": ""})
             if reload_runtime is not None:
                 offline_runtime = reload_runtime
+                offline_recalculation_completion_pending = offline_runtime
                 shutdown_resources["offline_runtime"] = offline_runtime
                 offline_info = dict(reload_info or offline_runtime.last_info)
                 if str(offline_info.get("geometry_mode", "")) == "cylindrical_regular":
@@ -6387,7 +6473,9 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                         label="RELOAD / RECALCULATE OFFLINE",
                         enabled=True,
                     )
-                _set_offline_tuning_status("Offline recalculation completed")
+                _set_offline_tuning_status(
+                    "Offline runtime ready; waiting for the reconstructed image..."
+                )
             elif reload_error:
                 offline_runtime = None
                 shutdown_resources["offline_runtime"] = None
@@ -6626,7 +6714,7 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                             f"{off_home_viewport_current.x_max_m:.3f}] m | "
                             f"Y [{off_home_viewport_current.y_min_m:.3f}, "
                             f"{off_home_viewport_current.y_max_m:.3f}] m\n"
-                            f"Backprojection queued on {offline_gui_w}x{offline_gui_h} grid.",
+                            f"Offline reconstruction queued on {offline_gui_w}x{offline_gui_h} grid.",
                         )
                 off_ui_pending["reset_view"] = False
                 if dpg.does_item_exist(PROC_CMAP_SCALE_TAG):
@@ -6717,15 +6805,24 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                             f"Offline {algorithm_text}: positions {info.get('x_start')} - "
                             f"{info.get('x_end')} ({info.get('n_pos_used', 'n/a')} used)"
                         )
-                    _render_offline_summary(
-                        state=status_text,
-                        calculation_ms=float(info.get("elapsed_ms", 0.0)),
+                    offline_frame_summary_pending = (
+                        status_text,
+                        float(info.get("elapsed_ms", 0.0)),
                     )
                 elif offline_runtime.last_error:
                     _render_offline_summary(state=f"ERROR: {offline_runtime.last_error}")
 
             if refresh_offline_display:
                 _refresh_offline_texture_from_cached_matrix()
+                if offline_frame_summary_pending is not None:
+                    status_text, calculation_ms = offline_frame_summary_pending
+                    _render_offline_summary(
+                        state=status_text,
+                        calculation_ms=calculation_ms,
+                    )
+                if offline_recalculation_completion_pending is offline_runtime and offline_frame_valid:
+                    _set_offline_tuning_status("Offline recalculation completed")
+                    offline_recalculation_completion_pending = None
 
             
             # 1. STATS UPDATE (1Hz) - GESTIONE DATI STAMPATI

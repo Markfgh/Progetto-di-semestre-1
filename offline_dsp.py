@@ -24,6 +24,40 @@ def phase_sign_normalize(value: Any, *, field_name: str = "phase_sign") -> int:
     return int(phase_sign_i)
 
 
+def residual_video_phase_sign_normalize(
+    value: Any,
+    *,
+    field_name: str = "residual_video_phase",
+) -> int:
+    """Normalize the optional FMCW residual-video-phase correction sign.
+
+    ``0``/``off`` disables the correction.  ``+`` and ``-`` add respectively
+    ``+/- pi * slope * (R_bi / c)^2`` to the backprojection phase.  The
+    appropriate sign depends on the dechirp/IQ convention of the capture.
+    """
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        aliases = {
+            "off": 0,
+            "none": 0,
+            "0": 0,
+            "+": 1,
+            "+1": 1,
+            "1": 1,
+            "-": -1,
+            "-1": -1,
+        }
+        if normalized in aliases:
+            return int(aliases[normalized])
+    try:
+        sign_i = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} non valido: {value!r}; usa off, + o -") from exc
+    if sign_i not in (-1, 0, 1):
+        raise ValueError(f"{field_name} deve essere off, + o -; trovato: {value!r}")
+    return int(sign_i)
+
+
 def power_image_to_db(img_power: np.ndarray) -> np.ndarray:
     out = np.asarray(img_power, dtype=np.float32).copy()
     np.add(out, np.float32(1e-12), out=out)
@@ -258,6 +292,8 @@ def back_projection_power_mimo_geometry(
     c_m_s: float,
     max_bin: int,
     phase_sign: int = -1,
+    residual_video_phase: int | str = 0,
+    slope_hz_s: float | None = None,
     chunk_size: int = 16384,
     pose_weights: np.ndarray | None = None,
     channel_weights: np.ndarray | None = None,
@@ -311,6 +347,10 @@ def back_projection_power_mimo_geometry(
         raise ValueError("c_m_s deve essere > 0")
 
     phase_sign_i = phase_sign_normalize(phase_sign, field_name="phase_sign")
+    rvp_sign_i = residual_video_phase_sign_normalize(
+        residual_video_phase,
+        field_name="residual_video_phase",
+    )
     pose_weight = _back_projection_weights(
         pose_weights,
         expected_size=n_pos,
@@ -330,6 +370,13 @@ def back_projection_power_mimo_geometry(
     voxel_flat = voxels.reshape(-1, 3).astype(np.float32, copy=False)
     k = np.float32((2.0 * np.pi * fc_f) / c_f)
     phase_scale = np.float32(float(phase_sign_i)) * k
+    rvp_phase_scale = np.float32(0.0)
+    if rvp_sign_i != 0:
+        if slope_hz_s is None or not np.isfinite(float(slope_hz_s)) or float(slope_hz_s) <= 0.0:
+            raise ValueError("slope_hz_s deve essere > 0 quando residual_video_phase e' attiva")
+        rvp_phase_scale = np.float32(
+            float(rvp_sign_i) * np.pi * float(slope_hz_s) / (c_f * c_f)
+        )
     inv_dr = np.float32(1.0 / dr_f)
     chunk_n = max(1, int(chunk_size))
     frame_acc = np.zeros((n_frames, int(voxel_flat.shape[0])), dtype=np.complex64)
@@ -371,9 +418,13 @@ def back_projection_power_mimo_geometry(
                     continue
 
                 valid_bins = bins[valid_idx]
-                phase = np.exp(
-                    1j * (phase_scale * r_total[valid_idx])
-                ).astype(np.complex64, copy=False)
+                phase_argument = phase_scale * r_total[valid_idx]
+                if rvp_sign_i != 0:
+                    phase_argument = (
+                        phase_argument
+                        + rvp_phase_scale * r_total[valid_idx] * r_total[valid_idx]
+                    )
+                phase = np.exp(1j * phase_argument).astype(np.complex64, copy=False)
                 output_idx = (start + valid_idx).astype(np.intp, copy=False)
                 for frame_i in range(n_frames):
                     interp = _interp_cubic_complex(
@@ -408,6 +459,8 @@ def back_projection_power_mimo_frames(
     c_m_s: float,
     max_bin: int,
     phase_sign: int = -1,
+    residual_video_phase: int | str = 0,
+    slope_hz_s: float | None = None,
     chunk_size: int = 16384,
 ) -> np.ndarray:
     """Reference-compatible adapter for the historical linear z=0 BP.
@@ -436,6 +489,10 @@ def back_projection_power_mimo_frames(
         raise ValueError("dr_m deve essere > 0")
 
     phase_sign_i = phase_sign_normalize(phase_sign, field_name="phase_sign")
+    rvp_sign_i = residual_video_phase_sign_normalize(
+        residual_video_phase,
+        field_name="residual_video_phase",
+    )
     n_pos, n_frames, n_ant, n_bins_avail = (int(v) for v in snapshots.shape)
     max_bin_eff = max(0, min(int(max_bin), int(n_bins_avail)))
     if max_bin_eff < 2 or n_frames <= 0:
@@ -446,6 +503,13 @@ def back_projection_power_mimo_frames(
     y_sq = (y_flat * y_flat).astype(np.float32, copy=False)
     k = np.float32((2.0 * np.pi * float(fc_hz)) / float(c_m_s))
     phase_scale = np.float32(float(phase_sign_i)) * k
+    rvp_phase_scale = np.float32(0.0)
+    if rvp_sign_i != 0:
+        if slope_hz_s is None or not np.isfinite(float(slope_hz_s)) or float(slope_hz_s) <= 0.0:
+            raise ValueError("slope_hz_s deve essere > 0 quando residual_video_phase e' attiva")
+        rvp_phase_scale = np.float32(
+            float(rvp_sign_i) * np.pi * float(slope_hz_s) / (float(c_m_s) * float(c_m_s))
+        )
     inv_dr = np.float32(1.0 / float(dr_m))
     chunk_n = max(1, int(chunk_size))
     frame_acc = np.zeros((n_frames, int(x_flat.size)), dtype=np.complex64)
@@ -471,7 +535,10 @@ def back_projection_power_mimo_frames(
                 if idx.size == 0:
                     continue
                 bins = b[idx]
-                phase = np.exp(1j * (phase_scale * r_total[idx])).astype(np.complex64, copy=False)
+                phase_argument = phase_scale * r_total[idx]
+                if rvp_sign_i != 0:
+                    phase_argument = phase_argument + rvp_phase_scale * r_total[idx] * r_total[idx]
+                phase = np.exp(1j * phase_argument).astype(np.complex64, copy=False)
                 for frame_i in range(n_frames):
                     interp = _interp_cubic_complex(
                         snapshots[pos_i, frame_i, ant_i],
@@ -584,6 +651,8 @@ def back_projection_image_mimo(
     c_m_s: float,
     max_bin: int,
     phase_sign: int = -1,
+    residual_video_phase: int | str = 0,
+    slope_hz_s: float | None = None,
     chunk_size: int = 16384,
 ) -> np.ndarray:
     """Return a dB image shaped exactly like the supplied spatial grids.
@@ -610,6 +679,8 @@ def back_projection_image_mimo(
         c_m_s=c_m_s,
         max_bin=max_bin,
         phase_sign=phase_sign,
+        residual_video_phase=residual_video_phase,
+        slope_hz_s=slope_hz_s,
         chunk_size=chunk_size,
     )
     return power_image_to_db(total_power)

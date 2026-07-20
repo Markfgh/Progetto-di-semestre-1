@@ -46,6 +46,7 @@ from offline_dsp import (
     phase_sign_normalize as _phase_sign_normalize,
     power_image_to_db as _power_image_to_db,
     prepare_mimo_snapshots as _prepare_mimo_snapshots,
+    residual_video_phase_sign_normalize as _residual_video_phase_sign_normalize,
     prepare_synthetic_aperture_data as _prepare_synthetic_aperture_data,
     synthetic_aperture_uniform_spacing_lambda as _synthetic_aperture_uniform_spacing_lambda,
 )
@@ -155,6 +156,10 @@ class SARStreamLayout:
     positions: np.ndarray
     files: tuple[Path, ...]
     n_frames_per_position: int
+    # Frames physically available in every capture file.  The processing
+    # count above can intentionally be smaller when the user selects just
+    # the first N frames of a run.
+    available_frames_per_position: int
     bytes_per_frame: int
     i16_per_frame: int
     samples: int
@@ -474,9 +479,9 @@ class SARReader:
 
         bytes_per_frame = int(chirps) * int(samples) * int(rx) * 4
         i16_per_frame = bytes_per_frame // 2
-        frames_expected = self.config.frames_per_position
-        if frames_expected is None:
-            frames_expected = frames_per_pos_hdr
+        frames_requested = self.config.frames_per_position
+        if frames_requested is None:
+            frames_requested = frames_per_pos_hdr
 
         ordered_files: list[Path] = []
         actual_frames_ref: int | None = None
@@ -498,10 +503,10 @@ class SARReader:
             n_frames = int(payload_size // int(bytes_per_frame))
             if n_frames <= 0:
                 raise ValueError(f"{path.name}: nessun frame nel payload (offset={data_offset})")
-            if frames_expected is not None and n_frames != int(frames_expected):
+            if frames_requested is not None and n_frames < int(frames_requested):
                 raise ValueError(
                     f"{capture_label}: n_frames={n_frames}, "
-                    f"atteso frames_per_position={int(frames_expected)}"
+                    f"ma frames_per_position richiesto={int(frames_requested)}"
                 )
             if actual_frames_ref is None:
                 actual_frames_ref = int(n_frames)
@@ -514,11 +519,13 @@ class SARReader:
 
         if actual_frames_ref is None:
             raise RuntimeError("Nessun dato configurato")
+        selected_frames = int(actual_frames_ref if frames_requested is None else frames_requested)
         return SARStreamLayout(
             source_dir=source_dir,
             positions=positions,
             files=tuple(ordered_files),
-            n_frames_per_position=int(actual_frames_ref),
+            n_frames_per_position=selected_frames,
+            available_frames_per_position=int(actual_frames_ref),
             bytes_per_frame=int(bytes_per_frame),
             i16_per_frame=int(i16_per_frame),
             samples=int(samples),
@@ -538,6 +545,7 @@ class SARReader:
                 path,
                 bytes_per_frame=int(layout.bytes_per_frame),
                 i16_per_frame=int(layout.i16_per_frame),
+                max_frames=int(layout.n_frames_per_position),
             )
             if int(n_frames) != int(layout.n_frames_per_position):
                 raise ValueError(
@@ -560,6 +568,7 @@ class SARReader:
         *,
         bytes_per_frame: int,
         i16_per_frame: int,
+        max_frames: int | None = None,
     ) -> tuple[np.ndarray, int]:
         path = Path(file_path)
         if not path.is_file():
@@ -578,15 +587,30 @@ class SARReader:
         if n_frames <= 0:
             raise ValueError(f"{path.name}: nessun frame nel payload (offset={data_offset})")
 
-        raw = np.fromfile(path, dtype=np.int16, offset=int(data_offset))
-        expected_i16 = n_frames * i16_per_frame
+        frames_to_read = int(n_frames)
+        if max_frames is not None:
+            if int(max_frames) <= 0:
+                raise ValueError("max_frames deve essere > 0")
+            if int(n_frames) < int(max_frames):
+                raise ValueError(
+                    f"{path.name}: n_frames={n_frames}, richiesti max_frames={int(max_frames)}"
+                )
+            frames_to_read = int(max_frames)
+
+        raw = np.fromfile(
+            path,
+            dtype=np.int16,
+            count=int(frames_to_read) * int(i16_per_frame),
+            offset=int(data_offset),
+        )
+        expected_i16 = frames_to_read * i16_per_frame
         if raw.size != expected_i16:
             raise ValueError(
                 f"{path.name}: int16 letti={raw.size}, attesi={expected_i16}"
             )
 
-        raw_frames = raw.reshape(n_frames, i16_per_frame)
-        return raw_frames, int(n_frames)
+        raw_frames = raw.reshape(frames_to_read, i16_per_frame)
+        return raw_frames, int(frames_to_read)
 
     def _detect_capture_data_offset(self, path: Path, file_size: int) -> int:
         if file_size < _CAPTURE_HEADER_PREFIX_LEN:
@@ -1015,15 +1039,21 @@ class SARReader:
     ) -> None:
         found_positions = [pos for pos, _ in pos_files]
         found_set = set(found_positions)
-        expected_set = set(expected_positions)
 
         missing = [pos for pos in expected_positions if pos not in found_set]
-        extra = sorted([pos for pos in found_positions if pos not in expected_set])
+        duplicate_positions = sorted(
+            pos for pos in found_set if found_positions.count(pos) > 1
+        )
 
-        if missing or extra:
+        # A run may contain more positions than the reconstruction currently
+        # needs.  ``x_start/x_end/x_step`` deliberately select a subset (for
+        # example every second capture), therefore non-selected files are not
+        # an error.  Every requested position must still exist exactly once.
+        if missing or duplicate_positions:
             raise ValueError(
-                "Posizioni non valide. "
-                f"Missing={missing if missing else '[]'} | Extra={extra if extra else '[]'}"
+                "Posizioni richieste non valide. "
+                f"Missing={missing if missing else '[]'} | "
+                f"Duplicate={duplicate_positions if duplicate_positions else '[]'}"
             )
 
     @staticmethod
@@ -1328,6 +1358,16 @@ def _read_phase_sign(offline_config_path: str | Path) -> int:
     bp_cfg = cfg.get("bp", {}) or {}
     raw = _pick(bp_cfg.get("phase_sign"), -1)
     return _phase_sign_normalize(raw, field_name="offline_config: bp.phase_sign")
+
+
+def _read_residual_video_phase(offline_config_path: str | Path) -> int:
+    cfg = _load_yaml_file(Path(offline_config_path))
+    bp_cfg = cfg.get("bp", {}) or {}
+    raw = _pick(bp_cfg.get("residual_video_phase"), "off")
+    return _residual_video_phase_sign_normalize(
+        raw,
+        field_name="offline_config: bp.residual_video_phase",
+    )
 
 
 def _read_fft_workers(fallback_capture_cfg: str | Path) -> int:
@@ -2105,6 +2145,7 @@ def _read_bp_runtime_cfg(offline_config_path: str | Path, fallback_capture_cfg: 
         "tx_offsets_m": None if tx_offsets_m is None else tx_offsets_m.astype(np.float32, copy=False),
         "rx_offsets_m": None if rx_offsets_m is None else rx_offsets_m.astype(np.float32, copy=False),
         "algorithm": str(algorithm),
+        "residual_video_phase": _read_residual_video_phase(offline_config_path),
         "map_bounds": offline_map_bounds_from_yaml_dict(cfg, fallback_cfg),
         "range_angle": _read_offline_sar_range_angle_cfg(cfg, fallback_cfg),
         "background_reference": background_reference,
@@ -2980,10 +3021,15 @@ def _offline_dsp_worker(
     map_bounds: OfflineMapBounds,
     x_pitch_m: float,
     phase_sign: int,
+    residual_video_phase: int,
 ) -> None:
     shm_range_fft = None
     try:
         phase_sign_i = _phase_sign_normalize(phase_sign, field_name="phase_sign")
+        residual_video_phase_i = _residual_video_phase_sign_normalize(
+            residual_video_phase,
+            field_name="residual_video_phase",
+        )
         init_msg = None
         while not stop_evt.is_set():
             try:
@@ -3130,6 +3176,7 @@ def _offline_dsp_worker(
                 "x_start": x_start,
                 "x_end": x_end,
                 "phase_sign": int(phase_sign_i),
+                "residual_video_phase": int(residual_video_phase_i),
                 "img_h": int(gui_h),
                 "img_w": int(gui_w),
                 "dr_m": float(dr_m),
@@ -3343,6 +3390,8 @@ def _offline_dsp_worker(
                         c_m_s=float(c_m_s),
                         max_bin=int(viewport_max_bin),
                         phase_sign=int(phase_sign_i),
+                        residual_video_phase=int(residual_video_phase_i),
+                        slope_hz_s=float(slope_hz_s),
                         chunk_size=16384,
                     )
                     img_db = _power_image_to_db(power)
@@ -3472,6 +3521,8 @@ def _offline_dsp_worker(
                             c_m_s=c_m_s,
                             max_bin=viewport_max_bin,
                             phase_sign=phase_sign_i,
+                            residual_video_phase=residual_video_phase_i,
+                            slope_hz_s=float(slope_hz_s),
                             chunk_size=16384,
                         )
                         doppler_bins_used = 1
@@ -3615,6 +3666,7 @@ class OfflineBPRuntime:
         image_w: int,
         x_pitch_m: float | None = None,
         phase_sign: int | None = None,
+        residual_video_phase: int | str | None = None,
     ) -> None:
         self.offline_config_path = str(offline_config_path)
         self.fallback_capture_cfg = str(fallback_capture_cfg)
@@ -3641,6 +3693,10 @@ class OfflineBPRuntime:
         self.phase_sign = _phase_sign_normalize(
             _pick(phase_sign, _read_phase_sign(self.offline_config_path)),
             field_name="phase_sign",
+        )
+        self.residual_video_phase = _residual_video_phase_sign_normalize(
+            _pick(residual_video_phase, _read_residual_video_phase(self.offline_config_path)),
+            field_name="residual_video_phase",
         )
 
         self._started = False
@@ -3730,6 +3786,7 @@ class OfflineBPRuntime:
                     "map_bounds": self.map_bounds,
                     "x_pitch_m": float(self.x_pitch_m),
                     "phase_sign": int(self.phase_sign),
+                    "residual_video_phase": int(self.residual_video_phase),
                 },
             )
             self._reader_p.daemon = True
