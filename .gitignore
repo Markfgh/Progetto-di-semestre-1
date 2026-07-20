@@ -11,3 +11,17 @@ venv/
 # Logs & data
 logs/
 *.bintor
+
+# Project documentation and reference manuals (kept locally)
+docs/
+PDF/
+
+# Test and coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
