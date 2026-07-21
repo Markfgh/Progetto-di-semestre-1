@@ -136,8 +136,39 @@ if _numba is not None:
                     threshold_for_log = 1e-12
                 threshold_map[row, col] = np.float32(10.0 * math.log10(threshold_for_log))
 
+
+    @_numba.njit(cache=True, fastmath=False, parallel=True)
+    def _angle_power_frame_loop_numba_kernel(angle_fft, heatmap):
+        """Collapse angle-FFT power over frame/loop without a full power cube."""
+        n_frames = angle_fft.shape[0]
+        n_loops = angle_fft.shape[1]
+        n_ranges = angle_fft.shape[2]
+        n_angles = angle_fft.shape[3]
+        sample_count = max(1, n_frames * n_loops)
+        scale = np.float32(1.0) / np.float32(sample_count)
+
+        for range_bin in _numba.prange(n_ranges):
+            for angle_bin in range(n_angles):
+                total = np.float32(0.0)
+                for frame_idx in range(n_frames):
+                    for loop_idx in range(n_loops):
+                        value = angle_fft[frame_idx, loop_idx, range_bin, angle_bin]
+                        total += (value.real * value.real) + (value.imag * value.imag)
+                heatmap[range_bin, angle_bin] = total * scale
+
 else:
     _ca_cfar_threshold_db_map_numba_kernel = None
+    _angle_power_frame_loop_numba_kernel = None
+
+
+def warmup_angle_power_numba() -> bool:
+    """Compile the angle-power reduction before the first realtime frame."""
+    if _angle_power_frame_loop_numba_kernel is None:
+        return False
+    angle_fft = np.zeros((1, 1, 1, 1), dtype=np.complex64)
+    heatmap = np.empty((1, 1), dtype=np.float32)
+    _angle_power_frame_loop_numba_kernel(angle_fft, heatmap)
+    return True
 
 
 # The DSP config is passed as a single packed struct to avoid relying on globals in the worker process.
@@ -1912,20 +1943,32 @@ def compute_angle_heatmap(
             overwrite_x=True,
         )
         angle_fft *= np.float32(max(1, int(dsp_cfg.nfft_angle)))
-        # power calculation
-        re = angle_fft.real 
-        im = angle_fft.imag
-        power = (re * re + im * im).astype(np.float32, copy=False) 
         spacing_lambda = 0.25
         if geometry is not None and geometry.uniform_spacing_lambda is not None:
             spacing_lambda = float(geometry.uniform_spacing_lambda)
         valid_u = np.abs(
             _build_angle_u_axis(dsp_cfg.nfft_angle, spacing_lambda=spacing_lambda).astype(np.float64, copy=False)
         ) <= float(_resolve_angle_u_to_sin_scale(geometry))
-        # Aggregate before shifting: fftshift acts only on the angle axis, so
-        # it commutes with the frame/loop aggregation while avoiding a large
-        # full-cube copy on every heatmap.
-        heatmap = _aggregate_angle_power(power)
+        # The common frame_loop path uses a compiled reduction that writes the
+        # final [range, angle] map directly, avoiding the large power cube.
+        # Other aggregation modes keep the NumPy implementation unchanged.
+        if (
+            _angle_power_frame_loop_numba_kernel is not None
+            and angle_fft.ndim == 4
+            and angle_fft.flags.c_contiguous
+            and str(getattr(angle_cfg, "aggregation", "frame_loop")).strip().lower() == "frame_loop"
+        ):
+            heatmap = np.empty((angle_fft.shape[2], angle_fft.shape[3]), dtype=np.float32)
+            _angle_power_frame_loop_numba_kernel(angle_fft, heatmap)
+        else:
+            # power calculation
+            re = angle_fft.real
+            im = angle_fft.imag
+            power = (re * re + im * im).astype(np.float32, copy=False)
+            # Aggregate before shifting: fftshift acts only on the angle axis,
+            # so it commutes with frame/loop aggregation while avoiding a
+            # large full-cube copy on every heatmap.
+            heatmap = _aggregate_angle_power(power)
         heatmap = np.fft.fftshift(heatmap, axes=-1)
         if np.any(~valid_u):
             heatmap[..., ~valid_u] = np.float32(0.0)
@@ -5437,6 +5480,8 @@ def dsp_worker(
     cfar_numba_cfg = cfar_numba_from_yaml_dict(cfg_dict)
     diagnostics_cfg = dsp_diagnostics_from_yaml_dict(cfg_dict)
     configure_cfar_numba_runtime(cfar_numba_cfg, log=("cfar_numba" in dsp_block))
+    if warmup_angle_power_numba():
+        print("[DSP NUMBA] angle-power reduction JIT warmed up.")
     mean_before_range_fft = mean_before_range_fft_from_yaml_dict(cfg_dict)
     detection_static_post_range_fft_filters = detection_static_post_range_fft_filters_from_yaml_dict(cfg_dict)
     detection_static_post_range_fft_filters, detection_static_filter_warnings = sanitize_detection_static_post_range_fft_filters(

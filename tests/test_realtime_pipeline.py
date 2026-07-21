@@ -71,6 +71,43 @@ def _dsp_cfg(samples: int = 32, loops: int = 4) -> realtime_dsp.RealtimeDSPConfi
     )
 
 
+def test_numba_angle_power_reduction_matches_numpy_frame_loop() -> None:
+    if realtime_dsp._angle_power_frame_loop_numba_kernel is None:
+        return
+
+    rng = np.random.default_rng(20260721)
+    virtual_array = (
+        rng.standard_normal((2, 4, 5, 8))
+        + 1j * rng.standard_normal((2, 4, 5, 8))
+    ).astype(np.complex64)
+    dsp_cfg = _dsp_cfg(samples=16, loops=4)
+    geometry = _geometry()
+    angle_cfg = realtime_dsp.AngleProcessingConfig(mode="fft", aggregation="frame_loop")
+
+    actual = realtime_dsp.compute_angle_heatmap(
+        virtual_array.copy(),
+        angle_cfg=angle_cfg,
+        dsp_cfg=dsp_cfg,
+        angle_steering=np.empty((0, 0), dtype=np.complex64),
+        geometry=geometry,
+    )
+
+    angle_fft = realtime_dsp.fft.ifft(
+        virtual_array.copy(),
+        n=dsp_cfg.nfft_angle,
+        axis=3,
+        workers=dsp_cfg.fft_workers,
+        overwrite_x=True,
+    )
+    angle_fft *= np.float32(dsp_cfg.nfft_angle)
+    power = (angle_fft.real * angle_fft.real + angle_fft.imag * angle_fft.imag).astype(np.float32, copy=False)
+    expected = np.fft.fftshift(power.mean(axis=(0, 1), dtype=np.float32), axes=-1)
+    valid_u = np.abs(realtime_dsp._build_angle_u_axis(dsp_cfg.nfft_angle, spacing_lambda=0.25)) <= 2.0
+    expected[:, ~valid_u] = np.float32(0.0)
+
+    np.testing.assert_array_equal(actual, expected)
+
+
 def _run_display_process(
     *,
     display_heatmap_mode: str | None = "power_xy",

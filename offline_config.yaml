@@ -1,7 +1,7 @@
 data:
   # Puoi mettere direttamente una run: logs/run_YYYYMMDD_HHMMSS
   # Se lasci "logs", SARReader prende automaticamente l'ultima run con capture_pos*.bin.
-  input_dir: "logs\\run_20260721_100114"
+  input_dir: "logs\\run_20260721_164116"
   # Maximum time allowed to prepare all offline data before reporting a timeout.
   startup_timeout_s: 3600
 
@@ -11,7 +11,7 @@ capture:
 
 scan:
   x_start: 1
-  x_end: 50
+  x_end: 150
   x_step: 1
   x_pitch_m: 0.007792000193148851 # 7.792 mm pitch
 
@@ -21,10 +21,10 @@ reconstruction:
   # constrained to this domain and reconstruct their selected sector on the
   # fixed offline image grid.
   map_bounds:
-    x_min_m: -5.0
-    x_max_m: 5.0
+    x_min_m: -0.5
+    x_max_m: 0.5
     y_min_m: 2.0
-    y_max_m: 12.5
+    y_max_m: 3.0
   # Optional fixed-world plane for rt_capture_v2 regular circular/cylindrical
   # scans.  Unlike legacy map_bounds, Y may be negative.  If omitted, the
   # offline reader derives a square from scene_center_m and radius_m.
@@ -69,7 +69,7 @@ bp:
 # The reference may contain a different number of frames than the target.
 offline_background:
   enabled: false
-  reference_dir: ""
+  reference_dir: "logs\\run_20260721_163131"
   scale: 1.0
 
 offline_sar_range_angle:
