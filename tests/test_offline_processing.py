@@ -17,7 +17,6 @@ from offline_processing import (
     CylindricalViewBounds,
     OfflineBPRuntime,
     SARReader,
-    _backprojection_display_x_axis,
     _backprojection_viewport_max_bin,
     _apply_offline_backprojection_aperture_window,
     _offline_reader_worker,
@@ -586,47 +585,6 @@ def test_backprojection_roi_reads_only_bins_reachable_by_selected_geometry() -> 
     # Farthest point is x=-2 m from a sensor at x=3 m and y=4 m:
     # ceil(hypot(5, 4)) plus two cubic-interpolation guard bins.
     assert max_bin == 9
-
-
-def test_backprojection_display_x_axis_reflects_roi_about_global_zero() -> None:
-    viewport = build_display_viewport(
-        x_min_m=-2.0,
-        x_max_m=0.0,
-        y_min_m=2.0,
-        y_max_m=4.0,
-        dr_m=0.05,
-    )
-
-    # Display X=-2..0 must evaluate physical BP points X=2..0.  The
-    # reflection stays anchored at zero rather than at the ROI centre (-1).
-    np.testing.assert_allclose(
-        _backprojection_display_x_axis(viewport, 3),
-        np.asarray([2.0, 1.0, 0.0], dtype=np.float32),
-    )
-
-
-def test_backprojection_mirrored_roi_max_bin_matches_reflected_grid() -> None:
-    viewport = build_display_viewport(
-        x_min_m=-2.0,
-        x_max_m=0.0,
-        y_min_m=0.0,
-        y_max_m=4.0,
-        dr_m=1.0,
-    )
-
-    max_bin = _backprojection_viewport_max_bin(
-        viewport,
-        x_pos_m=np.asarray([3.0], dtype=np.float32),
-        x_tx_ant_m=np.asarray([0.0], dtype=np.float32),
-        x_rx_ant_m=np.asarray([0.0], dtype=np.float32),
-        dr_m=1.0,
-        available_bins=128,
-        mirror_display_x=True,
-    )
-
-    # The reflected grid is X=2..0; its farthest point from X=3 at Y=4 is
-    # X=0, so ceil(hypot(3, 4)) plus the two interpolation guard bins is 7.
-    assert max_bin == 7
 
 
 def test_stream_reader_validates_without_loading_full_cube(tmp_path: Path) -> None:

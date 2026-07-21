@@ -1305,7 +1305,6 @@ def _backprojection_viewport_max_bin(
     x_rx_ant_m: np.ndarray,
     dr_m: float,
     available_bins: int,
-    mirror_display_x: bool = False,
 ) -> int:
     """Return the highest FMCW bin that can be addressed by an active BP ROI.
 
@@ -1325,13 +1324,7 @@ def _backprojection_viewport_max_bin(
     if x_tx_offsets.size != x_rx_offsets.size:
         raise ValueError("geometria TX/RX non coerente nel calcolo dei bin BP")
 
-    # BP is displayed with the same left/right convention as FFT angle.  In
-    # that convention an on-screen coordinate x corresponds to physical -x.
-    # Use the reflected endpoints here as well, otherwise an asymmetric ROI
-    # could omit range bins needed by its actual reconstruction grid.
     x_pixels = np.asarray((viewport.x_min_m, viewport.x_max_m), dtype=np.float64)
-    if mirror_display_x:
-        x_pixels = -x_pixels
     y_far = max(0.0, float(viewport.y_max_m))
     sensor_x = x_positions[:, None]
     x_tx = sensor_x + x_tx_offsets[None, :]
@@ -1345,25 +1338,6 @@ def _backprojection_viewport_max_bin(
     # Two guard samples cover the cubic complex interpolation used by BP.
     needed = int(np.ceil(max_one_way_m / float(dr_m))) + 2
     return max(1, min(needed, available))
-
-
-def _backprojection_display_x_axis(viewport: DisplayViewport, output_width: int) -> np.ndarray:
-    """Return physical BP X coordinates for the displayed X-axis labels.
-
-    The offline BP display follows the FFT-angle left/right convention: a
-    displayed coordinate ``x`` samples the physical coordinate ``-x``.  This
-    reflection is deliberately applied before reconstruction, rather than by
-    flipping the finished image, so the mapping stays fixed at X=0 for both a
-    full map and an arbitrary ROI.
-    """
-    return -np.linspace(
-        float(viewport.x_min_m),
-        float(viewport.x_max_m),
-        int(output_width),
-        dtype=np.float32,
-    )
-
-
 def _read_x_pitch_m(offline_config_path: str | Path) -> float:
     cfg = _load_yaml_file(Path(offline_config_path))
     scan_cfg = cfg.get("scan", {}) or {}
@@ -3368,20 +3342,12 @@ def _offline_dsp_worker(
                     if grid_cache_key == grid_key and grid_cache is not None:
                         voxel_xyz = grid_cache
                     else:
-                        if cylindrical_view.section.plane in {"xy", "xz"}:
-                            horizontal_axis = _backprojection_display_x_axis(
-                                applied_viewport,
-                                int(gui_w),
-                            )
-                        else:
-                            # YZ has world Y on the horizontal display axis;
-                            # it is not an azimuth/FFT-angle left-right axis.
-                            horizontal_axis = np.linspace(
-                                float(applied_viewport.x_min_m),
-                                float(applied_viewport.x_max_m),
-                                int(gui_w),
-                                dtype=np.float32,
-                            )
+                        horizontal_axis = np.linspace(
+                            float(applied_viewport.x_min_m),
+                            float(applied_viewport.x_max_m),
+                            int(gui_w),
+                            dtype=np.float32,
+                        )
                         vertical_axis = np.linspace(
                             float(applied_viewport.y_min_m),
                             float(applied_viewport.y_max_m),
@@ -3446,7 +3412,6 @@ def _offline_dsp_worker(
                         x_rx_ant_m=x_rx_ant_m,
                         dr_m=float(dr_m),
                         available_bins=int(n_bins_total),
-                        mirror_display_x=(algorithm == "backprojection"),
                     )
                     if algorithm == "synthetic_range_angle":
                         selected_positions = positions[sel_idx].astype(np.int32, copy=False)
@@ -3509,9 +3474,11 @@ def _offline_dsp_worker(
                         if grid_cache_key == grid_key and grid_cache is not None:
                             x_grid, y_grid = grid_cache
                         else:
-                            x_axis = _backprojection_display_x_axis(
-                                applied_viewport,
+                            x_axis = np.linspace(
+                                float(applied_viewport.x_min_m),
+                                float(applied_viewport.x_max_m),
                                 int(gui_w),
+                                dtype=np.float32,
                             )
                             y_axis = np.linspace(
                                 float(applied_viewport.y_min_m),

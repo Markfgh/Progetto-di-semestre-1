@@ -1,19 +1,22 @@
 radar:
   c: 3e8                 # Speed of light [m/s].
   fs: 10e6               # ADC sampling rate [Hz] = 10,000 ksps in mmWave Studio.
-  slope: 60.012e12       # FMCW slope [Hz/s] = 60.012 MHz/us; must match the applied mmWave Studio value.
-  fc: 77e9               # Carrier [Hz] (used for doppler axis in m/s).
+  # 60.012 MHz/us × 60 us = 3600.72 MHz, as displayed by mmWave Studio.
+  # The realtime DSP uses the positive FFT half: its physical range limit is
+  # c*fs/(4*slope) = 12.50 m.
+  slope: 60.012e12       # FMCW slope [Hz/s]; must match the applied mmWave Studio value.
+  fc: 78.80036e9         # Sweep centre [Hz] for 77 GHz start + 3600.72 MHz sweep.
   chirp_period_s: 160e-6 # PRI [s] = idle 100 us + ramp 60 us; must match mmWave Studio.
 
 capture:
-  samples: 256   # ADC samples/chirp; must match mmWave Studio.
+  samples: 256   # ADC samples/chirp; 25.6 us at 10 Msps; must match mmWave Studio.
   chirps: 256    # Chirps/frame.
   rx: 4          # Current IQ conversion assumes RX=4.
   tx: 2          # Uniform TDM-MIMO TX count; Doppler axis/compensation assume equal chirp spacing across TX.
   x_frames: 1    # Frames processed per DSP batch.
 
 fft:
-  nfft_range: 1024 # Zero-pads the 256 acquired ADC samples for a finer range grid.
+  nfft_range: 256 # FFT length matches the 256 acquired ADC samples.
   nfft_angle: 256 # Typical: 128/256/512. Higher = finer angular grid, more CPU.
   workers: 8      # FFT worker threads.
 
@@ -26,8 +29,8 @@ display:
   velocity_vmax_mps:  0.70 # Default mode-1 signed-velocity scale max [m/s].
   projection_mode:   cartesian # Options: polar_stretched, cartesian.
   projection_interp: nearest  # Used only in cartesian mode: nearest, bilinear.
-  range_max:  15.0    # Hard limit shown on Y axis [m].
-  crossrange_max: 7.5  # X extent [m]; use "auto" to derive it from angle FOV for the realtime heatmap.
+  range_max:  8.0    # Hard limit shown on Y axis [m].
+  crossrange_max: 4  # X extent [m]; use "auto" to derive it from angle FOV for the realtime heatmap.
   rangefft_db_min: 0
   rangefft_db_max: 95
   rangefft_lin_min: 0
@@ -48,7 +51,7 @@ display_zoom:
   fallback_mode: baseline_projection #
 
 processing:
-  range_max_m: 15.0 # Physical processing/detection limit [m]. If missing, falls back to display.range_max.
+  range_max_m: 12.5 # Positive-half FFT physical processing/detection limit [m].
 
 dsp:
   window_range: hanning # Options: none, rectangular, hanning, hamming, blackman.
@@ -146,7 +149,7 @@ dsp:
       clamp_positive_only: false
 
   angle_processing:
-    mode: bartlett # Options: fft, bartlett, mvdr. fft and bartlett honor aggregation/frame_index/loop_index; mvdr always uses all available frame x loop snapshots.
+    mode: fft # Options: fft, bartlett, mvdr. fft and bartlett honor aggregation/frame_index/loop_index; mvdr always uses all available frame x loop snapshots.
     mvdr_diagonal_loading: 0.02 # Stabilizza la covarianza per scene statiche (range tipico 0.01 - 0.05)
     aggregation: frame_loop # fft/bartlett only: frame_loop=all frames+loops, frame=all frames at loop_index, loop=all loops at frame_index, none=single [frame_index, loop_index].
     frame_index: 0 # Used only by fft/bartlett when aggregation is loop or none.

@@ -1910,23 +1910,25 @@ def compute_angle_heatmap(
             axis=3,
             workers=dsp_cfg.fft_workers,
             overwrite_x=True,
-        ) * np.float32(max(1, int(dsp_cfg.nfft_angle)))
+        )
+        angle_fft *= np.float32(max(1, int(dsp_cfg.nfft_angle)))
         # power calculation
         re = angle_fft.real 
         im = angle_fft.imag
         power = (re * re + im * im).astype(np.float32, copy=False) 
-        # shift zero angle to center bin
-        power  = np.fft.fftshift(power , axes=-1)
         spacing_lambda = 0.25
         if geometry is not None and geometry.uniform_spacing_lambda is not None:
             spacing_lambda = float(geometry.uniform_spacing_lambda)
         valid_u = np.abs(
             _build_angle_u_axis(dsp_cfg.nfft_angle, spacing_lambda=spacing_lambda).astype(np.float64, copy=False)
         ) <= float(_resolve_angle_u_to_sin_scale(geometry))
-        if np.any(~valid_u):
-            power[..., ~valid_u] = np.float32(0.0)
-        # aggregate according to angle_cfg and return
+        # Aggregate before shifting: fftshift acts only on the angle axis, so
+        # it commutes with the frame/loop aggregation while avoiding a large
+        # full-cube copy on every heatmap.
         heatmap = _aggregate_angle_power(power)
+        heatmap = np.fft.fftshift(heatmap, axes=-1)
+        if np.any(~valid_u):
+            heatmap[..., ~valid_u] = np.float32(0.0)
         return heatmap.astype(np.float32, copy=False)
 
     if (
