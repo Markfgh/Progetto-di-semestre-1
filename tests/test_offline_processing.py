@@ -94,6 +94,8 @@ def _write_capture(
     rx: int = 4,
     tx: int = 2,
     raw_i16_value: int | None = None,
+    stage_position_mm: float | None = None,
+    include_stage: bool = True,
 ) -> None:
     capture = {
         "samples": samples,
@@ -102,8 +104,13 @@ def _write_capture(
         "tx": tx,
         "frames_per_position": frames,
     }
+    header_payload = {"format": "rt_capture_v1", "position": position, "capture": capture}
+    if include_stage:
+        header_payload["stage"] = {
+            "position_mm": float(position * 10 if stage_position_mm is None else stage_position_mm),
+        }
     header = json.dumps(
-        {"format": "rt_capture_v1", "position": position, "capture": capture},
+        header_payload,
         separators=(",", ":"),
     ).encode("utf-8")
     i16_count = frames * chirps * samples * rx * 2
@@ -609,6 +616,52 @@ def test_stream_reader_validates_without_loading_full_cube(tmp_path: Path) -> No
     assert layout.n_frames_per_position == 2
     assert [pos for pos, _iq in streamed] == [1, 2]
     assert streamed[0][1].shape == (2, 2, 8, 8)
+
+
+def test_stream_reader_uses_measured_stage_positions_for_linear_geometry(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_stage_positions"
+    run_dir.mkdir()
+    _write_capture(
+        run_dir / "capture_pos1.bin",
+        position=1,
+        stage_position_mm=12.5,
+    )
+    _write_capture(
+        run_dir / "capture_pos2.bin",
+        position=2,
+        stage_position_mm=28.0,
+    )
+    offline_cfg = tmp_path / "offline_config.yaml"
+    _write_yaml(
+        offline_cfg,
+        {
+            "data": {"input_dir": str(run_dir)},
+            # Deliberately unlike the measured 15.5 mm separation.
+            "scan": {"x_start": 1, "x_end": 2, "x_step": 1, "x_pitch_m": 0.01},
+        },
+    )
+
+    layout = SARReader(offline_cfg).describe_stream()
+
+    assert layout.stage_positions_m is not None
+    np.testing.assert_allclose(layout.stage_positions_m, [0.0125, 0.0280])
+
+
+def test_stream_reader_rejects_linear_capture_without_measured_stage_position(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_without_stage"
+    run_dir.mkdir()
+    _write_capture(run_dir / "capture_pos1.bin", position=1, include_stage=False)
+    offline_cfg = tmp_path / "offline_config.yaml"
+    _write_yaml(
+        offline_cfg,
+        {
+            "data": {"input_dir": str(run_dir)},
+            "scan": {"x_start": 1, "x_end": 1, "x_step": 1, "x_pitch_m": 0.01},
+        },
+    )
+
+    with pytest.raises(ValueError, match="stage"):
+        SARReader(offline_cfg).describe_stream()
 
 
 def test_stream_reader_uses_requested_prefix_of_available_frames(tmp_path: Path) -> None:
@@ -1185,6 +1238,7 @@ def test_offline_reader_worker_publishes_compact_zero_doppler_cube(
         snapshots = np.ndarray(shape, dtype=np.complex64, buffer=shm.buf)
         assert shape == (2, 2, 8, nfft_range)
         assert np.all(np.isfinite(snapshots))
+        np.testing.assert_allclose(msg["bp_x_pos_m"], [0.01, 0.02])
     finally:
         shm.close()
         stop_evt.set()

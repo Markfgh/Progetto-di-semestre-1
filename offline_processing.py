@@ -173,6 +173,10 @@ class SARStreamLayout:
     capture_ids: np.ndarray | None = None
     acquisition_indices: np.ndarray | None = None
     cylindrical_captures: tuple[CylindricalCapture, ...] = ()
+    # Linear runs carry the measured carriage coordinate in every v1 header.
+    # It is the only valid physical X geometry for legacy BP; ``positions``
+    # remains solely an acquisition/selection identifier.
+    stage_positions_m: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -185,6 +189,7 @@ class _CaptureFileRecord:
     capture_id: int
     acquisition_index: int | None
     cylindrical: CylindricalCapture | None
+    stage_position_m: float | None
 
 
 def cylindrical_capture_world_coordinates(
@@ -453,6 +458,15 @@ class SARReader:
             acquisition_indices = np.arange(positions.size, dtype=np.int32)
             geometry_mode = "legacy_linear"
             cylindrical_captures: tuple[CylindricalCapture, ...] = ()
+            stage_positions_m = np.asarray(
+                [float(record.stage_position_m) for record in ordered_records],
+                dtype=np.float32,
+            )
+            if (
+                stage_positions_m.shape != positions.shape
+                or not np.all(np.isfinite(stage_positions_m))
+            ):
+                raise ValueError("Coordinate stage non valide per la scansione lineare")
         elif format_name == "rt_capture_v2":
             ordered_records = self._validate_regular_cylindrical_records(records)
             positions = np.asarray(
@@ -465,6 +479,7 @@ class SARReader:
                 dtype=np.int32,
             )
             geometry_mode = "cylindrical_regular"
+            stage_positions_m = None
             cylindrical_captures = tuple(
                 record.cylindrical for record in ordered_records if record.cylindrical is not None
             )
@@ -536,6 +551,7 @@ class SARReader:
             capture_ids=capture_ids,
             acquisition_indices=acquisition_indices,
             cylindrical_captures=cylindrical_captures,
+            stage_positions_m=stage_positions_m,
         )
 
     def iter_iq_positions(self, layout: SARStreamLayout):
@@ -807,6 +823,24 @@ class SARReader:
                 f"{path.name}: campo header 'position' non valido ({meta['position']!r})"
             ) from exc
 
+    @staticmethod
+    def _stage_position_m_from_metadata(path: Path, meta: Mapping[str, Any]) -> float:
+        """Read the measured carriage coordinate required by linear BP."""
+        stage = meta.get("stage")
+        if not isinstance(stage, Mapping):
+            raise ValueError(f"{path.name}: header senza oggetto obbligatorio 'stage'")
+        if "position_mm" not in stage:
+            raise ValueError(f"{path.name}: header.stage senza campo obbligatorio 'position_mm'")
+        try:
+            position_mm = float(stage["position_mm"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{path.name}: header.stage.position_mm non valido ({stage['position_mm']!r})"
+            ) from exc
+        if not np.isfinite(position_mm):
+            raise ValueError(f"{path.name}: header.stage.position_mm deve essere finito")
+        return float(position_mm * 1e-3)
+
     def _capture_record_from_header(self, path: Path, meta: Mapping[str, Any]) -> _CaptureFileRecord:
         """Turn one accepted v1/v2 header into an immutable reader record."""
         format_name = str(meta.get("format", ""))
@@ -819,6 +853,7 @@ class SARReader:
                 capture_id=position_legacy,
                 acquisition_index=None,
                 cylindrical=None,
+                stage_position_m=self._stage_position_m_from_metadata(path, meta),
             )
 
         if format_name != "rt_capture_v2":
@@ -850,6 +885,7 @@ class SARReader:
             capture_id=cylindrical.capture_id,
             acquisition_index=cylindrical.acquisition_index,
             cylindrical=cylindrical,
+            stage_position_m=None,
         )
 
     def _scan_capture_records(self, source_dir: Path) -> list[_CaptureFileRecord]:
@@ -2909,8 +2945,11 @@ def _offline_reader_worker(
             msg["cylindrical_summary"] = cylindrical_summary
         else:
             assert mimo_geometry is not None
+            if stream_layout.stage_positions_m is None:
+                raise ValueError("Coordinate stage mancanti per la BP lineare")
             msg["bp_x_tx_ant_m"] = np.asarray(mimo_geometry["x_tx_ant_m"], dtype=np.float32)
             msg["bp_x_rx_ant_m"] = np.asarray(mimo_geometry["x_rx_ant_m"], dtype=np.float32)
+            msg["bp_x_pos_m"] = np.asarray(stream_layout.stage_positions_m, dtype=np.float32)
         msg["bp_geometry_source"] = geometry_source
         _queue_put_latest(reader_to_dsp_q, msg)
         shm_cleanup_transferred = True
@@ -3124,6 +3163,15 @@ def _offline_dsp_worker(
             x_rx_ant_m = np.asarray(init_msg.get("bp_x_rx_ant_m"), dtype=np.float32).reshape(-1)
             if x_tx_ant_m.size != n_ant_data or x_rx_ant_m.size != n_ant_data:
                 raise ValueError("bp_x_tx_ant_m/bp_x_rx_ant_m size != asse antenna range_fft")
+            x_pos_m_full = np.asarray(init_msg.get("bp_x_pos_m"), dtype=np.float32).reshape(-1)
+            if x_pos_m_full.size != int(positions.size) or not np.all(np.isfinite(x_pos_m_full)):
+                raise ValueError("bp_x_pos_m non coerente con le posizioni della scansione lineare")
+            # BP is invariant to a common X translation.  Center only the
+            # measured trajectory, preserving its real pitch and any carriage
+            # positioning error captured in the headers.
+            x_pos_m_full = (
+                x_pos_m_full - np.mean(x_pos_m_full, dtype=np.float32)
+            ).astype(np.float32, copy=False)
         else:
             raise ValueError(f"geometry_mode non supportato nel DSP offline: {geometry_mode!r}")
         n_ant_used = int(n_ant_data)
@@ -3151,10 +3199,6 @@ def _offline_dsp_worker(
                 seq=0,
             )
         applied_viewport = home_viewport
-
-        pos_f = positions.astype(np.float32, copy=False)
-        pos_center = float(np.mean(pos_f)) if pos_f.size > 0 else 0.0
-        x_pos_m_full = (pos_f - np.float32(pos_center)) * np.float32(float(x_pitch_m))
 
         pos_min = int(np.min(positions))
         pos_max = int(np.max(positions))

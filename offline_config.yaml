@@ -1,18 +1,20 @@
 data:
   # Puoi mettere direttamente una run: logs/run_YYYYMMDD_HHMMSS
   # Se lasci "logs", SARReader prende automaticamente l'ultima run con capture_pos*.bin.
-  input_dir: "logs\\run_20260721_164116"
+  input_dir: "logs\\run_20260722_141305"
   # Maximum time allowed to prepare all offline data before reporting a timeout.
   startup_timeout_s: 3600
 
 capture:
   # Usa i primi N frame di ciascuna posizione (1..frame disponibili nella run).
-  frames_per_position: 1
+  frames_per_position: 16
 
 scan:
   x_start: 1
-  x_end: 150
+  x_end: 60
   x_step: 1
+  # Used by synthetic_range_angle only. Linear BP reads the measured
+  # stage.position_mm coordinates stored in each capture header.
   x_pitch_m: 0.007792000193148851 # 7.792 mm pitch
 
 reconstruction:
@@ -21,10 +23,10 @@ reconstruction:
   # constrained to this domain and reconstruct their selected sector on the
   # fixed offline image grid.
   map_bounds:
-    x_min_m: -0.5
-    x_max_m: 0.5
-    y_min_m: 2.0
-    y_max_m: 3.0
+    x_min_m: -2.0
+    x_max_m: 2.0
+    y_min_m: 1.0
+    y_max_m: 5.0
   # Optional fixed-world plane for rt_capture_v2 regular circular/cylindrical
   # scans.  Unlike legacy map_bounds, Y may be negative.  If omitted, the
   # offline reader derives a square from scene_center_m and radius_m.
@@ -69,7 +71,7 @@ bp:
 # The reference may contain a different number of frames than the target.
 offline_background:
   enabled: false
-  reference_dir: "logs\\run_20260721_163131"
+  reference_dir: "logs\\stanza vuota per cilindro 2,58m -0,17m"
   scale: 1.0
 
 offline_sar_range_angle:
@@ -82,8 +84,8 @@ offline_sar_range_angle:
   # Valore > input: conserva tutto l'ingresso e aggiunge zero-padding.
   # nfft_angle si applica come FFT/padding solo con angle_processing.mode=fft;
   # in Bartlett/MVDR indica invece il numero di punti della griglia angolare.
-  nfft_range: 32768
-  nfft_angle: 32768
+  nfft_range: 16384
+  nfft_angle: 16384
   window_range: "hanning"
   window_doppler: "hanning"
   window_angle: "none"
