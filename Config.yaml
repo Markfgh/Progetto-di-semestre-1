@@ -18,7 +18,7 @@ capture:
 fft:
   nfft_range: 256 # FFT length matches the 256 acquired ADC samples.
   nfft_angle: 256 # Typical: 128/256/512. Higher = finer angular grid, more CPU.
-  workers: 8      # FFT worker threads.
+  workers: 4      # Bounded with Numba below: keeps realtime responsive without saturating all CPU cores.
 
 display:
   vmax: 94           # Color scale max in RAW mode.
@@ -40,7 +40,7 @@ display:
   # are allocated when the application starts.
   image_resolution:
     realtime: { width: 256, height: 256 }
-    offline:  { width: 256, height: 256 }
+    offline:  { width: 512, height: 512 }
 
 display_zoom:
   enabled: true
@@ -70,6 +70,12 @@ dsp:
     enabled: true # Optional JIT for CA-CFAR only; OS-CFAR remains on the Python path.
     warmup_on_start: true # Compile/cache before the realtime loop to avoid a first-frame spike.
     self_check_on_start: true # Disable JIT automatically if Python/JIT equivalence fails.
+
+  # The per-frame angle-power reduction uses Numba parallelism.  Limit this
+  # separately from FFTW so the DSP does not claim every logical core.
+  angle_power_numba:
+    enabled: true
+    threads: 4
 
   diagnostics:
     log_cpu_runtime: false # Logs actual CPU affinity/SIMD/FFT/JIT runtime exposure for this DSP process.

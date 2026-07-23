@@ -6,6 +6,134 @@ from typing import Any
 
 import numpy as np
 
+try:
+    import numba as _numba
+except Exception:  # pragma: no cover - Numba is an optional local dependency
+    _numba = None
+
+
+if _numba is not None:
+
+    @_numba.njit(cache=True, fastmath=False, parallel=True)
+    def _back_projection_power_mimo_geometry_numba_kernel(
+        snapshots,
+        tx_global,
+        rx_global,
+        voxel_flat,
+        max_bin_eff,
+        inv_dr,
+        phase_scale,
+        rvp_phase_scale,
+        pose_weight,
+        channel_weight,
+    ):
+        """Parallel scalar form of the physical bistatic BP accumulation.
+
+        One worker owns one output voxel, so it can coherently accumulate all
+        poses/channels without locks.  The per-frame accumulation remains
+        separate, preserving the legacy ``sum(abs(coherent_frame_sum)**2)``
+        result instead of coherently mixing independent radar frames.
+        """
+        n_pos = snapshots.shape[0]
+        n_frames = snapshots.shape[1]
+        n_ant = snapshots.shape[2]
+        n_voxels = voxel_flat.shape[0]
+        frame_real = np.empty((n_voxels, n_frames), dtype=np.float32)
+        frame_imag = np.empty((n_voxels, n_frames), dtype=np.float32)
+        output = np.empty(n_voxels, dtype=np.float32)
+
+        half = np.float32(0.5)
+        two = np.float32(2.0)
+        three = np.float32(3.0)
+        four = np.float32(4.0)
+        five = np.float32(5.0)
+        zero = np.float32(0.0)
+
+        for voxel_i in _numba.prange(n_voxels):
+            for frame_i in range(n_frames):
+                frame_real[voxel_i, frame_i] = zero
+                frame_imag[voxel_i, frame_i] = zero
+
+            vx = voxel_flat[voxel_i, 0]
+            vy = voxel_flat[voxel_i, 1]
+            vz = voxel_flat[voxel_i, 2]
+            for pos_i in range(n_pos):
+                current_pose_weight = pose_weight[pos_i]
+                if current_pose_weight == zero:
+                    continue
+                for ant_i in range(n_ant):
+                    coherent_weight = current_pose_weight * channel_weight[ant_i]
+                    if coherent_weight == zero:
+                        continue
+
+                    tx_dx = vx - tx_global[pos_i, ant_i, 0]
+                    tx_dy = vy - tx_global[pos_i, ant_i, 1]
+                    tx_dz = vz - tx_global[pos_i, ant_i, 2]
+                    rx_dx = vx - rx_global[pos_i, ant_i, 0]
+                    rx_dy = vy - rx_global[pos_i, ant_i, 1]
+                    rx_dz = vz - rx_global[pos_i, ant_i, 2]
+                    r_tx = np.sqrt(tx_dx * tx_dx + tx_dy * tx_dy + tx_dz * tx_dz)
+                    r_rx = np.sqrt(rx_dx * rx_dx + rx_dy * rx_dy + rx_dz * rx_dz)
+                    r_total = r_tx + r_rx
+                    range_bin = half * r_total * inv_dr
+                    if not (range_bin >= zero and range_bin < np.float32(max_bin_eff - 1)):
+                        continue
+
+                    b0 = int(range_bin)
+                    frac = range_bin - np.float32(b0)
+                    phase_argument = phase_scale * r_total
+                    if rvp_phase_scale != zero:
+                        phase_argument = phase_argument + rvp_phase_scale * r_total * r_total
+                    phase_real = np.cos(phase_argument)
+                    phase_imag = np.sin(phase_argument)
+
+                    for frame_i in range(n_frames):
+                        spectrum = snapshots[pos_i, frame_i, ant_i]
+                        p1 = spectrum[b0]
+                        p2 = spectrum[b0 + 1]
+                        if b0 >= 1 and b0 <= max_bin_eff - 3:
+                            p0 = spectrum[b0 - 1]
+                            p3 = spectrum[b0 + 2]
+                            frac2 = frac * frac
+                            frac3 = frac2 * frac
+                            interp_real = half * (
+                                two * p1.real
+                                + (-p0.real + p2.real) * frac
+                                + (two * p0.real - five * p1.real + four * p2.real - p3.real) * frac2
+                                + (-p0.real + three * p1.real - three * p2.real + p3.real) * frac3
+                            )
+                            interp_imag = half * (
+                                two * p1.imag
+                                + (-p0.imag + p2.imag) * frac
+                                + (two * p0.imag - five * p1.imag + four * p2.imag - p3.imag) * frac2
+                                + (-p0.imag + three * p1.imag - three * p2.imag + p3.imag) * frac3
+                            )
+                        else:
+                            interp_real = p1.real + (p2.real - p1.real) * frac
+                            interp_imag = p1.imag + (p2.imag - p1.imag) * frac
+
+                        contribution_real = (
+                            interp_real * phase_real - interp_imag * phase_imag
+                        ) * coherent_weight
+                        contribution_imag = (
+                            interp_real * phase_imag + interp_imag * phase_real
+                        ) * coherent_weight
+                        frame_real[voxel_i, frame_i] += contribution_real
+                        frame_imag[voxel_i, frame_i] += contribution_imag
+
+            total_power = zero
+            for frame_i in range(n_frames):
+                value_real = frame_real[voxel_i, frame_i]
+                value_imag = frame_imag[voxel_i, frame_i]
+                total_power += value_real * value_real + value_imag * value_imag
+            output[voxel_i] = total_power
+
+        return output
+
+
+else:
+    _back_projection_power_mimo_geometry_numba_kernel = None
+
 @dataclass(frozen=True)
 class SyntheticApertureData:
     snapshot_cube: np.ndarray
@@ -297,6 +425,7 @@ def back_projection_power_mimo_geometry(
     chunk_size: int = 16384,
     pose_weights: np.ndarray | None = None,
     channel_weights: np.ndarray | None = None,
+    use_numba: bool = True,
 ) -> np.ndarray:
     """Backproject physical bistatic TX/RX coordinates into an arbitrary 3-D grid.
 
@@ -309,7 +438,8 @@ def back_projection_power_mimo_geometry(
     powers are summed, as in the legacy linear implementation.  ``pose_weights``
     and ``channel_weights`` are independent real coherent weights; omitted
     weights are uniform ones.  No position-times-channel aperture window is
-    applied here.
+    applied here.  When locally available, Numba parallelises independent
+    output voxels; pass ``use_numba=False`` only for numerical reference tests.
     """
     snapshots = np.asarray(snapshot_frame_ant_range, dtype=np.complex64)
     if snapshots.ndim != 4:
@@ -379,6 +509,22 @@ def back_projection_power_mimo_geometry(
         )
     inv_dr = np.float32(1.0 / dr_f)
     chunk_n = max(1, int(chunk_size))
+
+    if bool(use_numba) and _back_projection_power_mimo_geometry_numba_kernel is not None:
+        total_power = _back_projection_power_mimo_geometry_numba_kernel(
+            snapshots,
+            tx_global,
+            rx_global,
+            voxel_flat,
+            int(max_bin_eff),
+            inv_dr,
+            phase_scale,
+            rvp_phase_scale,
+            pose_weight,
+            channel_weight,
+        )
+        return total_power.reshape(output_shape).astype(np.float32, copy=False)
+
     frame_acc = np.zeros((n_frames, int(voxel_flat.shape[0])), dtype=np.complex64)
 
     for pos_i in range(n_pos):
@@ -462,14 +608,14 @@ def back_projection_power_mimo_frames(
     residual_video_phase: int | str = 0,
     slope_hz_s: float | None = None,
     chunk_size: int = 16384,
+    use_numba: bool = True,
 ) -> np.ndarray:
     """Reference-compatible adapter for the historical linear z=0 BP.
 
     The 3-D kernel above is the implementation for new cylindrical captures.
-    This legacy entry point intentionally retains the exact arithmetic and
-    chunk traversal of the previous linear implementation: existing linear
-    files therefore remain a numerical reference, rather than merely being
-    approximately equivalent after a coordinate conversion.
+    For the normal path this legacy geometry is mapped to that same physical
+    kernel and evaluated in parallel.  ``use_numba=False`` retains the original
+    X-only loop/chunk traversal as a numerical reference implementation.
     """
     snapshots = np.asarray(snapshot_frame_ant_range, dtype=np.complex64)
     if snapshots.ndim != 4:
@@ -500,6 +646,34 @@ def back_projection_power_mimo_frames(
 
     x_flat = x_grid.reshape(-1).astype(np.float32, copy=False)
     y_flat = y_grid.reshape(-1).astype(np.float32, copy=False)
+
+    if bool(use_numba) and _back_projection_power_mimo_geometry_numba_kernel is not None:
+        x_pos = np.asarray(x_pos_m, dtype=np.float32).reshape(-1)
+        x_tx = np.asarray(x_tx_ant_m, dtype=np.float32).reshape(-1)
+        x_rx = np.asarray(x_rx_ant_m, dtype=np.float32).reshape(-1)
+        tx_global = np.zeros((n_pos, n_ant, 3), dtype=np.float32)
+        rx_global = np.zeros((n_pos, n_ant, 3), dtype=np.float32)
+        tx_global[:, :, 0] = x_pos[:, None] + x_tx[None, :]
+        rx_global[:, :, 0] = x_pos[:, None] + x_rx[None, :]
+        voxel_flat = np.zeros((int(x_flat.size), 3), dtype=np.float32)
+        voxel_flat[:, 0] = x_flat
+        voxel_flat[:, 1] = y_flat
+        return back_projection_power_mimo_geometry(
+            snapshots,
+            tx_global,
+            rx_global,
+            voxel_flat,
+            dr_m=float(dr_m),
+            fc_hz=float(fc_hz),
+            c_m_s=float(c_m_s),
+            max_bin=int(max_bin_eff),
+            phase_sign=phase_sign_i,
+            residual_video_phase=rvp_sign_i,
+            slope_hz_s=slope_hz_s,
+            chunk_size=chunk_size,
+            use_numba=True,
+        ).reshape(x_grid.shape).astype(np.float32, copy=False)
+
     y_sq = (y_flat * y_flat).astype(np.float32, copy=False)
     k = np.float32((2.0 * np.pi * float(fc_hz)) / float(c_m_s))
     phase_scale = np.float32(float(phase_sign_i)) * k
@@ -654,6 +828,7 @@ def back_projection_image_mimo(
     residual_video_phase: int | str = 0,
     slope_hz_s: float | None = None,
     chunk_size: int = 16384,
+    use_numba: bool = True,
 ) -> np.ndarray:
     """Return a dB image shaped exactly like the supplied spatial grids.
 
@@ -682,5 +857,6 @@ def back_projection_image_mimo(
         residual_video_phase=residual_video_phase,
         slope_hz_s=slope_hz_s,
         chunk_size=chunk_size,
+        use_numba=use_numba,
     )
     return power_image_to_db(total_power)

@@ -341,13 +341,24 @@ def test_geometry_bp_matches_pre_generalization_linear_reference(phase_sign: int
         y_grid,
         **kwargs,
     )
-    adapter = back_projection_power_mimo_frames(
+    adapter_reference = back_projection_power_mimo_frames(
         snapshots,
         x_pos_m,
         x_tx_ant_m,
         x_rx_ant_m,
         x_grid,
         y_grid,
+        use_numba=False,
+        **kwargs,
+    )
+    adapter_accelerated = back_projection_power_mimo_frames(
+        snapshots,
+        x_pos_m,
+        x_tx_ant_m,
+        x_rx_ant_m,
+        x_grid,
+        y_grid,
+        use_numba=True,
         **kwargs,
     )
     tx_global, rx_global = _linear_world_geometry(x_pos_m, x_tx_ant_m, x_rx_ant_m)
@@ -359,10 +370,71 @@ def test_geometry_bp_matches_pre_generalization_linear_reference(phase_sign: int
         **kwargs,
     )
 
-    # The public legacy adapter keeps the original loop/chunk arithmetic, so
-    # legacy linear reconstructions remain bit-for-bit reproducible.
-    np.testing.assert_array_equal(adapter, reference)
+    # ``use_numba=False`` is the preserved pre-Numba reference path.  The
+    # parallel calculation follows the same formula; only last-bit float32
+    # rounding may differ because scalar libm is used for the phase.
+    np.testing.assert_array_equal(adapter_reference, reference)
+    np.testing.assert_allclose(adapter_accelerated, reference, atol=3e-4, rtol=2e-5)
+    assert np.unravel_index(
+        int(np.argmax(adapter_accelerated)), adapter_accelerated.shape
+    ) == np.unravel_index(int(np.argmax(reference)), reference.shape)
     np.testing.assert_allclose(core, reference, atol=3e-4, rtol=2e-5)
+
+
+def test_geometry_bp_numba_matches_numpy_reference_with_frames_weights_and_rvp() -> None:
+    """The accelerated physical BP must retain the pre-Numba calculation."""
+    import offline_dsp
+
+    if offline_dsp._back_projection_power_mimo_geometry_numba_kernel is None:
+        pytest.skip("Numba non installato")
+
+    rng = np.random.default_rng(20260722)
+    snapshots = (
+        rng.standard_normal((4, 3, 3, 40), dtype=np.float32)
+        + 1j * rng.standard_normal((4, 3, 3, 40), dtype=np.float32)
+    ).astype(np.complex64)
+    x_pos_m = np.asarray([-0.08, -0.02, 0.04, 0.10], dtype=np.float32)
+    x_tx_ant_m = np.asarray([-0.006, 0.0, 0.006], dtype=np.float32)
+    x_rx_ant_m = np.asarray([-0.004, 0.002, 0.008], dtype=np.float32)
+    tx_global, rx_global = _linear_world_geometry(x_pos_m, x_tx_ant_m, x_rx_ant_m)
+    x_grid, y_grid = np.meshgrid(
+        np.linspace(-0.16, 0.18, 23, dtype=np.float32),
+        np.linspace(0.24, 0.88, 29, dtype=np.float32),
+    )
+    kwargs = {
+        "dr_m": 0.04,
+        "fc_hz": 77e9,
+        "c_m_s": 3e8,
+        "max_bin": 40,
+        "phase_sign": -1,
+        "residual_video_phase": "+",
+        "slope_hz_s": 6e13,
+        "chunk_size": 47,
+        "pose_weights": np.asarray([1.0, 0.8, 0.6, 0.9], dtype=np.float32),
+        "channel_weights": np.asarray([0.7, 1.0, 0.5], dtype=np.float32),
+    }
+
+    reference = back_projection_power_mimo_geometry(
+        snapshots,
+        tx_global,
+        rx_global,
+        _plane_voxel_xyz(x_grid, y_grid),
+        use_numba=False,
+        **kwargs,
+    )
+    accelerated = back_projection_power_mimo_geometry(
+        snapshots,
+        tx_global,
+        rx_global,
+        _plane_voxel_xyz(x_grid, y_grid),
+        use_numba=True,
+        **kwargs,
+    )
+
+    np.testing.assert_allclose(accelerated, reference, atol=3e-4, rtol=2e-5)
+    assert np.unravel_index(int(np.argmax(accelerated)), accelerated.shape) == np.unravel_index(
+        int(np.argmax(reference)), reference.shape
+    )
 
 
 @pytest.mark.parametrize(

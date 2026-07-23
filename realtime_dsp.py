@@ -79,6 +79,12 @@ _CFAR_NUMBA_ENABLED = False
 _CFAR_NUMBA_SELF_CHECKED = False
 _CFAR_NUMBA_DISABLED_REASON = "not configured"
 _CFAR_NUMBA_LAST_ERROR = ""
+# The angle-power reduction is called for every realtime frame.  Unlike the
+# optional CFAR JIT, this kernel uses ``prange`` and therefore needs an
+# explicit runtime limit: otherwise Numba defaults to every logical CPU.
+_ANGLE_POWER_NUMBA_ENABLED = True
+_ANGLE_POWER_NUMBA_THREADS = 0
+_ANGLE_POWER_NUMBA_LAST_ERROR = ""
 _DSP_RUNTIME_DIAGNOSTICS_LOGGED = False
 
 
@@ -163,7 +169,7 @@ else:
 
 def warmup_angle_power_numba() -> bool:
     """Compile the angle-power reduction before the first realtime frame."""
-    if _angle_power_frame_loop_numba_kernel is None:
+    if not _ANGLE_POWER_NUMBA_ENABLED or _angle_power_frame_loop_numba_kernel is None:
         return False
     angle_fft = np.zeros((1, 1, 1, 1), dtype=np.complex64)
     heatmap = np.empty((1, 1), dtype=np.float32)
@@ -184,6 +190,19 @@ class CfarNumbaConfig:
     enabled: bool = False
     warmup_on_start: bool = False
     self_check_on_start: bool = False
+
+
+@dataclass(frozen=True)
+class AnglePowerNumbaConfig:
+    """Runtime policy for the parallel angle-power reduction.
+
+    ``threads=0`` retains Numba's runtime default.  A positive value caps the
+    Numba worker pool for the DSP process, which prevents this small,
+    per-frame reduction from monopolising a CPU shared with FFTW and the UI.
+    """
+
+    enabled: bool = True
+    threads: int = 0
 
 
 @dataclass(frozen=True)
@@ -1061,6 +1080,17 @@ def cfar_numba_from_yaml_dict(cfg: dict[str, Any]) -> CfarNumbaConfig:
         enabled=_to_bool(block.get("enabled", False), False),
         warmup_on_start=_to_bool(block.get("warmup_on_start", False), False),
         self_check_on_start=_to_bool(block.get("self_check_on_start", False), False),
+    )
+
+
+def angle_power_numba_from_yaml_dict(cfg: dict[str, Any]) -> AnglePowerNumbaConfig:
+    dsp = cfg.get("dsp", {}) or {}
+    block = dsp.get("angle_power_numba", {}) or {}
+    if not isinstance(block, dict):
+        block = {}
+    return AnglePowerNumbaConfig(
+        enabled=_to_bool(block.get("enabled", True), True),
+        threads=max(0, _to_int(block.get("threads", 0), 0)),
     )
 
 
@@ -1953,7 +1983,8 @@ def compute_angle_heatmap(
         # final [range, angle] map directly, avoiding the large power cube.
         # Other aggregation modes keep the NumPy implementation unchanged.
         if (
-            _angle_power_frame_loop_numba_kernel is not None
+            _ANGLE_POWER_NUMBA_ENABLED
+            and _angle_power_frame_loop_numba_kernel is not None
             and angle_fft.ndim == 4
             and angle_fft.flags.c_contiguous
             and str(getattr(angle_cfg, "aggregation", "frame_loop")).strip().lower() == "frame_loop"
@@ -3253,6 +3284,59 @@ def cfar_numba_runtime_status() -> dict[str, Any]:
     }
 
 
+def configure_angle_power_numba_runtime(
+    cfg: AnglePowerNumbaConfig,
+    *,
+    log: bool = True,
+) -> None:
+    """Apply the bounded Numba policy before the realtime frame loop starts."""
+    global _ANGLE_POWER_NUMBA_ENABLED, _ANGLE_POWER_NUMBA_THREADS, _ANGLE_POWER_NUMBA_LAST_ERROR
+
+    _ANGLE_POWER_NUMBA_LAST_ERROR = ""
+    if not cfg.enabled:
+        _ANGLE_POWER_NUMBA_ENABLED = False
+        _ANGLE_POWER_NUMBA_THREADS = 0
+        if log:
+            print("[DSP NUMBA] angle-power JIT disabled by config; NumPy reduction active.")
+        return
+    if _numba is None or _angle_power_frame_loop_numba_kernel is None:
+        _ANGLE_POWER_NUMBA_ENABLED = False
+        _ANGLE_POWER_NUMBA_THREADS = 0
+        _ANGLE_POWER_NUMBA_LAST_ERROR = f"numba unavailable: {_NUMBA_IMPORT_ERROR}"
+        if log:
+            print(f"[DSP NUMBA WARN] angle-power JIT unavailable ({_NUMBA_IMPORT_ERROR}); NumPy reduction active.")
+        return
+
+    try:
+        runtime_max = max(1, int(getattr(_numba.config, "NUMBA_NUM_THREADS", _numba.get_num_threads())))
+        requested = int(cfg.threads)
+        effective = runtime_max if requested <= 0 else min(max(1, requested), runtime_max)
+        _numba.set_num_threads(int(effective))
+        _ANGLE_POWER_NUMBA_ENABLED = True
+        _ANGLE_POWER_NUMBA_THREADS = int(_numba.get_num_threads())
+        if log:
+            print(
+                "[DSP NUMBA] "
+                f"angle-power JIT enabled; threads={_ANGLE_POWER_NUMBA_THREADS} "
+                f"(requested={'auto' if requested <= 0 else requested}, max={runtime_max})."
+            )
+    except Exception as exc:  # pragma: no cover - depends on the local Numba runtime
+        _ANGLE_POWER_NUMBA_ENABLED = False
+        _ANGLE_POWER_NUMBA_THREADS = 0
+        _ANGLE_POWER_NUMBA_LAST_ERROR = str(exc)
+        if log:
+            print(f"[DSP NUMBA WARN] angle-power JIT disabled; cannot set thread limit ({exc}).")
+
+
+def angle_power_numba_runtime_status() -> dict[str, Any]:
+    return {
+        "enabled": bool(_ANGLE_POWER_NUMBA_ENABLED),
+        "available": bool(_numba is not None and _angle_power_frame_loop_numba_kernel is not None),
+        "threads": int(_ANGLE_POWER_NUMBA_THREADS),
+        "last_error": str(_ANGLE_POWER_NUMBA_LAST_ERROR),
+    }
+
+
 def compute_cfar_threshold_db_map(
     power_lin: np.ndarray,
     *,
@@ -4340,6 +4424,7 @@ def _log_dsp_runtime_diagnostics_once(
         f"effective_priority={priority_value} source={priority_source}"
     )
     status = cfar_numba_runtime_status()
+    angle_power_status = angle_power_numba_runtime_status()
     if _numba is None:
         print(f"[DSP RUNTIME] numba=unavailable error={_NUMBA_IMPORT_ERROR}")
     else:
@@ -4361,7 +4446,10 @@ def _log_dsp_runtime_diagnostics_once(
             f"numba_version={status['numba_version']} numba_threads={num_threads} "
             f"threading_layer={threading_layer} cpu_name={cpu_name or 'auto'} "
             f"cpu_features={cpu_features or 'auto'} cfar_jit_enabled={status['enabled']} "
-            f"cfar_self_checked={status['self_checked']} disabled_reason={status['disabled_reason'] or 'none'}"
+            f"cfar_self_checked={status['self_checked']} "
+            f"angle_power_jit_enabled={angle_power_status['enabled']} "
+            f"angle_power_threads={angle_power_status['threads']} "
+            f"cfar_disabled_reason={status['disabled_reason'] or 'none'}"
         )
 
     show_runtime = getattr(np, "show_runtime", None)
@@ -5478,8 +5566,10 @@ def dsp_worker(
     selection = selection_from_yaml_dict(cfg_dict)
     calibration_cfg = getattr(dsp_cfg, "calibration", calibration_from_yaml_dict(cfg_dict, virtual_ant=int(dsp_cfg.virtual_ant)))
     cfar_numba_cfg = cfar_numba_from_yaml_dict(cfg_dict)
+    angle_power_numba_cfg = angle_power_numba_from_yaml_dict(cfg_dict)
     diagnostics_cfg = dsp_diagnostics_from_yaml_dict(cfg_dict)
     configure_cfar_numba_runtime(cfar_numba_cfg, log=("cfar_numba" in dsp_block))
+    configure_angle_power_numba_runtime(angle_power_numba_cfg, log=("angle_power_numba" in dsp_block))
     if warmup_angle_power_numba():
         print("[DSP NUMBA] angle-power reduction JIT warmed up.")
     mean_before_range_fft = mean_before_range_fft_from_yaml_dict(cfg_dict)
