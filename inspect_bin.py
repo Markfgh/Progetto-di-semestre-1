@@ -1,3 +1,9 @@
+"""Utility CLI per verificare struttura e metadati dei file di cattura RTPBIN.
+
+Legge solo l'header JSON: è quindi utile per diagnosticare file non leggibili
+prima di avviare una ricostruzione offline più costosa.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -18,7 +24,7 @@ HEADER_MAGIC = b"RTPBIN1\x00"
 HEADER_PREFIX_LEN = len(HEADER_MAGIC) + 4
 HEADER_MAX_LEN = 256 * 1024
 CAPTURE_NAME_RE = re.compile(r"^capture_pos(-?\d+)\.bin$")
-SUPPORTED_FORMATS = {"rt_capture_v1", "rt_capture_v2"}
+SUPPORTED_FORMATS = {"rt_capture_v1"}
 
 
 def _fmt_bytes(n: int) -> str:
@@ -43,6 +49,7 @@ def _to_int(x) -> int | None:
 
 
 def read_capture_header(path: Path) -> tuple[dict, int]:
+    """Valida l'header RTPBIN v1 e restituisce metadata più offset del payload."""
     file_size = path.stat().st_size
     if file_size < HEADER_PREFIX_LEN:
         raise ValueError(f"file troppo piccolo per header {HEADER_MAGIC!r}")
@@ -84,8 +91,9 @@ def read_capture_header(path: Path) -> tuple[dict, int]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Espone il controllo dell'header come comando a riga di comando."""
     parser = argparse.ArgumentParser(
-        description="Ispeziona un file capture .bin con header rt_capture_v1 o rt_capture_v2."
+        description="Ispeziona un file capture .bin con header rt_capture_v1."
     )
     parser.add_argument(
         "bin_path",

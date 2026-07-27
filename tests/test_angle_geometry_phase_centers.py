@@ -1,3 +1,5 @@
+"""Verifica la geometria fisica dell'array e il segno degli angoli stimati."""
+
 from __future__ import annotations
 
 from types import SimpleNamespace

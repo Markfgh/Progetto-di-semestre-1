@@ -1,3 +1,9 @@
+"""Benchmark riproducibili delle parti più costose della pipeline realtime.
+
+Il file confronta implementazioni Python/Numba e misura le FFT su forme di
+frame coerenti con la configurazione di cattura, senza usare hardware.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -24,6 +30,7 @@ def _load_config(path: Path) -> dict[str, Any]:
 
 
 def _shape_cfg(cfg: dict[str, Any]) -> dict[str, int]:
+    """Deriva forme coerenti per benchmark da una configurazione di cattura."""
     capture = cfg.get("capture", {}) or {}
     fft_cfg = cfg.get("fft", {}) or {}
     dsp_cfg = cfg.get("dsp", {}) or {}
@@ -35,6 +42,8 @@ def _shape_cfg(cfg: dict[str, Any]) -> dict[str, int]:
     nfft_range = int(fft_cfg.get("nfft_range", 256))
     nfft_angle = int(fft_cfg.get("nfft_angle", 128))
     workers = int(dsp_cfg.get("fft_workers", fft_cfg.get("workers", 1)))
+    # Nel TDM-MIMO i chirp sono alternati tra trasmettitori: la FFT Doppler vede
+    # quindi i soli loop per TX, mentre l'array virtuale combina TX * RX.
     loops = max(1, chirps // max(1, tx))
     return {
         "samples": samples,
@@ -52,6 +61,7 @@ def _shape_cfg(cfg: dict[str, Any]) -> dict[str, int]:
 
 
 def _median_ms(fn, *, repeats: int) -> float:
+    """Misura più volte una funzione e usa la mediana contro jitter e outlier."""
     samples: list[float] = []
     for _ in range(max(1, repeats)):
         t0 = time.perf_counter()
@@ -67,6 +77,8 @@ def _candidate_mask(power: np.ndarray, threshold_map: np.ndarray) -> np.ndarray:
 
 
 def benchmark_ca_cfar(*, repeats: int = 10) -> None:
+    """Confronta CA-CFAR Python e Numba verificandone anche l'equivalenza."""
+    # Il seme fisso fa ricevere ai due backend esattamente le stesse mappe di potenza.
     rng = np.random.default_rng(9955)
     cases = [
         ("static_range_angle", rng.lognormal(2.0, 0.9, size=(128, 128)).astype(np.float32), (8, 2, 8, 2)),
@@ -77,6 +89,7 @@ def benchmark_ca_cfar(*, repeats: int = 10) -> None:
     if not status["available"]:
         print("[BENCH] Numba unavailable; only Python baseline will run.")
     else:
+        # Il warmup separa compilazione JIT e verifica iniziale dai campioni temporali.
         realtime_dsp.configure_cfar_numba_runtime(
             realtime_dsp.CfarNumbaConfig(enabled=True, warmup_on_start=True, self_check_on_start=True),
             log=True,
@@ -103,6 +116,8 @@ def benchmark_ca_cfar(*, repeats: int = 10) -> None:
         if realtime_dsp.cfar_numba_runtime_status()["enabled"]:
             jit_map = realtime_dsp.compute_cfar_threshold_db_map(power, **kwargs)
             jit_mask = _candidate_mask(power, jit_map)
+            # Piccole differenze float sono ammesse nella mappa; la maschera deve invece
+            # restare identica, per garantire che le decisioni CFAR non cambino.
             np.testing.assert_allclose(py_map, jit_map, rtol=2e-5, atol=2e-4, equal_nan=True)
             if not np.array_equal(py_mask, jit_mask):
                 raise AssertionError(f"{name}: candidate_mask mismatch")
@@ -112,6 +127,7 @@ def benchmark_ca_cfar(*, repeats: int = 10) -> None:
 
 
 def benchmark_fft(shape: dict[str, int], *, repeats: int = 10) -> None:
+    """Misura le tre FFT con le forme effettive della pipeline radar."""
     rng = np.random.default_rng(1234)
     x_frames = shape["x_frames"]
     loops = shape["loops"]
@@ -124,12 +140,17 @@ def benchmark_fft(shape: dict[str, int], *, repeats: int = 10) -> None:
     bins = shape["processing_bins"]
     virtual_ant = shape["virtual_ant"]
 
+    # Le forme e gli assi riproducono la pipeline: range sull'asse sample (3),
+    # Doppler sui loop (1) e angolo sulle antenne virtuali (3).
+    # I buffer sono creati fuori dalla misura per cronometrare le FFT, non allocazione o RNG.
     range_in = (rng.standard_normal((x_frames, loops, tx, samples, rx)) + 1j * rng.standard_normal((x_frames, loops, tx, samples, rx))).astype(np.complex64)
     doppler_in = (rng.standard_normal((x_frames, loops, tx, bins, rx)) + 1j * rng.standard_normal((x_frames, loops, tx, bins, rx))).astype(np.complex64)
     angle_in = (rng.standard_normal((x_frames, loops, bins, virtual_ant)) + 1j * rng.standard_normal((x_frames, loops, bins, virtual_ant))).astype(np.complex64)
 
     print("[BENCH] FFT microbenchmarks using scipy.fft global backend")
     print(f"[BENCH] shape={shape}")
+    # overwrite_x=False rende ogni ripetizione equivalente: l'input sintetico non viene
+    # trasformato in-place dalla FFT precedente.
     range_ms = _median_ms(lambda: fft.fft(range_in, n=nfft_range, axis=3, workers=workers, overwrite_x=False), repeats=repeats)
     doppler_ms = _median_ms(lambda: fft.fft(doppler_in, n=loops, axis=1, workers=workers, overwrite_x=False), repeats=repeats)
     angle_ms = _median_ms(lambda: fft.ifft(angle_in, n=nfft_angle, axis=3, workers=workers, overwrite_x=False), repeats=repeats)
@@ -178,6 +199,7 @@ def _dsp_cfg(samples: int, loops: int, workers: int) -> realtime_dsp.RealtimeDSP
 
 
 def _run_synthetic_process_buffer(*, use_numba: bool, workers: int) -> list[realtime_dsp.Detection]:
+    """Esegue un frame sintetico end-to-end per controllare che Numba non cambi l'esito."""
     samples = 32
     loops = 8
     n_frames = 1
@@ -195,8 +217,12 @@ def _run_synthetic_process_buffer(*, use_numba: bool, workers: int) -> list[real
         * snapshot.reshape(1, 1, 2, 1, 4)
         * np.complex64(30.0 + 0.0j)
     )
+    # Inseriamo un solo bersaglio deterministico nel layout reale
+    # [frame, loop, tx, sample, rx], così il confronto osserva anche range e angolo.
     raw = np.tile(raw, (n_frames, loops, 1, 1, 1)).astype(np.complex64, copy=False).reshape(-1)
 
+    # Le due esecuzioni differiscono solo nel backend CFAR; configurazione, segnale e
+    # buffer di pubblicazione rimangono identici per rendere significativo il confronto.
     if use_numba:
         realtime_dsp.configure_cfar_numba_runtime(
             realtime_dsp.CfarNumbaConfig(enabled=True, warmup_on_start=True, self_check_on_start=True),
@@ -217,7 +243,9 @@ def _run_synthetic_process_buffer(*, use_numba: bool, workers: int) -> list[real
     )
     profiles_out = np.empty((dsp_cfg.range_profile_count, samples), dtype=np.float32)
 
-    _, detections, _ = realtime_dsp.process_buffer(
+    # process_buffer usa FFT in-place: la copia isola l'input del benchmark da tali
+    # trasformazioni e conserva il segnale sintetico di riferimento.
+    _, detections = realtime_dsp.process_buffer(
         raw.copy(),
         n_frames,
         np.ones((1, 1, 1, samples, 1), dtype=np.float32),
@@ -263,9 +291,6 @@ def _run_synthetic_process_buffer(*, use_numba: bool, workers: int) -> list[real
         realtime_dsp.BackgroundSubtractionState(),
         realtime_dsp.BackgroundSubtractionState(),
         None,
-        False,
-        np.ones(dsp_cfg.virtual_ant, dtype=np.complex64),
-        False,
         None,
         None,
         None,
@@ -292,6 +317,8 @@ def _run_synthetic_process_buffer(*, use_numba: bool, workers: int) -> list[real
 
 
 def _assert_detection_lists_equivalent(a: list[realtime_dsp.Detection], b: list[realtime_dsp.Detection]) -> None:
+    # Prima confrontiamo le decisioni discrete, poi le grandezze continue con una
+    # tolleranza numerica: accelerare non deve spostare o aggiungere detection.
     if len(a) != len(b):
         raise AssertionError(f"detection count changed: {len(a)} != {len(b)}")
     for idx, (left, right) in enumerate(zip(a, b)):
@@ -305,10 +332,13 @@ def _assert_detection_lists_equivalent(a: list[realtime_dsp.Detection], b: list[
 
 
 def benchmark_process_buffer(*, workers: int) -> None:
+    """Confronta la pipeline completa prima/dopo l'accelerazione JIT."""
     status = realtime_dsp.cfar_numba_runtime_status()
     if not status["available"]:
         print("[BENCH] process_buffer end-to-end skipped: Numba unavailable.")
         return
+    # Questo non misura il tempo end-to-end: verifica che il backend JIT conservi
+    # l'esito della pipeline completa sul medesimo scenario sintetico.
     py_detections = _run_synthetic_process_buffer(use_numba=False, workers=workers)
     jit_detections = _run_synthetic_process_buffer(use_numba=True, workers=workers)
     _assert_detection_lists_equivalent(py_detections, jit_detections)

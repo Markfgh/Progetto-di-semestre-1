@@ -1,0 +1,255 @@
+<mxfile host="app.diagrams.net" agent="Codex">
+  <diagram id="offline-dsp-pipeline" name="Offline DSP Pipeline">
+    <mxGraphModel dx="2200" dy="1120" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="827" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" parent="1" style="text;html=1;align=left;verticalAlign=middle;fontSize=22;fontStyle=1;fontColor=#0F172A;" value="OFFLINE DSP PIPELINE — SNAPSHOT PREPARATION AND OFFLINE RECONSTRUCTION" vertex="1">
+          <mxGeometry x="20" y="15" width="1750" height="32" as="geometry" />
+        </mxCell>
+        <mxCell id="subtitle" parent="1" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontColor=#475569;" value="The Reader prepares the complete zero-Doppler dataset once; the DSP attaches it by shared memory and runs the configured reconstruction. This is not a realtime frame stream." vertex="1">
+          <mxGeometry x="20" y="48" width="1750" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="input_group" parent="1" style="swimlane;html=1;rounded=1;startSize=28;fillColor=none;strokeColor=#94A3B8;fontStyle=1;fontColor=#334155;" value="CAPTURED DATA &amp; CONFIGURATION" vertex="1">
+          <mxGeometry x="20" y="95" width="250" height="650" as="geometry" />
+        </mxCell>
+        <mxCell id="capture_run" parent="input_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0F2FE;strokeColor=#0284C7;fontSize=13;fontStyle=1;" value="Target SAR capture run&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;capture_pos*.bin&lt;br&gt;header metadata + ADC RAW int16 I/Q&lt;/font&gt;" vertex="1">
+          <mxGeometry x="15" y="65" width="220" height="86" as="geometry" />
+        </mxCell>
+        <mxCell id="background_run" parent="input_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=#64748B;fontSize=12;fontStyle=1;dashed=1;" value="Empty-scene reference run (optional)&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;compatible captures, complex-averaged&lt;br&gt;and subtracted before reconstruction&lt;/font&gt;" vertex="1">
+          <mxGeometry x="15" y="205" width="220" height="76" as="geometry" />
+        </mxCell>
+        <mxCell id="offline_cfg" parent="input_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DCFCE7;strokeColor=#16A34A;fontSize=13;fontStyle=1;" value="Offline configuration&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;input run · selected frames · filters&lt;br&gt;radar geometry · algorithm · map / ROI settings&lt;/font&gt;" vertex="1">
+          <mxGeometry x="15" y="345" width="220" height="92" as="geometry" />
+        </mxCell>
+
+        <mxCell id="reader_group" parent="1" style="swimlane;html=1;rounded=1;startSize=28;fillColor=none;strokeColor=#64748B;fontStyle=1;fontColor=#334155;" value="OFFLINE READER / PRE-PROCESSING PROCESS" vertex="1">
+          <mxGeometry x="295" y="95" width="370" height="650" as="geometry" />
+        </mxCell>
+        <mxCell id="reader_validate" parent="reader_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0F2FE;strokeColor=#0284C7;fontSize=13;fontStyle=1;" value="Validate and order the capture run&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;headers · stage coordinates · layout · selected frames&lt;/font&gt;" vertex="1">
+          <mxGeometry x="35" y="65" width="300" height="76" as="geometry" />
+        </mxCell>
+        <mxCell id="reader_iq" parent="reader_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E8FF;strokeColor=#9333EA;fontSize=13;fontStyle=1;" value="Read each position and assemble complex MIMO data&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;RAW I/Q → [frame, loop, virtual antenna, sample]&lt;/font&gt;" vertex="1">
+          <mxGeometry x="25" y="180" width="320" height="78" as="geometry" />
+        </mxCell>
+        <mxCell id="reader_prepare" parent="reader_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#D97706;fontSize=13;fontStyle=1;" value="Range FFT and zero-Doppler preparation&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;range / Doppler windows · optional synthetic-range-angle filters&lt;br&gt;optional complex background subtraction&lt;/font&gt;" vertex="1">
+          <mxGeometry x="25" y="300" width="320" height="94" as="geometry" />
+        </mxCell>
+        <mxCell id="reader_fill" parent="reader_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0E7FF;strokeColor=#4F46E5;fontSize=13;fontStyle=1;" value="Allocate and populate the complete prepared snapshot cube&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;one position slice at a time&lt;/font&gt;" vertex="1">
+          <mxGeometry x="35" y="455" width="300" height="76" as="geometry" />
+        </mxCell>
+
+        <mxCell id="ipc_group" parent="1" style="swimlane;html=1;rounded=1;startSize=28;fillColor=none;strokeColor=#4F46E5;fontStyle=1;fontColor=#334155;" value="SHARED DATA &amp; IPC" vertex="1">
+          <mxGeometry x="695" y="95" width="300" height="650" as="geometry" />
+        </mxCell>
+        <mxCell id="snapshot_shm" parent="ipc_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0E7FF;strokeColor=#4F46E5;fontSize=13;fontStyle=1;" value="Named shared-memory snapshot cube&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;complex64 [position, frame, virtual antenna, range bin]&lt;br&gt;complete before reconstruction&lt;/font&gt;" vertex="1">
+          <mxGeometry x="15" y="60" width="270" height="96" as="geometry" />
+        </mxCell>
+        <mxCell id="descriptor_queue" parent="ipc_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1F5F9;strokeColor=#64748B;fontSize=12;fontStyle=1;" value="Reader → DSP descriptor Queue&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;SHM name · shape · dtype · positions&lt;br&gt;stage / MIMO geometry · algorithm metadata&lt;/font&gt;" vertex="1">
+          <mxGeometry x="15" y="195" width="270" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="cmd_queue" parent="ipc_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DCFCE7;strokeColor=#16A34A;fontSize=12;fontStyle=1;dashed=1;" value="GUI → DSP command Queue&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;ROI / viewport · active position range&lt;br&gt;latest request wins&lt;/font&gt;" vertex="1">
+          <mxGeometry x="15" y="325" width="270" height="76" as="geometry" />
+        </mxCell>
+        <mxCell id="status_queue" parent="ipc_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1F5F9;strokeColor=#64748B;fontSize=12;fontStyle=1;dashed=1;" value="Reader / DSP → GUI status Queue&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;progress · ready · frame · error metadata&lt;/font&gt;" vertex="1">
+          <mxGeometry x="15" y="455" width="270" height="68" as="geometry" />
+        </mxCell>
+        <mxCell id="stop_evt" parent="ipc_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FEE2E2;strokeColor=#DC2626;fontSize=12;fontStyle=1;dashed=1;" value="Shared stop Event&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;main process requests graceful worker shutdown&lt;/font&gt;" vertex="1">
+          <mxGeometry x="15" y="565" width="270" height="62" as="geometry" />
+        </mxCell>
+
+        <mxCell id="dsp_group" parent="1" style="swimlane;html=1;rounded=1;startSize=28;fillColor=none;strokeColor=#64748B;fontStyle=1;fontColor=#334155;" value="OFFLINE DSP RECONSTRUCTION PROCESS" vertex="1">
+          <mxGeometry x="1025" y="95" width="420" height="650" as="geometry" />
+        </mxCell>
+        <mxCell id="dsp_attach" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0E7FF;strokeColor=#4F46E5;fontSize=13;fontStyle=1;" value="Attach the prepared snapshot cube&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;use shared data and measured stage / MIMO geometry&lt;/font&gt;" vertex="1">
+          <mxGeometry x="40" y="60" width="330" height="78" as="geometry" />
+        </mxCell>
+        <mxCell id="dsp_select" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E8FF;strokeColor=#9333EA;fontSize=13;fontStyle=1;" value="Select aperture, viewport and configured algorithm&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;position interval · Cartesian XY ROI / fixed grid&lt;/font&gt;" vertex="1">
+          <mxGeometry x="40" y="170" width="330" height="78" as="geometry" />
+        </mxCell>
+        <mxCell id="dsp_bp" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#D97706;fontSize=13;fontStyle=1;" value="backprojection&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;linear MIMO-SAR coherent backprojection over positions and antennas&lt;/font&gt;" vertex="1">
+          <mxGeometry x="25" y="295" width="370" height="78" as="geometry" />
+        </mxCell>
+        <mxCell id="dsp_range_angle" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE7F3;strokeColor=#DB2777;fontSize=13;fontStyle=1;" value="synthetic_range_angle&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;synthetic aperture → FFT / Bartlett / MVDR&lt;br&gt;→ Cartesian display projection&lt;/font&gt;" vertex="1">
+          <mxGeometry x="25" y="405" width="370" height="94" as="geometry" />
+        </mxCell>
+        <mxCell id="dsp_image" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DBEAFE;strokeColor=#2563EB;fontSize=13;fontStyle=1;" value="Offline SAR image&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;float32 [image height, image width] power → dB map&lt;/font&gt;" vertex="1">
+          <mxGeometry x="70" y="545" width="280" height="74" as="geometry" />
+        </mxCell>
+
+        <mxCell id="gui_group" parent="1" style="swimlane;html=1;rounded=1;startSize=28;fillColor=none;strokeColor=#64748B;fontStyle=1;fontColor=#334155;" value="GUI / MAIN PROCESS" vertex="1">
+          <mxGeometry x="1475" y="95" width="300" height="650" as="geometry" />
+        </mxCell>
+        <mxCell id="gui_runtime" parent="gui_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E8FF;strokeColor=#9333EA;fontSize=13;fontStyle=1;" value="Offline runtime controller&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;starts Reader + DSP · drains status Queue&lt;br&gt;update_params / poll_frame&lt;/font&gt;" vertex="1">
+          <mxGeometry x="20" y="55" width="260" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="gui_controls" parent="gui_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DCFCE7;strokeColor=#16A34A;fontSize=12;fontStyle=1;" value="Apply ROI / position range&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;request a new reconstruction&lt;/font&gt;" vertex="1">
+          <mxGeometry x="20" y="190" width="260" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="gui_dbuf" parent="gui_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0E7FF;strokeColor=#4F46E5;fontSize=13;fontStyle=1;" value="GUI double buffer&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;RawArray · two float32 image buffers&lt;br&gt;[2, image height, image width]&lt;/font&gt;" vertex="1">
+          <mxGeometry x="20" y="310" width="260" height="84" as="geometry" />
+        </mxCell>
+        <mxCell id="publish_meta" parent="gui_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0E7FF;strokeColor=#4F46E5;fontSize=11;fontStyle=1;" value="Publish atomically&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;latest buffer index + sequence + lock&lt;/font&gt;" vertex="1">
+          <mxGeometry x="20" y="425" width="260" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="gui_display" parent="gui_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DBEAFE;strokeColor=#2563EB;fontSize=13;fontStyle=1;" value="Read latest image and render&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;offline heatmap / dB display&lt;/font&gt;" vertex="1">
+          <mxGeometry x="20" y="525" width="260" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="flow_capture_validate" edge="1" parent="1" source="capture_run" target="reader_validate" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;strokeColor=#0284C7;" value="capture files">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_config_validate" edge="1" parent="1" source="offline_cfg" target="reader_validate" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;strokeColor=#16A34A;dashed=1;" value="processing configuration">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_validate_iq" edge="1" parent="reader_group" source="reader_validate" target="reader_iq" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;" value="ordered positions">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_iq_prepare" edge="1" parent="reader_group" source="reader_iq" target="reader_prepare" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;" value="complex MIMO tensor">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_background_prepare" edge="1" parent="1" source="background_run" target="reader_prepare" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;strokeColor=#64748B;dashed=1;" value="optional reference data">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_prepare_fill" edge="1" parent="reader_group" source="reader_prepare" target="reader_fill" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;" value="prepared snapshot per position">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_fill_shm" edge="1" parent="1" source="reader_fill" target="snapshot_shm" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;strokeColor=#4F46E5;" value="create and fill all slices">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_fill_descriptor" edge="1" parent="1" source="reader_fill" target="descriptor_queue" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;strokeColor=#64748B;" value="after cube is complete">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_descriptor_attach" edge="1" parent="1" source="descriptor_queue" target="dsp_attach" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;strokeColor=#64748B;" value="descriptor / geometry">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_shm_attach" edge="1" parent="1" source="snapshot_shm" target="dsp_attach" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;strokeColor=#4F46E5;" value="attach by name — no cube copy">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_attach_select" edge="1" parent="dsp_group" source="dsp_attach" target="dsp_select" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;" value="prepared SAR data">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_config_select" edge="1" parent="1" source="offline_cfg" target="dsp_select" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;strokeColor=#16A34A;dashed=1;" value="algorithm / map configuration">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="280" y="500" />
+              <mxPoint x="1005" y="500" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="flow_select_bp" edge="1" parent="dsp_group" source="dsp_select" target="dsp_bp" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;" value="algorithm = backprojection">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_select_range_angle" edge="1" parent="dsp_group" source="dsp_select" target="dsp_range_angle" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;" value="algorithm = synthetic_range_angle">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="230" y="290" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="flow_bp_image" edge="1" parent="dsp_group" source="dsp_bp" target="dsp_image" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;" value="power image">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_range_angle_image" edge="1" parent="dsp_group" source="dsp_range_angle" target="dsp_image" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;" value="projected power image">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_image_dbuf" edge="1" parent="1" source="dsp_image" target="gui_dbuf" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;strokeColor=#4F46E5;" value="write inactive buffer">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_dbuf_publish" edge="1" parent="gui_group" source="gui_dbuf" target="publish_meta" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;strokeColor=#4F46E5;" value="publish">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_publish_display" edge="1" parent="gui_group" source="publish_meta" target="gui_display" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;strokeColor=#4F46E5;" value="latest consistent image">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_controls_cmd" edge="1" parent="1" source="gui_controls" target="cmd_queue" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;strokeColor=#16A34A;dashed=1;" value="new request">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_cmd_select" edge="1" parent="1" source="cmd_queue" target="dsp_select" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;strokeColor=#16A34A;dashed=1;" value="latest ROI / position range">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_reader_status" edge="1" parent="1" source="reader_prepare" target="status_queue" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;strokeColor=#64748B;dashed=1;" value="progress / reader_ready / error">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="675" y="455" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="flow_dsp_status" edge="1" parent="1" source="dsp_image" target="status_queue" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;strokeColor=#64748B;dashed=1;" value="ready / frame / error">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1010" y="680" />
+              <mxPoint x="1010" y="585" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="flow_status_runtime" edge="1" parent="1" source="status_queue" target="gui_runtime" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;strokeColor=#64748B;dashed=1;" value="drain status">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1010" y="500" />
+              <mxPoint x="1460" y="500" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="flow_runtime_reader" edge="1" parent="1" source="gui_runtime" target="reader_validate" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;strokeColor=#9333EA;dashed=1;" value="start Reader">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1460" y="105" />
+              <mxPoint x="675" y="105" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="flow_runtime_dsp" edge="1" parent="1" source="gui_runtime" target="dsp_attach" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;strokeColor=#9333EA;dashed=1;" value="start DSP">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1460" y="175" />
+              <mxPoint x="1010" y="175" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="flow_runtime_stop" edge="1" parent="1" source="gui_runtime" target="stop_evt" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;strokeColor=#DC2626;dashed=1;" value="stop">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1460" y="710" />
+              <mxPoint x="1010" y="710" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="flow_stop_reader" edge="1" parent="1" source="stop_evt" target="reader_prepare" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;strokeColor=#DC2626;dashed=1;" value="stop">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="680" y="690" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="flow_stop_dsp" edge="1" parent="1" source="stop_evt" target="dsp_select" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;strokeColor=#DC2626;dashed=1;" value="stop">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1010" y="690" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="legend_title" parent="1" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontStyle=1;fontColor=#334155;" value="LEGEND" vertex="1">
+          <mxGeometry x="20" y="775" width="70" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="legend_file" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0F2FE;strokeColor=#0284C7;fontSize=11;fontStyle=1;" value="Captured data / file" vertex="1">
+          <mxGeometry x="100" y="775" width="185" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="legend_process" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E8FF;strokeColor=#9333EA;fontSize=11;fontStyle=1;" value="Process / reconstruction stage" vertex="1">
+          <mxGeometry x="305" y="775" width="210" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="legend_shm" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0E7FF;strokeColor=#4F46E5;fontSize=11;fontStyle=1;" value="Shared memory / double buffer" vertex="1">
+          <mxGeometry x="535" y="775" width="220" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="legend_ipc" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1F5F9;strokeColor=#64748B;fontSize=11;fontStyle=1;" value="IPC Queue" vertex="1">
+          <mxGeometry x="775" y="775" width="120" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="legend_control" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DCFCE7;strokeColor=#16A34A;fontSize=11;fontStyle=1;dashed=1;" value="Control / status flow" vertex="1">
+          <mxGeometry x="915" y="775" width="180" height="30" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

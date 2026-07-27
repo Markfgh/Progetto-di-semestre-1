@@ -1,3 +1,5 @@
+"""Scenari sintetici per associazione, ciclo di vita e stato moto dei track."""
+
 from __future__ import annotations
 
 from types import SimpleNamespace

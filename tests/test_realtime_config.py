@@ -1,3 +1,5 @@
+"""Test dei parser di configurazione e delle invarianti della GUI realtime."""
+
 from __future__ import annotations
 
 import ast

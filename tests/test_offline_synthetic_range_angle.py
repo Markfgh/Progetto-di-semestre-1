@@ -1,3 +1,5 @@
+"""Casi sintetici per la ricostruzione offline range-angolo."""
+
 from __future__ import annotations
 
 from dataclasses import replace

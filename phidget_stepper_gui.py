@@ -3,7 +3,9 @@
 Il 1063 e' un controller open-loop: il riferimento di posizione viene
 stabilito esclusivamente dal finecorsa MIN durante HOME.  Il pulsante STOP
 ferma il moto mantenendo la coppia; non sostituisce un arresto di emergenza
-hardware cablato.
+hardware cablato. ``PhidgetStepperController`` concentra la logica di
+sicurezza e movimento; ``StepperGui`` la presenta in Dear PyGui. Il controller
+può essere usato senza GUI, ad esempio dalla scansione SAR integrata.
 """
 
 from __future__ import annotations
@@ -37,6 +39,8 @@ class MotionError(RuntimeError):
 
 
 class ControllerState(str, Enum):
+    """Stati osservabili del controller, inclusi i blocchi di sicurezza."""
+
     DISCONNECTED = "Disconnesso"
     IDLE = "Collegato - da eseguire HOME"
     HOMING = "HOME in corso"
@@ -53,6 +57,8 @@ class ControllerState(str, Enum):
 
 @dataclass
 class DeviceConfig:
+    """Indirizzamento del Phidget e dei due finecorsa cablati."""
+
     serial_number: int | None = None
     stepper_channel: int = 0
     limit_min_channel: int = 0
@@ -65,6 +71,8 @@ class DeviceConfig:
 
 @dataclass
 class MechanicsConfig:
+    """Conversione deterministica tra millimetri logici e microstep del motore."""
+
     belt_pitch_mm: float = 2.0
     pulley_teeth: int = 20
     motor_full_steps_per_rev: int = 200
@@ -108,6 +116,8 @@ class CycleConfig:
 
 @dataclass
 class AppConfig:
+    """Configurazione completa del carrello, caricabile dal YAML locale."""
+
     device: DeviceConfig = field(default_factory=DeviceConfig)
     mechanics: MechanicsConfig = field(default_factory=MechanicsConfig)
     motor: MotorConfig = field(default_factory=MotorConfig)
@@ -160,6 +170,7 @@ class AppConfig:
 
 
 def load_config(path: Path = CONFIG_PATH) -> AppConfig:
+    """Carica e valida il YAML, fallendo con un errore orientato all'operatore."""
     if not path.exists():
         raise ConfigError(f"Configurazione non trovata: {path}")
     try:
@@ -171,6 +182,7 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
 
 
 def save_config(config: AppConfig, path: Path = CONFIG_PATH) -> None:
+    """Valida prima di salvare, per non lasciare una configurazione impossibile."""
     config.validate()
     with path.open("w", encoding="utf-8", newline="\n") as handle:
         yaml.safe_dump(asdict(config), handle, allow_unicode=True, sort_keys=False)
@@ -381,6 +393,7 @@ class PhidgetStepperController:
                 raise MotionError("Attendere l'arresto del movimento corrente prima di inviare un altro comando.")
 
     def begin_external_scan(self) -> None:
+        """Riserva il controller alla scansione SAR e blocca i comandi manuali."""
         """Riserva il 1063 per una scansione coordinata dal radar.
 
         Non fidarsi del solo stato READY: i jog manuali storici impostano
@@ -406,6 +419,7 @@ class PhidgetStepperController:
         self.log("Scansione SAR riservata al controller radar.")
 
     def finish_external_scan(self, success: bool) -> None:
+        """Rilascia la riserva SAR riportando il controller in uno stato coerente."""
         """Rilascia l'esclusione del carrello quando la scansione termina."""
         with self.lock:
             was_active = self.external_scan_active
@@ -436,6 +450,7 @@ class PhidgetStepperController:
         timeout_seconds: float,
         cancel_event: threading.Event | None = None,
     ) -> None:
+        """Esegue un target assoluto e attende il segnale di arresto del motore."""
         """Muove un target di scansione e ritorna solo dopo ``Stopped``.
 
         Questo è il percorso usato dalla scansione SAR: non accumula arrotondamenti
@@ -609,6 +624,7 @@ class PhidgetStepperController:
         self._set_state(ControllerState.READY, f"target {target_mm:.3f} mm")
 
     def start_homing(self) -> None:
+        """Prenota e avvia HOME in un worker, impedendo avvii concorrenti."""
         # Controllo e prenotazione devono avvenire sotto lo stesso lock: lo
         # stato HOMING impostato dal worker sarebbe troppo tardi per bloccare
         # un secondo click immediato.
@@ -649,6 +665,7 @@ class PhidgetStepperController:
             raise MotionError("Operazione annullata.")
 
     def _homing_worker(self) -> None:
+        """Cerca MIN, rilascia il contatto e azzera la coordinata open-loop."""
         try:
             self.stop_requested.clear()
             self.cancel_requested.clear()
@@ -740,6 +757,7 @@ class PhidgetStepperController:
                 pass
 
     def emergency_stop(self) -> None:
+        """Disabilita il motore: richiede un nuovo HOME prima di qualsiasi moto."""
         self.stop_requested.set()
         self.cancel_requested.set()
         if self.cycle_progress:

@@ -1,3 +1,10 @@
+"""Ponte Python verso mmWave Studio e la scheda di acquisizione DCA1000.
+
+Incapsula i comandi Lua/RSTD usati per connettere l'hardware, armare la
+registrazione e avviare o fermare uno stream, esponendo uno stato adatto alla
+GUI principale.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -19,6 +26,8 @@ class MmwaveStudioError(RuntimeError):
 
 
 def list_available_com_ports() -> list[str]:
+    """Elenca porte seriali Windows, prima dal registro poi con pyserial."""
+    """Elenca porte seriali Windows, prima dal registro poi con pyserial."""
     ports: list[str] = []
     try:
         import winreg  # type: ignore
@@ -78,6 +87,10 @@ def _lua_path(value: str | Path) -> str:
 
 @dataclass(slots=True)
 class SequenceResult:
+    """Esiti della sequenza atomica StartRecord → StartFrame → StopFrame."""
+
+    """Esiti della sequenza atomica StartRecord → StartFrame → StopFrame."""
+
     adc_data_path: Path
     start_record_status: int
     start_frame_status: int
@@ -87,6 +100,10 @@ class SequenceResult:
 
 @dataclass(slots=True)
 class RadarConnectionConfig:
+    """Parametri della porta UART usata da mmWave Studio per il radar."""
+
+    """Parametri della porta UART usata da mmWave Studio per il radar."""
+
     uart_com_port: int = 24
     baudrate: int = 921600
     timeout_ms: int = 1000
@@ -94,6 +111,10 @@ class RadarConnectionConfig:
 
 @dataclass(slots=True)
 class DCA1000Config:
+    """Parametri rete e modalità di cattura della DCA1000."""
+
+    """Parametri rete e modalità di cattura della DCA1000."""
+
     capture_device: str = "DCA1000"
     pc_ip: str = "192.168.33.30"
     capture_card_ip: str = "192.168.33.180"
@@ -112,6 +133,10 @@ class DCA1000Config:
 
 @dataclass(slots=True)
 class GuiBridgeState:
+    """Stato serializzabile che la GUI può leggere senza interrogare l'hardware."""
+
+    """Stato serializzabile che la GUI può leggere senza interrogare l'hardware."""
+
     connected: bool
     streaming: bool
     rstd_connected: bool = False
@@ -198,6 +223,8 @@ class MmwaveStudioBridge:
         self.disconnect()
 
     def send_lua(self, lua_command: str, *, label: str | None = None) -> int:
+        """Invia un comando RSTD, uniformando codici di esito ed errori contestuali."""
+        """Invia un comando RSTD, uniformando codici di esito ed errori contestuali."""
         with self._lock:
             self.connect()
             print(f"[mmwave] TX {label or 'lua'}: {lua_command}", flush=True)
@@ -266,6 +293,8 @@ class MmwaveStudioBridge:
         return self.send_lua("ar1.Disconnect()", label="Radar Disconnect")
 
     def setup_dca1000(self, config: DCA1000Config) -> list[int]:
+        # Il firmware DCA1000 richiede quest'ordine: scheda selezionata, rete,
+        # modalità LVDS e infine ritardo fra pacchetti prima di poter armare la cattura.
         commands = [
             f'ar1.SelectCaptureDevice("{config.capture_device}")',
             (
@@ -289,12 +318,16 @@ class MmwaveStudioBridge:
         radar: RadarConnectionConfig | None = None,
         dca: DCA1000Config | None = None,
     ) -> GuiBridgeState:
+        """Connette nell'ordine necessario: RSTD, radar UART, poi DCA1000."""
+        """Connette nell'ordine necessario: RSTD, radar UART, poi DCA1000."""
         radar_cfg = radar or RadarConnectionConfig()
         dca_cfg = dca or DCA1000Config()
         with self._lock:
             if self._hw_connected:
                 self._last_message = "Hardware already connected"
                 return self.get_gui_state()
+            # RSTD deve essere collegato prima; Studio associa poi radar e DCA1000
+            # alla sessione nell'ordine selezione scheda -> UART radar -> rete DCA1000.
             self.connect()
             self.select_capture_device(dca_cfg.capture_device)
             self.radar_connect(
@@ -318,14 +351,20 @@ class MmwaveStudioBridge:
         with self._lock:
             if self._streaming:
                 try:
+                    # Fermare i frame prima di scollegare la UART evita che il radar
+                    # continui a inviare campioni verso una DCA1000 non più configurata.
                     self.stop_streaming(stop_delay_s=stop_delay_s)
                 except Exception:
+                    # Lo shutdown prosegue anche se lo stato locale e quello hardware
+                    # sono già divergenti: le risorse rimanenti vanno comunque rilasciate.
                     pass
             if self._hw_connected:
                 try:
                     if self._radar_connected:
                         self.radar_disconnect()
                 finally:
+                    # Aggiorniamo sempre lo stato locale, anche quando la disconnessione
+                    # UART fallisce, per non lasciare la GUI in uno stato fittiziamente attivo.
                     self._hw_connected = False
                     self._radar_connected = False
                     self._dca_ready = False
@@ -368,14 +407,19 @@ class MmwaveStudioBridge:
         capture_mode: int = 1,
         arm_delay_s: float = 1.0,
     ) -> GuiBridgeState:
+        """Arma la DCA1000 prima di avviare i frame radar, nell'ordine RSTD corretto."""
+        """Arma la DCA1000 prima di avviare i frame radar, nell'ordine RSTD corretto."""
         with self._lock:
             if not self._hw_connected:
                 raise MmwaveStudioError("Hardware is not connected. Connect DCA1000 and radar first.")
             if self._streaming:
                 self._last_message = "Streaming already active"
                 return self.get_gui_state()
+            # La DCA1000 va armata prima del radar: StartFrame fa partire subito i chirp
+            # e un record non ancora armato perderebbe l'inizio della cattura.
             self.start_record(adc_data_path, capture_mode=capture_mode)
             if arm_delay_s > 0:
+                # Lasciamo al firmware il tempo di applicare il comando di armamento.
                 time.sleep(float(arm_delay_s))
             self.start_frame()
             self._streaming = True
@@ -389,6 +433,8 @@ class MmwaveStudioBridge:
             if not self._streaming:
                 self._last_message = "Streaming already stopped"
                 return self.get_gui_state()
+            # StopFrame precede l'attesa: il ritardo consente alla catena DCA1000 di
+            # completare i pacchetti gia' in transito prima di dichiarare fermo lo stream.
             self.stop_frame()
             if stop_delay_s > 0:
                 time.sleep(float(stop_delay_s))
@@ -406,10 +452,14 @@ class MmwaveStudioBridge:
         arm_delay_s: float = 0.25,
         stop_delay_s: float = 0.25,
     ) -> GuiBridgeState:
+        """Ri-arma una registrazione senza ripetere la connessione hardware completa."""
+        """Ri-arma una registrazione senza ripetere la connessione hardware completa."""
         with self._lock:
             if not self._hw_connected:
                 raise MmwaveStudioError("Cannot rearm streaming: hardware is not connected.")
             try:
+                # Lo stop è intenzionalmente best-effort: dopo un'interruzione della GUI
+                # il radar potrebbe essere già fermo, ma il nuovo record deve essere riarmato.
                 self.stop_frame()
                 if stop_delay_s > 0:
                     time.sleep(float(stop_delay_s))
@@ -476,6 +526,8 @@ class MmwaveStudioBridge:
         StartRecord -> wait -> StartFrame -> wait -> StopFrame -> wait
         """
 
+        # L'ordine rispecchia la sequenza hardware: armamento DCA1000, produzione dei
+        # frame radar, quindi arresto e tempo residuo per svuotare la cattura.
         adc_path = Path(adc_data_path)
         start_record_status = self.start_record(adc_path, capture_mode=capture_mode)
         if arm_delay_s > 0:

@@ -1,3 +1,5 @@
+"""Verifica numericamente la back-projection SAR e le sue varianti MIMO."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -14,14 +16,6 @@ from offline_dsp import (
     prepare_mimo_snapshots,
     residual_video_phase_sign_normalize,
 )
-from sar_geometry import (
-    CylindricalCapture,
-    default_iwr1443_2tx4rx_geometry,
-    transform_element_coordinates,
-    xyz_volume_voxel_grid,
-)
-
-
 def _target_profile(n_bins: int, bin_float: float, phase: complex) -> np.ndarray:
     bins = np.arange(int(n_bins), dtype=np.float32)
     return (np.sinc(bins - np.float32(bin_float)).astype(np.complex64) * np.complex64(phase)).astype(np.complex64, copy=False)
@@ -131,65 +125,6 @@ def _legacy_linear_bp_reference(
         dtype=np.float32,
     )
     return total_power.reshape(x_grid.shape).astype(np.float32, copy=False)
-
-
-def _circular_physical_geometry(
-    azimuth_rad: np.ndarray,
-    heights_m: np.ndarray,
-    *,
-    radius_m: float,
-    x_tx_local_m: np.ndarray,
-    x_rx_local_m: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Physical ULA locations for a board whose +Y boresight points inward."""
-    azimuth = np.asarray(azimuth_rad, dtype=np.float32).reshape(-1)
-    heights = np.asarray(heights_m, dtype=np.float32).reshape(-1)
-    if azimuth.size != heights.size:
-        raise ValueError("azimuth_rad e heights_m devono avere la stessa size")
-
-    n_pose = int(azimuth.size)
-    n_ant = int(x_tx_local_m.size)
-    tx_global = np.zeros((n_pose, n_ant, 3), dtype=np.float32)
-    rx_global = np.zeros((n_pose, n_ant, 3), dtype=np.float32)
-    for pose_i, theta in enumerate(azimuth):
-        # Body +X is tangent, +Y is radial inward, +Z is up.
-        body_x_world = np.asarray([-np.sin(theta), np.cos(theta), 0.0], dtype=np.float32)
-        radar_world = np.asarray(
-            [radius_m * np.cos(theta), radius_m * np.sin(theta), heights[pose_i]],
-            dtype=np.float32,
-        )
-        tx_global[pose_i] = radar_world + x_tx_local_m[:, None] * body_x_world[None, :]
-        rx_global[pose_i] = radar_world + x_rx_local_m[:, None] * body_x_world[None, :]
-    return tx_global, rx_global
-
-
-def _point_target_snapshots(
-    tx_global_m: np.ndarray,
-    rx_global_m: np.ndarray,
-    target_xyz_m: np.ndarray,
-    *,
-    n_bins: int,
-    dr_m: float,
-    fc_hz: float,
-    c_m_s: float,
-) -> np.ndarray:
-    n_pose, n_ant, _ = tx_global_m.shape
-    snapshots = np.zeros((n_pose, 1, n_ant, int(n_bins)), dtype=np.complex64)
-    k_bistatic = np.float32((2.0 * np.pi * float(fc_hz)) / float(c_m_s))
-    target = np.asarray(target_xyz_m, dtype=np.float32)
-    for pose_i in range(n_pose):
-        for ant_i in range(n_ant):
-            delta_tx = target - tx_global_m[pose_i, ant_i]
-            delta_rx = target - rx_global_m[pose_i, ant_i]
-            r_tx = np.sqrt(np.sum(delta_tx * delta_tx, dtype=np.float32)).astype(np.float32, copy=False)
-            r_rx = np.sqrt(np.sum(delta_rx * delta_rx, dtype=np.float32)).astype(np.float32, copy=False)
-            r_total = (r_tx + r_rx).astype(np.float32, copy=False)
-            snapshots[pose_i, 0, ant_i] = _target_profile(
-                n_bins=n_bins,
-                bin_float=float((np.float32(0.5) * r_total) / np.float32(dr_m)),
-                phase=np.exp(-1j * np.float32(k_bistatic * r_total)),
-            )
-    return snapshots
 
 
 def test_default_geometry_matches_ula() -> None:
@@ -547,162 +482,6 @@ def test_geometry_bp_uniform_default_weights_match_explicit_ones() -> None:
     )
 
     np.testing.assert_array_equal(default_weights, explicit_uniform_weights)
-
-
-def test_geometry_bp_recovers_circular_target_on_fixed_xy_plane() -> None:
-    c_m_s = 3e8
-    fc_hz = 77e9
-    dr_m = 0.02
-    n_bins = 160
-    wavelength_m = np.float32(c_m_s / fc_hz)
-    x_tx_local_m, x_rx_local_m = _physical_iwr1443_geometry(wavelength_m)
-    azimuth = np.linspace(0.0, 2.0 * np.pi, 16, endpoint=False, dtype=np.float32)
-    tx_global, rx_global = _circular_physical_geometry(
-        azimuth,
-        np.full(azimuth.size, 0.40, dtype=np.float32),
-        radius_m=1.0,
-        x_tx_local_m=x_tx_local_m,
-        x_rx_local_m=x_rx_local_m,
-    )
-    x_axis = np.linspace(-0.4, 0.4, 81, dtype=np.float32)
-    y_axis = np.linspace(-0.4, 0.4, 81, dtype=np.float32)
-    target_xyz = np.asarray([x_axis[58], y_axis[28], 0.0], dtype=np.float32)
-    snapshots = _point_target_snapshots(
-        tx_global,
-        rx_global,
-        target_xyz,
-        n_bins=n_bins,
-        dr_m=dr_m,
-        fc_hz=fc_hz,
-        c_m_s=c_m_s,
-    )
-    x_grid, y_grid = np.meshgrid(x_axis, y_axis)
-    power = back_projection_power_mimo_geometry(
-        snapshots,
-        tx_global,
-        rx_global,
-        _plane_voxel_xyz(x_grid, y_grid, z_m=float(target_xyz[2])),
-        dr_m=dr_m,
-        fc_hz=fc_hz,
-        c_m_s=c_m_s,
-        max_bin=n_bins,
-        phase_sign=1,
-        chunk_size=1024,
-    )
-
-    peak_row, peak_col = np.unravel_index(int(np.argmax(power)), power.shape)
-    target_row, target_col = _target_cell(x_axis, y_axis, float(target_xyz[0]), float(target_xyz[1]))
-    assert abs(int(peak_row) - int(target_row)) <= 1
-    assert abs(int(peak_col) - int(target_col)) <= 1
-    assert float(power[target_row, target_col]) >= float(np.mean(power, dtype=np.float32)) * 8.0
-
-
-def test_geometry_bp_recovers_cylindrical_target_in_xyz_grid() -> None:
-    c_m_s = 3e8
-    fc_hz = 77e9
-    dr_m = 0.025
-    n_bins = 128
-    x_tx_local_m = np.asarray([-0.006, 0.006], dtype=np.float32)
-    x_rx_local_m = np.asarray([-0.004, 0.008], dtype=np.float32)
-    azimuth_one_ring = np.linspace(0.0, 2.0 * np.pi, 10, endpoint=False, dtype=np.float32)
-    azimuth = np.tile(azimuth_one_ring, 2)
-    heights = np.repeat(np.asarray([0.25, 0.65], dtype=np.float32), azimuth_one_ring.size)
-    tx_global, rx_global = _circular_physical_geometry(
-        azimuth,
-        heights,
-        radius_m=0.8,
-        x_tx_local_m=x_tx_local_m,
-        x_rx_local_m=x_rx_local_m,
-    )
-    x_axis = np.linspace(-0.24, 0.24, 25, dtype=np.float32)
-    y_axis = np.linspace(-0.24, 0.24, 25, dtype=np.float32)
-    z_axis = np.linspace(-0.20, 0.40, 13, dtype=np.float32)
-    target_xyz = np.asarray([x_axis[16], y_axis[9], z_axis[6]], dtype=np.float32)
-    snapshots = _point_target_snapshots(
-        tx_global,
-        rx_global,
-        target_xyz,
-        n_bins=n_bins,
-        dr_m=dr_m,
-        fc_hz=fc_hz,
-        c_m_s=c_m_s,
-    )
-    x_grid, y_grid, z_grid = np.meshgrid(x_axis, y_axis, z_axis, indexing="xy")
-    voxel_xyz = np.stack((x_grid, y_grid, z_grid), axis=-1).astype(np.float32, copy=False)
-    power = back_projection_power_mimo_geometry(
-        snapshots,
-        tx_global,
-        rx_global,
-        voxel_xyz,
-        dr_m=dr_m,
-        fc_hz=fc_hz,
-        c_m_s=c_m_s,
-        max_bin=n_bins,
-        phase_sign=1,
-        chunk_size=2048,
-    )
-
-    peak_idx = np.unravel_index(int(np.argmax(power)), power.shape)
-    target_idx = (
-        int(np.argmin(np.abs(y_axis - target_xyz[1]))),
-        int(np.argmin(np.abs(x_axis - target_xyz[0]))),
-        int(np.argmin(np.abs(z_axis - target_xyz[2]))),
-    )
-    assert all(abs(int(observed) - int(expected)) <= 1 for observed, expected in zip(peak_idx, target_idx))
-    assert float(power[target_idx]) >= float(np.mean(power, dtype=np.float32)) * 8.0
-
-
-def test_regular_cylinder_metadata_transforms_into_a_physical_xyz_reconstruction() -> None:
-    """Exercise the v2 pose geometry, physical 2x4 array and 3-D BP together."""
-    c_m_s = 3e8
-    fc_hz = 77e9
-    dr_m = 0.025
-    angle_count = 4
-    captures = tuple(
-        CylindricalCapture(
-            capture_id=100 + acquisition_index,
-            acquisition_index=acquisition_index,
-            angle_index=acquisition_index % angle_count,
-            height_index=acquisition_index // angle_count,
-            azimuth_rad=float(acquisition_index % angle_count) * (2.0 * np.pi / angle_count),
-            height_m=float(acquisition_index // angle_count) * 0.35,
-            radius_m=0.9,
-            scene_center_m=[0.0, 0.0, 0.0],
-            angle_count=angle_count,
-            height_count=2,
-        )
-        for acquisition_index in range(2 * angle_count)
-    )
-    array_geometry = default_iwr1443_2tx4rx_geometry(fc_hz=fc_hz, c_m_s=c_m_s)
-    tx_global, rx_global = transform_element_coordinates(captures, array_geometry)
-    x_axis = np.linspace(-0.24, 0.24, 13, dtype=np.float32)
-    y_axis = np.linspace(-0.24, 0.24, 13, dtype=np.float32)
-    z_axis = np.linspace(-0.15, 0.30, 10, dtype=np.float32)
-    target_xyz = np.asarray([x_axis[8], y_axis[5], z_axis[4]], dtype=np.float32)
-    snapshots = _point_target_snapshots(
-        tx_global.astype(np.float32),
-        rx_global.astype(np.float32),
-        target_xyz,
-        n_bins=160,
-        dr_m=dr_m,
-        fc_hz=fc_hz,
-        c_m_s=c_m_s,
-    )
-    volume = back_projection_power_mimo_geometry(
-        snapshots,
-        tx_global,
-        rx_global,
-        xyz_volume_voxel_grid(x_axis, y_axis, z_axis),
-        dr_m=dr_m,
-        fc_hz=fc_hz,
-        c_m_s=c_m_s,
-        max_bin=160,
-        phase_sign=1,
-        chunk_size=1024,
-    )
-
-    peak_idx = np.unravel_index(int(np.argmax(volume)), volume.shape)
-    assert peak_idx == (4, 5, 8)  # volume order is [Z, Y, X]
 
 
 def test_prepare_mimo_snapshots_returns_4d_and_uses_all_virtual_antennas() -> None:

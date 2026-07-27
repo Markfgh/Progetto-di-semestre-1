@@ -1,3 +1,10 @@
+"""Applicazione principale: GUI, acquisizione realtime, SAR e post-processing.
+
+Questo è il punto di integrazione del progetto.  Le routine esterne ai worker
+gestiscono la GUI Dear PyGui; ``radar_rx`` e ``logger_worker`` possiedono
+rispettivamente lo stream UDP e la scrittura delle catture su disco.
+"""
+
 import socket
 import time
 import queue as pyqueue
@@ -22,17 +29,15 @@ from sar_capture import (
     CaptureMetadataStore,
     CaptureSessionManager,
     normalize_capture_metadata,
-    normalize_cylindrical_metadata,
     read_capture_metadata,
     write_capture_metadata,
 )
 from sar_scan import (
-    CylindricalScanCoordinator,
-    CylindricalScanPlan,
-    RotaryAxis,
     SarScanCoordinator,
     ScanError,
+    ScanEvent,
     ScanPlan,
+    ScanState,
 )
 
 try:
@@ -383,18 +388,10 @@ def _apply_process_affinity(label: str, pid: int, cpus, enabled: bool) -> None:
 
 
 from offline_processing import (
-    CylindricalSection,
-    CylindricalView,
     OfflineBPRuntime,
     OfflineSARConfig,
     SARReader,
-    cylindrical_plane_from_yaml_dict,
-    cylindrical_run_summary,
-    cylindrical_section_axis_labels,
-    cylindrical_view_from_yaml_dict,
-    cylindrical_view_to_dict,
     offline_map_bounds_from_yaml_dict,
-    resolve_cylindrical_view,
 )
 from mmwave_studio_bridge import DCA1000Config, MmwaveStudioBridge, MmwaveStudioError, RadarConnectionConfig
 from shutdown_utils import cleanup_processes, close_queues
@@ -406,7 +403,6 @@ from realtime_dsp import (
     build_angle_axis_deg,
     build_doppler_axis_mps,
     build_display_viewport,
-    calibration_from_yaml_dict,
     clamp_display_viewport,
     display_image_resolutions_from_yaml_dict,
     display_projection_from_yaml_dict,
@@ -583,7 +579,6 @@ if _fft_workers_raw is None:
 else:
     FFT_WORKERS = int(_fft_workers_raw)
 FFT_WORKERS = max(1, min(FFT_WORKERS, LOGICAL_CPUS))
-CALIBRATION_CFG = calibration_from_yaml_dict(cfg, virtual_ant=int(VIRTUAL_ANT))
 RANGE_ANGLE_MOVING_CFG = range_angle_moving_from_yaml_dict(cfg)
 HEATMAP_VELOCITY_DEAD_ZONE = float(getattr(RANGE_ANGLE_MOVING_CFG, "velocity_dead_zone", 0.08))
 HEATMAP_VELOCITY_MIN_OPACITY = float(getattr(RANGE_ANGLE_MOVING_CFG, "min_opacity", 0.35))
@@ -610,7 +605,6 @@ REALTIME_DSP_CFG = RealtimeDSPConfig(
     range_max_processing_m=float(RANGE_MAX_PROCESSING),
     normalize_skip_range_bins=max(0, int(cfg.get("display", {}).get("normalize_skip_range_bins", 0))),
     zero_after_range_fft_bins=max(0, int(cfg.get("dsp", {}).get("zero_after_range_fft_bins", 0))),
-    calibration=CALIBRATION_CFG,
     range_angle_moving=RANGE_ANGLE_MOVING_CFG,
     display_zoom=display_zoom_cfg,
 )
@@ -649,13 +643,10 @@ def _build_capture_file_header(
     *,
     carriage_position_mm: float | None = None,
     carriage_microsteps: int | None = None,
-    capture_id: int | None = None,
-    acquisition_index: int | None = None,
-    cylindrical: dict | None = None,
 ) -> bytes:
-    cylindrical_v2 = None if cylindrical is None else normalize_cylindrical_metadata(cylindrical)
+    """Serializza l'header RTPBIN v1 che precede i frame raw nel file catturato."""
     header = {
-        "format": "rt_capture_v2" if cylindrical_v2 is not None else "rt_capture_v1",
+        "format": "rt_capture_v1",
         "position": int(pos_id),
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "radar": {
@@ -673,18 +664,6 @@ def _build_capture_file_header(
             "frames_per_position": int(FRAMES_PER_POSITION),
         },
     }
-    if cylindrical_v2 is not None:
-        header["capture_id"] = int(pos_id if capture_id is None else capture_id)
-        if int(header["capture_id"]) < 0:
-            raise ValueError("capture_id must be non-negative")
-        header["acquisition_index"] = int(
-            header["capture_id"] if acquisition_index is None else acquisition_index
-        )
-        if int(header["acquisition_index"]) < 0:
-            raise ValueError("acquisition_index must be non-negative")
-        # ``position`` resta deliberatamente un campo legacy: per v2 la
-        # geometria arriva esclusivamente da questo blocco cylindrical.
-        header["cylindrical"] = cylindrical_v2
     if carriage_position_mm is not None or carriage_microsteps is not None:
         stage: dict[str, float | int | str] = {"reference": "phidget_home_min"}
         if carriage_position_mm is not None and np.isfinite(float(carriage_position_mm)):
@@ -697,6 +676,7 @@ def _build_capture_file_header(
 
 
 def read_offline_scan_settings(path: Path) -> tuple[int, int, float]:
+    """Legge numero di frame, posizioni e pitch che la GUI mostrerà per il run."""
     """Legge ``(start_position_id, default_positions, pitch_mm)`` dal YAML."""
     with path.open("r", encoding="utf-8") as handle:
         raw = yaml.safe_load(handle) or {}
@@ -874,11 +854,10 @@ def _update_existing_yaml_scalar_paths(
 
     missing = sorted(set(updates) - updated)
     if missing:
-        # A v1 configuration legitimately lacks the newer v2 section-view
-        # branch.  This is the one schema-upgrade path where preserving every
-        # comment is less important than atomically materialising the exact
-        # requested mapping.  Subsequent saves remain scalar-only and keep
-        # the original layout/comments as before.
+        # A manually shortened configuration can lack one or more tuning
+        # paths. In that case materialise the exact requested mapping
+        # atomically; subsequent saves remain scalar-only and preserve the
+        # existing layout/comments as before.
         try:
             migrated = yaml.safe_load(original) or {}
             if not isinstance(migrated, dict):
@@ -918,6 +897,11 @@ def configure_offline_scan_for_run(
     positions: int,
     frames_per_position: int | None = None,
 ) -> float:
+    """Aggiorna solo i valori di scansione nel YAML conservando commenti e ordine.
+
+    Il ritorno è il pitch in millimetri, utile alla GUI per aggiornare subito
+    l'etichetta dopo che la sessione SAR ha scelto la sua cartella di output.
+    """
     """Aggiorna il set di file che l'offline dovrà leggere dopo la scansione.
 
     Il pitch non viene modificato: resta l'unica sorgente fisica della
@@ -968,49 +952,11 @@ def configure_offline_scan_for_run(
     return float(pitch_m * 1000.0)
 
 
-def configure_offline_cylindrical_scan_for_run(
-    path: Path,
-    *,
-    output_dir: Path,
-    frames_per_position: int | None = None,
-) -> None:
-    """Punta l'offline a una run v2 senza toccare i parametri lineari.
-
-    Il reader v2 deriva la geometria esclusivamente dagli header
-    ``rt_capture_v2``. Perciò aggiornare ``scan.x_*`` sarebbe non solo
-    superfluo, ma anche fuorviante: questa funzione modifica solo directory e
-    numero di frame che servono a riaprire la nuova run.
-    """
-
-    with path.open("r", encoding="utf-8") as handle:
-        raw = yaml.safe_load(handle) or {}
-    if not isinstance(raw, dict):
-        raise ValueError("offline_config.yaml must contain a YAML mapping")
-    data = raw.get("data")
-    if not isinstance(data, dict):
-        raise ValueError("offline_config.yaml.data must contain a mapping")
-    scalar_updates: dict[tuple[str, str], object] = {}
-    try:
-        relative_output = output_dir.resolve().relative_to(path.parent.resolve())
-        scalar_updates[("data", "input_dir")] = str(relative_output)
-    except Exception:
-        scalar_updates[("data", "input_dir")] = str(output_dir.resolve())
-    if frames_per_position is not None:
-        if int(frames_per_position) <= 0:
-            raise ValueError("frames_per_position must be greater than zero")
-        capture = raw.get("capture")
-        if not isinstance(capture, dict):
-            raise ValueError("offline_config.yaml.capture must contain a mapping")
-        scalar_updates[("capture", "frames_per_position")] = int(frames_per_position)
-    _update_top_level_yaml_scalars(path, scalar_updates)
-
-
 # ----------------------------
 # FUNZIONI DI ELABORAZIONE
 # ----------------------------
 def radar_rx(
     cmd_queue: Queue,
-    dsp_cmd_queue: Queue,
     free_slots: Queue,
     dsp_ready_queue: Queue,
     shm_frames,
@@ -1161,14 +1107,6 @@ def radar_rx(
             except pyqueue.Empty:
                 break
             if not cmd:
-                continue
-            if isinstance(cmd, dict):
-                cmd_type = str(cmd.get("type", "")).strip().lower()
-                if cmd_type == "calibrate_boresight":
-                    try:
-                        dsp_cmd_queue.put_nowait({"type": "calibrate_boresight"})
-                    except Exception:
-                        pass
                 continue
             cmd_type = str(cmd[0]).strip().upper()
             if cmd_type == "CAPTURE_STOP":
@@ -1529,8 +1467,7 @@ def logger_worker(
     cap_pos_id: Synchronized,
     cap_id: Synchronized,
     cap_saved: Synchronized,
-    cap_position_mm: Synchronized | None,
-    cap_position_microsteps: Synchronized | None,
+    capture_metadata: CaptureMetadataStore,
     cap_cancel_id: Synchronized,
     cap_done_id: Synchronized,
     cap_result: Synchronized,
@@ -1540,7 +1477,6 @@ def logger_worker(
     frames_per_position: int,
     block_frames: int = 16,
     ready_evt=None,
-    capture_metadata: CaptureMetadataStore | None = None,
 ):
     """
     Logger capture-only (reworked for performance):
@@ -1551,10 +1487,10 @@ def logger_worker(
       - deve arrivare a frames_per_position frame completi per la posizione corrente.
         Se perde frame (ring overwrite / race), semplicemente continua finchÃ© non raggiunge X.
 
-    ``cap_position_mm`` e ``cap_position_microsteps`` sono mantenuti solo per
-    compatibilità con invocatori legacy. La pipeline corrente usa invece
-    ``capture_metadata`` (blob JSON atomico associato al session ID).
+    ``capture_metadata`` è il blob JSON atomico associato al session ID.
     """
+    # RX e logger condividono lo stesso ring: ogni slot porta un bit per
+    # ciascun consumatore. Il logger libera solo il proprio bit dopo la copia.
     def _current_output_dir() -> Path:
         """Legge la run selezionata dalla GUI prima di aprire ogni file."""
         value = _read_shared_text(out_dir_shared)
@@ -1625,31 +1561,11 @@ def logger_worker(
     def _open_file(capture_file_id: int, session_id: int):
         nonlocal fbin, buf, buf_used, saved_local, pos_local, file_cap_id
         _close_file()
-        if capture_metadata is not None:
-            metadata = read_capture_metadata(capture_metadata, int(session_id))
-            if metadata is None:
-                raise RuntimeError(f"missing capture metadata for session {int(session_id)}")
-        else:
-            # Compatibilità transitoria per chiamanti diretti del worker (ad
-            # esempio test legacy). Il percorso di produzione non usa questi
-            # Value scollegati.
-            legacy_raw: dict[str, object] = {}
-            if cap_position_mm is not None:
-                try:
-                    legacy_raw["carriage_position_mm"] = float(cap_position_mm.value)
-                except Exception:
-                    pass
-            if cap_position_microsteps is not None:
-                try:
-                    legacy_raw["carriage_microsteps"] = int(cap_position_microsteps.value)
-                except Exception:
-                    pass
-            metadata = normalize_capture_metadata(int(capture_file_id), legacy_raw)
+        metadata = read_capture_metadata(capture_metadata, int(session_id))
+        if metadata is None:
+            raise RuntimeError(f"missing capture metadata for session {int(session_id)}")
         header_blob = _build_capture_file_header(
             int(metadata["position"]),
-            capture_id=int(metadata["capture_id"]),
-            acquisition_index=int(metadata["acquisition_index"]),
-            cylindrical=metadata.get("cylindrical"),
             carriage_position_mm=metadata.get("carriage_position_mm"),
             carriage_microsteps=metadata.get("carriage_microsteps"),
         )
@@ -1842,13 +1758,12 @@ def logger_worker(
         closed_id, _close_ok = _close_file()
         _mark_capture_finished(closed_id, -1)
 
-def main(*, rotary_axis: RotaryAxis | None = None):
-    """Avvia la GUI principale.
+def main():
+    """Crea la GUI e orchestra le risorse delle pipeline realtime e SAR.
 
-    ``rotary_axis`` è opzionale perché il repository non contiene il driver
-    dell'asse rotativo. Un'integrazione hardware reale lo passa esplicitamente
-    come adapter :class:`sar_scan.RotaryAxis`; senza adapter la GUI conserva la
-    scansione lineare e rende indisponibile l'avvio cilindrico.
+    Tutte le risorse esterne vengono registrate in ``shutdown_resources`` al
+    momento della creazione: il callback ``_shutdown`` può così ripulire anche
+    un avvio parziale o un'eccezione durante l'inizializzazione della GUI.
     """
     shutdown_state = {
         "in_progress": False,
@@ -1865,7 +1780,6 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         "mmwave_bridge": None,
         "motor_controller": None,
         "sar_scan": None,
-        "cylindrical_scan": None,
     }
     mmwave_auto_rearm_armed = False
 
@@ -1885,6 +1799,7 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         return obj
 
     def _shutdown():
+        """Arresto idempotente in ordine: scansione/hardware, worker, GUI."""
         nonlocal mmwave_auto_rearm_armed
         if shutdown_state["done"] or shutdown_state["in_progress"]:
             return
@@ -1892,14 +1807,13 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         try:
             mmwave_auto_rearm_armed = False
 
-            for scan_key in ("sar_scan", "cylindrical_scan"):
-                scan = shutdown_resources.get(scan_key)
-                if scan is not None:
-                    try:
-                        scan.cancel()
-                        scan.join(timeout=0.5)
-                    except Exception:
-                        pass
+            scan = shutdown_resources.get("sar_scan")
+            if scan is not None:
+                try:
+                    scan.cancel()
+                    scan.join(timeout=0.5)
+                except Exception:
+                    pass
 
             motor_controller = shutdown_resources.get("motor_controller")
             if motor_controller is not None:
@@ -1955,7 +1869,6 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             shutdown_resources["mmwave_bridge"] = None
             shutdown_resources["motor_controller"] = None
             shutdown_resources["sar_scan"] = None
-            shutdown_resources["cylindrical_scan"] = None
 
             if shutdown_state["dpg_context_created"] and not shutdown_state["dpg_context_destroyed"]:
                 try:
@@ -2158,7 +2071,6 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         target=radar_rx,
         args=(
             cmd_q,
-            dsp_cmd_q,
             free_slots,
             dsp_ready_queue,
             shm_frames,
@@ -2203,8 +2115,7 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             cap_pos_id,
             cap_id,
             cap_saved,
-            None,  # deprecated cap_position_mm; production uses capture_metadata
-            None,  # deprecated cap_position_microsteps
+            capture_metadata,
             cap_cancel_id,
             cap_done_id,
             cap_result,
@@ -2214,7 +2125,6 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             FRAMES_PER_POSITION,
             16,  # block_frames
             logger_ready_evt,
-            capture_metadata,
         ),
     )
     _track_process(p_log)
@@ -2332,37 +2242,6 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             stop_motion=stepper_controller.stop,
         )
         shutdown_resources["sar_scan"] = sar_scan
-
-    cylindrical_scan = None
-    rotary_error = ""
-    if rotary_axis is None:
-        rotary_error = (
-            "Rotary axis unavailable: pass a sar_scan.RotaryAxis adapter to main()."
-        )
-    elif stepper_controller is None:
-        rotary_error = "Vertical Phidget unavailable."
-    else:
-        # Il Phidget 1063 esistente resta l'asse verticale. Il suo HOME è il
-        # riferimento z=0 della prima fase, quindi mm<->m è una conversione
-        # meccanica diretta e non un sistema di calibrazione.
-        cylindrical_scan = CylindricalScanCoordinator(
-            begin_vertical_scan=stepper_controller.begin_external_scan,
-            finish_vertical_scan=stepper_controller.finish_external_scan,
-            get_vertical_microsteps=stepper_controller.position_microsteps,
-            height_m_from_microsteps=lambda steps: (
-                stepper_controller.config.mechanics.mm_from_microsteps(steps) / 1000.0
-            ),
-            microsteps_from_height_m=lambda height_m: (
-                stepper_controller.config.mechanics.microsteps_from_mm(float(height_m) * 1000.0)
-            ),
-            move_vertical_to_microsteps=stepper_controller.move_absolute_microsteps_and_wait,
-            stop_vertical=stepper_controller.stop,
-            rotary_axis=rotary_axis,
-            request_capture=capture_sessions.request,
-            wait_capture=capture_sessions.wait,
-            cancel_capture=capture_sessions.cancel,
-        )
-        shutdown_resources["cylindrical_scan"] = cylindrical_scan
 
     def _create_offline_runtime():
         """Build an isolated offline runtime from the persisted configuration."""
@@ -2528,7 +2407,21 @@ def main(*, rotary_axis: RotaryAxis | None = None):
     TAG_CBAR_COL    = "cbar_col"
     TAG_RANGEFFT_COL = "rangefft_col"
 
-    TXT_STATS_TAG = "txt_stats"
+    TXT_PIPELINE_CONFIG_TAG = "txt_pipeline_config"
+    TXT_DISPLAY_DIAG_TAG = "txt_display_diagnostics"
+    DEBUG_STAT_VALUE_TAGS = {
+        "udp_rx": "debug_stat_udp_rx",
+        "frames": "debug_stat_frames",
+        "ring": "debug_stat_ring",
+        "drops": "debug_stat_drops",
+        "dsp_frame": "debug_stat_dsp_frame",
+        "dsp_stale": "debug_stat_dsp_stale",
+        "image_updates": "debug_stat_image_updates",
+        "cpu": "debug_stat_cpu",
+        "logger": "debug_stat_logger",
+        "stalls": "debug_stat_stalls",
+        "resyncs": "debug_stat_resyncs",
+    }
     TXT_TUNING_STATUS_TAG = "txt_tuning_status"
     IN_VMIN, IN_VMAX = "in_vmin", "in_vmax"
     IN_RMAX, IN_XMAX = "in_rmax", "in_xmax"
@@ -2544,13 +2437,6 @@ def main(*, rotary_axis: RotaryAxis | None = None):
     TXT_RUN_DIR_TAG = "txt_sar_run_dir"
     IN_MOTOR_JOG_TAG = "in_motor_jog_mm"
     IN_SCAN_POSITIONS_TAG = "in_sar_scan_positions"
-    COMBO_SCAN_MODE_TAG = "combo_sar_scan_mode"
-    IN_CYL_ANGLES_TAG = "in_cylindrical_angles_per_turn"
-    IN_CYL_RADIUS_TAG = "in_cylindrical_radius_m"
-    IN_CYL_HEIGHTS_TAG = "in_cylindrical_height_count"
-    IN_CYL_VERTICAL_STEP_TAG = "in_cylindrical_vertical_step_m"
-    IN_CYL_ANGULAR_SETTLING_TAG = "in_cylindrical_angular_settling_s"
-    IN_CYL_VERTICAL_SETTLING_TAG = "in_cylindrical_vertical_settling_s"
     BTN_CAPTURE_TAG = "btn_capture_frame"
     BTN_NEW_SESSION_TAG = "btn_new_sar_session"
     BTN_SCAN_START_TAG = "btn_sar_scan_start"
@@ -2585,13 +2471,7 @@ def main(*, rotary_axis: RotaryAxis | None = None):
     PROC_IMG_SERIES_TAG = "proc_img_series"
     PROC_IN_XSTART = "proc_in_xstart"
     PROC_IN_XEND = "proc_in_xend"
-    PROC_GRP_LEGACY_BP_CONTROL = "proc_grp_legacy_bp_control"
-    PROC_GRP_CYLINDRICAL_SECTION = "proc_grp_cylindrical_section"
-    PROC_COMBO_CYL_SECTION = "proc_combo_cylindrical_section"
-    PROC_IN_CYL_SECTION_COORD = "proc_in_cylindrical_section_coordinate"
-    PROC_COMBO_CYL_HEIGHT = "proc_combo_cylindrical_height"
-    PROC_TXT_CYL_SECTION_HINT = "proc_txt_cylindrical_section_hint"
-    PROC_TXT_CYL_RUN_INFO = "proc_txt_cylindrical_run_info"
+    PROC_GRP_LINEAR_POSITION_SELECTION = "proc_grp_linear_position_selection"
     PROC_BTN_LOAD_OFFLINE = "proc_btn_load_offline"
     PROC_TXT_MEMORY_ESTIMATE = "proc_txt_memory_estimate"
     PROC_IN_VMIN = "proc_in_vmin"
@@ -2608,10 +2488,9 @@ def main(*, rotary_axis: RotaryAxis | None = None):
     TXT_OFFLINE_TUNING_INFO_TAG = "txt_offline_tuning_info"
     BTN_OFFLINE_INSPECT_RUN = "btn_offline_inspect_run"
     TXT_OFFLINE_RUN_FORMAT = "txt_offline_run_format"
-    OFFLINE_TUNING_GRP_LEGACY_SCAN = "offline_tuning_grp_legacy_scan"
-    OFFLINE_TUNING_GRP_LEGACY_RECON = "offline_tuning_grp_legacy_reconstruction"
-    OFFLINE_TUNING_GRP_LEGACY_MAP = "offline_tuning_grp_legacy_map"
-    OFFLINE_TUNING_GRP_CYLINDRICAL_VIEW = "offline_tuning_grp_cylindrical_view"
+    OFFLINE_TUNING_GRP_LINEAR_SCAN = "offline_tuning_grp_linear_scan"
+    OFFLINE_TUNING_GRP_RECONSTRUCTION = "offline_tuning_grp_reconstruction"
+    OFFLINE_TUNING_GRP_MAP_BOUNDS = "offline_tuning_grp_map_bounds"
     CMAP_SCALE_TAG = "cmap_scale"
     CMAP_NUM_FMT = "%+6.1f"
     CMAP_VELOCITY_NUM_FMT = "%+5.2f"
@@ -2979,7 +2858,6 @@ def main(*, rotary_axis: RotaryAxis | None = None):
     off_ui_pending = {
         "x_start": int(off_x_start),
         "x_end": int(off_x_end),
-        "cylindrical_section": None,
         "vmin": float(off_vmin),
         "vmax": float(off_vmax),
         "norm_enabled": bool(off_norm_enabled),
@@ -2989,14 +2867,6 @@ def main(*, rotary_axis: RotaryAxis | None = None):
     }
     offline_summary_state = f"ERROR: {offline_error}" if offline_error else ""
     offline_last_calculation_ms: float | None = None
-    # Updated from header-only inspection and then confirmed by the offline
-    # runtime.  The header is authoritative: no manual v1/v2 selector exists.
-    offline_run_view: dict[str, object] = {
-        "format": "unknown",
-        "geometry_mode": None,
-        "summary": None,
-        "view": None,
-    }
     # Populated by "Inspect run".  The bound is the minimum physical frame
     # count across the selected capture files, so one value is safe for every
     # position used by the reconstruction.
@@ -3133,13 +3003,6 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             max_r_bin = max(1, min(max_r_bin, int(fft_plot_h)))
         return max_r_bin, max_r_m
 
-    def _set_fft_x_ticks(max_r_m: float):
-        if not dpg.does_item_exist(RANGEFFT_XAXIS_TAG):
-            return
-        max_tick = max(0, int(np.floor(float(max_r_m) + 1e-6)))
-        ticks = tuple((str(x), float(x)) for x in range(0, max_tick + 1, 1))
-        dpg.set_axis_ticks(RANGEFFT_XAXIS_TAG, ticks)
-
     def _set_fft_x_ticks_window(xmin_m: float, xmax_m: float):
         if not dpg.does_item_exist(RANGEFFT_XAXIS_TAG):
             return
@@ -3272,8 +3135,7 @@ def main(*, rotary_axis: RotaryAxis | None = None):
     # La configurazione offline della run viene confermata soltanto dopo il
     # completamento di tutti i file. Su cancel/failure rimane quindi puntata
     # all'ultima acquisizione completa.
-    scan_pending_run: dict[str, int | str | None] = {
-        "mode": None,
+    scan_pending_run: dict[str, int | None] = {
         "start_position_id": None,
         "positions": None,
     }
@@ -3282,29 +3144,11 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         if dpg.does_item_exist(TXT_SCAN_STATUS_TAG):
             dpg.set_value(TXT_SCAN_STATUS_TAG, str(text))
 
-    def _selected_scan_mode() -> str:
-        if dpg.does_item_exist(COMBO_SCAN_MODE_TAG):
-            return "cylindrical" if str(dpg.get_value(COMBO_SCAN_MODE_TAG)) == "cylindrical" else "linear"
-        return "linear"
-
-    def _scan_for_mode(mode: str):
-        return cylindrical_scan if str(mode) == "cylindrical" else sar_scan
-
     def _any_scan_active() -> bool:
-        return bool(
-            (sar_scan is not None and sar_scan.active)
-            or (cylindrical_scan is not None and cylindrical_scan.active)
-        )
+        return bool(sar_scan is not None and sar_scan.active)
 
     def _active_or_pending_scan():
-        if sar_scan is not None and sar_scan.active:
-            return sar_scan
-        if cylindrical_scan is not None and cylindrical_scan.active:
-            return cylindrical_scan
-        pending_mode = scan_pending_run.get("mode")
-        if pending_mode in {"linear", "cylindrical"}:
-            return _scan_for_mode(str(pending_mode))
-        return _scan_for_mode(_selected_scan_mode())
+        return sar_scan
 
     def _update_scan_pitch_label(pitch_mm: float | None = None, error: str = "") -> None:
         if not dpg.does_item_exist(TXT_SCAN_PITCH_TAG):
@@ -3356,7 +3200,7 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         if _any_scan_active():
             _set_scan_status("A session cannot be changed during a SAR scan.")
             return
-        if scan_pending_run["mode"] is not None:
+        if scan_pending_run["start_position_id"] is not None:
             _set_scan_status("Wait for the previous scan offline finalization.")
             return
         try:
@@ -3427,11 +3271,8 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                 stepper_controller.log(f"STOP failed: {exc}")
 
     def _on_start_sar_scan() -> None:
-        mode = _selected_scan_mode()
-        selected_scan = _scan_for_mode(mode)
-        if selected_scan is None or stepper_controller is None:
-            unavailable = rotary_error if mode == "cylindrical" else stepper_error
-            _set_scan_status(f"Scan unavailable: {unavailable or 'Phidget not configured'}")
+        if sar_scan is None or stepper_controller is None:
+            _set_scan_status(f"Scan unavailable: {stepper_error or 'Phidget not configured'}")
             return
         if capture_sessions.inflight:
             _set_scan_status("Wait for the current capture to complete or be cancelled.")
@@ -3439,7 +3280,7 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         if _any_scan_active():
             _set_scan_status("A SAR scan is already active.")
             return
-        if scan_pending_run["mode"] is not None:
+        if scan_pending_run["start_position_id"] is not None:
             _set_scan_status("Wait for the previous scan offline finalization.")
             return
         try:
@@ -3461,132 +3302,69 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                 udp_idle_s = max(0.0, time.time() - float(rx_last_packet_time_s.value))
             if received_packets <= 0 or udp_idle_s > 2.0:
                 raise ScanError("Streaming is enabled but UDP is inactive: wait for radar data before scanning.")
-            if mode == "linear":
-                n_positions = int(dpg.get_value(IN_SCAN_POSITIONS_TAG))
-                start_id, _default_positions, pitch_mm = read_offline_scan_settings(offline_scan_config_path)
-                _update_scan_pitch_label(pitch_mm)
-                if n_positions <= 0:
-                    raise ScanError("The number of positions must be greater than zero.")
-                existing = [
-                    out_dir / f"capture_pos{position_id}.bin"
-                    for position_id in range(start_id, start_id + n_positions)
-                    if (out_dir / f"capture_pos{position_id}.bin").exists()
-                ]
-                if existing:
-                    raise ScanError(
-                        "The current run already contains captures (start a new session to avoid overwriting them)."
-                    )
-                with sar_pos_counter.get_lock():
-                    sar_pos_counter.value = int(start_id) - 1
-                plan = ScanPlan(
-                    positions=n_positions,
-                    pitch_mm=float(pitch_mm),
-                    start_position_id=int(start_id),
-                    # radar_rx applica già SETTLING_DELAY_S dopo che il carrello è
-                    # fermo; non duplicare inutilmente l'attesa qui.
-                    settling_seconds=0.0,
-                    motion_timeout_seconds=max(1.0, float(sar_cfg.get("scan_motion_timeout_s", 120.0))),
-                    capture_timeout_seconds=max(1.0, float(sar_cfg.get("scan_capture_timeout_s", 120.0))),
+            n_positions = int(dpg.get_value(IN_SCAN_POSITIONS_TAG))
+            start_id, _default_positions, pitch_mm = read_offline_scan_settings(offline_scan_config_path)
+            _update_scan_pitch_label(pitch_mm)
+            if n_positions <= 0:
+                raise ScanError("The number of positions must be greater than zero.")
+            existing = [
+                out_dir / f"capture_pos{position_id}.bin"
+                for position_id in range(start_id, start_id + n_positions)
+                if (out_dir / f"capture_pos{position_id}.bin").exists()
+            ]
+            if existing:
+                raise ScanError(
+                    "The current run already contains captures (start a new session to avoid overwriting them)."
                 )
-                sar_scan.start(plan)
-                scan_pending_run.update(
-                    {
-                        "mode": "linear",
-                        "start_position_id": int(start_id),
-                        "positions": int(n_positions),
-                    }
-                )
-                _set_scan_status(
-                    f"Linear scan started: {n_positions} positions, pitch {pitch_mm:.6f} mm"
-                )
-            else:
-                if cylindrical_scan is None:
-                    raise ScanError(rotary_error or "Rotary axis unavailable.")
-                angles_per_turn = int(dpg.get_value(IN_CYL_ANGLES_TAG))
-                radius_m = float(dpg.get_value(IN_CYL_RADIUS_TAG))
-                height_count = int(dpg.get_value(IN_CYL_HEIGHTS_TAG))
-                vertical_step_m = float(dpg.get_value(IN_CYL_VERTICAL_STEP_TAG))
-                angular_settling_s = float(dpg.get_value(IN_CYL_ANGULAR_SETTLING_TAG))
-                vertical_settling_s = float(dpg.get_value(IN_CYL_VERTICAL_SETTLING_TAG))
-                # Non rendere l'asse verticale una seconda sorgente di
-                # geometria: la quota iniziale è la posizione fisica HOME
-                # corrente, in metri, e ``scene_center`` resta l'origine
-                # fissa della prima fase.
-                start_steps = int(stepper_controller.position_microsteps())
-                initial_height_m = float(
-                    stepper_controller.config.mechanics.mm_from_microsteps(start_steps) / 1000.0
-                )
-                plan = CylindricalScanPlan(
-                    angles_per_turn=angles_per_turn,
-                    radius_m=radius_m,
-                    initial_height_m=initial_height_m,
-                    height_count=height_count,
-                    vertical_step_m=vertical_step_m,
-                    scene_center_m=(0.0, 0.0, 0.0),
-                    start_capture_id=1,
-                    angular_settling_seconds=angular_settling_s,
-                    vertical_settling_seconds=vertical_settling_s,
-                    motion_timeout_seconds=max(1.0, float(sar_cfg.get("scan_motion_timeout_s", 120.0))),
-                    capture_timeout_seconds=max(1.0, float(sar_cfg.get("scan_capture_timeout_s", 120.0))),
-                )
-                plan.validate()
-                existing = list(out_dir.glob("capture_pos*.bin"))
-                if existing:
-                    raise ScanError(
-                        "The current run already contains captures (start a new session for a cylindrical scan)."
-                    )
-                with sar_pos_counter.get_lock():
-                    sar_pos_counter.value = 0
-                cylindrical_scan.start(plan)
-                scan_pending_run.update(
-                    {
-                        "mode": "cylindrical",
-                        "start_position_id": int(plan.start_capture_id),
-                        "positions": int(plan.total_captures),
-                    }
-                )
-                _set_scan_status(
-                    f"Cylindrical scan started: {height_count} turns × {angles_per_turn} angles"
-                )
+            with sar_pos_counter.get_lock():
+                sar_pos_counter.value = int(start_id) - 1
+            plan = ScanPlan(
+                positions=n_positions,
+                pitch_mm=float(pitch_mm),
+                start_position_id=int(start_id),
+                # radar_rx applica già SETTLING_DELAY_S dopo che il carrello è
+                # fermo; non duplicare inutilmente l'attesa qui.
+                settling_seconds=0.0,
+                motion_timeout_seconds=max(1.0, float(sar_cfg.get("scan_motion_timeout_s", 120.0))),
+                capture_timeout_seconds=max(1.0, float(sar_cfg.get("scan_capture_timeout_s", 120.0))),
+            )
+            sar_scan.start(plan)
+            scan_pending_run.update(
+                {
+                    "start_position_id": int(start_id),
+                    "positions": int(n_positions),
+                }
+            )
+            _set_scan_status(
+                f"Linear scan started: {n_positions} positions, pitch {pitch_mm:.6f} mm"
+            )
         except Exception as exc:
             _set_scan_status(f"Scan did not start: {exc}")
 
     def _on_cancel_sar_scan() -> None:
-        active_scan = _active_or_pending_scan()
-        if active_scan is None or not active_scan.active:
+        if sar_scan is None or not sar_scan.active:
             _set_scan_status("No SAR scan is active.")
             return
-        active_scan.cancel()
+        sar_scan.cancel()
         _set_scan_status("Scan cancellation requested...")
 
     motor_log_lines: list[str] = []
 
-    def _english_scan_message(message: str) -> str:
-        """Translate the coordinator's Italian status for the English GUI."""
-        text = str(message)
-        translations = {
-            "Pronto": "Ready",
-            "Preparazione scansione SAR": "Preparing SAR scan",
-            "Assestamento meccanico": "Mechanical settling",
-            "Annullamento scansione...": "Cancelling scan...",
-            "Scansione SAR annullata": "SAR scan cancelled",
-            "Scansione SAR interrotta": "SAR scan interrupted",
-            "Errore chiusura scansione": "Scan finalization error",
-            "Scansione SAR completata": "SAR scan completed",
-            "Preparazione scansione cilindrica": "Preparing cylindrical scan",
-            "Annullamento scansione cilindrica...": "Cancelling cylindrical scan...",
-            "Scansione cilindrica annullata": "Cylindrical scan cancelled",
-            "Scansione cilindrica interrotta": "Cylindrical scan interrupted",
-            "Errore chiusura scansione cilindrica": "Cylindrical scan finalization error",
-            "Scansione cilindrica completata": "Cylindrical scan completed",
-            "Assestamento asse verticale": "Vertical-axis settling",
-            "Assestamento asse rotativo": "Rotary-axis settling",
-            "Scansione annullata.": "Scan cancelled.",
+    def _scan_event_label(event: ScanEvent) -> str:
+        """Renderizza l'evento SAR strutturato nella lingua della GUI."""
+        labels = {
+            ScanEvent.READY: "Ready",
+            ScanEvent.PREPARING: "Preparing SAR scan",
+            ScanEvent.CAPTURING_POSITION: "Capturing position",
+            ScanEvent.MOVING_TO_POSITION: "Moving to position",
+            ScanEvent.MECHANICAL_SETTLING: "Mechanical settling",
+            ScanEvent.CANCELLATION_REQUESTED: "Cancelling scan...",
+            ScanEvent.CANCELLED: "SAR scan cancelled",
+            ScanEvent.COMPLETED: "SAR scan completed",
+            ScanEvent.INTERRUPTED: "SAR scan interrupted",
+            ScanEvent.FINALIZATION_FAILED: "Scan finalization error",
         }
-        text = translations.get(text, text)
-        text = re.sub(r"^Cattura posizione (.+)$", r"Capturing position \1", text)
-        text = re.sub(r"^Movimento verso posizione (.+)$", r"Moving to position \1", text)
-        return text
+        return labels.get(event, "SAR scan status unavailable")
 
     def _drain_motor_events() -> None:
         if stepper_controller is None:
@@ -3622,52 +3400,34 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         if dpg.does_item_exist(TXT_MOTOR_LOG_TAG):
             dpg.set_value(TXT_MOTOR_LOG_TAG, "\n".join(motor_log_lines[-4:]))
 
-    def _refresh_sar_scan_ui() -> str:
+    def _refresh_sar_scan_ui() -> ScanState:
         """Aggiorna i controlli dal thread GUI e restituisce lo stato scan."""
-        state = "idle"
+        state = ScanState.IDLE
         active = False
-        active_or_pending_scan = _active_or_pending_scan()
-        if active_or_pending_scan is not None:
-            status = active_or_pending_scan.status()
-            state = str(status.state)
-            active = active_or_pending_scan.active
+        if sar_scan is not None:
+            status = sar_scan.status()
+            state = status.state
+            active = sar_scan.active
             # Non sovrascrivere un errore di pre-avvio con lo stato ``idle``.
             # Prima il callback mostrava "Scan did not start: ...", ma il
             # frame GUI seguente lo rimpiazzava subito con "Ready".
-            if active or state in {"completed", "cancelled", "failed"}:
-                detail = _english_scan_message(str(status.message))
+            if active or state in {ScanState.COMPLETED, ScanState.CANCELLED, ScanState.FAILED}:
+                detail = _scan_event_label(status.event)
                 if status.position_id is not None:
                     detail += f" | id={int(status.position_id)}"
                 if status.position_mm is not None:
                     detail += f" | x={float(status.position_mm):.4f} mm"
-                if status.capture_id is not None:
-                    detail += f" | capture_id={int(status.capture_id)}"
-                if status.acquisition_index is not None:
-                    detail += f" | acquisition={int(status.acquisition_index)}"
-                if status.height_index is not None:
-                    detail += f" | h={int(status.height_index)}"
-                if status.angle_index is not None:
-                    detail += f" | angle={int(status.angle_index)}"
-                if status.azimuth_rad is not None:
-                    detail += f" | az={float(status.azimuth_rad):.5f} rad"
-                if status.height_m is not None:
-                    detail += f" | z={float(status.height_m):.4f} m"
                 if status.total:
                     detail += f" | {int(status.completed)}/{int(status.total)}"
                 if status.error:
-                    detail += f" | ERROR: {_english_scan_message(str(status.error))}"
+                    detail += f" | ERROR: {status.error}"
                 if dpg.does_item_exist(TXT_SCAN_STATUS_TAG):
                     dpg.set_value(TXT_SCAN_STATUS_TAG, detail)
-            if state == "capturing" and status.position_id is not None:
+            if state is ScanState.CAPTURING and status.position_id is not None:
                 with sar_pos_counter.get_lock():
                     sar_pos_counter.value = int(status.position_id)
                 if dpg.does_item_exist(TXT_POS_TAG):
                     dpg.set_value(TXT_POS_TAG, f"Scan: position ID {int(status.position_id)}")
-            elif state == "capturing" and status.capture_id is not None:
-                with sar_pos_counter.get_lock():
-                    sar_pos_counter.value = int(status.capture_id)
-                if dpg.does_item_exist(TXT_POS_TAG):
-                    dpg.set_value(TXT_POS_TAG, f"Scan: capture ID {int(status.capture_id)}")
 
         busy_capture = bool(capture_sessions.inflight)
         if dpg.does_item_exist(TXT_CAPTURE_STATUS_TAG):
@@ -3686,17 +3446,16 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         if dpg.does_item_exist(BTN_NEW_SESSION_TAG):
             dpg.configure_item(
                 BTN_NEW_SESSION_TAG,
-                enabled=not active and not busy_capture and scan_pending_run["mode"] is None,
+                enabled=not active and not busy_capture and scan_pending_run["start_position_id"] is None,
             )
         if dpg.does_item_exist(BTN_SCAN_START_TAG):
-            selected_scan = _scan_for_mode(_selected_scan_mode())
             dpg.configure_item(
                 BTN_SCAN_START_TAG,
                 enabled=(
-                    selected_scan is not None
+                    sar_scan is not None
                     and not active
                     and not busy_capture
-                    and scan_pending_run["mode"] is None
+                    and scan_pending_run["start_position_id"] is None
                 ),
             )
         if dpg.does_item_exist(BTN_SCAN_CANCEL_TAG):
@@ -3880,12 +3639,6 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         except Exception as exc:
             mmwave_bridge.set_status(error=f"Unexpected radar streaming error: {exc}")
         _refresh_mmwave_controls()
-
-    def _on_calibrate_boresight():
-        try:
-            cmd_q.put_nowait({"type": "calibrate_boresight"})
-        except Exception:
-            pass
 
     def _norm_toggle_label(enabled: bool) -> str:
         return "NORM: ON" if enabled else "NORM: OFF"
@@ -4187,121 +3940,6 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             if dpg.does_item_exist(tag):
                 dpg.set_value(tag, value)
 
-    def _offline_world_section_viewport(
-        x_min_m: float,
-        x_max_m: float,
-        y_min_m: float,
-        y_max_m: float,
-        *,
-        seq: int,
-        home: DisplayViewport | None = None,
-    ) -> DisplayViewport:
-        x0, x1 = sorted((float(x_min_m), float(x_max_m)))
-        y0, y1 = sorted((float(y_min_m), float(y_max_m)))
-        if x1 <= x0 or y1 <= y0:
-            raise ValueError("World section viewport requires positive extents")
-        if home is None:
-            zoom = 1.0
-        else:
-            zoom = max(
-                (float(home.x_max_m) - float(home.x_min_m)) / (x1 - x0),
-                (float(home.y_max_m) - float(home.y_min_m)) / (y1 - y0),
-                1.0,
-            )
-        return DisplayViewport(
-            x_min_m=x0,
-            x_max_m=x1,
-            y_min_m=y0,
-            y_max_m=y1,
-            range_min_bin_f=0.0,
-            range_max_bin_f=0.0,
-            angle_min_deg=0.0,
-            angle_max_deg=0.0,
-            zoom_level=float(zoom),
-            seq=int(seq),
-        )
-
-    def _cylindrical_section_home_viewport(view_dict: dict, *, seq: int) -> DisplayViewport:
-        bounds = view_dict.get("bounds", {})
-        section = view_dict.get("section", {})
-        plane = str(section.get("plane", "xy"))
-        if plane == "xy":
-            values = (bounds["x_min_m"], bounds["x_max_m"], bounds["y_min_m"], bounds["y_max_m"])
-        elif plane == "xz":
-            values = (bounds["x_min_m"], bounds["x_max_m"], bounds["z_min_m"], bounds["z_max_m"])
-        else:
-            values = (bounds["y_min_m"], bounds["y_max_m"], bounds["z_min_m"], bounds["z_max_m"])
-        return _offline_world_section_viewport(*[float(value) for value in values], seq=int(seq))
-
-    def _on_cylindrical_section_changed(sender=None, app_data=None):
-        nonlocal off_home_viewport_current, off_requested_viewport_current, off_ui_dirty, off_ui_dirty_t
-        if not _offline_is_v2():
-            return
-        view_dict = offline_run_view.get("view")
-        summary = offline_run_view.get("summary")
-        if not isinstance(view_dict, dict) or not isinstance(summary, dict):
-            return
-        try:
-            plane = str(dpg.get_value(PROC_COMBO_CYL_SECTION)).strip().lower()
-            coordinate = float(dpg.get_value(PROC_IN_CYL_SECTION_COORD))
-        except (TypeError, ValueError):
-            return
-        if plane not in {"xy", "xz", "yz"}:
-            return
-        if plane != "xy" and not bool(summary.get("has_vertical_resolution", False)):
-            plane = "xy"
-        bounds = view_dict.get("bounds", {})
-        try:
-            if plane == "xy" and bounds.get("z_min_m") is not None:
-                coordinate = max(float(bounds["z_min_m"]), min(float(bounds["z_max_m"]), coordinate))
-            elif plane == "xz":
-                coordinate = max(float(bounds["y_min_m"]), min(float(bounds["y_max_m"]), coordinate))
-            elif plane == "yz":
-                coordinate = max(float(bounds["x_min_m"]), min(float(bounds["x_max_m"]), coordinate))
-        except (KeyError, TypeError, ValueError):
-            return
-        updated_view = dict(view_dict)
-        updated_view["section"] = {"plane": plane, "coordinate_m": float(coordinate)}
-        updated_view["axes"] = list({"xy": ("X", "Y"), "xz": ("X", "Z"), "yz": ("Y", "Z")}[plane])
-        offline_run_view["view"] = updated_view
-        _set_cylindrical_view_widgets(
-            CylindricalView(
-                bounds=cylindrical_view_from_yaml_dict(
-                    {"reconstruction": {"cylindrical_view": updated_view}}
-                ).bounds,
-                section=CylindricalSection(plane=plane, coordinate_m=coordinate),
-            )
-        )
-        off_home_viewport_current = _cylindrical_section_home_viewport(
-            updated_view,
-            seq=int(off_requested_viewport_current.seq) + 1,
-        )
-        off_requested_viewport_current = off_home_viewport_current
-        off_ui_pending["cylindrical_section"] = CylindricalSection(plane=plane, coordinate_m=coordinate)
-        off_ui_pending["reset_view"] = True
-        off_ui_pending["reconstruct"] = True
-        off_ui_pending["display_refresh"] = False
-        off_ui_dirty = True
-        off_ui_dirty_t = time.perf_counter()
-        _apply_offline_geometry_controls()
-        _render_offline_summary(state=f"Cylindrical {plane.upper()} section queued")
-
-    def _on_cylindrical_height_selected(sender=None, app_data=None):
-        if not _offline_is_v2():
-            return
-        values = offline_run_view.get("height_world_z_values")
-        items = offline_run_view.get("height_items")
-        try:
-            index = list(items).index(str(app_data))
-            z_value = float(list(values)[index])
-        except (TypeError, ValueError, AttributeError):
-            return
-        if dpg.does_item_exist(PROC_COMBO_CYL_SECTION):
-            dpg.set_value(PROC_COMBO_CYL_SECTION, "xy")
-        if dpg.does_item_exist(PROC_IN_CYL_SECTION_COORD):
-            dpg.set_value(PROC_IN_CYL_SECTION_COORD, z_value)
-        _on_cylindrical_section_changed()
-
     def _apply_offline_display_zoom(sender=None, app_data=None):
         """Reconstruct the requested offline ROI on the fixed offline grid."""
         nonlocal off_requested_viewport_current, off_ui_dirty, off_ui_dirty_t
@@ -4327,11 +3965,7 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             (float(home.x_max_m) - float(home.x_min_m)) / float(max(1, offline_gui_w)),
             1e-6,
         )
-        min_y_span = (
-            max((float(home.y_max_m) - float(home.y_min_m)) / float(max(1, offline_gui_h)), 1e-6)
-            if _offline_is_v2()
-            else max(float(dr_plot), 1e-6)
-        )
+        min_y_span = max(float(dr_plot), 1e-6)
         if x1 <= x0:
             x1 = min(float(home.x_max_m), x0 + min_x_span)
             if x1 <= x0:
@@ -4341,25 +3975,15 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             if y1 <= y0:
                 y0 = max(float(home.y_min_m), y1 - min_y_span)
 
-        if _offline_is_v2():
-            off_requested_viewport_current = _offline_world_section_viewport(
-                float(x0),
-                float(x1),
-                float(y0),
-                float(y1),
-                seq=int(off_requested_viewport_current.seq) + 1,
-                home=home,
-            )
-        else:
-            off_requested_viewport_current = build_display_viewport(
-                x_min_m=float(x0),
-                x_max_m=float(x1),
-                y_min_m=float(y0),
-                y_max_m=float(y1),
-                dr_m=float(dr_plot),
-                seq=int(off_requested_viewport_current.seq) + 1,
-                home_viewport=home,
-            )
+        off_requested_viewport_current = build_display_viewport(
+            x_min_m=float(x0),
+            x_max_m=float(x1),
+            y_min_m=float(y0),
+            y_max_m=float(y1),
+            dr_m=float(dr_plot),
+            seq=int(off_requested_viewport_current.seq) + 1,
+            home_viewport=home,
+        )
         # The offline DSP worker uses this viewport to build its x/y grid, so
         # this is a real back-projection request rather than a plot crop.
         off_ui_pending["reset_view"] = False
@@ -4414,30 +4038,25 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             vmax = float(dpg.get_value(PROC_IN_VMAX))
         except (TypeError, ValueError):
             return
-        if _offline_is_v2():
-            x_start_cl = int(off_ui_pending.get("x_start", off_x_start))
-            x_end_cl = int(off_ui_pending.get("x_end", off_x_end))
-            reconstruction_changed = False
-        else:
-            try:
-                x_start = int(dpg.get_value(PROC_IN_XSTART))
-                x_end = int(dpg.get_value(PROC_IN_XEND))
-            except (TypeError, ValueError):
-                return
-            x_start_cl = max(off_pos_min, min(off_pos_max, x_start))
-            x_end_cl = max(off_pos_min, min(off_pos_max, x_end))
-            if x_end_cl < x_start_cl:
-                x_start_cl, x_end_cl = x_end_cl, x_start_cl
-            if x_start_cl != x_start:
-                dpg.set_value(PROC_IN_XSTART, x_start_cl)
-            if x_end_cl != x_end:
-                dpg.set_value(PROC_IN_XEND, x_end_cl)
-            prev_x_start = int(off_ui_pending.get("x_start", x_start_cl))
-            prev_x_end = int(off_ui_pending.get("x_end", x_end_cl))
-            reconstruction_changed = bool(
-                prev_x_start != int(x_start_cl)
-                or prev_x_end != int(x_end_cl)
-            )
+        try:
+            x_start = int(dpg.get_value(PROC_IN_XSTART))
+            x_end = int(dpg.get_value(PROC_IN_XEND))
+        except (TypeError, ValueError):
+            return
+        x_start_cl = max(off_pos_min, min(off_pos_max, x_start))
+        x_end_cl = max(off_pos_min, min(off_pos_max, x_end))
+        if x_end_cl < x_start_cl:
+            x_start_cl, x_end_cl = x_end_cl, x_start_cl
+        if x_start_cl != x_start:
+            dpg.set_value(PROC_IN_XSTART, x_start_cl)
+        if x_end_cl != x_end:
+            dpg.set_value(PROC_IN_XEND, x_end_cl)
+        prev_x_start = int(off_ui_pending.get("x_start", x_start_cl))
+        prev_x_end = int(off_ui_pending.get("x_end", x_end_cl))
+        reconstruction_changed = bool(
+            prev_x_start != int(x_start_cl)
+            or prev_x_end != int(x_end_cl)
+        )
 
         if vmax <= vmin:
             vmax = vmin + 1.0
@@ -4472,24 +4091,16 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         {"section": "Data and scan", "path": "data.input_dir", "label": "Input folder", "kind": "text", "default": "logs", "mode": "shared"},
         {"section": "Data and scan", "path": "data.startup_timeout_s", "label": "Startup timeout (s)", "kind": "int", "default": 300, "min": 1, "max": 3600, "step": 30, "mode": "shared"},
         {"section": "Data and scan", "path": "capture.frames_per_position", "label": "Frames to use per position", "kind": "int", "default": 8, "min": 1, "step": 1, "mode": "shared"},
-        {"section": "Data and scan", "path": "scan.x_start", "label": "Start position", "kind": "int", "default": 1, "step": 1, "mode": "legacy"},
-        {"section": "Data and scan", "path": "scan.x_end", "label": "End position", "kind": "int", "default": 1, "step": 1, "mode": "legacy"},
-        {"section": "Data and scan", "path": "scan.x_step", "label": "Position step (use every Nth)", "kind": "int", "default": 1, "min": 1, "step": 1, "mode": "legacy"},
-        {"section": "Data and scan", "path": "scan.x_pitch_m", "label": "X pitch (m)", "kind": "float", "default": 0.01, "min": 0.000001, "step": 0.001, "format": "%.6f", "mode": "legacy"},
-        {"section": "Reconstruction", "path": "reconstruction.algorithm", "label": "Algorithm", "kind": "combo", "items": OFFLINE_TUNING_ALGORITHMS, "default": "synthetic_range_angle", "mode": "legacy"},
+        {"section": "Data and scan", "path": "scan.x_start", "label": "Start position", "kind": "int", "default": 1, "step": 1, "mode": "linear"},
+        {"section": "Data and scan", "path": "scan.x_end", "label": "End position", "kind": "int", "default": 1, "step": 1, "mode": "linear"},
+        {"section": "Data and scan", "path": "scan.x_step", "label": "Position step (use every Nth)", "kind": "int", "default": 1, "min": 1, "step": 1, "mode": "linear"},
+        {"section": "Data and scan", "path": "scan.x_pitch_m", "label": "X pitch (m)", "kind": "float", "default": 0.01, "min": 0.000001, "step": 0.001, "format": "%.6f", "mode": "linear"},
+        {"section": "Reconstruction", "path": "reconstruction.algorithm", "label": "Algorithm", "kind": "combo", "items": OFFLINE_TUNING_ALGORITHMS, "default": "synthetic_range_angle", "mode": "linear"},
         {"section": "Reconstruction", "path": "bp.phase_sign", "label": "Phase sign", "kind": "combo", "items": ["-1", "1"], "default": "-1", "mode": "shared"},
-        {"section": "Map reconstruction bounds", "path": "reconstruction.map_bounds.x_min_m", "label": "Map X min (m)", "kind": "float", "default": -25.0, "step": 0.5, "mode": "legacy"},
-        {"section": "Map reconstruction bounds", "path": "reconstruction.map_bounds.x_max_m", "label": "Map X max (m)", "kind": "float", "default": 25.0, "step": 0.5, "mode": "legacy"},
-        {"section": "Map reconstruction bounds", "path": "reconstruction.map_bounds.y_min_m", "label": "Map Y (range) min (m)", "kind": "float", "default": 0.0, "min": 0.0, "step": 0.5, "mode": "legacy"},
-        {"section": "Map reconstruction bounds", "path": "reconstruction.map_bounds.y_max_m", "label": "Map Y (range) max (m)", "kind": "float", "default": 50.0, "min": 0.0, "step": 0.5, "mode": "legacy"},
-        {"section": "Cylindrical v2 view", "path": "reconstruction.cylindrical_view.bounds.x_min_m", "label": "X min (m)", "kind": "float", "default": -1.0, "step": 0.05, "mode": "v2"},
-        {"section": "Cylindrical v2 view", "path": "reconstruction.cylindrical_view.bounds.x_max_m", "label": "X max (m)", "kind": "float", "default": 1.0, "step": 0.05, "mode": "v2"},
-        {"section": "Cylindrical v2 view", "path": "reconstruction.cylindrical_view.bounds.y_min_m", "label": "Y min (m)", "kind": "float", "default": -1.0, "step": 0.05, "mode": "v2"},
-        {"section": "Cylindrical v2 view", "path": "reconstruction.cylindrical_view.bounds.y_max_m", "label": "Y max (m)", "kind": "float", "default": 1.0, "step": 0.05, "mode": "v2"},
-        {"section": "Cylindrical v2 view", "path": "reconstruction.cylindrical_view.bounds.z_min_m", "label": "Z min (m)", "kind": "float", "default": 0.0, "step": 0.05, "mode": "v2"},
-        {"section": "Cylindrical v2 view", "path": "reconstruction.cylindrical_view.bounds.z_max_m", "label": "Z max (m)", "kind": "float", "default": 1.0, "step": 0.05, "mode": "v2"},
-        {"section": "Cylindrical v2 view", "path": "reconstruction.cylindrical_view.section.plane", "label": "Default section", "kind": "combo", "items": ["xy", "xz", "yz"], "default": "xy", "mode": "v2"},
-        {"section": "Cylindrical v2 view", "path": "reconstruction.cylindrical_view.section.coordinate_m", "label": "Section coordinate (m)", "kind": "float", "default": 0.0, "step": 0.05, "mode": "v2"},
+        {"section": "Map reconstruction bounds", "path": "reconstruction.map_bounds.x_min_m", "label": "Map X min (m)", "kind": "float", "default": -25.0, "step": 0.5, "mode": "linear"},
+        {"section": "Map reconstruction bounds", "path": "reconstruction.map_bounds.x_max_m", "label": "Map X max (m)", "kind": "float", "default": 25.0, "step": 0.5, "mode": "linear"},
+        {"section": "Map reconstruction bounds", "path": "reconstruction.map_bounds.y_min_m", "label": "Map Y (range) min (m)", "kind": "float", "default": 0.0, "min": 0.0, "step": 0.5, "mode": "linear"},
+        {"section": "Map reconstruction bounds", "path": "reconstruction.map_bounds.y_max_m", "label": "Map Y (range) max (m)", "kind": "float", "default": 50.0, "min": 0.0, "step": 0.5, "mode": "linear"},
         {"section": "Offline reference background", "path": "offline_background.enabled", "label": "Subtract empty-scene reference", "kind": "bool", "default": False},
         {"section": "Offline reference background", "path": "offline_background.reference_dir", "label": "Empty-scene folder", "kind": "text", "default": ""},
         {"section": "Offline reference background", "path": "offline_background.scale", "label": "Reference scale", "kind": "float", "default": 1.0, "min": 0.0, "step": 0.01},
@@ -4564,10 +4175,7 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         if dpg.does_item_exist(TXT_OFFLINE_TUNING_STATUS_TAG):
             dpg.set_value(TXT_OFFLINE_TUNING_STATUS_TAG, str(message))
 
-    def _offline_is_v2() -> bool:
-        return str(offline_run_view.get("geometry_mode") or "") == "cylindrical_regular"
-
-    def _offline_tuning_snapshot(*, materialize_v2: bool = False) -> dict:
+    def _offline_tuning_snapshot() -> dict:
         base = yaml.safe_load(yaml.safe_dump(offline_tuning_cfg, sort_keys=False)) or {}
         if not isinstance(base, dict):
             base = {}
@@ -4575,8 +4183,6 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         for spec in OFFLINE_TUNING_FIELD_SPECS:
             tag = _offline_tune_tag(spec["path"])
             current = _offline_cfg_path_get(base, spec["path"], missing)
-            if spec.get("mode") == "v2" and current is missing and not materialize_v2:
-                continue
             if dpg.does_item_exist(tag):
                 value = _offline_tuning_widget_value(spec)
             else:
@@ -4584,131 +4190,35 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             _offline_cfg_path_set(base, spec["path"], value)
         return base
 
-    def _set_cylindrical_view_widgets(view: CylindricalView) -> None:
-        values = {
-            "reconstruction.cylindrical_view.bounds.x_min_m": view.bounds.x_min_m,
-            "reconstruction.cylindrical_view.bounds.x_max_m": view.bounds.x_max_m,
-            "reconstruction.cylindrical_view.bounds.y_min_m": view.bounds.y_min_m,
-            "reconstruction.cylindrical_view.bounds.y_max_m": view.bounds.y_max_m,
-            "reconstruction.cylindrical_view.bounds.z_min_m": (
-                0.0 if view.bounds.z_min_m is None else view.bounds.z_min_m
-            ),
-            "reconstruction.cylindrical_view.bounds.z_max_m": (
-                0.0 if view.bounds.z_max_m is None else view.bounds.z_max_m
-            ),
-            "reconstruction.cylindrical_view.section.plane": view.section.plane,
-            "reconstruction.cylindrical_view.section.coordinate_m": view.section.coordinate_m,
-        }
-        for path, value in values.items():
-            tag = _offline_tune_tag(path)
-            if dpg.does_item_exist(tag):
-                dpg.set_value(tag, value)
-
     def _apply_offline_geometry_controls() -> None:
-        """Show controls compatible with the header-detected offline format."""
-        is_v2 = _offline_is_v2()
+        """Apply the fixed controls used by linear V1 captures."""
         for tag in (
-            OFFLINE_TUNING_GRP_LEGACY_SCAN,
-            OFFLINE_TUNING_GRP_LEGACY_RECON,
-            OFFLINE_TUNING_GRP_LEGACY_MAP,
-            PROC_GRP_LEGACY_BP_CONTROL,
+            OFFLINE_TUNING_GRP_LINEAR_SCAN,
+            OFFLINE_TUNING_GRP_RECONSTRUCTION,
+            OFFLINE_TUNING_GRP_MAP_BOUNDS,
+            PROC_GRP_LINEAR_POSITION_SELECTION,
         ):
             if dpg.does_item_exist(tag):
-                dpg.configure_item(tag, show=not is_v2)
-        for tag in (OFFLINE_TUNING_GRP_CYLINDRICAL_VIEW, PROC_GRP_CYLINDRICAL_SECTION):
-            if dpg.does_item_exist(tag):
-                dpg.configure_item(tag, show=is_v2)
-
-        if not is_v2:
-            if dpg.does_item_exist(PROC_XAXIS_TAG):
-                dpg.configure_item(PROC_XAXIS_TAG, label="X (m)")
-            if dpg.does_item_exist(PROC_YAXIS_TAG):
-                dpg.configure_item(PROC_YAXIS_TAG, label="Y (m)")
-            for tag, label in (
-                (PROC_IN_ZOOM_XMIN, "X min (m)"),
-                (PROC_IN_ZOOM_XMAX, "X max (m)"),
-                (PROC_IN_ZOOM_YMIN, "Y min (m)"),
-                (PROC_IN_ZOOM_YMAX, "Y max (m)"),
-            ):
-                if dpg.does_item_exist(tag):
-                    dpg.configure_item(tag, label=label)
-            if dpg.does_item_exist(TXT_OFFLINE_RUN_FORMAT):
-                if str(offline_run_view.get("format")) == "rt_capture_v1":
-                    dpg.set_value(TXT_OFFLINE_RUN_FORMAT, "Format: rt_capture_v1 / legacy linear")
-                else:
-                    dpg.set_value(TXT_OFFLINE_RUN_FORMAT, "Format: not inspected")
-            return
-
-        summary = offline_run_view.get("summary")
-        view_dict = offline_run_view.get("view")
-        if not isinstance(summary, dict) or not isinstance(view_dict, dict):
-            return
-        section = view_dict.get("section", {})
-        plane = str(section.get("plane", "xy"))
-        vertical_available = bool(summary.get("has_vertical_resolution", False))
-        allowed_planes = ["xy", "xz", "yz"] if vertical_available else ["xy"]
-        if plane not in allowed_planes:
-            plane = "xy"
-        if dpg.does_item_exist(PROC_COMBO_CYL_SECTION):
-            dpg.configure_item(PROC_COMBO_CYL_SECTION, items=allowed_planes)
-            dpg.set_value(PROC_COMBO_CYL_SECTION, plane)
-        axes = {
-            "xy": ("X", "Y", "Z"),
-            "xz": ("X", "Z", "Y"),
-            "yz": ("Y", "Z", "X"),
-        }[plane]
+                dpg.configure_item(tag, show=True)
         if dpg.does_item_exist(PROC_XAXIS_TAG):
-            dpg.configure_item(PROC_XAXIS_TAG, label=f"{axes[0]} (m)")
+            dpg.configure_item(PROC_XAXIS_TAG, label="X (m)")
         if dpg.does_item_exist(PROC_YAXIS_TAG):
-            dpg.configure_item(PROC_YAXIS_TAG, label=f"{axes[1]} (m)")
+            dpg.configure_item(PROC_YAXIS_TAG, label="Y (m)")
         for tag, label in (
-            (PROC_IN_ZOOM_XMIN, f"{axes[0]} min (m)"),
-            (PROC_IN_ZOOM_XMAX, f"{axes[0]} max (m)"),
-            (PROC_IN_ZOOM_YMIN, f"{axes[1]} min (m)"),
-            (PROC_IN_ZOOM_YMAX, f"{axes[1]} max (m)"),
+            (PROC_IN_ZOOM_XMIN, "X min (m)"),
+            (PROC_IN_ZOOM_XMAX, "X max (m)"),
+            (PROC_IN_ZOOM_YMIN, "Y min (m)"),
+            (PROC_IN_ZOOM_YMAX, "Y max (m)"),
         ):
             if dpg.does_item_exist(tag):
                 dpg.configure_item(tag, label=label)
-        if dpg.does_item_exist(PROC_IN_CYL_SECTION_COORD):
-            dpg.configure_item(PROC_IN_CYL_SECTION_COORD, label=f"{axes[2]} section (m)")
-            dpg.set_value(PROC_IN_CYL_SECTION_COORD, float(section.get("coordinate_m", 0.0)))
-        height_values = [float(value) for value in summary.get("height_m_values", [])]
-        world_z_values = [float(value) for value in summary.get("world_z_values_m", [])]
-        height_items = [
-            f"h={height:.6g} m | Z={z_value:.6g} m"
-            for height, z_value in zip(height_values, world_z_values)
-        ]
-        offline_run_view["height_items"] = height_items
-        offline_run_view["height_world_z_values"] = world_z_values
-        if dpg.does_item_exist(PROC_COMBO_CYL_HEIGHT):
-            dpg.configure_item(PROC_COMBO_CYL_HEIGHT, items=height_items, enabled=bool(height_items))
-            if height_items and not str(dpg.get_value(PROC_COMBO_CYL_HEIGHT)) in height_items:
-                dpg.set_value(PROC_COMBO_CYL_HEIGHT, height_items[0])
-        hint = (
-            "XY uses a world Z section. XZ/YZ use all heights."
-            if vertical_available
-            else "Only XY is available: XZ/YZ require at least two acquired heights."
-        )
-        if dpg.does_item_exist(PROC_TXT_CYL_SECTION_HINT):
-            dpg.set_value(PROC_TXT_CYL_SECTION_HINT, hint)
         if dpg.does_item_exist(TXT_OFFLINE_RUN_FORMAT):
-            dpg.set_value(
-                TXT_OFFLINE_RUN_FORMAT,
-                f"Format: rt_capture_v2 / {summary.get('kind')} | "
-                f"{summary.get('height_count')} heights x {summary.get('angle_count')} angles",
-            )
-        if dpg.does_item_exist(PROC_TXT_CYL_RUN_INFO):
-            center = summary.get("scene_center_m", [0.0, 0.0, 0.0])
-            dpg.set_value(
-                PROC_TXT_CYL_RUN_INFO,
-                f"{summary.get('capture_count')} captures | r={float(summary.get('radius_m', 0.0)):.4g} m | "
-                f"center=({float(center[0]):.4g}, {float(center[1]):.4g}, {float(center[2]):.4g}) m",
-            )
+            dpg.set_value(TXT_OFFLINE_RUN_FORMAT, "Format: rt_capture_v1 / linear")
 
     def _inspect_offline_run(sender=None, app_data=None) -> bool:
-        """Inspect headers only and apply the corresponding offline GUI mode."""
+        """Inspect the configured linear V1 run without loading its payload."""
         try:
-            snapshot = _offline_tuning_snapshot(materialize_v2=_offline_is_v2())
+            snapshot = _offline_tuning_snapshot()
             # Inspection must work even when the current control value is
             # larger than this run.  Read the full header/file capacity first,
             # then clamp the GUI control to a valid selectable range.
@@ -4726,63 +4236,16 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                 available_frames,
                 input_dir=str(_offline_cfg_path_get(snapshot, "data.input_dir", "")),
             )
-            snapshot = _offline_tuning_snapshot(materialize_v2=_offline_is_v2())
-            if str(layout.geometry_mode) == "cylindrical_regular":
-                summary = cylindrical_run_summary(layout)
-                configured_view = cylindrical_view_from_yaml_dict(snapshot)
-                legacy_plane = cylindrical_plane_from_yaml_dict(snapshot)
-                view = resolve_cylindrical_view(
-                    configured_view=configured_view,
-                    legacy_plane=legacy_plane,
-                    captures=tuple(layout.cylindrical_captures),
-                )
-                offline_run_view.update(
-                    {
-                        "format": "rt_capture_v2",
-                        "geometry_mode": "cylindrical_regular",
-                        "summary": {
-                            "kind": summary.kind,
-                            "capture_count": summary.capture_count,
-                            "angle_count": summary.angle_count,
-                            "height_count": summary.height_count,
-                            "radius_m": summary.radius_m,
-                            "scene_center_m": list(summary.scene_center_m),
-                            "height_m_values": list(summary.height_m_values),
-                            "world_z_values_m": list(summary.world_z_values_m),
-                            "has_vertical_resolution": summary.has_vertical_resolution,
-                        },
-                        "view": cylindrical_view_to_dict(view),
-                    }
-                )
-                _set_cylindrical_view_widgets(view)
-                algorithm_tag = _offline_tune_tag("reconstruction.algorithm")
-                if dpg.does_item_exist(algorithm_tag):
-                    dpg.set_value(algorithm_tag, "backprojection")
-                message = (
-                    f"Detected rt_capture_v2 {summary.kind}: {summary.height_count} heights x "
-                    f"{summary.angle_count} angles | {available_frames} frames available per position"
-                )
-            else:
-                offline_run_view.update(
-                    {
-                        "format": "rt_capture_v1",
-                        "geometry_mode": "legacy_linear",
-                        "summary": None,
-                        "view": None,
-                    }
-                )
-                message = (
-                    f"Detected rt_capture_v1 linear run: {int(layout.positions.size)} positions | "
-                    f"{available_frames} frames available per position"
-                )
+            snapshot = _offline_tuning_snapshot()
+            message = (
+                f"Detected rt_capture_v1 linear run: {int(layout.positions.size)} positions | "
+                f"{available_frames} frames available per position"
+            )
             _apply_offline_geometry_controls()
             _refresh_offline_memory_estimate(snapshot)
             _set_offline_tuning_status(message)
             return True
         except Exception as exc:
-            offline_run_view.update(
-                {"format": "unknown", "geometry_mode": None, "summary": None, "view": None}
-            )
             _apply_offline_geometry_controls()
             _set_offline_tuning_status(f"Run inspection error: {exc}")
             return False
@@ -4790,7 +4253,7 @@ def main(*, rotary_axis: RotaryAxis | None = None):
     def _offline_tuning_locked_by_scan() -> bool:
         return bool(
             _any_scan_active()
-            or scan_pending_run["mode"] is not None
+            or scan_pending_run["start_position_id"] is not None
         )
 
     def _refresh_offline_memory_estimate(cfg_source: dict | None = None) -> str:
@@ -4815,9 +4278,6 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                 raise ValueError("la radice YAML deve essere una mappa")
             offline_tuning_cfg = loaded
             _set_offline_frame_limit(None)
-            offline_run_view.update(
-                {"format": "unknown", "geometry_mode": None, "summary": None, "view": None}
-            )
             for spec in OFFLINE_TUNING_FIELD_SPECS:
                 tag = _offline_tune_tag(spec["path"])
                 if not dpg.does_item_exist(tag):
@@ -4870,8 +4330,7 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         return float(value_f)
 
     def _collect_offline_tuning_config() -> dict:
-        is_v2 = _offline_is_v2()
-        base = _offline_tuning_snapshot(materialize_v2=is_v2)
+        base = _offline_tuning_snapshot()
 
         if not str(_offline_cfg_path_get(base, "data.input_dir", "")).strip():
             raise ValueError("Input folder is required")
@@ -4895,33 +4354,11 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             _offline_cfg_path_get(base, "offline_background.reference_dir", "")
         ).strip():
             raise ValueError("Empty-scene folder is required when offline reference background is enabled")
-        if is_v2:
-            _offline_cfg_path_set(base, "reconstruction.algorithm", "backprojection")
-            summary = offline_run_view.get("summary")
-            if not isinstance(summary, dict):
-                raise ValueError("Run v2 must be inspected before saving its view configuration")
-            if not bool(summary.get("has_vertical_resolution", False)):
-                bounds_node = _offline_cfg_path_get(base, "reconstruction.cylindrical_view.bounds", {})
-                if isinstance(bounds_node, dict):
-                    # A single-height circular scan has no Z aperture.  Keep
-                    # its XY section coordinate, but omit meaningless Z
-                    # volume bounds from the persisted configuration.
-                    bounds_node.pop("z_min_m", None)
-                    bounds_node.pop("z_max_m", None)
-            v2_view = cylindrical_view_from_yaml_dict(base)
-            if v2_view is None:
-                raise ValueError("Cylindrical v2 view configuration is required after run inspection")
-            if bool(summary.get("has_vertical_resolution", False)):
-                if not v2_view.bounds.has_z_bounds:
-                    raise ValueError("Z bounds are required for a multi-height cylindrical run")
-            elif v2_view.section.plane != "xy":
-                raise ValueError("XZ/YZ sections require at least two acquired heights")
-        else:
-            if int(_offline_cfg_path_get(base, "scan.x_end")) < int(_offline_cfg_path_get(base, "scan.x_start")):
-                raise ValueError("End position must be greater than or equal to start position")
-            if float(_offline_cfg_path_get(base, "scan.x_pitch_m")) <= 0.0:
-                raise ValueError("Il pitch X deve essere > 0")
-            offline_map_bounds_from_yaml_dict(base, cfg)
+        if int(_offline_cfg_path_get(base, "scan.x_end")) < int(_offline_cfg_path_get(base, "scan.x_start")):
+            raise ValueError("End position must be greater than or equal to start position")
+        if float(_offline_cfg_path_get(base, "scan.x_pitch_m")) <= 0.0:
+            raise ValueError("Il pitch X deve essere > 0")
+        offline_map_bounds_from_yaml_dict(base, cfg)
         return base
 
     def _save_offline_tuning_config(*, allow_scan_finalize: bool = False) -> dict | None:
@@ -5083,22 +4520,22 @@ def main(*, rotary_axis: RotaryAxis | None = None):
             if spec["section"] == section and (mode is None or spec.get("mode") == mode):
                 _add_offline_tuning_widget(spec)
 
-    STATS_KEY_W = 16
-    STATS_VAL_W = 13
-
-    def _format_stats_table(rows):
-        if not rows:
-            return ""
-        rows_s = [(str(k), str(v)) for k, v in rows]
-        key_w = max(int(STATS_KEY_W), max(len(k) for k, _ in rows_s))
-        val_w = max(int(STATS_VAL_W), max(len(v) for _, v in rows_s))
-
-        def _format_stats_row(left: str, right: str) -> str:
-            return f"| {left:<{key_w}} | {right:>{val_w}} |"
-
-        border = "+" + "-" * (key_w + 2) + "+" + "-" * (val_w + 2) + "+\n"
-        body = "".join(_format_stats_row(k, v) + "\n" for k, v in rows_s)
-        return border + body + border
+    def _add_debug_metric_table(rows) -> None:
+        """Build a compact label/value table for the fixed-width realtime sidebar."""
+        with dpg.table(
+            header_row=False,
+            policy=dpg.mvTable_SizingStretchProp,
+            borders_innerH=True,
+            pad_outerX=False,
+        ):
+            dpg.add_table_column(init_width_or_weight=0.38, width_stretch=True)
+            dpg.add_table_column(init_width_or_weight=0.62, width_stretch=True)
+            for label, tag in rows:
+                with dpg.table_row():
+                    with dpg.table_cell():
+                        dpg.add_text(label, color=(150, 155, 165))
+                    with dpg.table_cell():
+                        dpg.add_text("--", tag=tag, color=(225, 230, 235))
 
     def _cfg_path_get(path: str, default=None):
         node = cfg
@@ -5454,14 +4891,6 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                         )
                         dpg.add_separator()
                         dpg.add_text("2. Automatic scan", color=(210, 210, 210))
-                        dpg.add_text("Scan mode", color=(210, 210, 210))
-                        dpg.add_combo(
-                            ["linear", "cylindrical"],
-                            default_value="linear",
-                            tag=COMBO_SCAN_MODE_TAG,
-                            width=CTRL_W,
-                        )
-                        dpg.add_text("Linear parameters", color=(190, 190, 190))
                         pitch_label = (
                             f"Pitch da offline_config: {scan_pitch_mm_default:.6f} mm"
                             if np.isfinite(scan_pitch_mm_default)
@@ -5477,66 +4906,6 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                             min_clamped=True,
                             width=CTRL_W,
                         )
-                        with dpg.collapsing_header(label="Regular cylindrical parameters", default_open=False):
-                            dpg.add_text(
-                                "Initial height is the current vertical HOME position; scene centre is [0, 0, 0].",
-                                wrap=CTRL_W,
-                                color=(190, 190, 190),
-                            )
-                            if cylindrical_scan is None:
-                                dpg.add_text(
-                                    rotary_error or "Rotary axis unavailable.",
-                                    wrap=CTRL_W,
-                                    color=(255, 150, 120),
-                                )
-                            dpg.add_input_int(
-                                label="Angles / turn",
-                                tag=IN_CYL_ANGLES_TAG,
-                                default_value=180,
-                                min_value=1,
-                                min_clamped=True,
-                                width=CTRL_W,
-                            )
-                            dpg.add_input_float(
-                                label="Radius [m]",
-                                tag=IN_CYL_RADIUS_TAG,
-                                default_value=1.0,
-                                min_value=0.001,
-                                min_clamped=True,
-                                width=CTRL_W,
-                            )
-                            dpg.add_input_int(
-                                label="Heights",
-                                tag=IN_CYL_HEIGHTS_TAG,
-                                default_value=2,
-                                min_value=1,
-                                min_clamped=True,
-                                width=CTRL_W,
-                            )
-                            dpg.add_input_float(
-                                label="Vertical step [m]",
-                                tag=IN_CYL_VERTICAL_STEP_TAG,
-                                default_value=0.05,
-                                min_value=0.000001,
-                                min_clamped=True,
-                                width=CTRL_W,
-                            )
-                            dpg.add_input_float(
-                                label="Angular settling [s]",
-                                tag=IN_CYL_ANGULAR_SETTLING_TAG,
-                                default_value=0.0,
-                                min_value=0.0,
-                                min_clamped=True,
-                                width=CTRL_W,
-                            )
-                            dpg.add_input_float(
-                                label="Vertical settling [s]",
-                                tag=IN_CYL_VERTICAL_SETTLING_TAG,
-                                default_value=0.0,
-                                min_value=0.0,
-                                min_clamped=True,
-                                width=CTRL_W,
-                            )
                         dpg.add_button(label="START SCAN", tag=BTN_SCAN_START_TAG, callback=_on_start_sar_scan, width=CTRL_W, height=38)
                         dpg.add_button(label="CANCEL SCAN", tag=BTN_SCAN_CANCEL_TAG, callback=_on_cancel_sar_scan, width=CTRL_W, height=30)
                         dpg.add_text("Scan status: ready", tag=TXT_SCAN_STATUS_TAG, wrap=CTRL_W, color=(190, 220, 190))
@@ -5546,18 +4915,43 @@ def main(*, rotary_axis: RotaryAxis | None = None):
 
                         if DEBUG_STATS:
                             dpg.add_spacer(height=14)
-                            dpg.add_text("SYSTEM STATS", color=(255, 200, 0))
+                            dpg.add_text("REALTIME PIPELINE DEBUG", color=(255, 200, 0))
                             dpg.add_separator()
-                            dpg.add_button(
-                                label="Run Boresight Calibration",
-                                callback=_on_calibrate_boresight,
-                                width=-1,
-                                height=32,
+                            dpg.add_text("CONFIGURATION", color=(175, 175, 175))
+                            dpg.add_text(
+                                (
+                                    f"Grid RT/OFF: {gui_w}x{gui_h} / {offline_gui_w}x{offline_gui_h}\n"
+                                    f"FFT range/angle: {NFFT_RANGE} / {NFFT_ANGLE}"
+                                ),
+                                tag=TXT_PIPELINE_CONFIG_TAG,
+                                wrap=-1,
+                                color=(175, 175, 175),
                             )
                             dpg.add_spacer(height=8)
-                            dpg.add_text("Waiting for data...", tag=TXT_STATS_TAG, wrap=-1)
-                            if font_mono:
-                                dpg.bind_item_font(TXT_STATS_TAG, font_mono)
+                            dpg.add_text("STREAM", color=(105, 180, 225))
+                            _add_debug_metric_table(
+                                [
+                                    ("UDP gaps / RX", DEBUG_STAT_VALUE_TAGS["udp_rx"]),
+                                    ("Frames", DEBUG_STAT_VALUE_TAGS["frames"]),
+                                    ("Ring ready", DEBUG_STAT_VALUE_TAGS["ring"]),
+                                    ("Ring drops", DEBUG_STAT_VALUE_TAGS["drops"]),
+                                ]
+                            )
+                            dpg.add_spacer(height=6)
+                            dpg.add_text("PROCESSING", color=(115, 205, 165))
+                            _add_debug_metric_table(
+                                [
+                                    ("DSP frame", DEBUG_STAT_VALUE_TAGS["dsp_frame"]),
+                                    ("DSP stale / image", DEBUG_STAT_VALUE_TAGS["dsp_stale"]),
+                                    ("CPU DSP / log", DEBUG_STAT_VALUE_TAGS["cpu"]),
+                                    ("Logger write", DEBUG_STAT_VALUE_TAGS["logger"]),
+                                    ("RX stalls", DEBUG_STAT_VALUE_TAGS["stalls"]),
+                                    ("RX resyncs", DEBUG_STAT_VALUE_TAGS["resyncs"]),
+                                ]
+                            )
+                            dpg.add_spacer(height=8)
+                            dpg.add_text("DISPLAY DIAGNOSTICS", color=(175, 175, 175))
+                            dpg.add_text("Waiting for display data...", tag=TXT_DISPLAY_DIAG_TAG, wrap=-1)
 
                 # --- PLOT ---
                 with dpg.table_cell():
@@ -6028,38 +5422,8 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                             color=(180, 210, 255),
                         )
                         dpg.add_spacer(height=14)
-                        with dpg.group(tag=PROC_GRP_CYLINDRICAL_SECTION, show=False):
-                            dpg.add_text("CYLINDRICAL V2 SECTION", color=(255, 200, 0))
-                            dpg.add_separator()
-                            dpg.add_text("", tag=PROC_TXT_CYL_RUN_INFO, wrap=300, color=(180, 210, 255))
-                            dpg.add_combo(
-                                ["xy"],
-                                label="Section plane",
-                                tag=PROC_COMBO_CYL_SECTION,
-                                default_value="xy",
-                                width=220,
-                                callback=_on_cylindrical_section_changed,
-                            )
-                            dpg.add_input_float(
-                                label="Z section (m)",
-                                tag=PROC_IN_CYL_SECTION_COORD,
-                                default_value=0.0,
-                                step=0.05,
-                                width=220,
-                                callback=_on_cylindrical_section_changed,
-                                on_enter=True,
-                            )
-                            dpg.add_combo(
-                                [],
-                                label="Acquired height (XY)",
-                                tag=PROC_COMBO_CYL_HEIGHT,
-                                width=220,
-                                callback=_on_cylindrical_height_selected,
-                            )
-                            dpg.add_text("", tag=PROC_TXT_CYL_SECTION_HINT, wrap=300, color=(180, 210, 255))
-                            dpg.add_spacer(height=10)
-                        with dpg.group(tag=PROC_GRP_LEGACY_BP_CONTROL):
-                            dpg.add_text("OFFLINE BP CONTROL", color=(255, 200, 0))
+                        with dpg.group(tag=PROC_GRP_LINEAR_POSITION_SELECTION):
+                            dpg.add_text("LINEAR SAR POSITION SELECTION", color=(255, 200, 0))
                             dpg.add_separator()
                             dpg.add_input_int(
                                 label="x_start",
@@ -6155,25 +5519,22 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                 with dpg.tab(label="Data"):
                     with dpg.child_window(width=-1, height=-1, border=False):
                         _add_offline_tuning_section("Data and scan", mode="shared")
-                        with dpg.group(tag=OFFLINE_TUNING_GRP_LEGACY_SCAN):
-                            _add_offline_tuning_section("Data and scan", mode="legacy")
+                        with dpg.group(tag=OFFLINE_TUNING_GRP_LINEAR_SCAN):
+                            _add_offline_tuning_section("Data and scan", mode="linear")
                 with dpg.tab(label="Reconstruction"):
                     with dpg.child_window(width=-1, height=-1, border=False):
                         _add_offline_tuning_section("Reconstruction", mode="shared")
-                        with dpg.group(tag=OFFLINE_TUNING_GRP_LEGACY_RECON):
-                            _add_offline_tuning_section("Reconstruction", mode="legacy")
-                        with dpg.group(tag=OFFLINE_TUNING_GRP_CYLINDRICAL_VIEW, show=False):
-                            dpg.add_text("World bounds and default v2 section. Geometry remains in capture headers.", wrap=-1)
-                            _add_offline_tuning_section("Cylindrical v2 view", mode="v2")
+                        with dpg.group(tag=OFFLINE_TUNING_GRP_RECONSTRUCTION):
+                            _add_offline_tuning_section("Reconstruction", mode="linear")
                 with dpg.tab(label="Map"):
                     with dpg.child_window(width=-1, height=-1, border=False):
-                        with dpg.group(tag=OFFLINE_TUNING_GRP_LEGACY_MAP):
+                        with dpg.group(tag=OFFLINE_TUNING_GRP_MAP_BOUNDS):
                             dpg.add_text(
                                 "Defines the full physical rectangle available to offline reconstruction. "
                                 "Full map reconstructs this rectangle; Apply ROI reconstructs a contained section on the same fixed image grid.",
                                 wrap=-1,
                             )
-                            _add_offline_tuning_section("Map reconstruction bounds", mode="legacy")
+                            _add_offline_tuning_section("Map reconstruction bounds", mode="linear")
                 with dpg.tab(label="FFT"):
                     with dpg.child_window(width=-1, height=-1, border=False):
                         dpg.add_text(
@@ -6248,6 +5609,10 @@ def main(*, rotary_axis: RotaryAxis | None = None):
         lost_prev = 0
         pkts_prev = 0
         frames_ok_prev = 0
+        ring_drop_prev = 0
+        dsp_skip_prev = 0
+        stall_events_prev = 0
+        stream_resets_prev = 0
         log_bytes_prev = 0
     gui_last_seq = 0
     tracks_last_seq = 0
@@ -6313,9 +5678,9 @@ def main(*, rotary_axis: RotaryAxis | None = None):
 
     fft_plot_period_s = 0.05
     fft_plot_last_t = 0.0
-    last_scan_terminal_state = ""
+    last_scan_terminal_state: ScanState | None = None
     if DEBUG_STATS:
-        ring_hwm = 0
+        ring_max_sampled = 0
         cpu_state = {}
 
     try:
@@ -6330,9 +5695,12 @@ def main(*, rotary_axis: RotaryAxis | None = None):
 
             _drain_motor_events()
             scan_state_now = _refresh_sar_scan_ui()
-            if scan_state_now not in {"completed", "cancelled", "failed"}:
-                last_scan_terminal_state = ""
-            elif scan_state_now == "completed" and last_scan_terminal_state != "completed":
+            if scan_state_now not in {ScanState.COMPLETED, ScanState.CANCELLED, ScanState.FAILED}:
+                last_scan_terminal_state = None
+            elif (
+                scan_state_now is ScanState.COMPLETED
+                and last_scan_terminal_state is not ScanState.COMPLETED
+            ):
                 with offline_reload_lock:
                     reload_already_running = bool(offline_reload_state["running"])
                 if reload_already_running:
@@ -6340,33 +5708,23 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                     # precedente termina, questo ramo viene ritentato.
                     _set_scan_status("Scan completed: waiting for the previous offline recalculation...")
                 else:
-                    mode = scan_pending_run["mode"]
                     start_id = scan_pending_run["start_position_id"]
                     positions = scan_pending_run["positions"]
-                    if mode is None or start_id is None or positions is None:
+                    if start_id is None or positions is None:
                         _set_scan_status("SAR scan completed.")
-                        last_scan_terminal_state = "completed"
+                        last_scan_terminal_state = ScanState.COMPLETED
                     else:
                         try:
                             # Solo ora tutti i file sono chiusi con successo:
-                            # conferma la directory della nuova run. La
-                            # geometria cilindrica è già interamente negli
-                            # header v2, quindi non si modifica scan.x_*.
-                            if mode == "cylindrical":
-                                configure_offline_cylindrical_scan_for_run(
-                                    offline_scan_config_path,
-                                    output_dir=out_dir,
-                                    frames_per_position=FRAMES_PER_POSITION,
-                                )
-                            else:
-                                pitch_mm = configure_offline_scan_for_run(
-                                    offline_scan_config_path,
-                                    output_dir=out_dir,
-                                    start_position_id=int(start_id),
-                                    positions=int(positions),
-                                    frames_per_position=FRAMES_PER_POSITION,
-                                )
-                                _update_scan_pitch_label(pitch_mm)
+                            # conferma directory e intervallo della nuova run.
+                            pitch_mm = configure_offline_scan_for_run(
+                                offline_scan_config_path,
+                                output_dir=out_dir,
+                                start_position_id=int(start_id),
+                                positions=int(positions),
+                                frames_per_position=FRAMES_PER_POSITION,
+                            )
+                            _update_scan_pitch_label(pitch_mm)
                             if not _read_offline_tuning_config():
                                 raise RuntimeError("impossibile rileggere offline_config.yaml")
                             reload_started = _on_apply_offline_tuning(
@@ -6374,24 +5732,18 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                                 allow_scan_finalize=True,
                             )
                             if reload_started:
-                                scan_pending_run.update(
-                                    {"mode": None, "start_position_id": None, "positions": None}
-                                )
+                                scan_pending_run.update({"start_position_id": None, "positions": None})
                                 _set_scan_status("Scan completed: offline reload started.")
-                                last_scan_terminal_state = "completed"
+                                last_scan_terminal_state = ScanState.COMPLETED
                         except Exception as exc:
                             # I file restano validi; sblocca il tuning manuale
                             # e comunica chiaramente il solo errore offline.
-                            scan_pending_run.update(
-                                {"mode": None, "start_position_id": None, "positions": None}
-                            )
+                            scan_pending_run.update({"start_position_id": None, "positions": None})
                             _set_scan_status(f"Scan completed; offline reload did not start: {exc}")
-                            last_scan_terminal_state = "completed"
-            elif scan_state_now in {"cancelled", "failed"}:
+                            last_scan_terminal_state = ScanState.COMPLETED
+            elif scan_state_now in {ScanState.CANCELLED, ScanState.FAILED}:
                 # Non puntare l'offline a un insieme di file parziale.
-                scan_pending_run.update(
-                    {"mode": None, "start_position_id": None, "positions": None}
-                )
+                scan_pending_run.update({"start_position_id": None, "positions": None})
                 last_scan_terminal_state = scan_state_now
             else:
                 last_scan_terminal_state = scan_state_now
@@ -6413,38 +5765,16 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                 offline_recalculation_completion_pending = offline_runtime
                 shutdown_resources["offline_runtime"] = offline_runtime
                 offline_info = dict(reload_info or offline_runtime.last_info)
-                if str(offline_info.get("geometry_mode", "")) == "cylindrical_regular":
-                    runtime_view = offline_info.get("cylindrical_view")
-                    runtime_summary = offline_info.get("cylindrical_summary")
-                    if not isinstance(runtime_view, dict) or not isinstance(runtime_summary, dict):
-                        raise RuntimeError("runtime v2 senza metadata della sezione cilindrica")
-                    offline_run_view.update(
-                        {
-                            "format": "rt_capture_v2",
-                            "geometry_mode": "cylindrical_regular",
-                            "summary": runtime_summary,
-                            "view": runtime_view,
-                        }
-                    )
-                    off_home_viewport_current = _cylindrical_section_home_viewport(
-                        runtime_view,
-                        seq=int(off_requested_viewport_current.seq) + 1,
-                    )
-                    _apply_offline_geometry_controls()
-                else:
-                    offline_run_view.update(
-                        {"format": "rt_capture_v1", "geometry_mode": "legacy_linear", "summary": None, "view": None}
-                    )
-                    off_map_bounds_current = offline_runtime.map_bounds
-                    off_home_viewport_current = build_display_viewport(
-                        x_min_m=float(off_map_bounds_current.x_min_m),
-                        x_max_m=float(off_map_bounds_current.x_max_m),
-                        y_min_m=float(off_map_bounds_current.y_min_m),
-                        y_max_m=float(off_map_bounds_current.y_max_m),
-                        dr_m=float(dr_plot),
-                        seq=int(off_requested_viewport_current.seq) + 1,
-                    )
-                    _apply_offline_geometry_controls()
+                off_map_bounds_current = offline_runtime.map_bounds
+                off_home_viewport_current = build_display_viewport(
+                    x_min_m=float(off_map_bounds_current.x_min_m),
+                    x_max_m=float(off_map_bounds_current.x_max_m),
+                    y_min_m=float(off_map_bounds_current.y_min_m),
+                    y_max_m=float(off_map_bounds_current.y_max_m),
+                    dr_m=float(dr_plot),
+                    seq=int(off_requested_viewport_current.seq) + 1,
+                )
+                _apply_offline_geometry_controls()
                 off_requested_viewport_current = off_home_viewport_current
                 off_pos_min = int(offline_info.get("pos_min", 0))
                 off_pos_max = int(offline_info.get("pos_max", off_pos_min))
@@ -6463,10 +5793,10 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                 off_ui_dirty_t = now - 1.0
                 if dpg.does_item_exist(PROC_IN_XSTART):
                     dpg.set_value(PROC_IN_XSTART, int(off_x_start))
-                    dpg.configure_item(PROC_IN_XSTART, enabled=not _offline_is_v2())
+                    dpg.configure_item(PROC_IN_XSTART, enabled=True)
                 if dpg.does_item_exist(PROC_IN_XEND):
                     dpg.set_value(PROC_IN_XEND, int(off_x_end))
-                    dpg.configure_item(PROC_IN_XEND, enabled=not _offline_is_v2())
+                    dpg.configure_item(PROC_IN_XEND, enabled=True)
                 if dpg.does_item_exist(PROC_BTN_LOAD_OFFLINE):
                     dpg.configure_item(
                         PROC_BTN_LOAD_OFFLINE,
@@ -6729,21 +6059,11 @@ def main(*, rotary_axis: RotaryAxis | None = None):
 
                 if offline_runtime is not None and reconstruct_offline:
                     try:
-                        if _offline_is_v2():
-                            section = off_ui_pending.get("cylindrical_section")
-                            offline_runtime.update_params(
-                                viewport=off_requested_viewport_current,
-                                cylindrical_section=(
-                                    section if isinstance(section, CylindricalSection) else None
-                                ),
-                            )
-                            off_ui_pending["cylindrical_section"] = None
-                        else:
-                            offline_runtime.update_params(
-                                x_start=int(off_ui_pending["x_start"]),
-                                x_end=int(off_ui_pending["x_end"]),
-                                viewport=off_requested_viewport_current,
-                            )
+                        offline_runtime.update_params(
+                            x_start=int(off_ui_pending["x_start"]),
+                            x_end=int(off_ui_pending["x_end"]),
+                            viewport=off_requested_viewport_current,
+                        )
                     except Exception as e:
                         _render_offline_summary(state=f"Offline update error: {e}")
 
@@ -6759,19 +6079,6 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                     proc_frame[:, :] = frame_db
                     offline_frame_valid = True
                     refresh_offline_display = True
-                    if str(info.get("geometry_mode", "")) == "cylindrical_regular":
-                        frame_view = info.get("cylindrical_view")
-                        frame_summary = info.get("cylindrical_summary")
-                        if isinstance(frame_view, dict) and isinstance(frame_summary, dict):
-                            offline_run_view.update(
-                                {
-                                    "format": "rt_capture_v2",
-                                    "geometry_mode": "cylindrical_regular",
-                                    "summary": frame_summary,
-                                    "view": frame_view,
-                                }
-                            )
-                            _apply_offline_geometry_controls()
                     try:
                         off_applied_meta_current = AppliedViewportMeta(
                             x_min_m=float(info.get("applied_viewport_x_min_m", off_applied_meta_current.x_min_m)),
@@ -6791,20 +6098,10 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                     except Exception:
                         pass
                     algorithm_text = str(info.get("algorithm", "backprojection"))
-                    if str(info.get("geometry_mode", "")) == "cylindrical_regular":
-                        summary = info.get("cylindrical_summary") or {}
-                        section = (info.get("cylindrical_view") or {}).get("section", {})
-                        status_text = (
-                            f"Offline {algorithm_text}: {summary.get('kind', 'v2')} "
-                            f"{summary.get('capture_count', info.get('n_pos_used', 'n/a'))} captures | "
-                            f"{str(section.get('plane', 'xy')).upper()} @ "
-                            f"{section.get('coordinate_m', 'n/a')} m"
-                        )
-                    else:
-                        status_text = (
-                            f"Offline {algorithm_text}: positions {info.get('x_start')} - "
-                            f"{info.get('x_end')} ({info.get('n_pos_used', 'n/a')} used)"
-                        )
+                    status_text = (
+                        f"Offline {algorithm_text}: positions {info.get('x_start')} - "
+                        f"{info.get('x_end')} ({info.get('n_pos_used', 'n/a')} used)"
+                    )
                     offline_frame_summary_pending = (
                         status_text,
                         float(info.get("elapsed_ms", 0.0)),
@@ -6844,10 +6141,12 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                             ready_slots += 1
                 except Exception:
                     ready_slots = 0
-                ring_hwm = max(ring_hwm, int(ready_slots))
+                ring_max_sampled = max(ring_max_sampled, int(ready_slots))
 
-                with rx_put_drops.get_lock(): drop_f = rx_put_drops.value
-                with rx_frames_ok.get_lock(): frames_ok_now = rx_frames_ok.value
+                with rx_put_drops.get_lock(): drop_f = int(rx_put_drops.value)
+                drop_delta = max(0, int(drop_f) - int(ring_drop_prev))
+                ring_drop_prev = int(drop_f)
+                with rx_frames_ok.get_lock(): frames_ok_now = int(rx_frames_ok.value)
                 frames_ok_delta = frames_ok_now - frames_ok_prev
                 frames_ok_prev = frames_ok_now
 
@@ -6866,6 +6165,8 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                 with dsp_ms_avg.get_lock(): dsp_avg_now = float(dsp_ms_avg.value)
                 with dsp_ms_p95.get_lock(): dsp_p95_now = float(dsp_ms_p95.value)
                 with dsp_skip.get_lock(): dsp_skip_now = int(dsp_skip.value)
+                dsp_skip_delta = max(0, int(dsp_skip_now) - int(dsp_skip_prev))
+                dsp_skip_prev = int(dsp_skip_now)
                 with log_bytes.get_lock(): log_bytes_now = int(log_bytes.value)
                 log_mbps = ((log_bytes_now - log_bytes_prev) / dt_mon) / (1024.0 * 1024.0) if dt_mon > 0 else 0.0
                 log_bytes_prev = log_bytes_now
@@ -6873,6 +6174,10 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                 cpu_log = _cpu_percent_pid(int(p_log.pid or 0), cpu_state)
                 with rx_stall_events.get_lock(): stall_events_now = int(rx_stall_events.value)
                 with rx_stream_resets.get_lock(): stream_resets_now = int(rx_stream_resets.value)
+                stall_events_delta = max(0, int(stall_events_now) - int(stall_events_prev))
+                stream_resets_delta = max(0, int(stream_resets_now) - int(stream_resets_prev))
+                stall_events_prev = int(stall_events_now)
+                stream_resets_prev = int(stream_resets_now)
                 with stat_raw_min_db.get_lock(): raw_min_now = float(stat_raw_min_db.value)
                 with stat_raw_max_db.get_lock(): raw_max_now = float(stat_raw_max_db.value)
                 with stat_norm_min_db.get_lock(): norm_min_now = float(stat_norm_min_db.value)
@@ -6881,32 +6186,43 @@ def main(*, rotary_axis: RotaryAxis | None = None):
                 norm_minmax_str = f"{norm_min_now:.2f}/{norm_max_now:.2f}" if (np.isfinite(norm_min_now) and np.isfinite(norm_max_now)) else "n/a"
                 cpu_dsp_str = f"{cpu_dsp:.1f}%" if np.isfinite(cpu_dsp) else "n/a"
                 cpu_log_str = f"{cpu_log:.1f}%" if np.isfinite(cpu_log) else "n/a"
+                with heatmap_view_mode.get_lock(): heatmap_mode_now = int(heatmap_view_mode.value)
+                with norm_to_peak.get_lock(): normalization_requested = bool(norm_to_peak.value)
+                with cap_active.get_lock(): capture_active_now = bool(cap_active.value)
                 
-                # --- AGGIORNAMENTO TESTI GUI (FORMATO TABELLA ASCII) ---
-                stats_rows = [
-                    ("LOSS %", f"{loss_pct:.3f}%"),
-                    ("RX pkt/s", f"{pkt_rate:.0f}"),
-                    ("RX frames_ok", f"{frames_ok_rate:.1f}/s ({int(frames_ok_now)})"),
-                    ("RX drops_ring", f"{int(drop_f)}"),
-                    ("RING ready/slots", f"{ready_slots}/{N_SLOTS} HWM {ring_hwm}"),
-                    ("DSP ms avg/p95", f"{dsp_avg_now:.2f}/{dsp_p95_now:.2f}"),
-                    ("DSP skip", f"{dsp_skip_now}"),
-                    ("GUI Hz", f"{img_hz:.1f}"),
-                    ("Image grid RT", f"{gui_w}x{gui_h}"),
-                    ("Image grid OFF", f"{offline_gui_w}x{offline_gui_h}"),
-                    ("FFT range/angle", f"{NFFT_RANGE}/{NFFT_ANGLE}"),
-                    ("RAW min/max dB", raw_minmax_str),
-                    ("NORM min/max dB", norm_minmax_str),
-                    ("LOG MB/s", f"{log_mbps:.2f}"),
-                    ("CPU dsp%", cpu_dsp_str),
-                    ("CPU log%", cpu_log_str),
-                    ("stall_events", f"{stall_events_now}"),
-                    ("stream_resets", f"{stream_resets_now}"),
-                ]
+                stat_values = {
+                    "udp_rx": f"{loss_pct:.3f}% | {pkt_rate:.0f}/s",
+                    "frames": f"{frames_ok_rate:.1f}/s  ({frames_ok_now})",
+                    "ring": f"{ready_slots}/{N_SLOTS} | peak {ring_max_sampled}",
+                    "drops": f"{drop_delta / dt_mon:.1f}/s  ({drop_f})",
+                    "dsp_frame": f"{dsp_avg_now:.2f} ms | p95 {dsp_p95_now:.2f}",
+                    "dsp_stale": f"{dsp_skip_delta / dt_mon:.1f}/s | {img_hz:.1f}/s",
+                    "cpu": f"{cpu_dsp_str} / {cpu_log_str}",
+                    "logger": f"{log_mbps:.2f} MB/s" if capture_active_now else "Inactive",
+                    "stalls": f"{stall_events_delta / dt_mon:.1f}/s  ({stall_events_now})",
+                    "resyncs": f"{stream_resets_delta / dt_mon:.1f}/s  ({stream_resets_now})",
+                }
+                if heatmap_mode_now == 1:
+                    display_diag = (
+                        "Moving velocity\n"
+                        f"Range: {raw_minmax_str} m/s"
+                    )
+                elif normalization_requested:
+                    display_diag = (
+                        "Power XY\n"
+                        f"Raw: {raw_minmax_str} dB\n"
+                        f"Norm: {norm_minmax_str} dB"
+                    )
+                else:
+                    display_diag = (
+                        "Power XY\n"
+                        f"Raw: {raw_minmax_str} dB\n"
+                        "Normalization: off"
+                    )
 
-                stats_str = _format_stats_table(stats_rows)
-
-                dpg.set_value(TXT_STATS_TAG, stats_str)
+                for stat_name, value in stat_values.items():
+                    dpg.set_value(DEBUG_STAT_VALUE_TAGS[stat_name], value)
+                dpg.set_value(TXT_DISPLAY_DIAG_TAG, display_diag)
                 _refresh_mmwave_controls()
             # 2. GUI TEXTURE UPDATE (double-buffer latest-wins)
             seq_now = int(gui_latest_seq.value)

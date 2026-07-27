@@ -1,3 +1,5 @@
+"""Casi sintetici per soglie relative, CA-CFAR e OS-CFAR."""
+
 from __future__ import annotations
 
 import numpy as np

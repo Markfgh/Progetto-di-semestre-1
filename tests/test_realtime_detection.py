@@ -1,3 +1,5 @@
+"""Detection realtime su bersagli sintetici con coordinate fisiche note."""
+
 from __future__ import annotations
 
 import numpy as np

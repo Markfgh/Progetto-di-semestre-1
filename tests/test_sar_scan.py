@@ -1,17 +1,15 @@
+"""Casi di successo, annullamento ed errore della macchina a stati SAR."""
+
 from __future__ import annotations
 
 import threading
 
-import pytest
-
-from sar_capture import normalize_cylindrical_metadata
 from sar_scan import (
-    CylindricalScanCoordinator,
-    CylindricalScanPlan,
+    ScanEvent,
     ScanPlan,
+    ScanState,
     SarScanCoordinator,
     absolute_scan_targets_microsteps,
-    dry_run_cylindrical_scan,
 )
 
 
@@ -73,7 +71,10 @@ def test_coordinator_captures_before_each_move_and_skips_final_move() -> None:
     coordinator.start(ScanPlan(positions=3, pitch_mm=1.25, settling_seconds=0.0))
     coordinator.join(timeout=1.0)
 
-    assert coordinator.status().state == "completed"
+    status = coordinator.status()
+    assert status.state is ScanState.COMPLETED
+    assert status.event is ScanEvent.COMPLETED
+    assert status.completed == 3
     assert events == [
         ("begin",),
         ("capture", 1, 500.0, 1_000),
@@ -90,11 +91,18 @@ def test_coordinator_captures_before_each_move_and_skips_final_move() -> None:
 
 def test_cancel_after_capture_confirmation_cannot_become_completed() -> None:
     events: list[tuple] = []
+    cancellation_status: tuple[ScanState, ScanEvent] | None = None
     coordinator: SarScanCoordinator
 
     def wait_capture(ticket: int, _timeout: float, _cancel: threading.Event) -> None:
         events.append(("saved", ticket))
         coordinator.cancel()
+
+    def stop_motion() -> None:
+        nonlocal cancellation_status
+        status = coordinator.status()
+        cancellation_status = (status.state, status.event)
+        events.append(("stop",))
 
     coordinator = SarScanCoordinator(
         begin_motion=lambda: events.append(("begin",)),
@@ -106,14 +114,16 @@ def test_cancel_after_capture_confirmation_cannot_become_completed() -> None:
         request_capture=lambda pos_id, _mm, _steps: pos_id,
         wait_capture=wait_capture,
         cancel_capture=lambda: events.append(("cancel_capture",)),
-        stop_motion=lambda: events.append(("stop",)),
+        stop_motion=stop_motion,
     )
 
     coordinator.start(ScanPlan(positions=1, pitch_mm=1.0))
     coordinator.join(timeout=1.0)
 
     status = coordinator.status()
-    assert status.state == "cancelled"
+    assert status.state is ScanState.CANCELLED
+    assert status.event is ScanEvent.CANCELLED
+    assert cancellation_status == (ScanState.CANCELLING, ScanEvent.CANCELLATION_REQUESTED)
     assert status.completed == 0
     assert events == [
         ("begin",),
@@ -125,7 +135,7 @@ def test_cancel_after_capture_confirmation_cannot_become_completed() -> None:
 
 
 def test_completed_is_published_only_after_finish_motion_returns() -> None:
-    states_seen_during_finish: list[str] = []
+    states_seen_during_finish: list[ScanState] = []
     coordinator: SarScanCoordinator
 
     def finish_motion(success: bool) -> None:
@@ -148,15 +158,17 @@ def test_completed_is_published_only_after_finish_motion_returns() -> None:
     coordinator.start(ScanPlan(positions=1, pitch_mm=1.0))
     coordinator.join(timeout=1.0)
 
-    assert states_seen_during_finish == ["capturing"]
-    assert coordinator.status().state == "completed"
+    assert states_seen_during_finish == [ScanState.CAPTURING]
+    status = coordinator.status()
+    assert status.state is ScanState.COMPLETED
+    assert status.event is ScanEvent.COMPLETED
 
 
 def test_finish_motion_failure_never_reports_completed() -> None:
     coordinator: SarScanCoordinator
 
     def finish_motion(_success: bool) -> None:
-        assert coordinator.status().state != "completed"
+        assert coordinator.status().state is not ScanState.COMPLETED
         raise RuntimeError("chiusura motore fallita")
 
     coordinator = SarScanCoordinator(
@@ -176,110 +188,74 @@ def test_finish_motion_failure_never_reports_completed() -> None:
     coordinator.join(timeout=1.0)
 
     status = coordinator.status()
-    assert status.state == "failed"
+    assert status.state is ScanState.FAILED
+    assert status.event is ScanEvent.FINALIZATION_FAILED
     assert status.error == "chiusura motore fallita"
 
 
-def test_cylindrical_dry_run_end_to_end_two_heights_generates_v2_metadata_in_order() -> None:
-    plan = CylindricalScanPlan(
-        angles_per_turn=4,
-        radius_m=1.25,
-        initial_height_m=0.20,
-        height_count=2,
-        vertical_step_m=0.15,
-        scene_center_m=(1.0, -2.0, 0.5),
-        start_capture_id=40,
-        angular_settling_seconds=0.25,
-        vertical_settling_seconds=0.5,
-    )
+def test_operational_failure_publishes_interrupted_event() -> None:
+    def request_capture(*_args: object) -> None:
+        raise RuntimeError("logger unavailable")
 
-    result = dry_run_cylindrical_scan(plan)
-
-    assert result.status.state == "completed"
-    assert [capture.capture_id for capture in result.captures] == list(range(40, 48))
-    assert [capture.acquisition_index for capture in result.captures] == list(range(8))
-    assert [capture.angle_index for capture in result.captures] == [0, 1, 2, 3, 0, 1, 2, 3]
-    assert [capture.height_index for capture in result.captures] == [0, 0, 0, 0, 1, 1, 1, 1]
-    expected_azimuth = [0.0, 0.5 * 3.141592653589793, 3.141592653589793, 1.5 * 3.141592653589793]
-    assert [capture.azimuth_rad for capture in result.captures] == pytest.approx(expected_azimuth * 2)
-    assert [capture.height_m for capture in result.captures] == pytest.approx([0.20] * 4 + [0.35] * 4)
-    for capture in result.captures:
-        normalized = normalize_cylindrical_metadata(capture.to_dict())
-        assert normalized["position_m"] == pytest.approx(capture.position_world_m.tolist())
-
-    capture_events = [event for event in result.events if event[0] == "capture"]
-    flushed_events = [event for event in result.events if event[0] == "flushed"]
-    assert [event[1] for event in capture_events] == list(range(40, 48))
-    assert [event[1] for event in flushed_events] == list(range(40, 48))
-    # Quattro passi positivi (tre campioni successivi + chiusura) per ciascun
-    # giro, per un avanzamento fisico totale di 2*pi senza duplicare azimuth 0.
-    rotary_moves = [event[1] for event in result.events if event[0] == "rotary_move"]
-    assert rotary_moves == pytest.approx([plan.angular_step_rad] * 8)
-    assert sum(rotary_moves[:4]) == pytest.approx(2.0 * 3.141592653589793)
-    assert sum(rotary_moves[4:]) == pytest.approx(2.0 * 3.141592653589793)
-
-
-def test_cylindrical_cancel_stops_vertical_and_rotary_axes() -> None:
-    events: list[tuple] = []
-    aligned = threading.Event()
-    release = threading.Event()
-    current_steps = 0
-
-    class BlockingRotary:
-        def begin_external_scan(self) -> None:
-            events.append(("rotary_begin",))
-
-        def finish_external_scan(self, success: bool) -> None:
-            events.append(("rotary_finish", success))
-
-        def align_zero_and_wait(self, _timeout: float, cancel_event: threading.Event) -> None:
-            events.append(("rotary_align",))
-            aligned.set()
-            release.wait(1.0)
-            if cancel_event.is_set():
-                raise RuntimeError("Scansione annullata.")
-
-        def move_relative_rad_and_wait(self, *_args) -> None:
-            events.append(("rotary_move",))
-
-        def stop(self) -> None:
-            events.append(("rotary_stop",))
-            release.set()
-
-    def move_vertical(target: int, _timeout: float, _cancel: threading.Event) -> None:
-        nonlocal current_steps
-        current_steps = target
-        events.append(("vertical_move", target))
-
-    coordinator = CylindricalScanCoordinator(
-        begin_vertical_scan=lambda: events.append(("vertical_begin",)),
-        finish_vertical_scan=lambda success: events.append(("vertical_finish", success)),
-        get_vertical_microsteps=lambda: current_steps,
-        height_m_from_microsteps=lambda steps: steps / 1000.0,
-        microsteps_from_height_m=lambda height_m: int(round(height_m * 1000.0)),
-        move_vertical_to_microsteps=move_vertical,
-        stop_vertical=lambda: events.append(("vertical_stop",)),
-        rotary_axis=BlockingRotary(),
-        request_capture=lambda **_kwargs: None,
+    coordinator = SarScanCoordinator(
+        begin_motion=lambda: None,
+        finish_motion=lambda _success: None,
+        get_position_microsteps=lambda: 100,
+        mm_from_microsteps=lambda steps: float(steps),
+        mm_per_microstep=lambda: 1.0,
+        move_to_microsteps=lambda *_args: None,
+        request_capture=request_capture,
         wait_capture=lambda *_args: None,
-        cancel_capture=lambda: events.append(("capture_cancel",)),
+        cancel_capture=lambda: None,
+        stop_motion=lambda: None,
     )
-    coordinator.start(
-        CylindricalScanPlan(
-            angles_per_turn=4,
-            radius_m=1.0,
-            initial_height_m=0.0,
-            height_count=2,
-            vertical_step_m=0.1,
-        )
-    )
-    assert aligned.wait(1.0)
-    coordinator.cancel()
+
+    coordinator.start(ScanPlan(positions=1, pitch_mm=1.0))
     coordinator.join(timeout=1.0)
 
-    assert coordinator.status().state == "cancelled"
-    assert ("vertical_stop",) in events
-    assert ("rotary_stop",) in events
-    assert ("capture_cancel",) in events
-    assert ("rotary_finish", False) in events
-    assert ("vertical_finish", False) in events
+    status = coordinator.status()
+    assert status.state is ScanState.FAILED
+    assert status.event is ScanEvent.INTERRUPTED
+    assert status.error == "logger unavailable"
+
+
+def test_status_uses_event_codes_and_separate_position_data() -> None:
+    """Il coordinatore non produce messaggi localizzati per gli stati SAR."""
+
+    events_seen: list[tuple[ScanState, ScanEvent, int | None, float | None]] = []
+    current_steps = 100
+    coordinator: SarScanCoordinator
+
+    def wait_capture(_ticket: int, _timeout: float, _cancel: threading.Event) -> None:
+        status = coordinator.status()
+        events_seen.append((status.state, status.event, status.position_id, status.position_mm))
+
+    def move(_target: int, _timeout: float, _cancel: threading.Event) -> None:
+        nonlocal current_steps
+        status = coordinator.status()
+        events_seen.append((status.state, status.event, status.position_id, status.position_mm))
+        current_steps = _target
+
+    coordinator = SarScanCoordinator(
+        begin_motion=lambda: None,
+        finish_motion=lambda _success: None,
+        get_position_microsteps=lambda: current_steps,
+        mm_from_microsteps=lambda steps: float(steps) / 10.0,
+        mm_per_microstep=lambda: 1.0,
+        move_to_microsteps=move,
+        request_capture=lambda pos_id, _mm, _steps: pos_id,
+        wait_capture=wait_capture,
+        cancel_capture=lambda: None,
+        stop_motion=lambda: None,
+    )
+
+    coordinator.start(ScanPlan(positions=2, pitch_mm=1.0))
+    coordinator.join(timeout=1.0)
+
+    assert events_seen == [
+        (ScanState.CAPTURING, ScanEvent.CAPTURING_POSITION, 1, 10.0),
+        (ScanState.MOVING, ScanEvent.MOVING_TO_POSITION, 2, 10.1),
+        (ScanState.CAPTURING, ScanEvent.CAPTURING_POSITION, 2, 10.1),
+    ]
+    status = coordinator.status()
+    assert not hasattr(status, "message")

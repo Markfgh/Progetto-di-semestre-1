@@ -1,3 +1,10 @@
+"""Operazioni DSP per ricostruzioni SAR offline.
+
+Qui vivono la preparazione dei cubi MIMO e la back-projection bistatica.  Il
+modulo non gestisce file o processi: riceve array numerici già validati da
+``offline_processing`` e restituisce immagini di potenza.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -136,6 +143,8 @@ else:
 
 @dataclass(frozen=True)
 class SyntheticApertureData:
+    """Apertura SAR/MIMO appiattita, pronta per il beamforming range-angolo."""
+
     snapshot_cube: np.ndarray
     x_position_m: np.ndarray
     x_phase_center_m: np.ndarray
@@ -143,6 +152,7 @@ class SyntheticApertureData:
 
 
 def phase_sign_normalize(value: Any, *, field_name: str = "phase_sign") -> int:
+    """Valida il segno della fase di rifocalizzazione bistatica (solo ±1)."""
     try:
         phase_sign_i = int(value)
     except (TypeError, ValueError) as exc:
@@ -187,6 +197,7 @@ def residual_video_phase_sign_normalize(
 
 
 def power_image_to_db(img_power: np.ndarray) -> np.ndarray:
+    """Converte potenza lineare in dB, proteggendo il logaritmo dallo zero."""
     out = np.asarray(img_power, dtype=np.float32).copy()
     np.add(out, np.float32(1e-12), out=out)
     np.log10(out, out=out)
@@ -223,6 +234,12 @@ def build_mimo_geometry(
     tx_offsets_m: Any = None,
     rx_offsets_m: Any = None,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Restituisce le coordinate TX/RX per canale virtuale, centrate sull'array.
+
+    Per la geometria IWR1443 2Tx/4Rx usa il layout fisico noto; altre
+    configurazioni richiedono offset espliciti per non introdurre assunzioni
+    geometriche silenziose.
+    """
     n_tx_i = int(n_tx)
     n_rx_i = int(n_rx)
     if n_tx_i <= 0 or n_rx_i <= 0:
@@ -262,11 +279,15 @@ def build_mimo_geometry(
         tx_base_m = (np.asarray([0.0, 2.0], dtype=np.float32) * wavelength_m).astype(np.float32, copy=False)
         rx_base_m = (np.asarray([0.0, 0.5, 1.0, 1.5], dtype=np.float32) * wavelength_m).astype(np.float32, copy=False)
 
+    # L'ordine TX-major/RX-minor deve coincidere con il reshape dei dati MIMO:
+    # ogni canale virtuale conserva così le coordinate fisiche TX e RX corrette.
     tx_idx = np.repeat(np.arange(n_tx_i, dtype=np.int32), n_rx_i)
     rx_idx = np.tile(np.arange(n_rx_i, dtype=np.int32), n_tx_i)
     x_tx_ant_m = tx_base_m[tx_idx].astype(np.float32, copy=False)
     x_rx_ant_m = rx_base_m[rx_idx].astype(np.float32, copy=False)
 
+    # Trasla TX e RX con lo stesso riferimento. La fase relativa resta invariata
+    # mentre la geometria è espressa attorno all'origine della scena SAR.
     center_m = (np.mean((x_tx_ant_m + x_rx_ant_m).astype(np.float32, copy=False), dtype=np.float32) * np.float32(0.5)).astype(np.float32, copy=False)
     x_tx_ant_m = (x_tx_ant_m - center_m).astype(np.float32, copy=False)
     x_rx_ant_m = (x_rx_ant_m - center_m).astype(np.float32, copy=False)
@@ -380,6 +401,8 @@ def prepare_mimo_snapshots(
         int(n_tx_i * n_rx),
         int(n_bins),
     ).astype(np.complex64, copy=False)
+    # I frame restano separati: la backprojection somma prima in modo coerente
+    # per ciascun frame e combina le rispettive potenze solo alla fine.
     prep_ms = np.float32((time.perf_counter() - t0) * 1000.0)
     est_bp_snapshots = int(n_frames)
     if bool(log_info):
@@ -497,6 +520,8 @@ def back_projection_power_mimo_geometry(
     if max_bin_eff < 2 or n_frames <= 0:
         return np.zeros(output_shape, dtype=np.float32)
 
+    # Per un percorso bistatico il bin di range corrisponde a metà della
+    # distanza TX→voxel→RX: bin = (r_tx + r_rx) / (2 * dr_m).
     voxel_flat = voxels.reshape(-1, 3).astype(np.float32, copy=False)
     k = np.float32((2.0 * np.pi * fc_f) / c_f)
     phase_scale = np.float32(float(phase_sign_i)) * k
@@ -510,6 +535,8 @@ def back_projection_power_mimo_geometry(
     inv_dr = np.float32(1.0 / dr_f)
     chunk_n = max(1, int(chunk_size))
 
+    # Il kernel JIT e il percorso NumPy ricevono gli stessi pesi e la stessa
+    # convenzione di fase; ``use_numba=False`` serve quindi come riferimento.
     if bool(use_numba) and _back_projection_power_mimo_geometry_numba_kernel is not None:
         total_power = _back_projection_power_mimo_geometry_numba_kernel(
             snapshots,
@@ -525,6 +552,8 @@ def back_projection_power_mimo_geometry(
         )
         return total_power.reshape(output_shape).astype(np.float32, copy=False)
 
+    # Accumula pose e canali coerentemente all'interno di ogni frame. I frame
+    # vengono poi sommati in potenza per non imporre coerenza tra acquisizioni.
     frame_acc = np.zeros((n_frames, int(voxel_flat.shape[0])), dtype=np.complex64)
 
     for pos_i in range(n_pos):
@@ -539,6 +568,8 @@ def back_projection_power_mimo_geometry(
             tx = tx_global[pos_i, ant_i]
             rx = rx_global[pos_i, ant_i]
             for start in range(0, int(voxel_flat.shape[0]), chunk_n):
+                # Il chunking limita soltanto la memoria temporanea dei voxel;
+                # non cambia la somma coerente su pose, canali o frame.
                 stop = min(start + chunk_n, int(voxel_flat.shape[0]))
                 voxel_chunk = voxel_flat[start:stop]
                 if voxel_chunk.size == 0:
@@ -612,10 +643,10 @@ def back_projection_power_mimo_frames(
 ) -> np.ndarray:
     """Reference-compatible adapter for the historical linear z=0 BP.
 
-    The 3-D kernel above is the implementation for new cylindrical captures.
-    For the normal path this legacy geometry is mapped to that same physical
-    kernel and evaluated in parallel.  ``use_numba=False`` retains the original
-    X-only loop/chunk traversal as a numerical reference implementation.
+    The general geometry kernel above is also used by the linear path through
+    this adapter and evaluated in parallel. ``use_numba=False`` retains the
+    original X-only loop/chunk traversal as a numerical reference
+    implementation.
     """
     snapshots = np.asarray(snapshot_frame_ant_range, dtype=np.complex64)
     if snapshots.ndim != 4:
@@ -768,12 +799,16 @@ def prepare_synthetic_aperture_data(
         raise ValueError(f"x_pitch_m non valido: {x_pitch_m!r}")
 
     x_position_m = (pos_values * np.float32(pitch)).astype(np.float32, copy=False)
+    # Il centro di fase virtuale è il punto medio TX/RX; la posizione meccanica
+    # della slitta lo trasla per costruire l'apertura sintetica completa.
     x_phase_center_m = (
         np.float32(0.5) * (x_tx + x_rx).astype(np.float32, copy=False)
     ).astype(np.float32, copy=False)
     x_element_m = (
         x_position_m[:, None] + x_phase_center_m[None, :]
     ).astype(np.float32, copy=False)
+    # Da [pos, frame, ant, bin] a [frame, 1, bin, synthetic_ant]: il canale
+    # sintetico contiene prima la posizione SAR, poi il canale MIMO fisico.
     flattened = np.transpose(snapshots, (1, 3, 0, 2)).reshape(
         int(n_frames),
         int(n_bins),
@@ -794,6 +829,7 @@ def synthetic_aperture_uniform_spacing_lambda(
     wavelength_m: float,
     atol: float = 1e-4,
 ) -> float | None:
+    """Restituisce il passo uniforme dell'apertura in lambda, o ``None`` se irregolare."""
     phase_centers_lambda = (
         np.asarray(x_element_m, dtype=np.float32).reshape(-1) / np.float32(float(wavelength_m))
     ).astype(np.float32, copy=False)

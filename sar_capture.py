@@ -30,107 +30,11 @@ class CaptureMetadataStore:
     lock: Any
 
 
-CYLINDRICAL_REQUIRED_FIELDS = (
-    "angle_index",
-    "height_index",
-    "angle_count",
-    "azimuth_rad",
-    "height_m",
-    "radius_m",
-    "scene_center_m",
-)
-
-
-def _finite_float(value: Any, field: str) -> float:
-    try:
-        converted = float(value)
-    except (TypeError, ValueError) as exc:
-        raise CaptureError(f"cylindrical.{field} must be a finite number") from exc
-    if not math.isfinite(converted):
-        raise CaptureError(f"cylindrical.{field} must be a finite number")
-    return converted
-
-
-def _nonnegative_int(value: Any, field: str, *, positive: bool = False) -> int:
-    try:
-        converted = int(value)
-    except (TypeError, ValueError) as exc:
-        raise CaptureError(f"cylindrical.{field} must be an integer") from exc
-    if converted < 0 or (positive and converted <= 0):
-        qualifier = "positive" if positive else "non-negative"
-        raise CaptureError(f"cylindrical.{field} must be {qualifier}")
-    return converted
-
-
-def normalize_cylindrical_metadata(cylindrical: Mapping[str, Any]) -> dict[str, Any]:
-    """Valida e canonicalizza il metadata geometrico cylindrical v2.
-
-    ``height_m`` è lo scostamento verticale dal terzo componente di
-    ``scene_center_m``.  ``position_m`` viene sempre derivata dai parametri
-    cilindrici per impedire che una seconda coordinata incoerente diventi
-    autorevole.
-    """
-
-    if not isinstance(cylindrical, Mapping):
-        raise CaptureError("cylindrical metadata must be a mapping")
-    missing = [field for field in CYLINDRICAL_REQUIRED_FIELDS if field not in cylindrical]
-    if missing:
-        raise CaptureError(f"cylindrical metadata is missing: {', '.join(missing)}")
-
-    center_raw = cylindrical["scene_center_m"]
-    if isinstance(center_raw, (str, bytes)):
-        raise CaptureError("cylindrical.scene_center_m must contain exactly three numbers")
-    try:
-        center_values = list(center_raw)
-    except TypeError as exc:
-        raise CaptureError("cylindrical.scene_center_m must contain exactly three numbers") from exc
-    if len(center_values) != 3:
-        raise CaptureError("cylindrical.scene_center_m must contain exactly three numbers")
-    center = [_finite_float(value, "scene_center_m") for value in center_values]
-
-    angle_index = _nonnegative_int(cylindrical["angle_index"], "angle_index")
-    height_index = _nonnegative_int(cylindrical["height_index"], "height_index")
-    angle_count = _nonnegative_int(cylindrical["angle_count"], "angle_count", positive=True)
-    if angle_index >= angle_count:
-        raise CaptureError("cylindrical.angle_index must be smaller than cylindrical.angle_count")
-    azimuth_rad = _finite_float(cylindrical["azimuth_rad"], "azimuth_rad")
-    if not 0.0 <= azimuth_rad < 2.0 * math.pi:
-        raise CaptureError("cylindrical.azimuth_rad must be in [0, 2*pi)")
-    height_m = _finite_float(cylindrical["height_m"], "height_m")
-    radius_m = _finite_float(cylindrical["radius_m"], "radius_m")
-    if radius_m <= 0.0:
-        raise CaptureError("cylindrical.radius_m must be strictly positive")
-
-    result: dict[str, Any] = {
-        "angle_index": angle_index,
-        "height_index": height_index,
-        "angle_count": angle_count,
-        "azimuth_rad": azimuth_rad,
-        "height_m": height_m,
-        "radius_m": radius_m,
-        "scene_center_m": center,
-        "position_m": [
-            center[0] + radius_m * math.cos(azimuth_rad),
-            center[1] + radius_m * math.sin(azimuth_rad),
-            center[2] + height_m,
-        ],
-    }
-    try:
-        payload = json.dumps(result, allow_nan=False, ensure_ascii=True, separators=(",", ":"))
-        decoded = json.loads(payload)
-    except (TypeError, ValueError) as exc:
-        raise CaptureError("cylindrical metadata must be JSON serializable") from exc
-    if not isinstance(decoded, dict):  # Defensive: json.loads di un mapping lo è sempre.
-        raise CaptureError("cylindrical metadata must be a JSON mapping")
-    return decoded
-
-
 def normalize_capture_metadata(capture_id: int, metadata: Mapping[str, Any] | None) -> dict[str, Any]:
     """Produce il blob canonico associato a un identificatore di cattura.
 
     ``capture_id`` identifica il file/cattura; ``acquisition_index`` è
-    l'ordine temporale. ``position`` resta un campo legacy e non descrive la
-    geometria v2.
+    l'ordine temporale. ``position`` è l'indice della posizione lineare.
     """
 
     if metadata is None:
@@ -144,10 +48,9 @@ def normalize_capture_metadata(capture_id: int, metadata: Mapping[str, Any] | No
         capture_id_i = int(capture_id)
     except (TypeError, ValueError) as exc:
         raise CaptureError("capture_id must be a non-negative integer") from exc
-    # A v2 capture identifier is non-negative.  Keep historical negative
-    # linear ``position_id`` values readable/writable when no v2 metadata was
-    # requested; those values are legacy positions, not v2 capture IDs.
-    if capture_id_i < 0 and (raw.get("cylindrical") is not None or "capture_id" in raw):
+    # Mantiene leggibili gli storici ``position_id`` lineari negativi quando
+    # non è stato fornito un identificatore di cattura esplicito.
+    if capture_id_i < 0 and "capture_id" in raw:
         raise CaptureError("capture_id must be a non-negative integer")
     supplied_capture_id = raw.get("capture_id", capture_id_i)
     try:
@@ -177,8 +80,6 @@ def normalize_capture_metadata(capture_id: int, metadata: Mapping[str, Any] | No
             result["carriage_microsteps"] = int(raw["carriage_microsteps"])
         except (TypeError, ValueError) as exc:
             raise CaptureError("carriage_microsteps must be an integer") from exc
-    if raw.get("cylindrical") is not None:
-        result["cylindrical"] = normalize_cylindrical_metadata(raw["cylindrical"])
     return result
 
 
@@ -228,11 +129,10 @@ class CaptureTicket:
     position_microsteps: int | None
     capture_id: int
     acquisition_index: int
-    cylindrical: dict[str, Any] | None
 
     @property
     def position(self) -> int:
-        """Campo legacy; non descrive la geometria cylindrical v2."""
+        """Indice della posizione lineare associata alla cattura."""
         return int(self.position_id)
 
 
@@ -245,6 +145,12 @@ def _read_shared(value: Any) -> int:
 
 
 class CaptureSessionManager:
+    """Serializza i comandi di cattura e ne attende l'esito dal logger.
+
+    Il ``session_id`` evita di scambiare una conferma tardiva della cattura
+    precedente con il completamento della richiesta corrente.
+    """
+
     """Serializza le catture e attende il flush del logger.
 
     ``cap_id`` è assegnato dal processo RX; ``cap_done_id`` viene aggiornato
@@ -274,8 +180,8 @@ class CaptureSessionManager:
         *,
         capture_id: int | None = None,
         acquisition_index: int | None = None,
-        cylindrical: Mapping[str, Any] | None = None,
     ) -> CaptureTicket:
+        """Invia una richiesta CAPTURE e restituisce il ticket da attendere."""
         with self._lock:
             self._reap_completed_locked()
             if self._ticket is not None:
@@ -284,16 +190,16 @@ class CaptureSessionManager:
                 raise CaptureError("A capture requires capture_id or legacy position_id.")
             legacy_position = int(capture_id if position_id is None else position_id)
             effective_capture_id = int(legacy_position if capture_id is None else capture_id)
-            if effective_capture_id < 0 and (capture_id is not None or cylindrical is not None):
+            if effective_capture_id < 0 and capture_id is not None:
                 raise CaptureError("capture_id must be non-negative")
             effective_acquisition_index = int(
                 effective_capture_id if acquisition_index is None else acquisition_index
             )
             if effective_acquisition_index < 0:
                 raise CaptureError("acquisition_index must be non-negative")
-            cylindrical_normalized = (
-                None if cylindrical is None else normalize_cylindrical_metadata(cylindrical)
-            )
+            # Il ticket ricorda l'ID osservato prima del comando. Solo un ID
+            # successivo può appartenere a questa richiesta, non a una cattura
+            # terminata in ritardo dalla sessione precedente.
             previous_session_id = _read_shared(self._cap_id)
             ticket = CaptureTicket(
                 previous_session_id=previous_session_id,
@@ -302,17 +208,13 @@ class CaptureSessionManager:
                 position_microsteps=None if position_microsteps is None else int(position_microsteps),
                 capture_id=effective_capture_id,
                 acquisition_index=effective_acquisition_index,
-                cylindrical=cylindrical_normalized,
             )
             metadata = {
                 "carriage_position_mm": ticket.position_mm,
                 "carriage_microsteps": ticket.position_microsteps,
             }
-            # Il comando legacy resta identico quando non viene richiesta una
-            # geometria nuova: utile per compatibilità e test di regressione.
             if (
-                ticket.cylindrical is not None
-                or capture_id is not None
+                capture_id is not None
                 or acquisition_index is not None
                 or int(ticket.capture_id) != int(ticket.position_id)
             ):
@@ -323,8 +225,6 @@ class CaptureSessionManager:
                         "position": int(ticket.position_id),
                     }
                 )
-            if ticket.cylindrical is not None:
-                metadata["cylindrical"] = ticket.cylindrical
             try:
                 self._cmd_queue.put_nowait(("CAPTURE", int(ticket.capture_id), metadata))
             except queue.Full as exc:
@@ -335,6 +235,7 @@ class CaptureSessionManager:
             return ticket
 
     def wait(self, ticket: CaptureTicket, timeout_seconds: float, cancel_event: threading.Event) -> None:
+        """Attende esclusivamente il completamento della sessione del ticket."""
         deadline = time.monotonic() + max(0.001, float(timeout_seconds))
         session_id: int | None = None
         while True:
@@ -344,9 +245,14 @@ class CaptureSessionManager:
 
             current_id = _read_shared(self._cap_id)
             if session_id is None and current_id != int(ticket.previous_session_id):
+                # RX assegna qui l'ID di sessione reale: il valore del ticket
+                # resta un riferimento stabile anche se cap_id continua a vivere
+                # in memoria condivisa tra processi.
                 session_id = current_id
 
             if session_id is not None and _read_shared(self._cap_done_id) == session_id:
+                # cap_done_id viene pubblicato dal logger soltanto dopo
+                # flush/close: un risultato positivo garantisce il file su disco.
                 result = _read_shared(self._cap_result)
                 with self._lock:
                     if self._ticket == ticket:
@@ -383,5 +289,7 @@ class CaptureSessionManager:
         current_id = _read_shared(self._cap_id)
         if current_id == int(ticket.previous_session_id):
             return
+        # Libera il ticket solo per l'ID effettivamente osservato dopo la
+        # richiesta; una vecchia conferma non deve sbloccare una nuova cattura.
         if _read_shared(self._cap_done_id) == current_id:
             self._ticket = None

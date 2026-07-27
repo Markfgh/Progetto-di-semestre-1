@@ -1,3 +1,5 @@
+"""Verifica conversioni, limiti e stati sicuri del controller Phidget."""
+
 from pathlib import Path
 
 import pytest

@@ -1,3 +1,10 @@
+"""Pipeline DSP realtime per acquisizioni radar FMCW MIMO.
+
+Il modulo converte frame IQ in mappe range-angolo/range-Doppler, estrae e
+fonde le detection e prepara le immagini per la GUI.  Le funzioni pure sono
+separate dal worker multiprocessing, che coordina memoria condivisa e comandi.
+"""
+
 from __future__ import annotations
 
 import contextlib
@@ -66,6 +73,9 @@ _GAUSSIAN_3X3_KERNEL = (
     / np.float32(16.0)
 )
 
+# Invariante della pipeline: [frame, loop, tx, sample/range_bin, rx]. L'asse
+# 3 non cambia posizione dopo la Range FFT, quindi sample e range_bin condividono
+# lo stesso indice nella configurazione dei filtri.
 _MEAN_AXIS_INDEX = {
     "frame": 0,
     "loop": 1,
@@ -177,9 +187,12 @@ def warmup_angle_power_numba() -> bool:
     return True
 
 
-# The DSP config is passed as a single packed struct to avoid relying on globals in the worker process.
+# La configurazione è passata come struct al processo DSP: con ``spawn`` non
+# bisogna affidarsi a globali inizializzate soltanto nel processo della GUI.
 @dataclass(frozen=True)
 class DspSelection:
+    """Finestre applicate alle tre dimensioni FFT della pipeline."""
+
     window_range: WindowType = "blackman"
     window_doppler: WindowType = "hanning"
     window_angle: WindowType = "hanning"
@@ -211,13 +224,6 @@ class DspDiagnosticsConfig:
 
 
 @dataclass(frozen=True)
-class CalibrationConfig:
-    enabled: bool = True
-    vector_real: tuple[float, ...] = (1.0,) * 8
-    vector_imag: tuple[float, ...] = (0.0,) * 8
-
-
-@dataclass(frozen=True)
 class MeanSelection:
     axes: tuple[MeanAxis, ...] = ("tx",)
     enabled: bool = False
@@ -235,6 +241,8 @@ class BackgroundSubtractionConfig:
 
 @dataclass
 class BackgroundSubtractionState:
+    """Memoria mutabile del modello di sfondo EMA o a finestra mobile."""
+
     model: np.ndarray | None = None
     init_sum: np.ndarray | None = None
     init_count: int = 0
@@ -368,6 +376,12 @@ class SlowTimeConfig:
 
 @dataclass(frozen=True)
 class PostRangeFftFilterConfig:
+    """Filtri di una branca applicati dopo la range FFT.
+
+    Le branche static, moving e display possono usare configurazioni diverse:
+    un filtro estetico della GUI non deve cambiare le detection.
+    """
+
     mean_after_range_fft: MeanSelection = MeanSelection(enabled=False)
     slow_time: SlowTimeConfig = SlowTimeConfig(enabled=False)
     background_subtraction: BackgroundSubtractionConfig = BackgroundSubtractionConfig(enabled=False)
@@ -421,6 +435,13 @@ class FusionConfig:
 
 @dataclass
 class Detection:
+    """Picco radar espresso sia in bin sia in coordinate fisiche.
+
+    ``source`` identifica la branca che l'ha prodotto: ``static`` oppure
+    ``moving``; dopo la fusione può anche conservare il Doppler della branca
+    mobile insieme all'angolo della branca statica.
+    """
+
     range_bin: int
     angle_bin: int | None
     doppler_bin: int | None
@@ -445,6 +466,8 @@ class RangeAngleMovingConfig:
 
 @dataclass(frozen=True)
 class RealtimeDSPConfig:
+    """Parametri geometrici e dimensionali immutabili di una sessione realtime."""
+
     # Packed config passed to the DSP process to avoid relying on globals.
     c: float
     fs: float
@@ -465,13 +488,14 @@ class RealtimeDSPConfig:
     range_max_processing_m: float = 0.0
     normalize_skip_range_bins: int = 0
     zero_after_range_fft_bins: int = 0
-    calibration: CalibrationConfig = CalibrationConfig()
     range_angle_moving: RangeAngleMovingConfig = field(default_factory=RangeAngleMovingConfig)
     display_zoom: DisplayZoomConfig = field(default_factory=DisplayZoomConfig)
 
 
 @dataclass(frozen=True)
 class VirtualArrayGeometry:
+    """Ordine e centri di fase dell'array virtuale TDM-MIMO, in lunghezze d'onda."""
+
     order_flat: np.ndarray
     phase_centers_lambda: np.ndarray
     identity_order: bool
@@ -503,6 +527,7 @@ def build_windows(
     n_loops: int,
     virtual_ant: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Crea finestre ``float32`` già sagomate per il broadcasting sugli array IQ."""
     # Pre-shaped for NumPy broadcasting on range and virtual-array axes.
     w_range = _get_window_1d(selection.window_range, samples).reshape(1, 1, 1, samples, 1)
     w_doppler = _get_window_1d(selection.window_doppler, n_loops).reshape(1, n_loops, 1, 1, 1)
@@ -552,35 +577,6 @@ def selection_from_yaml_dict(cfg: dict[str, Any]) -> DspSelection:
         window_range=window_type_normalize(dsp.get("window_range"), "blackman"),
         window_doppler=window_type_normalize(dsp.get("window_doppler"), "hanning"),
         window_angle=window_type_normalize(dsp.get("window_angle"), "hanning"),
-    )
-
-
-def _calibration_vector_from_yaml(raw_value: Any, *, size: int, default: float) -> tuple[float, ...]:
-    size = max(1, int(size))
-    if isinstance(raw_value, (list, tuple)):
-        raw_items = list(raw_value)
-    else:
-        raw_items = []
-    out: list[float] = []
-    for raw_item in raw_items[:size]:
-        try:
-            val = float(raw_item)
-        except (TypeError, ValueError):
-            val = float(default)
-        out.append(val)
-    if len(out) < size:
-        out.extend([float(default)] * (size - len(out)))
-    return tuple(out)
-
-
-def calibration_from_yaml_dict(cfg: dict[str, Any], *, virtual_ant: int = 8) -> CalibrationConfig:
-    dsp = cfg.get("dsp", {}) or {}
-    block = dsp.get("calibration", {}) or {}
-    size = max(1, int(virtual_ant))
-    return CalibrationConfig(
-        enabled=bool(block.get("enabled", True)),
-        vector_real=_calibration_vector_from_yaml(block.get("vector_real"), size=size, default=1.0),
-        vector_imag=_calibration_vector_from_yaml(block.get("vector_imag"), size=size, default=0.0),
     )
 
 
@@ -1183,6 +1179,8 @@ def build_virtual_array_geometry_from_yaml_dict(
     cfg: dict[str, Any],
     dsp_cfg: RealtimeDSPConfig,
 ) -> tuple[VirtualArrayGeometry, list[str]]:
+    # Riordina i canali acquisiti TX-major/RX-minor nell'ordine fisico
+    # dell'apertura; i phase center devono seguire lo stesso ordine di uscita.
     block = cfg.get("antenna", {}) or cfg.get("virtual_array", {}) or {}
     virtual_ant = int(dsp_cfg.virtual_ant)
     default_order = _default_virtual_array_order_flat(virtual_ant)
@@ -1743,6 +1741,7 @@ def tracker_from_yaml_dict(cfg: dict[str, Any]) -> TrackerConfig:
 
 
 def subtract_selected_mean(data: np.ndarray, selection: MeanSelection) -> np.ndarray:
+    """Rimuove in-place la media lungo gli assi richiesti dalla configurazione."""
     if not selection.enabled or not selection.axes:
         return data
     axes = tuple(_MEAN_AXIS_INDEX[axis] for axis in selection.axes)
@@ -1781,6 +1780,11 @@ def apply_slow_time_filter(
     *,
     fft_workers: int = 1,
 ) -> np.ndarray:
+    """Filtra l'asse dei loop/chirp dopo la range FFT.
+
+    I modi disponibili sopprimono il clutter statico oppure trasformano già
+    l'asse lento in Doppler; il chiamante decide quale branca possa usarli.
+    """
     if not slow_time_cfg.enabled or slow_time_cfg.mode == "none":
         return data
     if data.ndim != 5 or int(data.shape[1]) <= 0:
@@ -1825,6 +1829,9 @@ def apply_post_range_fft_filters(
     fft_workers: int,
     apply_loop_average_after_background: bool,
 ) -> np.ndarray:
+    """Applica la sequenza canonica di filtri di una branca DSP."""
+    # Ordine intenzionale: slow-time, rimozione media, background e infine
+    # media sui loop. Invertirlo cambia il clutter stimato e il cubo a valle.
     out = apply_slow_time_filter(data,filters_cfg.slow_time,fft_workers=fft_workers,)
     out = subtract_selected_mean(out, filters_cfg.mean_after_range_fft)
     out = apply_background_subtraction(out, filters_cfg.background_subtraction, bg_state)
@@ -1859,6 +1866,7 @@ def build_angle_steering_matrix(
     nfft_angle: int,
     geometry: VirtualArrayGeometry | None = None,
 ) -> np.ndarray:
+    """Costruisce steering normalizzato per beamforming Bartlett/MVDR."""
     if geometry is None:
         phase_centers_lambda = _default_virtual_array_phase_centers_lambda(int(virtual_ant))
     else:
@@ -1889,6 +1897,12 @@ def compute_angle_heatmap(
     geometry: VirtualArrayGeometry | None = None,
     ant_spacing: float | None = None,
 ) -> np.ndarray:
+    """Riduce l'array virtuale a una mappa ``[range_bin, angle_bin]``.
+
+    La modalità FFT è la più economica; Bartlett e MVDR usano i centri di fase
+    fisici. MVDR aggiunge carico diagonale e degrada localmente a Bartlett se
+    una covarianza non è risolvibile, invece di invalidare l'intera mappa.
+    """
     # in [frame, loop, range_bin, angle_bin] -> [range_bin, angle_bin] con eventuale aggregazione su frame/loop a seconda di angle_cfg
     def _aggregate_angle_power(power: np.ndarray) -> np.ndarray:
         if power.ndim != 4:
@@ -2232,6 +2246,9 @@ def build_display_projection_lut(
     angle_src_idx = finite_cols[angle_sorted_order].astype(np.int32, copy=False)
     angle_sorted_deg = angle_axis[angle_src_idx].astype(np.float32, copy=False)
 
+    # Inverse mapping pixel→radar: per ogni pixel cartesiano calcola range e
+    # angolo, poi conserva gli indici/interpolanti per non rifare la geometria
+    # a ogni frame della GUI.
     x_axis_m = lut["x_axis_m"]
     y_axis_m = lut["y_axis_m"]
     x_grid_m, y_grid_m = np.meshgrid(x_axis_m, y_axis_m, indexing="xy")
@@ -2662,6 +2679,8 @@ def build_doppler_axis_mps(
             f"[DSP WARN] Doppler axis generalized to uniform TDM with tx={tx_count}; "
             "verify against the real chirp schedule if TX delays are non-uniform."
         )
+    # In TDM lo stesso TX ricompare ogni ``tx_count`` chirp: il PRI effettivo
+    # del canale virtuale è quindi più lungo del PRI dello stream ADC.
     effective_pri_s = float(chirp_period_s) * float(tx_count)
     wavelength_m = float(dsp_cfg.c) / float(fc_hz)
     doppler_cycles = _build_doppler_bin_cycles_axis(n_doppler, doppler_fft_shift=doppler_fft_shift)
@@ -2738,6 +2757,9 @@ def _build_virtual_array_from_range_fft(
     work_buf: np.ndarray | None = None,
     flat_work_buf: np.ndarray | None = None,
 ) -> np.ndarray:
+    # L'acquisizione usa [frame, loop, tx, range, rx].  Portare ``range``
+    # accanto a ``loop`` consente di appiattire TX×RX senza cambiare l'ordine
+    # TX-major/RX-minor atteso da ``geometry.order_flat``.
     trimmed = range_fft[:, :, :, :max_bin, :]
     va_src = trimmed.transpose(0, 1, 3, 2, 4)
     if (
@@ -2756,6 +2778,8 @@ def _build_virtual_array_from_range_fft(
         int(max_bin),
         int(dsp_cfg.virtual_ant),
     )
+    # La geometria può correggere l'ordine di cablaggio/fase, ma non altera
+    # né i campioni né la forma della matrice virtuale.
     if geometry.identity_order:
         return va_flat
     if (
@@ -2767,59 +2791,6 @@ def _build_virtual_array_from_range_fft(
         np.take(va_flat, geometry.order_flat, axis=-1, out=flat_work_buf)
         return flat_work_buf
     return np.take(va_flat, geometry.order_flat, axis=-1).astype(np.complex64, copy=False)
-
-
-def _build_complex_calibration_vector(calibration_cfg: CalibrationConfig, virtual_ant: int) -> np.ndarray:
-    size = max(1, int(virtual_ant))
-    real = np.asarray(calibration_cfg.vector_real[:size], dtype=np.float32)
-    imag = np.asarray(calibration_cfg.vector_imag[:size], dtype=np.float32)
-    if real.size < size:
-        real = np.pad(real, (0, size - real.size), constant_values=np.float32(1.0))
-    if imag.size < size:
-        imag = np.pad(imag, (0, size - imag.size), constant_values=np.float32(0.0))
-    return (real + (1j * imag)).astype(np.complex64, copy=False)
-
-
-def _apply_calibration_vector(virtual_array: np.ndarray, cal_vector: np.ndarray | None) -> np.ndarray:
-    if cal_vector is None or virtual_array.size <= 0 or virtual_array.ndim <= 0:
-        return virtual_array
-    cal = np.asarray(cal_vector, dtype=np.complex64).reshape(-1)
-    if cal.size != int(virtual_array.shape[-1]):
-        return virtual_array
-    cal_shape = (1,) * max(0, virtual_array.ndim - 1) + (int(cal.size),)
-    np.multiply(virtual_array, cal.reshape(cal_shape), out=virtual_array)
-    return virtual_array
-
-
-def _estimate_boresight_calibration_vector(virtual_array: np.ndarray) -> tuple[np.ndarray | None, int | None]:
-    if virtual_array.ndim != 4 or virtual_array.shape[2] <= 0 or virtual_array.shape[3] <= 0:
-        return None, None
-    avg_snapshot = virtual_array.mean(axis=(0, 1), dtype=np.complex64)
-    if avg_snapshot.ndim != 2 or avg_snapshot.shape[0] <= 0 or avg_snapshot.shape[1] <= 0:
-        return None, None
-    re = avg_snapshot.real
-    im = avg_snapshot.imag
-    energy = (re * re + im * im).sum(axis=-1, dtype=np.float32)
-    if energy.size <= 0 or not np.any(np.isfinite(energy)):
-        return None, None
-    target_bin = int(np.nanargmax(energy))
-    antenna_row = np.asarray(avg_snapshot[target_bin, :], dtype=np.complex64).reshape(-1)
-    if antenna_row.size <= 0:
-        return None, target_bin
-    ref = np.complex64(antenna_row[0])
-    if abs(ref) <= 1e-12:
-        return None, target_bin
-    relative_phases = np.angle(antenna_row * np.conj(ref)).astype(np.float32, copy=False)
-    cal_vector = np.exp((-1j) * relative_phases.astype(np.float64, copy=False)).astype(np.complex64, copy=False)
-    cal_vector[0] = np.complex64(1.0 + 0.0j)
-    return cal_vector, target_bin
-
-
-def _format_calibration_vector_for_log(cal_vector: np.ndarray) -> tuple[str, str]:
-    vec = np.asarray(cal_vector, dtype=np.complex64).reshape(-1)
-    real_str = ", ".join(f"{float(v):.6f}" for v in vec.real)
-    imag_str = ", ".join(f"{float(v):.6f}" for v in vec.imag)
-    return real_str, imag_str
 
 
 def _power_to_db(power_lin: np.ndarray) -> np.ndarray:
@@ -3024,6 +2995,8 @@ def _cfar_training_values_for_cell(
     c0 = int(col) - guard_col - train_col
     c1 = int(col) + guard_col + train_col + 1
     if r0 < 0 or c0 < 0 or r1 > n_rows or c1 > n_cols:
+        # Ai bordi non esiste una finestra CFAR completa: una soglia infinita
+        # è preferibile a una stima del rumore con un numero variabile di celle.
         return None
 
     window = power_lin[r0:r1, c0:c1]
@@ -3032,6 +3005,8 @@ def _cfar_training_values_for_cell(
     gr1 = train_row + (2 * guard_row) + 1
     gc0 = train_col
     gc1 = train_col + (2 * guard_col) + 1
+    # Escludi CUT e celle di guardia: l'energia del possibile bersaglio non
+    # deve entrare nella stima del rumore locale.
     training_mask[gr0:gr1, gc0:gc1] = False
     training = window[training_mask]
     if training.size <= 0:
@@ -3461,6 +3436,8 @@ def _select_localmax_2d(
         c = int(candidates[idx, 1])
         if suppressed[r, c]:
             continue
+        # Selezione greedy dal picco più forte: la finestra soppressa evita
+        # che i bin della stessa lobatura producano detection duplicate.
         selected.append((r, c))
         r0 = max(0, r - row_pad)
         r1 = min(n_rows, r + row_pad + 1)
@@ -3489,11 +3466,14 @@ def detect_static_targets(
     range_bin_m: float,
     max_bin: int,
     apply_angle_window: bool,
-    calibration_enabled: bool = False,
-    cal_vector: np.ndarray | None = None,
     virtual_array_work_buf: np.ndarray | None = None,
     virtual_array_flat_work_buf: np.ndarray | None = None,
 ) -> tuple[list[Detection], np.ndarray]:
+    """Estrae bersagli statici dalla mappa range-angolo.
+
+    Restituisce anche la mappa lineare da cui sono stati scelti i picchi: la
+    stessa mappa può quindi essere riusata per diagnosi e visualizzazione.
+    """
     if not static_cfg.enabled:
         return [], np.empty((0, 0), dtype=np.float32)
     if range_fft.ndim != 5 or max_bin <= 0:
@@ -3509,8 +3489,6 @@ def detect_static_targets(
         work_buf=virtual_array_work_buf,
         flat_work_buf=virtual_array_flat_work_buf,
     )
-    if calibration_enabled:
-        _apply_calibration_vector(virtual_array, cal_vector)
     if apply_angle_window:
         virtual_array *= w_angle
     static_heatmap = compute_angle_heatmap(
@@ -3524,6 +3502,8 @@ def detect_static_targets(
     static_db = compute_detection_power_db_map(static_heatmap)
     candidates_mask: np.ndarray | None = None
     if static_cfg.threshold_mode in {"ca_cfar", "os_cfar"}:
+        # CFAR decide quali celle sono statisticamente interessanti; il NMS
+        # sottostante conserva poi un solo massimo per ciascun bersaglio.
         candidates_mask, _ = compute_cfar_candidate_mask(
             static_heatmap,
             threshold_mode=static_cfg.threshold_mode,
@@ -3644,6 +3624,7 @@ def compute_range_doppler(
     apply_doppler_window: bool,
     doppler_work_buf: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Calcola il cubo Doppler e la sua proiezione di potenza range-Doppler."""
     doppler_cube = _compute_doppler_cube(
         range_fft,
         max_bin=max_bin,
@@ -3663,6 +3644,8 @@ def compute_range_doppler(
 
     excl = int(max(0, moving_cfg.zero_doppler_exclusion_bins))
     if excl > 0 and range_doppler_map.shape[1] > 0:
+        # Lo zero-Doppler viene azzerato solo nella mappa di detection: il
+        # cubo complesso resta integro per la successiva stima angolare.
         zero_idx = int(range_doppler_map.shape[1] // 2) if moving_cfg.doppler_fft_shift else 0
         d0 = max(0, zero_idx - excl)
         d1 = min(int(range_doppler_map.shape[1]), zero_idx + excl + 1)
@@ -3685,8 +3668,6 @@ def compute_range_angle_moving_velocity_map(
     virtual_array_geometry: VirtualArrayGeometry,
     angle_steering: np.ndarray,
     angle_axis_deg: np.ndarray | None = None,
-    calibration_enabled: bool = False,
-    cal_vector: np.ndarray | None = None,
     doppler_work_buf: np.ndarray | None = None,
     virtual_array_work_buf: np.ndarray | None = None,
     virtual_array_flat_work_buf: np.ndarray | None = None,
@@ -3702,6 +3683,9 @@ def compute_range_angle_moving_velocity_map(
     """
     n_range = max(0, int(max_bin))
     n_angle = max(1, int(dsp_cfg.nfft_angle))
+    # Zero è un valore fisico ambiguo nella mappa velocità. ``alpha_ra`` è
+    # dunque anche la maschera di validità: alpha=0 significa nessuna stima
+    # affidabile, non necessariamente velocità nulla.
     velocity_ra = np.zeros((n_range, n_angle), dtype=np.float32)
     alpha_ra = np.zeros((n_range, n_angle), dtype=np.float32)
     if n_range <= 0:
@@ -3740,6 +3724,9 @@ def compute_range_angle_moving_velocity_map(
 
     comp_table = None if tdm_mimo_compensation_table is None else np.asarray(tdm_mimo_compensation_table, dtype=np.complex64)
     if comp_table is not None and comp_table.ndim == 2 and comp_table.shape[0] >= n_doppler and comp_table.shape[1] >= n_tx:
+        # In TDM i TX sono campionati in istanti diversi. Compensare la fase
+        # per bin Doppler prima di appiattire TX×RX evita un angolo falso per
+        # i bersagli in movimento.
         phase = comp_table[:n_doppler, :n_tx].reshape(1, n_doppler, n_tx, 1, 1)
         np.multiply(doppler_cube, phase, out=doppler_cube)
 
@@ -3767,8 +3754,6 @@ def compute_range_angle_moving_velocity_map(
         else:
             va_flat = np.take(va_flat, virtual_array_geometry.order_flat, axis=-1).astype(np.complex64, copy=False)
 
-    if calibration_enabled:
-        _apply_calibration_vector(va_flat, cal_vector)
     if apply_angle_window:
         va_flat *= w_angle
 
@@ -3835,6 +3820,7 @@ def detect_moving_targets(
     range_bin_m: float,
     doppler_axis_mps: np.ndarray | None,
 ) -> list[Detection]:
+    """Estrae picchi mobili e associa a ogni bin la velocità Doppler fisica."""
     if not moving_cfg.enabled or range_doppler_map.size <= 0:
         return []
     moving_db = compute_detection_power_db_map(range_doppler_map)
@@ -3906,8 +3892,6 @@ def estimate_angle_for_moving_detections(
     virtual_array_geometry: VirtualArrayGeometry,
     angle_steering: np.ndarray,
     angle_axis_deg: np.ndarray,
-    calibration_enabled: bool = False,
-    cal_vector: np.ndarray | None = None,
     tdm_mimo_compensation_table: np.ndarray | None = None,
 ) -> list[Detection]:
     if not detections or doppler_cube.ndim != 5:
@@ -3937,8 +3921,6 @@ def estimate_angle_for_moving_detections(
             np.copyto(va_view, snapshot_flat, casting="unsafe")
         else:
             np.take(snapshot_flat, virtual_array_geometry.order_flat, axis=-1, out=va_view)
-        if calibration_enabled:
-            _apply_calibration_vector(va, cal_vector)
         if apply_angle_window:
             va *= w_angle
         angle_pow = compute_angle_heatmap(
@@ -4007,6 +3989,11 @@ def fuse_detections(
     detections_moving: list[Detection],
     fusion_cfg: FusionConfig,
 ) -> list[Detection]:
+    """Unisce detection statiche e mobili che descrivono lo stesso bersaglio.
+
+    La fusione conserva la geometria angolare della branca statica e, quando
+    disponibile, il Doppler della branca mobile.
+    """
     if not detections_static and not detections_moving:
         return []
     if not fusion_cfg.enabled:
@@ -4052,6 +4039,7 @@ def clean_detections_for_tracking(
     detections: list[Detection],
     fusion_cfg: FusionConfig,
 ) -> list[Detection]:
+    """Normalizza valori non finiti e rimuove duplicati prima del tracking."""
     if not detections:
         return []
 
@@ -4209,6 +4197,8 @@ def apply_background_subtraction(
         return range_fft
     bg_broadcast = model.reshape((1,) + model.shape)
     if bg_cfg.clamp_positive_only:
+        # Questo ramo sottrae le magnitudini e conserva la fase corrente: è un
+        # floor visivo/non coerente, non una cancellazione complessa del clutter.
         current_mag = np.abs(range_fft)
         bg_mag = np.abs(bg_broadcast)
         out_mag = np.maximum(current_mag - bg_mag, 0.0).astype(np.float32, copy=False)
@@ -4508,9 +4498,6 @@ def process_buffer(
     detection_moving_bg_state: BackgroundSubtractionState,
     display_bg_state: BackgroundSubtractionState,
     heatmap_ema: np.ndarray | None,
-    calibration_enabled: bool,
-    cal_vector: np.ndarray,
-    pending_calibration: bool,
     virtual_array_work_buf: np.ndarray | None,
     virtual_array_flat_work_buf: np.ndarray | None,
     doppler_work_buf: np.ndarray | None,
@@ -4548,9 +4535,14 @@ def process_buffer(
     gui_doppler_diag_views: tuple[np.ndarray, np.ndarray] | None = None,
     angle_diag_out_buf: np.ndarray | None = None,
     doppler_diag_out_buf: np.ndarray | None = None,
-) -> tuple[np.ndarray | None, list[Detection], np.ndarray]:
+) -> tuple[np.ndarray | None, list[Detection]]:
+    """Elabora un batch IQ e pubblica l'ultima immagine nella GUI.
+
+    Il batch percorre tre branche indipendenti dopo la range FFT: detection
+    statica, detection mobile e display. La funzione restituisce l'EMA della
+    heatmap e le detection pulite, ma la GUI legge i double buffer condivisi.
+    """
     try:
-        cal_vector_out = np.asarray(cal_vector, dtype=np.complex64).reshape(-1)
         display_mode = _normalize_display_heatmap_mode(display_heatmap_mode)
         display_zoom_cfg_eff = display_zoom_cfg or getattr(dsp_cfg, "display_zoom", DisplayZoomConfig())
         home_viewport = (
@@ -4626,46 +4618,6 @@ def process_buffer(
         range_bin_m = dsp_cfg.c * dsp_cfg.fs / (2.0 * dsp_cfg.slope * dsp_cfg.nfft_range)
         zoom_range_bin_m = dsp_cfg.c * dsp_cfg.fs / (2.0 * dsp_cfg.slope * zoom_range_nfft)
 
-        if pending_calibration:
-            calibration_max_bin = max(1, min(max(int(processing_max_bin), int(display_max_bin)), dsp_cfg.nfft_range // 2))
-            calibration_virtual_array = _build_virtual_array_from_range_fft(
-                range_fft_common,
-                max_bin=calibration_max_bin,
-                dsp_cfg=dsp_cfg,
-                geometry=virtual_array_geometry,
-                work_buf=(
-                    None
-                    if virtual_array_work_buf is None
-                    else virtual_array_work_buf[
-                        :n_frames,
-                        : int(range_fft_common.shape[1]),
-                        :calibration_max_bin,
-                        :,
-                        :,
-                    ]
-                ),
-                flat_work_buf=(
-                    None
-                    if virtual_array_flat_work_buf is None
-                    else virtual_array_flat_work_buf[
-                        :n_frames,
-                        : int(range_fft_common.shape[1]),
-                        :calibration_max_bin,
-                        :,
-                    ]
-                ),
-            )
-            updated_cal_vector, target_bin = _estimate_boresight_calibration_vector(calibration_virtual_array)
-            if updated_cal_vector is None:
-                print("[DSP CAL] boresight calibration skipped: target/reference antenna not valid on current batch.")
-            else:
-                cal_vector_out = updated_cal_vector
-                real_str, imag_str = _format_calibration_vector_for_log(cal_vector_out)
-                print(f"[DSP CAL] boresight updated on range_bin={int(target_bin or 0)}")
-                print(f"[DSP CAL] vector_real: [{real_str}]")
-                print(f"[DSP CAL] vector_imag: [{imag_str}]")
-
-
         # Split the shared range-FFT cube into three logical branches:
         # static detection, moving detection, and display.
         # Each branch reuses the common range-FFT output unless its own
@@ -4733,8 +4685,6 @@ def process_buffer(
                 range_bin_m=range_bin_m,
                 max_bin=processing_max_bin,
                 apply_angle_window=apply_angle_window,
-                calibration_enabled=calibration_enabled,
-                cal_vector=cal_vector_out,
                 virtual_array_work_buf=(
                     None
                     if virtual_array_work_buf is None
@@ -4788,8 +4738,6 @@ def process_buffer(
                 virtual_array_geometry=virtual_array_geometry,
                 angle_steering=angle_steering,
                 angle_axis_deg=angle_axis_deg,
-                calibration_enabled=calibration_enabled,
-                cal_vector=cal_vector_out,
                 tdm_mimo_compensation_table=tdm_mimo_compensation_table,
             )
         fused_detections = fuse_detections(detections_static, detections_moving, fusion_cfg)
@@ -4881,8 +4829,6 @@ def process_buffer(
                         ]
                     ),
                 )
-                if calibration_enabled:
-                    _apply_calibration_vector(diag_virtual_array, cal_vector_out)
                 if apply_angle_window:
                     diag_virtual_array *= w_angle
                 diag_angle_pow = compute_angle_heatmap(
@@ -5034,8 +4980,6 @@ def process_buffer(
                 virtual_array_geometry=virtual_array_geometry,
                 angle_steering=angle_steering,
                 angle_axis_deg=angle_axis_deg,
-                calibration_enabled=calibration_enabled,
-                cal_vector=cal_vector_out,
                 doppler_work_buf=(
                     None
                     if doppler_work_buf is None
@@ -5160,8 +5104,6 @@ def process_buffer(
                         virtual_array_geometry=virtual_array_geometry,
                         angle_steering=zoom_steering,
                         angle_axis_deg=zoom_angle_axis,
-                        calibration_enabled=calibration_enabled,
-                        cal_vector=cal_vector_out,
                         doppler_work_buf=None,
                         virtual_array_work_buf=None,
                         virtual_array_flat_work_buf=None,
@@ -5236,8 +5178,6 @@ def process_buffer(
                 ),
             )
 
-            if calibration_enabled:
-                _apply_calibration_vector(virtual_array, cal_vector_out)
             if apply_angle_window:
                 virtual_array *= w_angle
 
@@ -5324,8 +5264,6 @@ def process_buffer(
                         work_buf=None,
                         flat_work_buf=None,
                     )
-                    if calibration_enabled:
-                        _apply_calibration_vector(zoom_virtual_array, cal_vector_out)
                     if apply_angle_window:
                         zoom_virtual_array *= w_angle
 
@@ -5502,11 +5440,11 @@ def process_buffer(
                     dst_doppler[:n_doppler_diag] = doppler_flat[:n_doppler_diag]
             gui_latest_idx.value = next_idx
             gui_latest_seq.value = int(gui_latest_seq.value) + 1
-        return heatmap_ema, tracking_detections, cal_vector_out
+        return heatmap_ema, tracking_detections
 
     except Exception as e:
         print(f"[DSP ERR] {e}")
-        return heatmap_ema, [], np.asarray(cal_vector, dtype=np.complex64).reshape(-1)
+        return heatmap_ema, []
 
 
 def dsp_worker(
@@ -5562,9 +5500,14 @@ def dsp_worker(
     angle_diag_w: int = 0,
     doppler_diag_w: int = 0,
 ) -> None:
+    """Loop del processo DSP: consuma slot RX, elabora e rilascia lo slot.
+
+    La regola di proprietà è cruciale: uno slot torna a ``free_slots`` solo
+    dopo che i dati sono stati copiati/elaborati, così RX non sovrascrive il
+    frame ancora in uso dal DSP.
+    """
     dsp_block = cfg_dict.get("dsp", {}) or {}
     selection = selection_from_yaml_dict(cfg_dict)
-    calibration_cfg = getattr(dsp_cfg, "calibration", calibration_from_yaml_dict(cfg_dict, virtual_ant=int(dsp_cfg.virtual_ant)))
     cfar_numba_cfg = cfar_numba_from_yaml_dict(cfg_dict)
     angle_power_numba_cfg = angle_power_numba_from_yaml_dict(cfg_dict)
     diagnostics_cfg = dsp_diagnostics_from_yaml_dict(cfg_dict)
@@ -5786,9 +5729,6 @@ def dsp_worker(
     n_slots = len(slot_state)
     heatmap_ema = None
     display_zoom_runtime = DisplayZoomRuntime(home_viewport=home_viewport)
-    calibration_enabled = bool(calibration_cfg.enabled)
-    cal_vector = _build_complex_calibration_vector(calibration_cfg, int(dsp_cfg.virtual_ant))
-    pending_calibration = False
     detection_static_bg_state = BackgroundSubtractionState()
     detection_moving_bg_state = BackgroundSubtractionState()
     display_bg_state = BackgroundSubtractionState()
@@ -5937,6 +5877,9 @@ def dsp_worker(
         if not isinstance(cfg_patch, dict) or not cfg_patch:
             return
 
+        # Un controllo GUI invia solo una patch: il deep-merge preserva le
+        # chiavi sorelle della configurazione corrente invece di sostituire
+        # l'intero blocco YAML.
         next_cfg_dict = _deep_merge_dict(cfg_dict, cfg_patch)
         next_selection = selection_from_yaml_dict(next_cfg_dict)
         next_mean_before_range_fft = mean_before_range_fft_from_yaml_dict(next_cfg_dict)
@@ -5972,6 +5915,8 @@ def dsp_worker(
             apply_doppler_window = not _window_is_identity(next_selection.window_doppler)
             apply_angle_window = not _window_is_identity(next_selection.window_angle)
 
+        # EMA e modelli di clutter dipendono dai parametri che li hanno
+        # generati; azzerarli evita di mescolare due regimi di filtraggio.
         if next_detection_static_filters != detection_static_post_range_fft_filters:
             detection_static_bg_state = BackgroundSubtractionState()
             warned_detection_loop_average_after_doppler = False
@@ -6040,7 +5985,6 @@ def dsp_worker(
         print("[DSP CFG] runtime config updated from GUI.")
 
     def _poll_dsp_commands() -> None:
-        nonlocal pending_calibration
         while True:
             try:
                 cmd = dsp_cmd_queue.get_nowait()
@@ -6049,10 +5993,7 @@ def dsp_worker(
             if not isinstance(cmd, dict):
                 continue
             cmd_type = str(cmd.get("type", "")).strip().lower()
-            if cmd_type == "calibrate_boresight":
-                pending_calibration = True
-                print("[DSP CAL] boresight calibration requested; waiting for next processed batch.")
-            elif cmd_type == "update_runtime_config":
+            if cmd_type == "update_runtime_config":
                 cfg_patch = cmd.get("cfg_patch", cmd.get("patch", {}))
                 try:
                     _apply_runtime_config_patch(
@@ -6270,8 +6211,7 @@ def dsp_worker(
                 print("[DSP WARN] detection_static_filters.loop_average_after_background skipped because detection_static_filters.slow_time.mode=doppler_fft.")
                 warned_detection_loop_average_after_doppler = True
             apply_detection_loop_average_after_background = False
-        requested_calibration = bool(pending_calibration)
-        heatmap_ema, tracking_detections, cal_vector = process_buffer(
+        heatmap_ema, tracking_detections = process_buffer(
             complex_view,
             n_proc,
             window_range,
@@ -6305,9 +6245,6 @@ def dsp_worker(
             detection_moving_bg_state,
             display_bg_state,
             heatmap_ema,
-            calibration_enabled,
-            cal_vector,
-            requested_calibration,
             virtual_array_work_buf[:n_proc, :, :, :, :],
             virtual_array_flat_work_buf[:n_proc, :, :, :],
             doppler_work_buf[:n_proc, :, :, :, :],
@@ -6347,8 +6284,6 @@ def dsp_worker(
             doppler_diag_out_buf=doppler_diag_out_buf,
         )
         _write_applied_viewport(display_zoom_runtime.last_applied_meta)
-        if requested_calibration:
-            pending_calibration = False
         if tracker is not None and tracking_runtime_enabled:
             tracker_timestamp_s: float | None
             if tracker_nominal_frame_dt_s is not None and proc_seqs:

@@ -1,7 +1,7 @@
 data:
   # Puoi mettere direttamente una run: logs/run_YYYYMMDD_HHMMSS
   # Se lasci "logs", SARReader prende automaticamente l'ultima run con capture_pos*.bin.
-  input_dir: "logs\\run_20260722_143013"
+  input_dir: "logs\\run_20260724_095618"
   # Maximum time allowed to prepare all offline data before reporting a timeout.
   startup_timeout_s: 3600
 
@@ -23,34 +23,10 @@ reconstruction:
   # constrained to this domain and reconstruct their selected sector on the
   # fixed offline image grid.
   map_bounds:
-    x_min_m: -2.0
-    x_max_m: 2.0
-    y_min_m: 1.0
-    y_max_m: 5.0
-  # Optional fixed-world plane for rt_capture_v2 regular circular/cylindrical
-  # scans.  Unlike legacy map_bounds, Y may be negative.  If omitted, the
-  # offline reader derives a square from scene_center_m and radius_m.
-  # cylindrical_plane:
-  #   x_min_m: -1.0
-  #   x_max_m: 1.0
-  #   y_min_m: -1.0
-  #   y_max_m: 1.0
-  #   z_m: 0.0
-  # Preferred rt_capture_v2 section-view configuration.  X/Y/Z are world
-  # bounds; ``plane`` selects XY, XZ or YZ and coordinate_m is the fixed
-  # world coordinate of that plane.  It is materialised by Save Configuration
-  # after inspecting a v2 run, so bounds default from its actual headers.
-  # cylindrical_view:
-  #   bounds:+
-  #     x_min_m: -1.0
-  #     x_max_m: 1.0
-  #     y_min_m: -1.0
-  #     y_max_m: 1.0
-  #     z_min_m: 0.0
-  #     z_max_m: 0.3
-  #   section:
-  #     plane: "xy"
-  #     coordinate_m: 0.15
+    x_min_m: -5.0
+    x_max_m: 5.0
+    y_min_m: 0.0
+    y_max_m: 10.0
 
 bp:
   phase_sign: -1
@@ -88,7 +64,7 @@ offline_sar_range_angle:
   nfft_angle: 16384
   window_range: "blackman"
   window_doppler: "blackman"
-  window_angle: "hanning"
+  window_angle: "blackman"
   zero_after_range_fft_bins: 0
 
   mean_after_range_fft:

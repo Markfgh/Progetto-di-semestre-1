@@ -1,3 +1,5 @@
+"""Regressione sulla proprietà dello slot condiviso fra RX e worker DSP."""
+
 from __future__ import annotations
 
 import multiprocessing as mp
@@ -109,8 +111,7 @@ def test_dsp_releases_slot_only_after_copy(monkeypatch) -> None:
         captured["raw_buffer"] = np.array(raw_buffer[: expected_complex.size], copy=True)
         captured["display_heatmap_mode"] = kwargs.get("display_heatmap_mode")
         stop_evt.set()
-        cal_vector = np.asarray(kwargs.get("cal_vector", np.ones(dsp_cfg.virtual_ant, dtype=np.complex64)), dtype=np.complex64)
-        return None, [], cal_vector
+        return None, []
 
     monkeypatch.setattr(realtime_dsp, "process_buffer", fake_process_buffer)
 

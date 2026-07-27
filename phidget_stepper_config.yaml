@@ -1,3 +1,4 @@
+# Indirizzi del Phidget 1063 e dei due finecorsa fisici.
 device:
   serial_number: null
   stepper_channel: 0
@@ -5,20 +6,24 @@ device:
   limit_max_channel: 1
   limit_min_polarity: 'NO'
   limit_max_polarity: 'NO'
+# Conversione tra corsa lineare e microstep del motore.
 mechanics:
   belt_pitch_mm: 2.0
   pulley_teeth: 20
   motor_full_steps_per_rev: 200
   gear_reduction: 0.44388777017593399
+# Limiti elettrici e cinematici usati durante il moto normale.
 motor:
   velocity_microsteps_s: 400.0
   acceleration_microsteps_s2: 10000.0
   current_limit_a: 2.0
+# Ricerca del riferimento MIN: questa procedura definisce lo zero logico.
 homing:
   search_distance_mm: 1000.0
   release_distance_mm: 10.0
   velocity_microsteps_s: 400.0
   timeout_seconds: 30.0
+# Parametri del semplice ciclo automatico manuale (non della scansione SAR).
 cycle:
   step_mm: 100.0
   wait_seconds: 2.000000238418579

@@ -1,3 +1,5 @@
+"""Regressioni sul rilascio robusto di processi, code e risorse condivise."""
+
 from __future__ import annotations
 
 import queue
@@ -78,6 +80,34 @@ class FakeProcessBase:
         self.closed = True
 
 
+def _capture_metadata_store() -> main_refactory.CaptureMetadataStore:
+    return main_refactory.CaptureMetadataStore(
+        buffer=mp.RawArray("B", main_refactory.CAPTURE_METADATA_BUFFER_BYTES),
+        byte_count=mp.Value("I", 0),
+        session_id=mp.Value("I", 0),
+        lock=mp.Lock(),
+    )
+
+
+def _publish_capture_metadata(
+    store: main_refactory.CaptureMetadataStore,
+    *,
+    session_id: int,
+    position_id: int,
+    position_mm: float,
+    position_microsteps: int,
+) -> None:
+    metadata = main_refactory.normalize_capture_metadata(
+        position_id,
+        {
+            "position": position_id,
+            "carriage_position_mm": position_mm,
+            "carriage_microsteps": position_microsteps,
+        },
+    )
+    main_refactory.write_capture_metadata(store, session_id, metadata)
+
+
 def _runtime(tmp_path: Path) -> OfflineBPRuntime:
     offline_cfg = tmp_path / "offline_config.yaml"
     fallback_cfg = tmp_path / "Config.yaml"
@@ -133,13 +163,13 @@ def test_logger_flushes_pending_buffer_on_stop(tmp_path: Path, monkeypatch: pyte
     cap_pos_id = mp.Value("i", 7)
     cap_id = mp.Value("I", 0)
     cap_saved = mp.Value("i", 0)
-    cap_position_mm = mp.Value("d", 12.5)
-    cap_position_microsteps = mp.Value("q", 1000)
+    capture_metadata = _capture_metadata_store()
     cap_cancel_id = mp.Value("I", 0)
     cap_done_id = mp.Value("I", 0)
     cap_result = mp.Value("i", 0)
     log_bytes = mp.Value("L", 0)
     stop_evt = threading.Event()
+    ready_evt = threading.Event()
     out_dir_shared = mp.Array("u", 1024, lock=True)
     main_refactory._write_shared_text(out_dir_shared, str(tmp_path))
 
@@ -157,28 +187,37 @@ def test_logger_flushes_pending_buffer_on_stop(tmp_path: Path, monkeypatch: pyte
             "cap_pos_id": cap_pos_id,
             "cap_id": cap_id,
             "cap_saved": cap_saved,
-            "cap_position_mm": cap_position_mm,
-            "cap_position_microsteps": cap_position_microsteps,
+            "capture_metadata": capture_metadata,
             "cap_cancel_id": cap_cancel_id,
             "cap_done_id": cap_done_id,
             "cap_result": cap_result,
             "log_bytes": log_bytes,
             "stop_evt": stop_evt,
-                "out_dir_shared": out_dir_shared,
+            "out_dir_shared": out_dir_shared,
             "frames_per_position": 2,
             "block_frames": 4,
+            "ready_evt": ready_evt,
         },
         daemon=True,
     )
     worker.start()
+    assert ready_evt.wait(1.0)
+
+    _publish_capture_metadata(
+        capture_metadata,
+        session_id=1,
+        position_id=7,
+        position_mm=12.5,
+        position_microsteps=1000,
+    )
 
     with cap_active.get_lock():
         cap_active.value = 1
+    with cap_id.get_lock():
+        cap_id.value = 1
 
     deadline = time.perf_counter() + 2.0
     while time.perf_counter() < deadline:
-        with cap_id.get_lock():
-            cap_id.value = (int(cap_id.value) + 1) & 0xFFFFFFFF
         with cap_saved.get_lock():
             if int(cap_saved.value) == 1:
                 break
@@ -215,8 +254,7 @@ def test_logger_completion_releases_surplus_capture_slots(
     cap_pos_id = mp.Value("i", 7)
     cap_id = mp.Value("I", 0)
     cap_saved = mp.Value("i", 0)
-    cap_position_mm = mp.Value("d", 1.0)
-    cap_position_microsteps = mp.Value("q", 10)
+    capture_metadata = _capture_metadata_store()
     cap_cancel_id = mp.Value("I", 0)
     cap_done_id = mp.Value("I", 0)
     cap_result = mp.Value("i", 0)
@@ -240,14 +278,13 @@ def test_logger_completion_releases_surplus_capture_slots(
             "cap_pos_id": cap_pos_id,
             "cap_id": cap_id,
             "cap_saved": cap_saved,
-            "cap_position_mm": cap_position_mm,
-            "cap_position_microsteps": cap_position_microsteps,
+            "capture_metadata": capture_metadata,
             "cap_cancel_id": cap_cancel_id,
             "cap_done_id": cap_done_id,
             "cap_result": cap_result,
             "log_bytes": log_bytes,
             "stop_evt": stop_evt,
-                "out_dir_shared": out_dir_shared,
+            "out_dir_shared": out_dir_shared,
             "frames_per_position": 1,
             "block_frames": 4,
             "ready_evt": ready_evt,
@@ -256,6 +293,13 @@ def test_logger_completion_releases_surplus_capture_slots(
     )
     worker.start()
     assert ready_evt.wait(1.0)
+    _publish_capture_metadata(
+        capture_metadata,
+        session_id=1,
+        position_id=7,
+        position_mm=1.0,
+        position_microsteps=10,
+    )
     with cap_active.get_lock():
         cap_active.value = 1
     with cap_id.get_lock():
@@ -305,8 +349,7 @@ def test_logger_reports_flush_failure_as_capture_failure(
     cap_pos_id = mp.Value("i", 9)
     cap_id = mp.Value("I", 0)
     cap_saved = mp.Value("i", 0)
-    cap_position_mm = mp.Value("d", 2.0)
-    cap_position_microsteps = mp.Value("q", 20)
+    capture_metadata = _capture_metadata_store()
     cap_cancel_id = mp.Value("I", 0)
     cap_done_id = mp.Value("I", 0)
     cap_result = mp.Value("i", 0)
@@ -329,14 +372,13 @@ def test_logger_reports_flush_failure_as_capture_failure(
             "cap_pos_id": cap_pos_id,
             "cap_id": cap_id,
             "cap_saved": cap_saved,
-            "cap_position_mm": cap_position_mm,
-            "cap_position_microsteps": cap_position_microsteps,
+            "capture_metadata": capture_metadata,
             "cap_cancel_id": cap_cancel_id,
             "cap_done_id": cap_done_id,
             "cap_result": cap_result,
             "log_bytes": mp.Value("L", 0),
             "stop_evt": stop_evt,
-                "out_dir_shared": out_dir_shared,
+            "out_dir_shared": out_dir_shared,
             "frames_per_position": 1,
             "block_frames": 4,
             "ready_evt": ready_evt,
@@ -345,6 +387,13 @@ def test_logger_reports_flush_failure_as_capture_failure(
     )
     worker.start()
     assert ready_evt.wait(1.0)
+    _publish_capture_metadata(
+        capture_metadata,
+        session_id=1,
+        position_id=9,
+        position_mm=2.0,
+        position_microsteps=20,
+    )
     cap_active.value = 1
     cap_id.value = 1
     deadline = time.perf_counter() + 2.0

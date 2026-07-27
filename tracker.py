@@ -1,3 +1,10 @@
+"""Tracciamento multi-oggetto delle detection prodotte dal DSP realtime.
+
+Il modulo separa le detection grezze dai track persistenti: predice lo stato
+con un filtro di Kalman, associa le misure tramite gating spaziale/Doppler e
+gestisce il ciclo di vita ``tentative -> confirmed -> deleted``.
+"""
+
 from __future__ import annotations
 
 from collections import deque
@@ -23,6 +30,12 @@ _LARGE_COST = 1e6
 
 
 class DetectionLike(Protocol):
+    """Contratto minimo della detection consumata dal tracker.
+
+    Le implementazioni concrete arrivano dal DSP; il protocollo evita che il
+    tracker dipenda dalla loro specifica dataclass.
+    """
+
     range_m: float
     angle_deg: float
     doppler_mps: float | None
@@ -35,6 +48,8 @@ class DetectionLike(Protocol):
 
 @dataclass(frozen=True)
 class TrackingConfig:
+    """Regole di vita dei track, indipendenti dal modello di moto."""
+
     enabled: bool = True
     dt_s: float | None = None
     max_tracks: int = 30
@@ -46,6 +61,8 @@ class TrackingConfig:
 
 @dataclass(frozen=True)
 class TrackerConfig:
+    """Parametri del filtro di Kalman, del gating e della classificazione moto."""
+
     model: str = "kalman_cv_2d"
     gating_xy_m: float = 0.75
     gating_doppler_mps: float = 0.50
@@ -68,6 +85,12 @@ class TrackerConfig:
 
 @dataclass
 class Track:
+    """Stato persistente di un bersaglio, con vettore ``[x, y, vx, vy]``.
+
+    ``state_vector`` e ``covariance`` restano interni al filtro; le proprietà
+    espongono le unità fisiche usate dal resto dell'applicazione.
+    """
+
     track_id: int
     state_vector: np.ndarray = field(repr=False)
     covariance: np.ndarray = field(repr=False)
@@ -189,6 +212,8 @@ class Track:
 
 @dataclass(frozen=True)
 class Measurement:
+    """Copia normalizzata di una detection valida, pronta per l'associazione."""
+
     x_m: float
     y_m: float
     range_m: float
@@ -202,6 +227,8 @@ class Measurement:
 
 @dataclass(frozen=True)
 class TrackerDebugSnapshot:
+    """Contatori dell'ultimo ciclo, utili per log e diagnostica della GUI."""
+
     assignment: str
     detections_in: int
     detections_used: int
@@ -222,6 +249,8 @@ def _clamp(value: float, low: float, high: float) -> float:
 
 
 class MultiObjectTracker:
+    """Tracker a velocità costante 2D con associazione one-to-one delle misure."""
+
     def __init__(self, tracking_cfg: TrackingConfig, tracker_cfg: TrackerConfig):
         self.tracking_cfg = tracking_cfg
         self.tracker_cfg = tracker_cfg
@@ -271,6 +300,12 @@ class MultiObjectTracker:
         self._last_dt_s = self._fallback_dt_s()
 
     def step(self, detections: list[DetectionLike], timestamp_s: float | None = None) -> list[Track]:
+        """Avanza il tracker di un frame e restituisce i track ancora vivi.
+
+        L'ordine è intenzionale: prima predizione, poi associazione/aggiornamento,
+        quindi gestione delle assenze e nascita di nuovi track.  In questo modo
+        una detection non può aggiornare due track nello stesso frame.
+        """
         if not self.tracking_cfg.enabled:
             self.reset()
             return []
@@ -279,6 +314,7 @@ class MultiObjectTracker:
         dt_s = self._resolve_dt(now_s)
         measurements, invalid_count = self._sanitize_detections(detections)
 
+        # La predizione porta tutti i track allo stesso istante della misura.
         self._predict_stage(dt_s, now_s)
         matches, unmatched_tracks, unmatched_measurements, assoc_debug = self._associate_stage(measurements, now_s)
         self._update_stage(matches, measurements, now_s)
@@ -337,6 +373,8 @@ class MultiObjectTracker:
             dt_s = self._last_dt_s
         if not math.isfinite(dt_s) or dt_s <= 0.0:
             dt_s = self._fallback_dt_s()
+        # Evita che un timestamp duplicato o una lunga pausa della GUI faccia
+        # collassare o esplodere la covarianza del filtro a velocità costante.
         dt_s = float(min(max(dt_s, 1e-3), 1.0))
         self._last_timestamp_s = float(timestamp_s)
         self._last_dt_s = dt_s
@@ -423,6 +461,8 @@ class MultiObjectTracker:
         )
 
     def _build_state_transition(self, dt_s: float) -> np.ndarray:
+        # Modello CV per stato [x, y, vx, vy]: la posizione avanza di v*dt,
+        # mentre la velocità resta costante fino alla prossima misura.
         return np.array(
             [
                 [1.0, 0.0, dt_s, 0.0],
@@ -475,6 +515,8 @@ class MultiObjectTracker:
         dt4 = dt2 * dt2
         q_vel = max(self.tracker_cfg.process_noise_vel, 1e-3) ** 2
         q_pos = max(self.tracker_cfg.process_noise_pos, 1e-3) ** 2
+        # Rumore di accelerazione discreto del modello CV più un floor
+        # posizionale: il filtro può adattarsi a manovre e a misura rumorosa.
         q_cv = q_vel * np.array(
             [
                 [0.25 * dt4, 0.0, 0.5 * dt3, 0.0],
@@ -507,6 +549,8 @@ class MultiObjectTracker:
                 "gating_reject_doppler": 0,
             }
 
+        # I pair fuori gate mantengono il costo sentinella e non potranno essere
+        # selezionati né dall'algoritmo ungherese né dal fallback greedy.
         cost_matrix = np.full((n_tracks, n_meas), _LARGE_COST, dtype=np.float64)
         reject_xy = 0
         reject_doppler = 0
@@ -638,6 +682,8 @@ class MultiObjectTracker:
         k_mat = pht @ s_inv
         track.state_vector = track.state_vector + (k_mat @ innovation)
         i_kh = self._i4 - (k_mat @ self._h_mat)
+        # Forma di Joseph: mantiene la covarianza simmetrica e semidefinita
+        # positiva anche con errori numerici delle matrici in float64.
         track.covariance = i_kh @ track.covariance @ i_kh.T + (k_mat @ self._r_mat @ k_mat.T)
         track.covariance = 0.5 * (track.covariance + track.covariance.T)
         track.hits += 1
@@ -649,6 +695,7 @@ class MultiObjectTracker:
             track.state = "confirmed"
 
     def _mark_unmatched(self, track: Track, now_s: float) -> bool:
+        """Applica la politica di sopravvivenza a un track senza misura associata."""
         max_age = int(max(0, self.tracking_cfg.max_track_age))
         if max_age > 0 and track.age > max_age:
             track.state = "deleted"
@@ -713,6 +760,9 @@ class MultiObjectTracker:
         if available_slots <= 0 or not unmatched_measurements:
             return 0
 
+        # In caso di capacità limitata, privilegia prima i target mobili e poi
+        # le detection più energetiche: i nuovi track meno affidabili restano
+        # fuori finché non si libera uno slot.
         ranked = sorted(
             unmatched_measurements,
             key=lambda meas_idx: (
@@ -832,6 +882,11 @@ class MultiObjectTracker:
         return radial_velocity
 
     def _update_motion_state(self, track: Track, meas: Measurement, now_s: float) -> None:
+        """Conferma i passaggi moving/stopped con evidenza su più frame.
+
+        La doppia soglia e i contatori evitano che rumore Doppler o una singola
+        detection statica facciano oscillare la classificazione.
+        """
         move_confirm = max(1, int(self.tracker_cfg.motion_confirm_frames_moving))
         stop_confirm = max(1, int(self.tracker_cfg.motion_confirm_frames_stopped))
         speed_mps = float(track.speed_mps)

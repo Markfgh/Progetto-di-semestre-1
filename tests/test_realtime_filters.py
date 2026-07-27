@@ -1,3 +1,5 @@
+"""Test unitari dei filtri applicati prima e dopo la range FFT."""
+
 from __future__ import annotations
 
 import numpy as np

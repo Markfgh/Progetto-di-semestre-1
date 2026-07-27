@@ -80,11 +80,6 @@ dsp:
   diagnostics:
     log_cpu_runtime: false # Logs actual CPU affinity/SIMD/FFT/JIT runtime exposure for this DSP process.
   
-  calibration:
-    enabled: false
-    vector_real: [1.000000, 0.999575, 0.940848, 0.968703, 0.964520, 0.980703, 0.996999, 0.999461]
-    vector_imag: [0.000000, -0.029159, -0.338830, -0.248224, 0.264009, 0.195503, -0.077414, -0.032823]
-
   mean_before_range_fft:
     enabled: true # Keep enabled for a stable DC removal, especially in the presence of strong static targets.  
     axes: [sample] # Options: frame, loop, tx, sample, range_bin, rx.

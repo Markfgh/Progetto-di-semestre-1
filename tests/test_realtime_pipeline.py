@@ -1,3 +1,5 @@
+"""Test end-to-end della pipeline realtime su frame radar artificiali."""
+
 from __future__ import annotations
 
 import math
@@ -168,7 +170,7 @@ def _run_display_process(
     if display_zoom_runtime is not None:
         process_kwargs["display_zoom_runtime"] = display_zoom_runtime
 
-    heatmap_ema, _, _ = realtime_dsp.process_buffer(
+    heatmap_ema, _ = realtime_dsp.process_buffer(
         _raw_target(
             samples=samples,
             loops=loops,
@@ -209,9 +211,6 @@ def _run_display_process(
         realtime_dsp.BackgroundSubtractionState(),
         realtime_dsp.BackgroundSubtractionState(),
         None,
-        False,
-        np.ones(dsp_cfg.virtual_ant, dtype=np.complex64),
-        False,
         None,
         None,
         np.empty((n_frames, loops, dsp_cfg.tx, 20, dsp_cfg.rx), dtype=np.complex64),
@@ -348,9 +347,6 @@ def test_process_buffer_publishes_angle_and_doppler_diagnostics():
         realtime_dsp.BackgroundSubtractionState(),
         realtime_dsp.BackgroundSubtractionState(),
         None,
-        False,
-        np.ones(dsp_cfg.virtual_ant, dtype=np.complex64),
-        False,
         np.empty((n_frames, loops, 20, dsp_cfg.tx, dsp_cfg.rx), dtype=np.complex64),
         np.empty((n_frames, loops, 20, dsp_cfg.virtual_ant), dtype=np.complex64),
         np.empty((n_frames, loops, dsp_cfg.tx, 20, dsp_cfg.rx), dtype=np.complex64),
@@ -419,7 +415,7 @@ def test_process_buffer_synthetic_static_target_outputs_detection_and_finite_vie
     )
     profiles_out = np.empty((dsp_cfg.range_profile_count, samples), dtype=np.float32)
 
-    heatmap_ema, detections, cal_vector = realtime_dsp.process_buffer(
+    heatmap_ema, detections = realtime_dsp.process_buffer(
         raw,
         n_frames,
         np.ones((1, 1, 1, samples, 1), dtype=np.float32),
@@ -461,9 +457,6 @@ def test_process_buffer_synthetic_static_target_outputs_detection_and_finite_vie
         realtime_dsp.BackgroundSubtractionState(),
         realtime_dsp.BackgroundSubtractionState(),
         None,
-        False,
-        np.ones(dsp_cfg.virtual_ant, dtype=np.complex64),
-        False,
         None,
         None,
         None,
@@ -497,7 +490,6 @@ def test_process_buffer_synthetic_static_target_outputs_detection_and_finite_vie
     assert np.all(np.isfinite(gui_heat_views[1]))
     assert np.all(np.isfinite(gui_profile_views[1]))
     assert np.all(np.isfinite(profiles_out))
-    np.testing.assert_allclose(cal_vector, np.ones(dsp_cfg.virtual_ant, dtype=np.complex64))
 
 
 def test_range_angle_moving_reports_signed_doppler_and_alpha_for_synthetic_target() -> None:
@@ -760,7 +752,7 @@ def test_process_buffer_zoom_args_leave_tracking_detections_unchanged() -> None:
         display_viewport: realtime_dsp.DisplayViewport,
         display_zoom_cfg: realtime_dsp.DisplayZoomConfig,
         display_zoom_runtime: realtime_dsp.DisplayZoomRuntime,
-    ) -> tuple[np.ndarray | None, list[realtime_dsp.Detection], np.ndarray]:
+    ) -> tuple[np.ndarray | None, list[realtime_dsp.Detection]]:
         gui_heat_views = (
             np.full(gui_h * gui_w, -120.0, dtype=np.float32),
             np.full(gui_h * gui_w, -120.0, dtype=np.float32),
@@ -812,9 +804,6 @@ def test_process_buffer_zoom_args_leave_tracking_detections_unchanged() -> None:
             realtime_dsp.BackgroundSubtractionState(),
             realtime_dsp.BackgroundSubtractionState(),
             None,
-            False,
-            np.ones(dsp_cfg.virtual_ant, dtype=np.complex64),
-            False,
             None,
             None,
             None,
@@ -841,21 +830,20 @@ def test_process_buffer_zoom_args_leave_tracking_detections_unchanged() -> None:
             display_zoom_runtime=display_zoom_runtime,
         )
 
-    _, detections_base, cal_base = _run_detection(
+    _, detections_base = _run_detection(
         display_viewport=home_viewport,
         display_zoom_cfg=realtime_dsp.DisplayZoomConfig(
             enabled=False,
         ),
         display_zoom_runtime=realtime_dsp.DisplayZoomRuntime(home_viewport=home_viewport),
     )
-    _, detections_zoom, cal_zoom = _run_detection(
+    _, detections_zoom = _run_detection(
         display_viewport=zoom_viewport,
         display_zoom_cfg=zoom_cfg,
         display_zoom_runtime=realtime_dsp.DisplayZoomRuntime(home_viewport=home_viewport),
     )
 
     assert detections_base == detections_zoom
-    np.testing.assert_allclose(cal_base, cal_zoom, rtol=0.0, atol=0.0)
 
 
 def test_range_angle_moving_ignores_normalize_to_peak() -> None:
