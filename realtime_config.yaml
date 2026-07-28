@@ -5,7 +5,7 @@ radar:
   # The realtime DSP uses the positive FFT half: its physical range limit is
   # c*fs/(4*slope) = 12.50 m.
   slope: 60.012e12       # FMCW slope [Hz/s]; must match the applied mmWave Studio value.
-  fc: 78.80036e9         # Sweep centre [Hz] for 77 GHz start + 3600.72 MHz sweep.
+  fc: 78.125e9         # Sweep centre [Hz] for 77 GHz start + 3600.72 MHz sweep.
   chirp_period_s: 160e-6 # PRI [s] = idle 100 us + ramp 60 us; must match mmWave Studio.
 
 capture:
@@ -260,7 +260,7 @@ debug:
   print_top_peaks_angle_max_deg: 90.0 # Optional upper bound for debug angle search.
 
 sar:
-  frames_per_position: 16
+  frames_per_position: 2
   settling_delay_s: 1
   # Timeout usati dal coordinatore della scansione SAR automatica in main.
   scan_motion_timeout_s: 120.0

@@ -56,7 +56,7 @@ from offline_dsp import (
     prepare_synthetic_aperture_data as _prepare_synthetic_aperture_data,
     synthetic_aperture_uniform_spacing_lambda as _synthetic_aperture_uniform_spacing_lambda,
 )
-from shutdown_utils import cleanup_processes, close_queues
+from process_cleanup import cleanup_processes, close_queues
 
 _CAPTURE_FILE_RE = re.compile(r"^capture_pos(-?\d+)\.bin$")
 _CAPTURE_HEADER_MAGIC = b"RTPBIN1\x00"
@@ -2534,7 +2534,7 @@ class OfflineBPRuntime:
         self,
         *,
         offline_config_path: str | Path = "offline_config.yaml",
-        fallback_capture_cfg: str | Path = "Config.yaml",
+        fallback_capture_cfg: str | Path = "realtime_config.yaml",
         c_m_s: float,
         fs_hz: float,
         slope_hz_s: float,

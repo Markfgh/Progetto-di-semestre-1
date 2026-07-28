@@ -117,7 +117,7 @@ def _write_capture(
     path.write_bytes(b"RTPBIN1\x00" + struct.pack("<I", len(header)) + header + raw)
 def test_read_bp_runtime_cfg_rejects_invalid_reconstruction_algorithm(tmp_path: Path) -> None:
     offline_cfg = tmp_path / "offline_config.yaml"
-    fallback_cfg = tmp_path / "Config.yaml"
+    fallback_cfg = tmp_path / "realtime_config.yaml"
     _write_yaml(offline_cfg, _offline_reconstruction_cfg(algorithm="wrong_mode"))
     _write_yaml(fallback_cfg, _fallback_capture_cfg())
 
@@ -127,7 +127,7 @@ def test_read_bp_runtime_cfg_rejects_invalid_reconstruction_algorithm(tmp_path: 
 
 def test_read_bp_runtime_cfg_mimo_sar_keeps_physical_offset_overrides(tmp_path: Path) -> None:
     offline_cfg = tmp_path / "offline_config.yaml"
-    fallback_cfg = tmp_path / "Config.yaml"
+    fallback_cfg = tmp_path / "realtime_config.yaml"
     tx_offsets = [0.0, 0.01]
     rx_offsets = [0.0, 0.002, 0.004, 0.006]
     _write_yaml(
@@ -152,7 +152,7 @@ def test_read_bp_runtime_cfg_parses_residual_video_phase(
     expected: int,
 ) -> None:
     offline_cfg = tmp_path / "offline_config.yaml"
-    fallback_cfg = tmp_path / "Config.yaml"
+    fallback_cfg = tmp_path / "realtime_config.yaml"
     _write_yaml(offline_cfg, _offline_reconstruction_cfg(residual_video_phase=configured))
     _write_yaml(fallback_cfg, _fallback_capture_cfg())
 
@@ -163,7 +163,7 @@ def test_read_bp_runtime_cfg_parses_residual_video_phase(
 
 def test_offline_map_bounds_are_loaded_from_reconstruction_config(tmp_path: Path) -> None:
     offline_cfg = tmp_path / "offline_config.yaml"
-    fallback_cfg = tmp_path / "Config.yaml"
+    fallback_cfg = tmp_path / "realtime_config.yaml"
     _write_yaml(
         offline_cfg,
         {
@@ -206,7 +206,7 @@ def test_offline_map_bounds_validate_physical_rectangle(bounds: dict, error: str
 
 def test_read_bp_runtime_cfg_parses_empty_scene_reference_background(tmp_path: Path) -> None:
     offline_cfg = tmp_path / "offline_config.yaml"
-    fallback_cfg = tmp_path / "Config.yaml"
+    fallback_cfg = tmp_path / "realtime_config.yaml"
     _write_yaml(
         offline_cfg,
         {
@@ -241,7 +241,7 @@ def test_read_bp_runtime_cfg_rejects_invalid_empty_scene_reference_background(
     error: str,
 ) -> None:
     offline_cfg = tmp_path / "offline_config.yaml"
-    fallback_cfg = tmp_path / "Config.yaml"
+    fallback_cfg = tmp_path / "realtime_config.yaml"
     _write_yaml(
         offline_cfg,
         {
@@ -257,7 +257,7 @@ def test_read_bp_runtime_cfg_rejects_invalid_empty_scene_reference_background(
 
 def test_reference_background_is_supported_for_synthetic_range_angle(tmp_path: Path) -> None:
     offline_cfg = tmp_path / "offline_config.yaml"
-    fallback_cfg = tmp_path / "Config.yaml"
+    fallback_cfg = tmp_path / "realtime_config.yaml"
     _write_yaml(
         offline_cfg,
         {
@@ -304,7 +304,7 @@ def test_subtract_reference_background_validates_antenna_and_range_shape() -> No
 
 def test_read_bp_runtime_cfg_parses_synthetic_range_angle_settings(tmp_path: Path) -> None:
     offline_cfg = tmp_path / "offline_config.yaml"
-    fallback_cfg = tmp_path / "Config.yaml"
+    fallback_cfg = tmp_path / "realtime_config.yaml"
     _write_yaml(
         offline_cfg,
         {
@@ -357,7 +357,7 @@ def test_read_bp_runtime_cfg_parses_synthetic_range_angle_settings(tmp_path: Pat
 
 def test_offline_synthetic_range_angle_does_not_inherit_realtime_slow_time_filter(tmp_path: Path) -> None:
     offline_cfg = tmp_path / "offline_config.yaml"
-    fallback_cfg = tmp_path / "Config.yaml"
+    fallback_cfg = tmp_path / "realtime_config.yaml"
     _write_yaml(
         offline_cfg,
         {
@@ -385,7 +385,7 @@ def test_offline_synthetic_range_angle_does_not_inherit_realtime_slow_time_filte
 
 def test_read_bp_runtime_cfg_inherits_fft_sizes_when_not_overridden(tmp_path: Path) -> None:
     offline_cfg = tmp_path / "offline_config.yaml"
-    fallback_cfg = tmp_path / "Config.yaml"
+    fallback_cfg = tmp_path / "realtime_config.yaml"
     _write_yaml(offline_cfg, _offline_reconstruction_cfg(algorithm="synthetic_range_angle"))
     _write_yaml(
         fallback_cfg,
@@ -624,7 +624,7 @@ def test_offline_reader_worker_publishes_compact_zero_doppler_cube(
     _write_capture(run_dir / "capture_pos1.bin", position=1)
     _write_capture(run_dir / "capture_pos2.bin", position=2)
     offline_cfg = tmp_path / "offline_config.yaml"
-    fallback_cfg = tmp_path / "Config.yaml"
+    fallback_cfg = tmp_path / "realtime_config.yaml"
     _write_yaml(
         offline_cfg,
         {
@@ -705,7 +705,7 @@ def test_offline_reader_subtracts_empty_scene_reference_with_different_frame_cou
         )
 
     offline_cfg = tmp_path / "offline_config.yaml"
-    fallback_cfg = tmp_path / "Config.yaml"
+    fallback_cfg = tmp_path / "realtime_config.yaml"
     _write_yaml(
         offline_cfg,
         {

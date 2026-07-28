@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from tracker import MultiObjectTracker, TrackerConfig, TrackingConfig
+from multi_object_tracker import MultiObjectTracker, TrackerConfig, TrackingConfig
 
 
 def _det(

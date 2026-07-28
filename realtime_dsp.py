@@ -32,7 +32,7 @@ except Exception as _numba_import_exc:  # pragma: no cover - depends on optional
 else:  # pragma: no cover - exercised only when numba is installed
     _NUMBA_IMPORT_ERROR = None
 
-from tracker import MultiObjectTracker, Track, TrackerConfig, TrackingConfig
+from multi_object_tracker import MultiObjectTracker, Track, TrackerConfig, TrackingConfig
 
 # Diciamo a SciPy di usare il motore di FFTW sotto il cofano
 pyfftw.interfaces.cache.enable()

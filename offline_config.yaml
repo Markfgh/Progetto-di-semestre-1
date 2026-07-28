@@ -1,7 +1,7 @@
 data:
   # Puoi mettere direttamente una run: logs/run_YYYYMMDD_HHMMSS
   # Se lasci "logs", SARReader prende automaticamente l'ultima run con capture_pos*.bin.
-  input_dir: "logs\\run_20260724_095618"
+  input_dir: "logs\\run_20260724_094250"
   # Maximum time allowed to prepare all offline data before reporting a timeout.
   startup_timeout_s: 3600
 
@@ -17,16 +17,18 @@ scan:
   # stage.position_mm coordinates stored in each capture header.
   x_pitch_m: 0.007792000193148851 # 7.792 mm pitch
 
+
+
 reconstruction:
   algorithm: "backprojection" # Options: backprojection, synthetic_range_angle.
   # Full physical rectangle reconstructed by "Full map".  ROI controls are
   # constrained to this domain and reconstruct their selected sector on the
   # fixed offline image grid.
   map_bounds:
-    x_min_m: -5.0
-    x_max_m: 5.0
-    y_min_m: 0.0
-    y_max_m: 10.0
+    x_min_m: -0.4000000059604645
+    x_max_m: 0.4000000059604645
+    y_min_m: 2.299999952316284
+    y_max_m: 3.299999952316284
 
 bp:
   phase_sign: -1
@@ -62,13 +64,13 @@ offline_sar_range_angle:
   # in Bartlett/MVDR indica invece il numero di punti della griglia angolare.
   nfft_range: 16384
   nfft_angle: 16384
-  window_range: "blackman"
+  window_range: "hamming"
   window_doppler: "blackman"
-  window_angle: "blackman"
+  window_angle: "none"
   zero_after_range_fft_bins: 0
 
   mean_after_range_fft:
-    enabled: false
+    enabled: true
     axes: [range_bin]
 
   angle_processing:

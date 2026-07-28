@@ -26,7 +26,7 @@ from Phidget22.Devices.Stepper import Stepper
 from Phidget22.PhidgetException import PhidgetException
 
 
-CONFIG_PATH = Path(__file__).with_name("phidget_stepper_config.yaml")
+CONFIG_PATH = Path(__file__).with_name("phidget_stepper.yaml")
 MICROSTEPS_PER_FULL_STEP = 16
 
 

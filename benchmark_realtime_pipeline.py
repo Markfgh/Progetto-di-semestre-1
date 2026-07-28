@@ -347,7 +347,7 @@ def benchmark_process_buffer(*, workers: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Manual realtime DSP benchmarks.")
-    parser.add_argument("--config", type=Path, default=Path(__file__).with_name("Config.yaml"))
+    parser.add_argument("--config", type=Path, default=Path(__file__).with_name("realtime_config.yaml"))
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--fft-workers", type=int, nargs="+", default=None, help="Optional FFT worker counts to sweep.")
     parser.add_argument("--skip-e2e", action="store_true")

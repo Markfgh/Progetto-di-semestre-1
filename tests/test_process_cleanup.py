@@ -10,10 +10,10 @@ from pathlib import Path
 import multiprocessing as mp
 import pytest
 
-import main_refactory
+import radar_app
 import offline_processing
 from offline_processing import OfflineBPRuntime
-from shutdown_utils import cleanup_processes, close_queues, process_is_alive
+from process_cleanup import cleanup_processes, close_queues, process_is_alive
 
 
 class FakeQueue:
@@ -80,9 +80,9 @@ class FakeProcessBase:
         self.closed = True
 
 
-def _capture_metadata_store() -> main_refactory.CaptureMetadataStore:
-    return main_refactory.CaptureMetadataStore(
-        buffer=mp.RawArray("B", main_refactory.CAPTURE_METADATA_BUFFER_BYTES),
+def _capture_metadata_store() -> radar_app.CaptureMetadataStore:
+    return radar_app.CaptureMetadataStore(
+        buffer=mp.RawArray("B", radar_app.CAPTURE_METADATA_BUFFER_BYTES),
         byte_count=mp.Value("I", 0),
         session_id=mp.Value("I", 0),
         lock=mp.Lock(),
@@ -90,14 +90,14 @@ def _capture_metadata_store() -> main_refactory.CaptureMetadataStore:
 
 
 def _publish_capture_metadata(
-    store: main_refactory.CaptureMetadataStore,
+    store: radar_app.CaptureMetadataStore,
     *,
     session_id: int,
     position_id: int,
     position_mm: float,
     position_microsteps: int,
 ) -> None:
-    metadata = main_refactory.normalize_capture_metadata(
+    metadata = radar_app.normalize_capture_metadata(
         position_id,
         {
             "position": position_id,
@@ -105,12 +105,12 @@ def _publish_capture_metadata(
             "carriage_microsteps": position_microsteps,
         },
     )
-    main_refactory.write_capture_metadata(store, session_id, metadata)
+    radar_app.write_capture_metadata(store, session_id, metadata)
 
 
 def _runtime(tmp_path: Path) -> OfflineBPRuntime:
     offline_cfg = tmp_path / "offline_config.yaml"
-    fallback_cfg = tmp_path / "Config.yaml"
+    fallback_cfg = tmp_path / "realtime_config.yaml"
     offline_cfg.write_text("{}", encoding="utf-8")
     fallback_cfg.write_text("{}", encoding="utf-8")
     return OfflineBPRuntime(
@@ -148,8 +148,8 @@ def test_cleanup_helpers_are_idempotent() -> None:
 
 
 def test_logger_flushes_pending_buffer_on_stop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(main_refactory, "BYTES_PER_FRAME", 4)
-    monkeypatch.setattr(main_refactory, "_build_capture_file_header", lambda pos_id, **_kwargs: b"HDR")
+    monkeypatch.setattr(radar_app, "BYTES_PER_FRAME", 4)
+    monkeypatch.setattr(radar_app, "_build_capture_file_header", lambda pos_id, **_kwargs: b"HDR")
 
     free_slots: queue.Queue[int] = queue.Queue()
     shm_frames = bytearray(b"ABCD")
@@ -171,10 +171,10 @@ def test_logger_flushes_pending_buffer_on_stop(tmp_path: Path, monkeypatch: pyte
     stop_evt = threading.Event()
     ready_evt = threading.Event()
     out_dir_shared = mp.Array("u", 1024, lock=True)
-    main_refactory._write_shared_text(out_dir_shared, str(tmp_path))
+    radar_app._write_shared_text(out_dir_shared, str(tmp_path))
 
     worker = threading.Thread(
-        target=main_refactory.logger_worker,
+        target=radar_app.logger_worker,
         kwargs={
             "free_slots": free_slots,
             "shm_frames": shm_frames,
@@ -240,8 +240,8 @@ def test_logger_completion_releases_surplus_capture_slots(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Frame gia' taggati oltre il target non devono consumare il ring."""
-    monkeypatch.setattr(main_refactory, "BYTES_PER_FRAME", 4)
-    monkeypatch.setattr(main_refactory, "_build_capture_file_header", lambda pos_id, **_kwargs: b"HDR")
+    monkeypatch.setattr(radar_app, "BYTES_PER_FRAME", 4)
+    monkeypatch.setattr(radar_app, "_build_capture_file_header", lambda pos_id, **_kwargs: b"HDR")
 
     free_slots: queue.Queue[int] = queue.Queue()
     shm_frames = bytearray(b"ABCDEFGH")
@@ -262,10 +262,10 @@ def test_logger_completion_releases_surplus_capture_slots(
     stop_evt = threading.Event()
     ready_evt = threading.Event()
     out_dir_shared = mp.Array("u", 1024, lock=True)
-    main_refactory._write_shared_text(out_dir_shared, str(tmp_path))
+    radar_app._write_shared_text(out_dir_shared, str(tmp_path))
 
     worker = threading.Thread(
-        target=main_refactory.logger_worker,
+        target=radar_app.logger_worker,
         kwargs={
             "free_slots": free_slots,
             "shm_frames": shm_frames,
@@ -325,8 +325,8 @@ def test_logger_reports_flush_failure_as_capture_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(main_refactory, "BYTES_PER_FRAME", 4)
-    monkeypatch.setattr(main_refactory, "_build_capture_file_header", lambda pos_id, **_kwargs: b"HDR")
+    monkeypatch.setattr(radar_app, "BYTES_PER_FRAME", 4)
+    monkeypatch.setattr(radar_app, "_build_capture_file_header", lambda pos_id, **_kwargs: b"HDR")
 
     class FlushFailingFile:
         def write(self, payload) -> int:
@@ -356,10 +356,10 @@ def test_logger_reports_flush_failure_as_capture_failure(
     stop_evt = threading.Event()
     ready_evt = threading.Event()
     out_dir_shared = mp.Array("u", 1024, lock=True)
-    main_refactory._write_shared_text(out_dir_shared, str(tmp_path))
+    radar_app._write_shared_text(out_dir_shared, str(tmp_path))
 
     worker = threading.Thread(
-        target=main_refactory.logger_worker,
+        target=radar_app.logger_worker,
         kwargs={
             "free_slots": free_slots,
             "shm_frames": bytearray(b"ABCD"),

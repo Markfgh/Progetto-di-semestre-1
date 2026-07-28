@@ -44,7 +44,7 @@ try:
     # Il backend non crea una finestra: la GUI standalone viene istanziata solo
     # sotto il suo ``if __name__ == '__main__'``.  Main resta quindi l'unico
     # proprietario del 1063 durante una scansione SAR.
-    from phidget_stepper_gui import PhidgetStepperController, load_config as load_stepper_config
+    from phidget_stepper_app import PhidgetStepperController, load_config as load_stepper_config
 except Exception as exc:  # Il radar può restare utilizzabile senza SDK Phidget.
     PhidgetStepperController = None
     load_stepper_config = None
@@ -393,8 +393,8 @@ from offline_processing import (
     SARReader,
     offline_map_bounds_from_yaml_dict,
 )
-from mmwave_studio_bridge import DCA1000Config, MmwaveStudioBridge, MmwaveStudioError, RadarConnectionConfig
-from shutdown_utils import cleanup_processes, close_queues
+from dca1000_bridge import DCA1000Config, MmwaveStudioBridge, MmwaveStudioError, RadarConnectionConfig
+from process_cleanup import cleanup_processes, close_queues
 from realtime_dsp import (
     AppliedViewportMeta,
     DisplayViewport,
@@ -417,7 +417,7 @@ from realtime_dsp import (
 
 
 # --- CONFIGURAZIONE ---
-CFG_PATH = Path(__file__).with_name("Config.yaml")  # <-- nome esatto del tuo file
+CFG_PATH = Path(__file__).with_name("realtime_config.yaml")  # <-- nome esatto del tuo file
 with CFG_PATH.open("r", encoding="utf-8") as f:
     cfg = yaml.safe_load(f)
 
@@ -2215,7 +2215,7 @@ def main():
         print("[STATS] psutil not available: using Windows fallback for CPU%.")
 
     # Il 1063 viene aperto soltanto da questa istanza di main.  La GUI
-    # standalone resta utile per configurare phidget_stepper_config.yaml, ma
+    # standalone resta utile per configurare phidget_stepper.yaml, ma
     # una volta iniziata la scansione non deve essere eseguita in parallelo.
     stepper_controller = None
     stepper_error = _PHIDGET_BACKEND_ERROR
@@ -2247,7 +2247,7 @@ def main():
         """Build an isolated offline runtime from the persisted configuration."""
         return OfflineBPRuntime(
             offline_config_path=Path(__file__).with_name("offline_config.yaml"),
-            fallback_capture_cfg=Path(__file__).with_name("Config.yaml"),
+            fallback_capture_cfg=Path(__file__).with_name("realtime_config.yaml"),
             c_m_s=float(C),
             fs_hz=float(FS),
             slope_hz_s=float(SLOPE),

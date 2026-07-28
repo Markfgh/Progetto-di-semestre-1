@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-import main_refactory
+import radar_app
 from sar_capture import (
     CaptureError,
     CaptureMetadataStore,
@@ -60,18 +60,18 @@ def test_capture_waits_for_matching_completed_session() -> None:
 
 
 def test_capture_header_and_offline_scan_config_include_stage_coordinates(tmp_path: Path) -> None:
-    header = main_refactory._build_capture_file_header(
+    header = radar_app._build_capture_file_header(
         7,
         carriage_position_mm=12.375,
         carriage_microsteps=439,
     )
-    prefix_len = len(main_refactory.CAPTURE_HEADER_MAGIC) + 4
-    assert header.startswith(main_refactory.CAPTURE_HEADER_MAGIC)
-    header_len = struct.unpack("<I", header[len(main_refactory.CAPTURE_HEADER_MAGIC) : prefix_len])[0]
+    prefix_len = len(radar_app.CAPTURE_HEADER_MAGIC) + 4
+    assert header.startswith(radar_app.CAPTURE_HEADER_MAGIC)
+    header_len = struct.unpack("<I", header[len(radar_app.CAPTURE_HEADER_MAGIC) : prefix_len])[0]
     payload = json.loads(header[prefix_len : prefix_len + header_len].decode("utf-8"))
     assert payload["format"] == "rt_capture_v1"
     assert payload["position"] == 7
-    assert payload["capture"]["frames_per_position"] == main_refactory.FRAMES_PER_POSITION
+    assert payload["capture"]["frames_per_position"] == radar_app.FRAMES_PER_POSITION
     assert payload["stage"] == {
         "reference": "phidget_home_min",
         "position_mm": 12.375,
@@ -88,18 +88,18 @@ def test_capture_header_and_offline_scan_config_include_stage_coordinates(tmp_pa
     )
     output_dir = tmp_path / "logs" / "run_test"
     output_dir.mkdir(parents=True)
-    pitch_mm = main_refactory.configure_offline_scan_for_run(
+    pitch_mm = radar_app.configure_offline_scan_for_run(
         offline_config,
         output_dir=output_dir,
         start_position_id=3,
         positions=4,
-        frames_per_position=main_refactory.FRAMES_PER_POSITION,
+        frames_per_position=radar_app.FRAMES_PER_POSITION,
     )
     with offline_config.open("r", encoding="utf-8") as handle:
-        saved = main_refactory.yaml.safe_load(handle)
+        saved = radar_app.yaml.safe_load(handle)
     assert pitch_mm == pytest.approx(7.792)
     assert saved["scan"] == {"x_start": 3, "x_end": 6, "x_step": 1, "x_pitch_m": 0.007792}
-    assert saved["capture"]["frames_per_position"] == main_refactory.FRAMES_PER_POSITION
+    assert saved["capture"]["frames_per_position"] == radar_app.FRAMES_PER_POSITION
     assert saved["data"]["input_dir"] == "logs\\run_test" or saved["data"]["input_dir"] == "logs/run_test"
     saved_text = offline_config.read_text(encoding="utf-8")
     assert "# commento da conservare" in saved_text
@@ -116,7 +116,7 @@ def test_manual_yaml_scalar_update_preserves_comments_and_nested_structure(tmp_p
         encoding="utf-8",
     )
 
-    main_refactory._update_existing_yaml_scalar_paths(
+    radar_app._update_existing_yaml_scalar_paths(
         config_path,
         {
             "data.input_dir": "logs/run_new",
@@ -127,7 +127,7 @@ def test_manual_yaml_scalar_update_preserves_comments_and_nested_structure(tmp_p
     )
 
     saved_text = config_path.read_text(encoding="utf-8")
-    saved = main_refactory.yaml.safe_load(saved_text)
+    saved = radar_app.yaml.safe_load(saved_text)
     assert saved["data"]["input_dir"] == "logs/run_new"
     assert saved["scan"]["x_pitch_m"] == pytest.approx(0.01)
     assert saved["outer"]["nested"]["enabled"] is True

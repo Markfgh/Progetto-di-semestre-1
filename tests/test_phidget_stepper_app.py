@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from phidget_stepper_gui import (
+from phidget_stepper_app import (
     AppConfig,
     ConfigError,
     ControllerState,
@@ -89,7 +89,7 @@ def test_home_is_reserved_before_worker_start(monkeypatch):
         def start(self):
             pass
 
-    monkeypatch.setattr("phidget_stepper_gui.threading.Thread", DeferredThread)
+    monkeypatch.setattr("phidget_stepper_app.threading.Thread", DeferredThread)
 
     controller.start_homing()
     assert controller.homing_worker_active
