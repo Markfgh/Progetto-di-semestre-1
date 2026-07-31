@@ -24,6 +24,108 @@ import re
 import struct
 from datetime import datetime
 
+
+def display_matrix_index_from_xy(
+    matrix_shape: tuple[int, int],
+    *,
+    x_m: float,
+    y_m: float,
+    x_min_m: float,
+    x_max_m: float,
+    y_min_m: float,
+    y_max_m: float,
+) -> tuple[int, int] | None:
+    """Return the row/column of a displayed map at physical X/Y coordinates.
+
+    The matrices used by ``add_image_series`` are ordered from low to high Y;
+    the texture is flipped only while it is uploaded.  Sampling the matrix
+    directly therefore keeps cursor values aligned with the displayed map.
+    """
+    if len(matrix_shape) != 2:
+        return None
+    height, width = int(matrix_shape[0]), int(matrix_shape[1])
+    values = (x_m, y_m, x_min_m, x_max_m, y_min_m, y_max_m)
+    if (
+        height <= 0
+        or width <= 0
+        or not all(np.isfinite(float(value)) for value in values)
+        or float(x_max_m) <= float(x_min_m)
+        or float(y_max_m) <= float(y_min_m)
+        or float(x_m) < float(x_min_m)
+        or float(x_m) > float(x_max_m)
+        or float(y_m) < float(y_min_m)
+        or float(y_m) > float(y_max_m)
+    ):
+        return None
+
+    x_fraction = (float(x_m) - float(x_min_m)) / (float(x_max_m) - float(x_min_m))
+    y_fraction = (float(y_m) - float(y_min_m)) / (float(y_max_m) - float(y_min_m))
+    col = min(width - 1, max(0, int(x_fraction * width)))
+    row = min(height - 1, max(0, int(y_fraction * height)))
+    return row, col
+
+
+def sample_display_matrix_at_xy(
+    matrix: np.ndarray,
+    *,
+    x_m: float,
+    y_m: float,
+    x_min_m: float,
+    x_max_m: float,
+    y_min_m: float,
+    y_max_m: float,
+) -> tuple[int, int, float] | None:
+    """Sample a displayed 2-D matrix with the same bounds as its image series."""
+    src = np.asarray(matrix)
+    if src.ndim != 2:
+        return None
+    index = display_matrix_index_from_xy(
+        (int(src.shape[0]), int(src.shape[1])),
+        x_m=x_m,
+        y_m=y_m,
+        x_min_m=x_min_m,
+        x_max_m=x_max_m,
+        y_min_m=y_min_m,
+        y_max_m=y_max_m,
+    )
+    if index is None:
+        return None
+    row, col = index
+    return row, col, float(src[row, col])
+
+
+def resolve_display_power_db(
+    displayed_power_db: float,
+    *,
+    normalization_reference_db: float,
+    displayed_is_normalized: bool,
+) -> tuple[float | None, float | None]:
+    """Return raw and peak-normalized power from a displayed dB sample."""
+    displayed = float(displayed_power_db)
+    reference = float(normalization_reference_db)
+    if not np.isfinite(displayed):
+        return None, None
+    if not np.isfinite(reference):
+        return (None, displayed) if displayed_is_normalized else (displayed, None)
+    normalized = displayed if displayed_is_normalized else displayed - reference
+    return normalized + reference, normalized
+
+
+def format_power_cursor_readout(
+    *,
+    x_m: float,
+    y_m: float,
+    raw_power_db: float | None,
+    normalized_power_db: float | None,
+) -> str:
+    """Format a compact map-cursor power readout for a plot annotation."""
+    position = f"X: {float(x_m):+.3f} m | Y: {float(y_m):+.3f} m"
+    if raw_power_db is None and normalized_power_db is None:
+        return f"{position}\nPower: no valid data"
+    raw_text = "n/a" if raw_power_db is None else f"{float(raw_power_db):+.2f} dB"
+    norm_text = "n/a" if normalized_power_db is None else f"{float(normalized_power_db):+.2f} dB"
+    return f"{position}\nPower raw: {raw_text}\nPower norm: {norm_text}"
+
 from sar_capture import (
     CaptureError,
     CaptureMetadataStore,
@@ -2042,6 +2144,10 @@ def main():
     stat_raw_max_db = _track_mp_ref(Value("d", float("nan")))
     stat_norm_min_db = _track_mp_ref(Value("d", float("nan")))
     stat_norm_max_db = _track_mp_ref(Value("d", float("nan")))
+    # Published together with the heatmap so the GUI can show both the
+    # absolute dB value and its value relative to the normalization peak.
+    display_normalization_reference_db = _track_mp_ref(Value("d", float("nan")))
+    display_power_normalized = _track_mp_ref(Value("b", 0))
 
     out_root = Path(__file__).with_name("logs")
 
@@ -2185,6 +2291,8 @@ def main():
             "gui_doppler_diag_dbuf": gui_doppler_diag_dbuf,
             "angle_diag_w": int(ANGLEFFT_BINS),
             "doppler_diag_w": int(DOPPLERFFT_BINS),
+            "display_normalization_reference_db": display_normalization_reference_db,
+            "display_power_normalized": display_power_normalized,
         },
     )
     _track_process(p_dsp)
@@ -2409,6 +2517,7 @@ def main():
 
     TXT_PIPELINE_CONFIG_TAG = "txt_pipeline_config"
     TXT_DISPLAY_DIAG_TAG = "txt_display_diagnostics"
+    TXT_HEAT_CURSOR_TAG = "txt_heat_cursor_power"
     DEBUG_STAT_VALUE_TAGS = {
         "udp_rx": "debug_stat_udp_rx",
         "frames": "debug_stat_frames",
@@ -2454,6 +2563,7 @@ def main():
     HEAT_PLOT_TAG = "heat_plot"
     XAXIS_TAG, YAXIS_TAG = "xaxis", "yaxis"
     IMG_SERIES_TAG = "img_series"
+    HEAT_CURSOR_ANNOTATION_TAG = "heat_cursor_power_annotation"
     GUIDE_POS20_TAG = "guide_pos20"
     GUIDE_NEG20_TAG = "guide_neg20"
     TRACK_SCATTER_CONF_TAG = "track_scatter_confirmed"
@@ -2469,6 +2579,7 @@ def main():
     PROC_HEAT_PLOT_TAG = "proc_heat_plot"
     PROC_XAXIS_TAG, PROC_YAXIS_TAG = "proc_xaxis", "proc_yaxis"
     PROC_IMG_SERIES_TAG = "proc_img_series"
+    PROC_CURSOR_ANNOTATION_TAG = "proc_cursor_power_annotation"
     PROC_IN_XSTART = "proc_in_xstart"
     PROC_IN_XEND = "proc_in_xend"
     PROC_GRP_LINEAR_POSITION_SELECTION = "proc_grp_linear_position_selection"
@@ -2483,6 +2594,7 @@ def main():
     PROC_IN_ZOOM_YMAX = "proc_in_zoom_ymax"
     PROC_TXT_ZOOM_STATUS = "proc_txt_zoom_status"
     PROC_CMAP_SCALE_TAG = "proc_cmap_scale"
+    PROC_TXT_CURSOR_TAG = "proc_txt_cursor_power"
     PROC_CMAP_NUM_FMT = "%+6.1f"
     TXT_OFFLINE_TUNING_STATUS_TAG = "txt_offline_tuning_status"
     TXT_OFFLINE_TUNING_INFO_TAG = "txt_offline_tuning_info"
@@ -4760,6 +4872,7 @@ def main():
 
     track_annotation_tags: list[str] = []
     supports_plot_annotation = bool(hasattr(dpg, "add_plot_annotation"))
+    cursor_annotation_supported = bool(supports_plot_annotation)
 
     # 6) Build UI (ONLY TABLE LAYOUT)
     with dpg.window(tag=TAG_MAIN_WINDOW):
@@ -4810,6 +4923,13 @@ def main():
                             width=-1,
                             height=32,
                             enabled=(vis_heatmap_mode == 0),
+                        )
+                        dpg.add_spacer(height=8)
+                        dpg.add_text(
+                            "Cursor: move over the map",
+                            tag=TXT_HEAT_CURSOR_TAG,
+                            wrap=300,
+                            color=(205, 225, 255),
                         )
                         dpg.add_spacer(height=14)
                         dpg.add_text("MMWAVE STUDIO CONTROL", color=(255, 200, 0))
@@ -4978,6 +5098,20 @@ def main():
                         guide_pos_x, _ = _guide_line_points(+1.0, RANGE_MAX_DISPLAY)
                         dpg.add_line_series(guide_neg_x, guide_y, label="-20 deg", tag=GUIDE_NEG20_TAG, parent=YAXIS_TAG)
                         dpg.add_line_series(guide_pos_x, guide_y, label="+20 deg", tag=GUIDE_POS20_TAG, parent=YAXIS_TAG)
+                        if cursor_annotation_supported:
+                            try:
+                                dpg.add_plot_annotation(
+                                    label="",
+                                    default_value=(0.0, 0.0),
+                                    offset=(10, 10),
+                                    color=(245, 245, 245, 230),
+                                    clamped=True,
+                                    parent=YAXIS_TAG,
+                                    tag=HEAT_CURSOR_ANNOTATION_TAG,
+                                )
+                                dpg.configure_item(HEAT_CURSOR_ANNOTATION_TAG, show=False)
+                            except Exception:
+                                cursor_annotation_supported = False
                         dpg.bind_item_theme(TRACK_SCATTER_CONF_TAG, track_conf_theme)
                         dpg.bind_item_theme(TRACK_SCATTER_UNCONF_TAG, track_unconf_theme)
                         dpg.bind_item_theme(TRACK_SCATTER_MOVING_TAG, track_moving_theme)
@@ -5369,6 +5503,13 @@ def main():
                             width=-1,
                             height=32,
                         )
+                        dpg.add_spacer(height=8)
+                        dpg.add_text(
+                            "Cursor: move over the map",
+                            tag=PROC_TXT_CURSOR_TAG,
+                            wrap=300,
+                            color=(205, 225, 255),
+                        )
                         dpg.add_spacer(height=14)
                         dpg.add_text("OFFLINE ROI RECONSTRUCTION", color=(255, 200, 0))
                         dpg.add_separator()
@@ -5457,6 +5598,20 @@ def main():
                             tag=PROC_IMG_SERIES_TAG,
                             parent=PROC_YAXIS_TAG,
                         )
+                        if cursor_annotation_supported:
+                            try:
+                                dpg.add_plot_annotation(
+                                    label="",
+                                    default_value=(0.0, 0.0),
+                                    offset=(10, 10),
+                                    color=(245, 245, 245, 230),
+                                    clamped=True,
+                                    parent=PROC_YAXIS_TAG,
+                                    tag=PROC_CURSOR_ANNOTATION_TAG,
+                                )
+                                dpg.configure_item(PROC_CURSOR_ANNOTATION_TAG, show=False)
+                            except Exception:
+                                cursor_annotation_supported = False
 
                 with dpg.table_cell():
                     with dpg.child_window(width=-1, height=-1, border=True):
@@ -5615,6 +5770,9 @@ def main():
         stream_resets_prev = 0
         log_bytes_prev = 0
     gui_last_seq = 0
+    realtime_frame_valid = False
+    rt_power_normalization_reference_db = float("nan")
+    rt_power_display_normalized = False
     tracks_last_seq = 0
     gui_frame = np.zeros((gui_h, gui_w), dtype=np.float32)
     gui_alpha_frame = np.zeros((gui_h, gui_w), dtype=np.float32)
@@ -5645,21 +5803,26 @@ def main():
     proc_lut_idx = np.empty((proc_tex_h, proc_tex_w), dtype=np.int32)
     proc_rgba_frame = np.empty((proc_tex_h, proc_tex_w, 4), dtype=np.float32)
     proc_view_frame = np.empty((proc_tex_h, proc_tex_w), dtype=np.float32)
+    off_power_normalization_reference_db = float("nan")
     lut_last = float(jet_lut.shape[0] - 1)
 
     def _refresh_offline_texture_from_cached_matrix() -> None:
         """Reapply normalization/levels/LUT without invoking offline DSP."""
+        nonlocal off_power_normalization_reference_db
         if not offline_frame_valid:
+            off_power_normalization_reference_db = float("nan")
             proc_lut_idx.fill(0)
             np.take(jet_lut, proc_lut_idx, axis=0, out=proc_rgba_frame)
             proc_tex_np[:] = proc_rgba_frame.reshape(-1)
             if dpg.does_item_exist(PROC_TEX_TAG):
                 dpg.set_value(PROC_TEX_TAG, proc_tex_buf)
             return
-        if off_norm_enabled and proc_frame.size > 0:
-            finite_values = proc_frame[np.isfinite(proc_frame)]
-            peak_db = float(np.max(finite_values)) if finite_values.size > 0 else 0.0
-            np.subtract(proc_frame, peak_db, out=proc_view_frame)
+        finite_values = proc_frame[np.isfinite(proc_frame)] if proc_frame.size > 0 else np.empty(0, dtype=np.float32)
+        off_power_normalization_reference_db = (
+            float(np.max(finite_values)) if finite_values.size > 0 else float("nan")
+        )
+        if off_norm_enabled and np.isfinite(off_power_normalization_reference_db):
+            np.subtract(proc_frame, off_power_normalization_reference_db, out=proc_view_frame)
         else:
             proc_view_frame[:, :] = proc_frame
 
@@ -5675,6 +5838,145 @@ def main():
         proc_tex_np[:] = proc_rgba_frame.reshape(-1)
         if dpg.does_item_exist(PROC_TEX_TAG):
             dpg.set_value(PROC_TEX_TAG, proc_tex_buf)
+
+    def _hovered_plot_xy(plot_tag: str) -> tuple[float, float] | None:
+        is_item_hovered = getattr(dpg, "is_item_hovered", None)
+        get_plot_mouse_pos = getattr(dpg, "get_plot_mouse_pos", None)
+        if not callable(is_item_hovered) or not callable(get_plot_mouse_pos):
+            return None
+        try:
+            if not dpg.does_item_exist(plot_tag) or not bool(is_item_hovered(plot_tag)):
+                return None
+            x_m, y_m = get_plot_mouse_pos()
+            x_m = float(x_m)
+            y_m = float(y_m)
+        except Exception:
+            return None
+        return (x_m, y_m) if np.isfinite(x_m) and np.isfinite(y_m) else None
+
+    def _hide_cursor_readout(text_tag: str, annotation_tag: str) -> None:
+        nonlocal cursor_annotation_supported
+        if dpg.does_item_exist(text_tag):
+            dpg.set_value(text_tag, "Cursor: move over the map")
+        if cursor_annotation_supported and dpg.does_item_exist(annotation_tag):
+            try:
+                dpg.configure_item(annotation_tag, show=False)
+            except Exception:
+                cursor_annotation_supported = False
+
+    def _show_cursor_readout(
+        text_tag: str,
+        annotation_tag: str,
+        *,
+        x_m: float,
+        y_m: float,
+        readout: str,
+    ) -> None:
+        nonlocal cursor_annotation_supported
+        if dpg.does_item_exist(text_tag):
+            dpg.set_value(text_tag, readout)
+        if cursor_annotation_supported and dpg.does_item_exist(annotation_tag):
+            try:
+                dpg.configure_item(
+                    annotation_tag,
+                    label=readout,
+                    default_value=(float(x_m), float(y_m)),
+                    show=True,
+                )
+            except Exception:
+                cursor_annotation_supported = False
+
+    def _refresh_realtime_cursor_readout() -> None:
+        cursor_xy = _hovered_plot_xy(HEAT_PLOT_TAG)
+        if cursor_xy is None or not realtime_frame_valid:
+            _hide_cursor_readout(TXT_HEAT_CURSOR_TAG, HEAT_CURSOR_ANNOTATION_TAG)
+            return
+        x_m, y_m = cursor_xy
+        sampled = sample_display_matrix_at_xy(
+            gui_frame,
+            x_m=x_m,
+            y_m=y_m,
+            x_min_m=float(rt_applied_meta_current.x_min_m),
+            x_max_m=float(rt_applied_meta_current.x_max_m),
+            y_min_m=float(rt_applied_meta_current.y_min_m),
+            y_max_m=float(rt_applied_meta_current.y_max_m),
+        )
+        if sampled is None:
+            _hide_cursor_readout(TXT_HEAT_CURSOR_TAG, HEAT_CURSOR_ANNOTATION_TAG)
+            return
+        row, col, value = sampled
+        if int(vis_heatmap_mode) == 1:
+            alpha = float(gui_alpha_frame[row, col])
+            if not np.isfinite(value) or not np.isfinite(alpha) or alpha <= 0.0:
+                readout = format_power_cursor_readout(
+                    x_m=x_m,
+                    y_m=y_m,
+                    raw_power_db=None,
+                    normalized_power_db=None,
+                )
+            else:
+                readout = f"X: {x_m:+.3f} m | Y: {y_m:+.3f} m\nVelocity: {value:+.3f} m/s"
+        else:
+            raw_power_db, normalized_power_db = resolve_display_power_db(
+                value,
+                normalization_reference_db=rt_power_normalization_reference_db,
+                displayed_is_normalized=bool(rt_power_display_normalized),
+            )
+            readout = format_power_cursor_readout(
+                x_m=x_m,
+                y_m=y_m,
+                raw_power_db=raw_power_db,
+                normalized_power_db=normalized_power_db,
+            )
+        _show_cursor_readout(
+            TXT_HEAT_CURSOR_TAG,
+            HEAT_CURSOR_ANNOTATION_TAG,
+            x_m=x_m,
+            y_m=y_m,
+            readout=readout,
+        )
+
+    def _refresh_offline_cursor_readout() -> None:
+        cursor_xy = _hovered_plot_xy(PROC_HEAT_PLOT_TAG)
+        if cursor_xy is None or not offline_frame_valid:
+            _hide_cursor_readout(PROC_TXT_CURSOR_TAG, PROC_CURSOR_ANNOTATION_TAG)
+            return
+        x_m, y_m = cursor_xy
+        sampled = sample_display_matrix_at_xy(
+            proc_frame,
+            x_m=x_m,
+            y_m=y_m,
+            x_min_m=float(off_applied_meta_current.x_min_m),
+            x_max_m=float(off_applied_meta_current.x_max_m),
+            y_min_m=float(off_applied_meta_current.y_min_m),
+            y_max_m=float(off_applied_meta_current.y_max_m),
+        )
+        if sampled is None:
+            _hide_cursor_readout(PROC_TXT_CURSOR_TAG, PROC_CURSOR_ANNOTATION_TAG)
+            return
+        _row, _col, raw_power_db = sampled
+        _, normalized_power_db = resolve_display_power_db(
+            raw_power_db,
+            normalization_reference_db=off_power_normalization_reference_db,
+            displayed_is_normalized=False,
+        )
+        readout = format_power_cursor_readout(
+            x_m=x_m,
+            y_m=y_m,
+            raw_power_db=raw_power_db if np.isfinite(raw_power_db) else None,
+            normalized_power_db=normalized_power_db,
+        )
+        _show_cursor_readout(
+            PROC_TXT_CURSOR_TAG,
+            PROC_CURSOR_ANNOTATION_TAG,
+            x_m=x_m,
+            y_m=y_m,
+            readout=readout,
+        )
+
+    def _refresh_cursor_readouts() -> None:
+        _refresh_realtime_cursor_readout()
+        _refresh_offline_cursor_readout()
 
     fft_plot_period_s = 0.05
     fft_plot_last_t = 0.0
@@ -6269,6 +6571,20 @@ def main():
                             offset=doppler_base * 4,
                         )
                         dopplerfft_frame.reshape(-1)[:] = doppler_flat
+                        # The DSP publishes these values under the same GUI
+                        # lock as the frame, keeping raw/norm cursor power in
+                        # sync with the sampled display matrix.
+                        try:
+                            with display_normalization_reference_db.get_lock():
+                                rt_power_normalization_reference_db = float(
+                                    display_normalization_reference_db.value
+                                )
+                            with display_power_normalized.get_lock():
+                                rt_power_display_normalized = bool(display_power_normalized.value)
+                        except Exception:
+                            rt_power_normalization_reference_db = float("nan")
+                            rt_power_display_normalized = False
+                        realtime_frame_valid = True
                     gui_last_seq = seq_locked
 
                 denom = (vis_vmax - vis_vmin)
@@ -6552,6 +6868,7 @@ def main():
                                     dpg.configure_item(hide_tag, show=False)
                             break
 
+            _refresh_cursor_readouts()
             _maybe_rearm_mmwave_stream(now)
             dpg.render_dearpygui_frame()
 

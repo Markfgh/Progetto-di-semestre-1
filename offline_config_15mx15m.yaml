@@ -1,0 +1,84 @@
+# Profilo offline per una mappa frontale 15 m x 15 m.
+# Usare soltanto acquisizioni registrate con il profilo hardware corrispondente
+# a realtime_config_15mx15m.yaml (15 MHz, 384 ADC samples, slope 60.012 MHz/us).
+data:
+  # Puoi mettere direttamente una run: logs/run_YYYYMMDD_HHMMSS
+  # Se lasci "logs", SARReader prende automaticamente l'ultima run con capture_pos*.bin.
+  input_dir: "logs\\run_20260730_170349" # Sostituire con la nuova run acquisita usando il profilo 15x15 m.
+  # Maximum time allowed to prepare all offline data before reporting a timeout.
+  startup_timeout_s: 3600
+
+capture:
+  # Usa i primi N frame di ciascuna posizione (1..frame disponibili nella run).
+  frames_per_position: 2
+
+scan:
+  x_start: 1
+  x_end: 150
+  x_step: 1
+  # Used by synthetic_range_angle only. Linear BP reads the measured
+  # stage.position_mm coordinates stored in each capture header.
+  x_pitch_m: 0.007679999805986881 # 7.68 mm pitch
+
+
+
+reconstruction:
+  algorithm: "backprojection" # Options: backprojection, synthetic_range_angle.
+  # Full physical rectangle reconstructed by "Full map".  ROI controls are
+  # constrained to this domain and reconstruct their selected sector on the
+  # fixed offline image grid.
+  map_bounds:
+    x_min_m: -7.5
+    x_max_m: 7.5
+    y_min_m: 0.0
+    y_max_m: 15.0
+
+bp:
+  phase_sign: -1
+  # FMCW residual-video-phase correction during backprojection.  Leave "off"
+  # unless a point-target test confirms a benefit; the sign depends on the
+  # dechirp/IQ convention. Options: "off", "+", "-".
+  residual_video_phase: "off"
+  tx_offsets_lambda:  null
+  rx_offsets_lambda:  null
+  tx_offsets_m: null
+  rx_offsets_m: null
+
+# Optional empty-scene reference for either reconstruction algorithm. Capture
+# this run with the same radar/setup and scan positions, then set this folder
+# and turn it on for a target run. All reference frames are complex-averaged
+# per position/antenna/range bin and subtracted before reconstruction (not
+# from the dB image).
+# The reference may contain a different number of frames than the target.
+offline_background:
+  enabled: false
+  reference_dir: "logs\\scena vuota"
+  scale: 1.0
+
+offline_sar_range_angle:
+  # range=fast-time e doppler=loop prima del bin zero. window_angle viene
+  # applicata sull'asse angolare da synthetic_range_angle e come finestra
+  # dell'apertura continua posizione×antenna dalla BP MIMO-SAR lineare.
+  use_realtime_filters: true
+  # Dimensioni FFT offline, indipendenti dal realtime.
+  # Valore < input: usa/tronca i primi campioni range o una sotto-apertura angolare centrata.
+  # Valore > input: conserva tutto l'ingresso e aggiunge zero-padding.
+  # nfft_angle si applica come FFT/padding solo con angle_processing.mode=fft;
+  # in Bartlett/MVDR indica invece il numero di punti della griglia angolare.
+  nfft_range: 16384
+  nfft_angle: 16384
+  window_range: "hamming"
+  window_doppler: "blackman"
+  window_angle: "blackman"
+  zero_after_range_fft_bins: 0
+
+  mean_after_range_fft:
+    enabled: true
+    axes: [range_bin]
+
+  angle_processing:
+    mode: "fft" # Options: fft,bartlett, mvdr
+    mvdr_diagonal_loading: 0.05000000074505806
+    aggregation: "frame_loop"
+    frame_index: 0
+    loop_index: 0

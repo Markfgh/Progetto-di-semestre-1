@@ -1,13 +1,13 @@
 data:
   # Puoi mettere direttamente una run: logs/run_YYYYMMDD_HHMMSS
   # Se lasci "logs", SARReader prende automaticamente l'ultima run con capture_pos*.bin.
-  input_dir: "logs\\run_20260724_094250"
+  input_dir: "logs\\run_20260730_170349"
   # Maximum time allowed to prepare all offline data before reporting a timeout.
   startup_timeout_s: 3600
 
 capture:
   # Usa i primi N frame di ciascuna posizione (1..frame disponibili nella run).
-  frames_per_position: 1
+  frames_per_position: 2
 
 scan:
   x_start: 1
@@ -15,7 +15,7 @@ scan:
   x_step: 1
   # Used by synthetic_range_angle only. Linear BP reads the measured
   # stage.position_mm coordinates stored in each capture header.
-  x_pitch_m: 0.007792000193148851 # 7.792 mm pitch
+  x_pitch_m: 0.007679999805986881 # 7.68 mm pitch
 
 
 
@@ -25,10 +25,10 @@ reconstruction:
   # constrained to this domain and reconstruct their selected sector on the
   # fixed offline image grid.
   map_bounds:
-    x_min_m: -0.4000000059604645
-    x_max_m: 0.4000000059604645
-    y_min_m: 2.299999952316284
-    y_max_m: 3.299999952316284
+    x_min_m: -3.0
+    x_max_m: 3.0
+    y_min_m: 0.0
+    y_max_m: 6.0
 
 bp:
   phase_sign: -1
@@ -36,8 +36,8 @@ bp:
   # unless a point-target test confirms a benefit; the sign depends on the
   # dechirp/IQ convention. Options: "off", "+", "-".
   residual_video_phase: "off"
-  tx_offsets_lambda: null
-  rx_offsets_lambda: null
+  tx_offsets_lambda:  null
+  rx_offsets_lambda:  null
   tx_offsets_m: null
   rx_offsets_m: null
 
@@ -49,7 +49,7 @@ bp:
 # The reference may contain a different number of frames than the target.
 offline_background:
   enabled: false
-  reference_dir: "logs\\stanza vuota per cilindro 2,58m -0,17m"
+  reference_dir: "logs\\scena vuota"
   scale: 1.0
 
 offline_sar_range_angle:
@@ -66,7 +66,7 @@ offline_sar_range_angle:
   nfft_angle: 16384
   window_range: "hamming"
   window_doppler: "blackman"
-  window_angle: "none"
+  window_angle: "blackman"
   zero_after_range_fft_bins: 0
 
   mean_after_range_fft:

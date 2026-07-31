@@ -1736,11 +1736,13 @@ def _subtract_reference_background(
     *,
     scale: float,
 ) -> np.ndarray:
-    """Subtract an empty-scene complex mean without mutating the target data.
+    """Subtract the complex scene means without mutating the target data.
 
     ``target_snapshots`` is ``[frame, antenna, range_bin]`` and
     ``reference_mean`` is ``[antenna, range_bin]``.  The operation is done
-    before BP/power/dB so phase is preserved.
+    before BP/power/dB so phase is preserved.  Averaging both acquisitions
+    produces one coherent residual frame and prevents the BP from summing the
+    powers of opposite per-frame deviations around the reference mean.
     """
     target = np.asarray(target_snapshots, dtype=np.complex64)
     reference = np.asarray(reference_mean, dtype=np.complex64)
@@ -1761,9 +1763,9 @@ def _subtract_reference_background(
     if not np.isfinite(scale_f) or scale_f < 0.0:
         raise ValueError("background reference scale deve essere finito e >= 0")
 
-    out = np.array(target, dtype=np.complex64, copy=True)
-    out -= np.complex64(scale_f) * reference[None, :, :]
-    return out.astype(np.complex64, copy=False)
+    target_mean = target.mean(axis=0, dtype=np.complex64)
+    residual = target_mean - np.complex64(scale_f) * reference
+    return residual[None, :, :].astype(np.complex64, copy=False)
 
 
 # ---------------------------------------------------------------------
@@ -1850,7 +1852,10 @@ def _offline_reader_worker(
             print(f"[OFFLINE WARN] {warning}")
 
         n_pos = int(stream_layout.positions.size)
-        n_frames = int(stream_layout.n_frames_per_position)
+        target_frames = int(stream_layout.n_frames_per_position)
+        # Background subtraction now yields one coherent
+        # mean(target)-scale*mean(reference) snapshot per position.
+        n_frames = 1 if background_reference.enabled else target_frames
         n_ant = int(stream_layout.tx) * int(stream_layout.rx)
         prepared_shape = (n_pos, n_frames, n_ant, int(nfft_range))
         shm_range_fft = shared_memory.SharedMemory(
@@ -1996,7 +2001,10 @@ def _offline_reader_worker(
                 "type": "reader_ready",
                 "phase": "zero-Doppler snapshots ready",
                 "positions": int(stream_layout.positions.size),
-                "frames_per_pos": int(stream_layout.n_frames_per_position),
+                "frames_per_pos": int(n_frames),
+                "target_frames_averaged": (
+                    int(target_frames) if background_reference.enabled else 0
+                ),
                 "algorithm": str(algorithm),
                 "range_angle_enabled_filters": _offline_sar_range_angle_filters_enabled(range_angle_cfg),
                 "range_angle_use_realtime_filters": bool(range_angle_cfg.use_realtime_filters),

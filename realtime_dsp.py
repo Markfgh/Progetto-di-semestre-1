@@ -4535,6 +4535,8 @@ def process_buffer(
     gui_doppler_diag_views: tuple[np.ndarray, np.ndarray] | None = None,
     angle_diag_out_buf: np.ndarray | None = None,
     doppler_diag_out_buf: np.ndarray | None = None,
+    display_normalization_reference_db_out: Synchronized | None = None,
+    display_power_normalized_out: Synchronized | None = None,
 ) -> tuple[np.ndarray | None, list[Detection]]:
     """Elabora un batch IQ e pubblica l'ultima immagine nella GUI.
 
@@ -4772,6 +4774,8 @@ def process_buffer(
         publish_fill_value = np.float32(-120.0)
         fallback_used = False
         view_alpha: np.ndarray | None = None
+        normalization_reference_db = float("nan")
+        power_display_normalized = False
         viewport_range_max_m = max(0.0, float(active_viewport.range_max_bin_f) * float(range_bin_m))
 
         def _viewport_max_bin_for(dr_local: float, available_bins: int) -> int:
@@ -5362,10 +5366,13 @@ def process_buffer(
                     skip_range_bins=int(getattr(dsp_cfg, "normalize_skip_range_bins", 0)),
                 )
                 raw_max = float(np.max(view_display))
+                normalization_reference_db = (
+                    raw_max if norm_ref_db is None else float(norm_ref_db)
+                )
                 if dsp_cfg.debug_stats:
                     raw_min = float(np.min(view_display))
                     norm_max = 0.0
-                    norm_peak = raw_max if norm_ref_db is None else float(norm_ref_db)
+                    norm_peak = normalization_reference_db
                     norm_min = float(raw_min - norm_peak)
                     try:
                         with stat_raw_min_db.get_lock():
@@ -5379,7 +5386,8 @@ def process_buffer(
                     except Exception:
                         pass
                 if normalize_to_peak:
-                    view_display -= raw_max if norm_ref_db is None else float(norm_ref_db)
+                    view_display -= normalization_reference_db
+                    power_display_normalized = True
 
         if display_zoom_runtime is not None:
             display_zoom_runtime.last_viewport_signature = active_viewport_sig
@@ -5398,6 +5406,18 @@ def process_buffer(
 
         # Latest-wins publish to the GUI double buffer.
         with gui_lock:
+            if display_normalization_reference_db_out is not None:
+                try:
+                    with display_normalization_reference_db_out.get_lock():
+                        display_normalization_reference_db_out.value = float(normalization_reference_db)
+                except Exception:
+                    pass
+            if display_power_normalized_out is not None:
+                try:
+                    with display_power_normalized_out.get_lock():
+                        display_power_normalized_out.value = 1 if power_display_normalized else 0
+                except Exception:
+                    pass
             prev_idx = int(gui_latest_idx.value)
             next_idx = 1 if prev_idx == 0 else 0
             dst = gui_heat_views[next_idx]
@@ -5499,6 +5519,8 @@ def dsp_worker(
     gui_doppler_diag_dbuf=None,
     angle_diag_w: int = 0,
     doppler_diag_w: int = 0,
+    display_normalization_reference_db: Synchronized | None = None,
+    display_power_normalized: Synchronized | None = None,
 ) -> None:
     """Loop del processo DSP: consuma slot RX, elabora e rilascia lo slot.
 
@@ -6282,6 +6304,8 @@ def dsp_worker(
             gui_doppler_diag_views=gui_doppler_diag_views,
             angle_diag_out_buf=angle_diag_out_buf,
             doppler_diag_out_buf=doppler_diag_out_buf,
+            display_normalization_reference_db_out=display_normalization_reference_db,
+            display_power_normalized_out=display_power_normalized,
         )
         _write_applied_viewport(display_zoom_runtime.last_applied_meta)
         if tracker is not None and tracking_runtime_enabled:

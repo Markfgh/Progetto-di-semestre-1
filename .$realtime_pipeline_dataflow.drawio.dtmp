@@ -1,0 +1,417 @@
+<mxfile host="Electron" agent="Codex">
+  <diagram id="realtime-dataflow" name="Real-Time Dataflow">
+    <mxGraphModel dx="2182" dy="1864" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="input_group" parent="1" style="swimlane;html=1;rounded=1;startSize=28;fillColor=none;strokeColor=#94A3B8;fontStyle=1;fontColor=#334155;" value="ACQUISITION" vertex="1">
+          <mxGeometry height="960" width="300" x="-800" y="-1160" as="geometry" />
+        </mxCell>
+        <mxCell id="rawring" parent="input_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0F2FE;strokeColor=#0284C7;fontSize=14;fontStyle=1;" value="64-slot RAW Ring Buffer&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;complete valid ADC frames&lt;br&gt;int16 I/Q&lt;/font&gt;" vertex="1">
+          <mxGeometry height="70" width="165" x="10" y="380" as="geometry" />
+        </mxCell>
+        <mxCell id="receiver" parent="input_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0F2FE;strokeColor=#0284C7;fontSize=14;fontStyle=1;" value="UDP Receiver&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;ordering · integrity check&lt;br&gt;frame reassembly&lt;/font&gt;" vertex="1">
+          <mxGeometry height="95" width="155" x="15" y="194" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="input_group" source="receiver" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;" target="rawring" value="Complete RAW frame">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="92.5" y="380" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="radar" parent="input_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0F2FE;strokeColor=#0284C7;fontSize=14;fontStyle=1;" value="Radar / DCA1000&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;UDP packets with ADC samples&lt;/font&gt;" vertex="1">
+          <mxGeometry height="65" width="135" x="25" y="70" as="geometry" />
+        </mxCell>
+        <mxCell id="e1" edge="1" parent="input_group" source="radar" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;" target="receiver" value="UDP packets">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="free_slots" parent="input_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1F5F9;strokeColor=#64748B;fontSize=12;fontStyle=1;" value="Free-slots Queue&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;available ring-slot IDs&lt;/font&gt;" vertex="1">
+          <mxGeometry height="55" width="155" x="60" y="548" as="geometry" />
+        </mxCell>
+        <mxCell id="capture_logger" parent="input_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=#64748B;fontSize=12;fontStyle=1;dashed=1;" value="Capture Logger (optional)&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;only while a capture is active&lt;/font&gt;" vertex="1">
+          <mxGeometry height="60" width="155" x="60" y="741" as="geometry" />
+        </mxCell>
+        <mxCell id="capture_file" parent="input_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=#64748B;fontSize=11;fontStyle=1;dashed=1;" value="Capture .bin file&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;header + valid RAW frames&lt;/font&gt;" vertex="1">
+          <mxGeometry height="55" width="155" x="60" y="861" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_free_receiver" edge="1" parent="input_group" source="free_slots" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;dashed=1;strokeColor=#64748B;exitX=0.75;exitY=0;exitDx=0;exitDy=0;entryX=1;entryY=0.75;entryDx=0;entryDy=0;" target="receiver" value="free slot ID">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="176.29" y="500" />
+              <mxPoint x="210" y="500" />
+              <mxPoint x="210" y="265.29" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="flow_ring_logger" edge="1" parent="input_group" source="rawring" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;dashed=1;strokeColor=#64748B;entryX=0.25;entryY=0;entryDx=0;entryDy=0;exitX=0.25;exitY=1;exitDx=0;exitDy=0;" target="capture_logger" value="logger bit +&amp;nbsp;&lt;div&gt;valid RAW frame&lt;/div&gt;">
+          <mxGeometry relative="1" x="0.6562" y="20" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="50" y="450" />
+              <mxPoint x="50" y="710" />
+              <mxPoint x="98.69" y="710" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="flow_logger_file" edge="1" parent="input_group" source="capture_logger" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;dashed=1;strokeColor=#64748B;" target="capture_file" value="header + RAW data">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_logger_free" edge="1" parent="input_group" source="capture_logger" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;dashed=1;strokeColor=#64748B;exitX=0.75;exitY=0;exitDx=0;exitDy=0;entryX=0.75;entryY=1;entryDx=0;entryDy=0;" target="free_slots" value="release logger bit">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="V2xDKZWKjhshhrR2fZ9Q-1" edge="1" parent="1" source="dsp_group" style="edgeStyle=none;curved=1;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;fontSize=12;startSize=8;endSize=8;">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="149.14285714285688" y="-20" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="dsp_group" parent="1" style="swimlane;html=1;rounded=1;startSize=28;fillColor=none;strokeColor=#64748B;fontStyle=1;fontColor=#334155;" value="REAL-TIME DSP PROCESS" vertex="1">
+          <mxGeometry height="1150" width="1270" x="-486" y="-1160" as="geometry" />
+        </mxCell>
+        <mxCell id="acquire" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E8FF;strokeColor=#9333EA;fontSize=13;fontStyle=1;" value="Acquire newest valid frame(s)&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;stale frames may be dropped&lt;/font&gt;" vertex="1">
+          <mxGeometry height="70" width="160" x="280" y="60" as="geometry" />
+        </mxCell>
+        <mxCell id="dsp_ready_queue" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1F5F9;strokeColor=#64748B;fontSize=12;fontStyle=1;" value="DSP-ready Queue&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;(sequence, slot)&lt;/font&gt;" vertex="1">
+          <mxGeometry height="70" width="120" x="51" y="60" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_ready_acquire" edge="1" parent="dsp_group" source="dsp_ready_queue" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;strokeColor=#64748B;" target="acquire" value="ready descriptors">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="static_header" parent="dsp_group" style="text;html=1;align=center;verticalAlign=middle;fontSize=13;fontStyle=1;fontColor=#0F766E;" value="STATIC DETECTION" vertex="1">
+          <mxGeometry height="24" width="240" x="34" y="230" as="geometry" />
+        </mxCell>
+        <mxCell id="static_filters" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#CCFBF1;strokeColor=#0F766E;fontSize=13;fontStyle=1;" value="Static-branch filters&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;background / loop averaging&lt;/font&gt;" vertex="1">
+          <mxGeometry height="70" width="190" x="59" y="270" as="geometry" />
+        </mxCell>
+        <mxCell id="static_detect" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#CCFBF1;strokeColor=#0F766E;fontSize=13;fontStyle=1;" value="Virtual array + angle estimation&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;range-angle power · threshold / CFAR&lt;/font&gt;" vertex="1">
+          <mxGeometry height="80" width="230" x="39" y="390" as="geometry" />
+        </mxCell>
+        <mxCell id="F4-p9xJcjg5hclvvZdXk-63" edge="1" parent="dsp_group" source="static_out" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;" target="fusion">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="static_out" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ECFDF5;strokeColor=#059669;fontSize=13;fontStyle=1;" value="Static detections&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;range + angle&lt;/font&gt;" vertex="1">
+          <mxGeometry height="60" width="160" x="74" y="510" as="geometry" />
+        </mxCell>
+        <mxCell id="e11" edge="1" parent="dsp_group" source="static_filters" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;" target="static_detect">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e12" edge="1" parent="dsp_group" source="static_detect" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;" target="static_out">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="convert" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E8FF;strokeColor=#9333EA;fontSize=13;fontStyle=1;" value="RAW → complex I/Q&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;return slot to free pool&lt;/font&gt;" vertex="1">
+          <mxGeometry height="70" width="160" x="480" y="60" as="geometry" />
+        </mxCell>
+        <mxCell id="e4" edge="1" parent="dsp_group" source="acquire" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="convert">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="reshape" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E8FF;strokeColor=#9333EA;fontSize=13;fontStyle=1;" value="Radar tensor&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;[frame, loop, TX, sample, RX]&lt;/font&gt;" vertex="1">
+          <mxGeometry height="70" width="175" x="680" y="60" as="geometry" />
+        </mxCell>
+        <mxCell id="e5" edge="1" parent="dsp_group" source="convert" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;" target="reshape">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="preprocess" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#D97706;fontSize=13;fontStyle=1;" value="Range pre-processing&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;mean / DC removal&lt;br&gt;range window&lt;/font&gt;" vertex="1">
+          <mxGeometry height="95" width="170" x="896" y="47.5" as="geometry" />
+        </mxCell>
+        <mxCell id="e6" edge="1" parent="dsp_group" source="reshape" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;" target="preprocess">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="O5q0VxoFzDKG9elTlvRm-1" edge="1" parent="dsp_group" source="rangefft" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="moving_filters">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1177.5" y="170.13" />
+              <mxPoint x="400" y="170.13" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="rangefft" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#D97706;fontSize=14;fontStyle=1;" value="Range FFT&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;range-FFT cube&lt;/font&gt;" vertex="1">
+          <mxGeometry height="70" width="145" x="1105" y="60" as="geometry" />
+        </mxCell>
+        <mxCell id="e7" edge="1" parent="dsp_group" source="preprocess" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="rangefft">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1035.05" y="95" />
+              <mxPoint x="1275.05" y="95" />
+            </Array>
+            <mxPoint x="1035.05" y="95" as="sourcePoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e8" edge="1" parent="dsp_group" source="rangefft" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="static_filters" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1177.5" y="170.13" />
+              <mxPoint x="154" y="170.13" />
+            </Array>
+            <mxPoint x="1062.5" y="80" as="sourcePoint" />
+            <mxPoint x="230.00000000000023" y="220" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="display_header" parent="dsp_group" style="text;html=1;align=center;verticalAlign=middle;fontSize=13;fontStyle=1;fontColor=#1D4ED8;" value="DISPLAY BRANCH" vertex="1">
+          <mxGeometry height="24" width="250" x="512.5" y="231" as="geometry" />
+        </mxCell>
+        <mxCell id="display_filters" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DBEAFE;strokeColor=#2563EB;fontSize=13;fontStyle=1;" value="&lt;font style=&quot;font-size: 11px;&quot;&gt;Display-branch filters&lt;br&gt;&lt;font style=&quot;&quot;&gt;slow-time · background&lt;br&gt;loop averaging&lt;/font&gt;&lt;/font&gt;" vertex="1">
+          <mxGeometry height="82" width="200" x="590" y="270" as="geometry" />
+        </mxCell>
+        <mxCell id="virtual_array" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DBEAFE;strokeColor=#2563EB;fontSize=13;fontStyle=1;" value="Virtual-array formation&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;TX × RX channels&lt;br&gt;optional angle window&lt;/font&gt;" vertex="1">
+          <mxGeometry height="82" width="200" x="590" y="390" as="geometry" />
+        </mxCell>
+        <mxCell id="angle" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DBEAFE;strokeColor=#2563EB;fontSize=13;fontStyle=1;" value="Angle processing&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;FFT · Bartlett · MVDR&lt;/font&gt;" vertex="1">
+          <mxGeometry height="65" width="170" x="606" y="510" as="geometry" />
+        </mxCell>
+        <mxCell id="heatmap" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DBEAFE;strokeColor=#2563EB;fontSize=13;fontStyle=1;" value="Range-angle heatmap&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;EMA + spatial filter&lt;/font&gt;" vertex="1">
+          <mxGeometry height="65" width="190" x="596" y="620" as="geometry" />
+        </mxCell>
+        <mxCell id="e13" edge="1" parent="dsp_group" source="display_filters" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;" target="virtual_array">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e14" edge="1" parent="dsp_group" source="virtual_array" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;" target="angle">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e15" edge="1" parent="dsp_group" source="angle" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;" target="heatmap">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e9" edge="1" parent="dsp_group" source="rangefft" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="display_filters" value="">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1177.5" y="170.13" />
+              <mxPoint x="690" y="170.13" />
+            </Array>
+            <mxPoint x="1070" y="140" as="sourcePoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="moving_header" parent="dsp_group" style="text;html=1;align=center;verticalAlign=middle;fontSize=13;fontStyle=1;fontColor=#BE123C;" value="MOVING DETECTION" vertex="1">
+          <mxGeometry height="24" width="260" x="280" y="230" as="geometry" />
+        </mxCell>
+        <mxCell id="moving_filters" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE4E6;strokeColor=#E11D48;fontSize=13;fontStyle=1;" value="Moving-branch filters&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;clutter / slow-time removal&lt;/font&gt;" vertex="1">
+          <mxGeometry height="70" width="200" x="300" y="270" as="geometry" />
+        </mxCell>
+        <mxCell id="doppler" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE4E6;strokeColor=#E11D48;fontSize=13;fontStyle=1;" value="Doppler processing&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;Doppler window + Doppler FFT&lt;br&gt;range-Doppler map&lt;/font&gt;" vertex="1">
+          <mxGeometry height="82" width="220" x="290" y="380" as="geometry" />
+        </mxCell>
+        <mxCell id="moving_detect" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE4E6;strokeColor=#E11D48;fontSize=13;fontStyle=1;" value="Threshold / CFAR + angle estimate&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;TDM-MIMO Doppler compensation&lt;/font&gt;" vertex="1">
+          <mxGeometry height="70" width="220" x="290" y="510" as="geometry" />
+        </mxCell>
+        <mxCell id="moving_out" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF1F2;strokeColor=#E11D48;fontSize=13;fontStyle=1;" value="Moving detections&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;range + angle + velocity&lt;/font&gt;" vertex="1">
+          <mxGeometry height="60" width="160" x="320" y="630" as="geometry" />
+        </mxCell>
+        <mxCell id="e17" edge="1" parent="dsp_group" source="moving_filters" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;" target="doppler">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e18" edge="1" parent="dsp_group" source="doppler" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;" target="moving_detect">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e19" edge="1" parent="dsp_group" source="moving_detect" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;" target="moving_out">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="project" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DBEAFE;strokeColor=#2563EB;fontSize=13;fontStyle=1;" value="Projection and display scaling&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;range-angle → X/Y map&lt;br&gt;dB conversion + optional normalization&lt;/font&gt;" vertex="1">
+          <mxGeometry height="70" width="220" x="581" y="730" as="geometry" />
+        </mxCell>
+        <mxCell id="moving_display" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF1F2;strokeColor=#E11D48;fontSize=11;fontStyle=1;dashed=1;" value="Optional moving display&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;range-angle velocity map&lt;/font&gt;" vertex="1">
+          <mxGeometry height="65" width="155" x="325" y="750" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_doppler_moving_display" edge="1" parent="dsp_group" source="doppler" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;dashed=1;strokeColor=#E11D48;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="moving_display" value="optional velocity-map path">
+          <mxGeometry relative="1" x="0.6315" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="276" y="421.03" />
+              <mxPoint x="276" y="720" />
+              <mxPoint x="402.51" y="720" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="flow_moving_display_project" edge="1" parent="dsp_group" source="moving_display" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;dashed=1;strokeColor=#E11D48;" target="project" value="project&amp;nbsp;&lt;div&gt;velocity map&lt;/div&gt;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_heatmap_project" edge="1" parent="dsp_group" source="heatmap" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;" target="project" value="range-angle heatmap">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="runtime_queue" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DCFCE7;strokeColor=#16A34A;fontSize=12;fontStyle=1;" value="Queue: runtime commands&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;configuration update · reset&lt;/font&gt;" vertex="1">
+          <mxGeometry height="65" width="205" x="715" y="1055" as="geometry" />
+        </mxCell>
+        <mxCell id="dsp_runtime_control" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DCFCE7;strokeColor=#16A34A;fontSize=12;fontStyle=1;" value="DSP runtime configuration&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;filters · detection · display · tracking&lt;br&gt;may reset internal states&lt;/font&gt;" vertex="1">
+          <mxGeometry height="72" width="220" x="1090" y="1053" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_runtime_queue_dsp" edge="1" parent="dsp_group" source="runtime_queue" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;dashed=1;strokeColor=#16A34A;" target="dsp_runtime_control" value="runtime update / reset">
+          <mxGeometry relative="1" x="-0.1137" y="-2" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="fusion" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E8FF;strokeColor=#7E22CE;fontSize=13;fontStyle=1;" value="Detection fusion&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;combine static + moving targets&lt;/font&gt;" vertex="1">
+          <mxGeometry height="65" width="205" x="51" y="710" as="geometry" />
+        </mxCell>
+        <mxCell id="tracker" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E8FF;strokeColor=#7E22CE;fontSize=13;fontStyle=1;" value="Kalman tracking&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;position · velocity · motion state&lt;/font&gt;" vertex="1">
+          <mxGeometry height="65" width="205" x="51.5" y="830" as="geometry" />
+        </mxCell>
+        <mxCell id="tracks" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0E7FF;strokeColor=#4F46E5;fontSize=12;fontStyle=1;" value="Shared track-state buffers (not double-buffered)&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;x, y, vx, vy · ID/status/age · stop marker&lt;br&gt;published with tracks_seq + tracks_lock&lt;/font&gt;" vertex="1">
+          <mxGeometry height="65" width="220" x="44" y="972.5" as="geometry" />
+        </mxCell>
+        <mxCell id="e22" edge="1" parent="dsp_group" source="fusion" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;" target="tracker">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e23" edge="1" parent="dsp_group" source="tracker" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;" target="tracks">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="982.5" y="1092.5000000000002" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="gui" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1F5F9;strokeColor=inherit;fontSize=15;fontStyle=1;" value="GUI&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;renders map, profiles, diagnostics, and tracks&lt;/font&gt;" vertex="1">
+          <mxGeometry height="100" width="175" x="390" y="955" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_tracks_gui" edge="1" parent="dsp_group" source="tracks" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;" target="gui" value="track overlay">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="applied_viewport" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DCFCE7;strokeColor=#16A34A;fontSize=12;fontStyle=1;" value="Shared memory: applied viewport&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;actual bounds · sequence · frame sequence&lt;br&gt;fallback status&lt;/font&gt;" vertex="1">
+          <mxGeometry height="72" width="220" x="581" y="845" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_applied_viewport_gui" edge="1" parent="dsp_group" source="applied_viewport" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;dashed=1;strokeColor=#16A34A;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="gui" value="update plot bounds">
+          <mxGeometry relative="1" x="0.4594" as="geometry">
+            <mxPoint as="offset" />
+            <mxPoint x="536.25" y="1106" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="viewport" parent="dsp_group" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DCFCE7;strokeColor=#16A34A;fontSize=12;fontStyle=1;" value="Shared memory: requested viewport&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;xmin · xmax · ymin · ymax · sequence&lt;/font&gt;" vertex="1">
+          <mxGeometry height="70" width="205" x="715" y="970" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_gui_viewport" edge="1" parent="dsp_group" source="gui" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;dashed=1;strokeColor=#16A34A;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="viewport" value="requested&amp;nbsp;&lt;div&gt;viewport / zoom&lt;/div&gt;">
+          <mxGeometry relative="1" x="-0.0449" y="25" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="O5q0VxoFzDKG9elTlvRm-2" edge="1" parent="dsp_group" source="moving_out" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0.75;entryY=0;entryDx=0;entryDy=0;" target="fusion">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_gui_runtime_queue" edge="1" parent="dsp_group" source="gui" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;dashed=1;strokeColor=#16A34A;entryX=0;entryY=0.5;entryDx=0;entryDy=0;exitX=0.75;exitY=1;exitDx=0;exitDy=0;" target="runtime_queue" value="configuration update / reset">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_project_applied_viewport" edge="1" parent="dsp_group" source="project" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;dashed=1;strokeColor=#16A34A;" target="applied_viewport" value="publish applied viewport">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_viewport_project" edge="1" parent="dsp_group" source="viewport" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;dashed=1;strokeColor=#16A34A;entryX=1;entryY=0.75;entryDx=0;entryDy=0;exitX=0.75;exitY=0;exitDx=0;exitDy=0;" target="project" value="read request">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="display_buffers" parent="dsp_group" style="swimlane;html=1;rounded=1;startSize=38;fillColor=#EEF2FF;strokeColor=#4F46E5;fontSize=12;fontStyle=1;" value="SHARED-MEMORY DOUBLE-BUFFER BANK&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;bank 0 / bank 1 — all outputs share the published index&lt;/font&gt;" vertex="1">
+          <mxGeometry height="550" width="290" x="950" y="370" as="geometry" />
+        </mxCell>
+        <mxCell id="db_sync" parent="display_buffers" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DDD6FE;strokeColor=#6D28D9;fontSize=11;fontStyle=1;" value="Publish metadata&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;gui_latest_idx + gui_latest_seq + gui_lock&lt;br&gt;all five buffers are published atomically&lt;/font&gt;" vertex="1">
+          <mxGeometry height="68" width="260" x="15" y="460" as="geometry" />
+        </mxCell>
+        <mxCell id="O0-aMySbNQ6MJRrhMB_B-8" edge="1" parent="display_buffers" source="db_angle_diag" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0.75;entryY=0;entryDx=0;entryDy=0;fontSize=12;startSize=8;endSize=8;strokeColor=inherit;" target="db_sync">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="db_angle_diag" parent="display_buffers" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0E7FF;strokeColor=inherit;fontSize=11;fontStyle=1;" value="Angle diagnostic&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;gui_angle_diag_dbuf&lt;/font&gt;" vertex="1">
+          <mxGeometry height="50" width="135" x="13.75" y="220" as="geometry" />
+        </mxCell>
+        <mxCell id="O0-aMySbNQ6MJRrhMB_B-7" edge="1" parent="display_buffers" source="db_doppler_diag" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0.75;entryY=0;entryDx=0;entryDy=0;fontSize=12;startSize=8;endSize=8;strokeColor=inherit;" target="db_sync">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="db_doppler_diag" parent="display_buffers" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0E7FF;strokeColor=inherit;fontSize=11;fontStyle=1;" value="Doppler diagnostic&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;gui_doppler_diag_dbuf&lt;/font&gt;" vertex="1">
+          <mxGeometry height="50" width="135" x="13.75" y="130" as="geometry" />
+        </mxCell>
+        <mxCell id="O0-aMySbNQ6MJRrhMB_B-6" edge="1" parent="display_buffers" source="db_profiles" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0.75;entryY=0;entryDx=0;entryDy=0;fontSize=12;startSize=8;endSize=8;strokeColor=inherit;" target="db_sync">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="db_profiles" parent="display_buffers" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0E7FF;strokeColor=inherit;fontSize=11;fontStyle=1;" value="Range profiles&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;gui_prof_dbuf · float32 P × R&lt;/font&gt;" vertex="1">
+          <mxGeometry height="50" width="130" x="13.75" y="50" as="geometry" />
+        </mxCell>
+        <mxCell id="O0-aMySbNQ6MJRrhMB_B-9" edge="1" parent="display_buffers" source="db_alpha" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0.75;entryY=0;entryDx=0;entryDy=0;fontSize=12;startSize=8;endSize=8;strokeColor=inherit;" target="db_sync">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="db_alpha" parent="display_buffers" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0E7FF;strokeColor=inherit;fontSize=11;fontStyle=1;" value="Alpha map&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;gui_alpha_dbuf · float32 H × W&lt;/font&gt;" vertex="1">
+          <mxGeometry height="50" width="115" x="16.25" y="300" as="geometry" />
+        </mxCell>
+        <mxCell id="O0-aMySbNQ6MJRrhMB_B-5" edge="1" parent="display_buffers" source="db_heatmap" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0.75;entryY=0;entryDx=0;entryDy=0;fontSize=12;startSize=8;endSize=8;strokeColor=inherit;" target="db_sync">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="db_heatmap" parent="display_buffers" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0E7FF;strokeColor=inherit;fontSize=11;fontStyle=1;" value="Heatmap&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;gui_dbuf · float32 H × W&lt;/font&gt;" vertex="1">
+          <mxGeometry height="50" width="115" x="16.25" y="371" as="geometry" />
+        </mxCell>
+        <mxCell id="gui_local_cache" parent="display_buffers" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=inherit;fontSize=12;fontStyle=1;" value="GUI local copies&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;consistent heatmap, alpha, profiles,&lt;br&gt;and diagnostic arrays&lt;/font&gt;" vertex="1">
+          <mxGeometry height="72" width="180" x="56.25" y="595" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_publish_gui_cache" edge="1" parent="display_buffers" source="db_sync" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;strokeColor=inherit;" target="gui_local_cache" value="same bank index + sequence + lock">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_heatmap_buffer" edge="1" parent="dsp_group" source="project" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;exitX=1;exitY=0.5;exitDx=0;exitDy=0;" target="db_heatmap" value="display map">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="flow_alpha_buffer" edge="1" parent="dsp_group" source="project" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;exitX=1;exitY=0.25;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="db_alpha" value="pixel validity / alpha">
+          <mxGeometry relative="1" x="0.3496" y="5" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="820.04" y="748.52" />
+              <mxPoint x="820.04" y="695.04" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="flow_profile_buffer" edge="1" parent="dsp_group" source="display_filters" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;" target="db_profiles" value="range profiles">
+          <mxGeometry relative="1" x="-0.4445" y="2" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="900.04" y="312" />
+              <mxPoint x="900.04" y="445.04" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="flow_angle_buffer" edge="1" parent="dsp_group" source="angle" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="db_angle_diag" value="angle diagnostic">
+          <mxGeometry relative="1" x="0.4591" y="5" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="820.04" y="543.48" />
+              <mxPoint x="820.04" y="615.04" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="flow_doppler_buffer" edge="1" parent="dsp_group" source="doppler" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;exitX=0.75;exitY=0;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="db_doppler_diag" value="Doppler diagnostic">
+          <mxGeometry relative="1" x="0.6525" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="455" y="370" />
+              <mxPoint x="860.04" y="370" />
+              <mxPoint x="860.04" y="525.04" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="flow_cache_gui" edge="1" parent="dsp_group" source="gui_local_cache" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;entryX=0.5;entryY=1;entryDx=0;entryDy=0;exitX=0.5;exitY=1;exitDx=0;exitDy=0;strokeColor=inherit;" target="gui" value="render">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1076.29" y="1037" />
+              <mxPoint x="1076.29" y="1130.05" />
+              <mxPoint x="477.52" y="1130.05" />
+            </Array>
+            <mxPoint x="1080.03" y="1100" as="sourcePoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="flow_receiver_ready" edge="1" parent="1" source="receiver" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;strokeColor=#64748B;exitX=1;exitY=0.5;exitDx=0;exitDy=0;" target="dsp_ready_queue" value="publish complete frame:&amp;nbsp;&lt;div&gt;sequence + slot&lt;/div&gt;">
+          <mxGeometry relative="1" x="0.4457" y="-5" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="-630" y="-920" />
+              <mxPoint x="-570" y="-920" />
+              <mxPoint x="-570" y="-1060" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e3" edge="1" parent="1" source="rawring" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=11;" target="acquire" value="read RAW slot by slot ID">
+          <mxGeometry relative="1" x="0.3414" y="10" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="-707.52" y="-684" />
+              <mxPoint x="-509.86" y="-684" />
+              <mxPoint x="-509.86" y="-1000" />
+              <mxPoint x="-126" y="-1000" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="flow_dsp_free_slot" edge="1" parent="1" source="convert" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;fontSize=10;dashed=1;strokeColor=#64748B;exitX=0.25;exitY=1;exitDx=0;exitDy=0;" target="free_slots" value="clear DSP bit; free only&amp;nbsp;&lt;div&gt;when logger bit is clear&lt;/div&gt;">
+          <mxGeometry relative="1" x="0.8967" y="-16" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="34" y="-970" />
+              <mxPoint x="-470" y="-970" />
+              <mxPoint x="-470" y="-584.48" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

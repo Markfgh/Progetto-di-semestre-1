@@ -289,9 +289,27 @@ def test_subtract_reference_background_is_complex_and_does_not_mutate_input() ->
 
     residual = _subtract_reference_background(target, reference, scale=0.5)
 
-    np.testing.assert_allclose(residual, target - np.complex64(0.5) * reference[None, :, :])
+    expected = target.mean(axis=0, dtype=np.complex64) - np.complex64(0.5) * reference
+    assert residual.shape == (1, 2, 2)
+    np.testing.assert_allclose(residual[0], expected)
     np.testing.assert_array_equal(target, original)
     assert residual.dtype == np.complex64
+
+
+def test_subtract_reference_background_identical_scene_means_are_zero() -> None:
+    scene = np.array(
+        [
+            [[1.0 + 2.0j, 3.0 - 4.0j]],
+            [[5.0 - 1.0j, -2.0 + 6.0j]],
+        ],
+        dtype=np.complex64,
+    )
+    reference_mean = scene.mean(axis=0, dtype=np.complex64)
+
+    residual = _subtract_reference_background(scene, reference_mean, scale=1.0)
+
+    assert residual.shape == (1, 1, 2)
+    np.testing.assert_array_equal(residual, np.zeros_like(residual))
 
 
 def test_subtract_reference_background_validates_antenna_and_range_shape() -> None:
@@ -751,7 +769,7 @@ def test_offline_reader_subtracts_empty_scene_reference_with_different_frame_cou
     try:
         shape = tuple(int(v) for v in msg["range_fft_shape"])
         snapshots = np.ndarray(shape, dtype=np.complex64, buffer=shm.buf)
-        assert shape == (2, 2, 8, 8)
+        assert shape == (2, 1, 8, 8)
         np.testing.assert_allclose(snapshots, 0.0, atol=1e-5)
     finally:
         shm.close()
