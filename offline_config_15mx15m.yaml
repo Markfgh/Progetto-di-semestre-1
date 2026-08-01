@@ -7,6 +7,9 @@ data:
   input_dir: "logs\\run_20260730_170349" # Sostituire con la nuova run acquisita usando il profilo 15x15 m.
   # Maximum time allowed to prepare all offline data before reporting a timeout.
   startup_timeout_s: 3600
+  # Optional hard cap for the preflight memory estimate; null uses only the
+  # automatic guard against currently available system RAM.
+  max_memory_gib: null
 
 capture:
   # Usa i primi N frame di ciascuna posizione (1..frame disponibili nella run).
@@ -16,8 +19,8 @@ scan:
   x_start: 1
   x_end: 150
   x_step: 1
-  # Used by synthetic_range_angle only. Linear BP reads the measured
-  # stage.position_mm coordinates stored in each capture header.
+  # Nominal scan pitch kept for acquisition/planning compatibility. Both
+  # offline reconstructions use measured stage.position_mm from each header.
   x_pitch_m: 0.007679999805986881 # 7.68 mm pitch
 
 
@@ -61,7 +64,9 @@ offline_sar_range_angle:
   # dell'apertura continua posizione×antenna dalla BP MIMO-SAR lineare.
   use_realtime_filters: true
   # Dimensioni FFT offline, indipendenti dal realtime.
-  # Valore < input: usa/tronca i primi campioni range o una sotto-apertura angolare centrata.
+  # Backprojection: nfft_range deve essere almeno 6x i campioni ADC usati,
+  # per rendere affidabile l'interpolazione complessa phase-aware.
+  # synthetic_range_angle può invece usare nfft_range < input (troncamento).
   # Valore > input: conserva tutto l'ingresso e aggiunge zero-padding.
   # nfft_angle si applica come FFT/padding solo con angle_processing.mode=fft;
   # in Bartlett/MVDR indica invece il numero di punti della griglia angolare.

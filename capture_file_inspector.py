@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import struct
 import sys
 from pathlib import Path
+from typing import Any
 
 
 # Parametri modificabili ------------------------------------------------------
@@ -41,11 +43,95 @@ def _fmt_bytes(n: int) -> str:
     return f"{value:.2f} {unit}"
 
 
-def _to_int(x) -> int | None:
+def _required_object(meta: dict[str, Any], field_name: str) -> dict[str, Any]:
+    value = meta.get(field_name)
+    if not isinstance(value, dict):
+        raise ValueError(f"header senza oggetto obbligatorio {field_name!r}")
+    return value
+
+
+def _required_int(field_name: str, value: Any) -> int:
+    if value is None:
+        raise ValueError(f"{field_name} mancante")
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} non valido: {value!r}")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value) and value.is_integer():
+            return int(value)
+        raise ValueError(f"{field_name} deve essere un intero, trovato: {value!r}")
+    if isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
+        return int(value.strip())
+    raise ValueError(f"{field_name} non valido: {value!r}")
+
+
+def _required_positive_int(field_name: str, value: Any) -> int:
+    result = _required_int(field_name, value)
+    if result <= 0:
+        raise ValueError(f"{field_name} deve essere > 0")
+    return result
+
+
+def _required_finite_float(field_name: str, value: Any) -> float:
+    if value is None:
+        raise ValueError(f"{field_name} mancante")
     try:
-        return int(x)
-    except Exception:
-        return None
+        result = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field_name} non valido: {value!r}") from exc
+    if not math.isfinite(result):
+        raise ValueError(f"{field_name} deve essere finito")
+    return result
+
+
+def _required_positive_float(field_name: str, value: Any) -> float:
+    result = _required_finite_float(field_name, value)
+    if result <= 0.0:
+        raise ValueError(f"{field_name} deve essere > 0")
+    return result
+
+
+def validate_capture_metadata(meta: dict[str, Any], path: Path) -> None:
+    """Valida i metadati necessari al reader offline lineare."""
+    format_name = meta.get("format")
+    if format_name not in SUPPORTED_FORMATS:
+        supported = ", ".join(sorted(SUPPORTED_FORMATS))
+        raise ValueError(
+            f"formato header non supportato: {format_name!r} (attesi: {supported})"
+        )
+
+    position = _required_int("header.position", meta.get("position"))
+    name_match = CAPTURE_NAME_RE.match(path.name)
+    if name_match is not None:
+        position_from_name = int(name_match.group(1))
+        if position_from_name != position:
+            raise ValueError(
+                f"{path.name}: posizione incoerente "
+                f"(nome={position_from_name}, header={position})"
+            )
+
+    radar = _required_object(meta, "radar")
+    for field in ("c", "fs", "slope", "fc"):
+        _required_positive_float(f"header.radar.{field}", radar.get(field))
+
+    capture = _required_object(meta, "capture")
+    _required_positive_int("header.capture.samples", capture.get("samples"))
+    chirps = _required_positive_int("header.capture.chirps", capture.get("chirps"))
+    _required_positive_int("header.capture.rx", capture.get("rx"))
+    tx = _required_positive_int("header.capture.tx", capture.get("tx"))
+    if chirps % tx != 0:
+        raise ValueError("header.capture.chirps deve essere multiplo di tx")
+
+    # Sono conteggi facoltativi per compatibilita' tra versioni del logger,
+    # ma quando presenti devono comunque descrivere batch non vuoti.
+    for field in ("x_frames", "frames_per_position"):
+        if capture.get(field) is not None:
+            _required_positive_int(f"header.capture.{field}", capture.get(field))
+
+    # L'asse stage puo' legittimamente avere coordinate <= 0.
+    stage = _required_object(meta, "stage")
+    _required_finite_float("header.stage.position_mm", stage.get("position_mm"))
 
 
 def read_capture_header(path: Path) -> tuple[dict, int]:
@@ -83,10 +169,7 @@ def read_capture_header(path: Path) -> tuple[dict, int]:
         raise ValueError("header JSON non valido") from e
     if not isinstance(meta, dict):
         raise ValueError("header JSON deve essere un oggetto")
-    format_name = meta.get("format")
-    if format_name not in SUPPORTED_FORMATS:
-        supported = ", ".join(sorted(SUPPORTED_FORMATS))
-        raise ValueError(f"formato header non supportato: {format_name!r} (attesi: {supported})")
+    validate_capture_metadata(meta, path)
     return meta, data_offset
 
 
@@ -138,15 +221,14 @@ def main(argv: list[str] | None = None) -> int:
         pos_from_name = int(m.group(1))
         print(f"Posizione da nome file: {pos_from_name}")
 
-    pos_from_header = _to_int(header.get("position"))
+    # Questi campi sono gia' stati validati da ``read_capture_header``.
+    pos_from_header = _required_int("header.position", header.get("position"))
     created_at = header.get("created_at")
-    radar = header.get("radar") if isinstance(header.get("radar"), dict) else {}
-    capture = header.get("capture") if isinstance(header.get("capture"), dict) else {}
+    radar = _required_object(header, "radar")
+    capture = _required_object(header, "capture")
 
     if pos_from_header is not None:
         print(f"Posizione da header: {pos_from_header}")
-        if pos_from_name is not None and pos_from_name != pos_from_header:
-            print("[WARN] Posizione nome file != posizione header")
     if created_at is not None:
         print(f"Data/ora: {created_at}")
 
@@ -167,26 +249,20 @@ def main(argv: list[str] | None = None) -> int:
         print("Header JSON:")
         print(json.dumps(header, indent=2, ensure_ascii=False))
 
-    samples = _to_int(capture.get("samples"))
-    chirps = _to_int(capture.get("chirps"))
-    rx = _to_int(capture.get("rx"))
+    samples = _required_positive_int("header.capture.samples", capture.get("samples"))
+    chirps = _required_positive_int("header.capture.chirps", capture.get("chirps"))
+    rx = _required_positive_int("header.capture.rx", capture.get("rx"))
 
-    if samples is not None and chirps is not None and rx is not None:
-        bytes_per_frame = int(chirps) * int(samples) * int(rx) * 4
-        print(f"bytes_per_frame: {bytes_per_frame}")
-        if payload_size % bytes_per_frame != 0:
-            print(
-                "[WARN] Payload non multiplo di bytes_per_frame: "
-                f"resto={payload_size % bytes_per_frame}"
-            )
-        else:
-            n_frames = payload_size // bytes_per_frame
-            print(f"Frame nel payload: {n_frames}")
-    else:
+    bytes_per_frame = chirps * samples * rx * 4
+    print(f"bytes_per_frame: {bytes_per_frame}")
+    if payload_size % bytes_per_frame != 0:
         print(
-            "[WARN] Header capture incompleto: impossibile calcolare i frame "
-            "(servono samples/chirps/rx)."
+            "[WARN] Payload non multiplo di bytes_per_frame: "
+            f"resto={payload_size % bytes_per_frame}"
         )
+    else:
+        n_frames = payload_size // bytes_per_frame
+        print(f"Frame nel payload: {n_frames}")
 
     return 0
 

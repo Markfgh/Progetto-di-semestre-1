@@ -147,6 +147,58 @@ def test_cleanup_helpers_are_idempotent() -> None:
         q.put_nowait("closed")
 
 
+def test_offline_runtime_fatal_error_is_sticky_across_later_status(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    runtime._status_q = FakeQueue()
+    runtime._ready = True
+    runtime._status_q.put_nowait({"type": "error", "error": "fatal worker"})
+    runtime._status_q.put_nowait({"type": "progress", "phase": "stale progress"})
+    runtime._status_q.put_nowait({"type": "ready"})
+
+    runtime._drain_status()
+
+    assert runtime.last_error == "fatal worker"
+    # A stale ready message must not make a failed runtime usable again.
+    assert runtime.ready is False
+    assert runtime.poll_frame() is None
+
+
+def test_offline_runtime_rejects_started_state_with_dead_worker(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    reader = FakeProcessBase()
+    dsp = FakeProcessBase()
+    reader.start()
+    dsp.start()
+    dsp.terminate()
+    runtime._started = True
+    runtime._reader_p = reader
+    runtime._dsp_p = dsp
+
+    with pytest.raises(RuntimeError, match="non vitale: dsp"):
+        runtime.start()
+
+    assert runtime.last_error == "offline runtime non vitale: dsp"
+
+
+def test_offline_runtime_poll_detects_worker_hard_exit(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    reader = FakeProcessBase()
+    dsp = FakeProcessBase()
+    reader.start()
+    dsp.start()
+    reader.terminate()
+    runtime._started = True
+    runtime._ready = True
+    runtime._reader_p = reader
+    runtime._dsp_p = dsp
+
+    assert runtime.poll_frame() is None
+    assert runtime.last_error == "offline runtime non vitale: reader"
+    assert runtime.ready is False
+
+
 def test_logger_flushes_pending_buffer_on_stop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(radar_app, "BYTES_PER_FRAME", 4)
     monkeypatch.setattr(radar_app, "_build_capture_file_header", lambda pos_id, **_kwargs: b"HDR")
@@ -487,3 +539,34 @@ def test_offline_runtime_start_timeout_closes_processes_and_queues(
     assert runtime._dsp_p is None
     assert runtime._reader_to_dsp_q is None
     runtime.stop()
+
+
+def test_offline_runtime_detects_reader_hard_exit_without_waiting_for_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_processes: list[FakeProcessBase] = []
+
+    class ReaderDiesProcess(FakeProcessBase):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.process_index = len(fake_processes)
+            fake_processes.append(self)
+
+        def start(self) -> None:
+            super().start()
+            if self.process_index == 0:
+                self.terminate()
+
+    monkeypatch.setattr(offline_processing.mp, "Queue", FakeQueue)
+    monkeypatch.setattr(offline_processing.mp, "Event", FakeEvent)
+    monkeypatch.setattr(offline_processing, "Process", ReaderDiesProcess)
+
+    runtime = _runtime(tmp_path)
+    started_at = time.perf_counter()
+    with pytest.raises(RuntimeError, match="terminato durante start: reader"):
+        runtime.start(timeout_s=5.0)
+
+    assert time.perf_counter() - started_at < 1.0
+    assert runtime._reader_p is None
+    assert runtime._dsp_p is None

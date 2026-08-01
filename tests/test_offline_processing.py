@@ -14,14 +14,22 @@ import yaml
 
 from offline_processing import (
     OfflineBPRuntime,
+    OfflineSARConfig,
     SARReader,
     _backprojection_viewport_max_bin,
     _apply_offline_backprojection_aperture_window,
     _offline_reader_worker,
     _read_bp_runtime_cfg,
+    _read_offline_sar_range_angle_cfg,
+    _read_x_pitch_m,
+    _resolve_position_interval,
     _subtract_reference_background,
+    _validate_background_reference_layout,
+    _validate_offline_memory_budget,
     _viewport_from_cmd_payload,
+    estimate_offline_processing_peak_bytes,
     offline_map_bounds_from_yaml_dict,
+    resolve_offline_synthetic_angle_mode,
 )
 from realtime_dsp import build_display_viewport
 
@@ -34,6 +42,8 @@ def _fallback_capture_cfg() -> dict:
     return {
         "radar": {
             "c": 3.0e8,
+            "fs": 10.0e6,
+            "slope": 60.0e12,
             "fc": 77.0e9,
         },
         "capture": {
@@ -81,7 +91,7 @@ def _offline_reconstruction_cfg(*, algorithm: str = "backprojection", **bp_overr
 def _write_capture(
     path: Path,
     *,
-    position: int,
+    position: object,
     frames: int = 2,
     samples: int = 8,
     chirps: int = 4,
@@ -91,6 +101,7 @@ def _write_capture(
     stage_position_mm: float | None = None,
     include_stage: bool = True,
     format_name: str = "rt_capture_v1",
+    radar: dict[str, float] | None = None,
 ) -> None:
     capture = {
         "samples": samples,
@@ -99,7 +110,16 @@ def _write_capture(
         "tx": tx,
         "frames_per_position": frames,
     }
-    header_payload = {"format": format_name, "position": position, "capture": capture}
+    header_payload = {
+        "format": format_name,
+        "position": position,
+        "radar": (
+            {"c": 3.0e8, "fs": 10.0e6, "slope": 60.0e12, "fc": 77.0e9}
+            if radar is None
+            else dict(radar)
+        ),
+        "capture": capture,
+    }
     if include_stage:
         header_payload["stage"] = {
             "position_mm": float(position * 10 if stage_position_mm is None else stage_position_mm),
@@ -115,6 +135,132 @@ def _write_capture(
         raw_i16 = np.full(i16_count, int(raw_i16_value), dtype=np.int16)
     raw = raw_i16.tobytes()
     path.write_bytes(b"RTPBIN1\x00" + struct.pack("<I", len(header)) + header + raw)
+
+
+def _reader_config(run_dir: Path, *, x_end: int = 1) -> OfflineSARConfig:
+    return OfflineSARConfig.from_mapping(
+        {
+            "data": {"input_dir": str(run_dir)},
+            "capture": {"frames_per_position": 2},
+            "scan": {"x_start": 1, "x_end": x_end, "x_step": 1},
+        }
+    )
+
+
+def test_reader_requires_complete_radar_profile_in_every_header(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_missing_radar"
+    run_dir.mkdir()
+    _write_capture(run_dir / "capture_pos1.bin", position=1, radar={})
+
+    with pytest.raises(ValueError, match=r"header\.radar\.c"):
+        SARReader(config=_reader_config(run_dir)).describe_stream()
+
+
+def test_reader_rejects_inconsistent_radar_profiles_between_positions(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_mixed_profile"
+    run_dir.mkdir()
+    _write_capture(run_dir / "capture_pos1.bin", position=1)
+    _write_capture(
+        run_dir / "capture_pos2.bin",
+        position=2,
+        radar={"c": 3e8, "fs": 15e6, "slope": 60e12, "fc": 77e9},
+    )
+
+    with pytest.raises(ValueError, match="profilo radar incoerente"):
+        SARReader(config=_reader_config(run_dir, x_end=2)).describe_stream()
+
+
+def test_background_layout_rejects_different_radar_profile(tmp_path: Path) -> None:
+    target_dir = tmp_path / "target_profile"
+    reference_dir = tmp_path / "reference_profile"
+    target_dir.mkdir()
+    reference_dir.mkdir()
+    _write_capture(target_dir / "capture_pos1.bin", position=1)
+    _write_capture(
+        reference_dir / "capture_pos1.bin",
+        position=1,
+        radar={"c": 3e8, "fs": 12e6, "slope": 60e12, "fc": 77e9},
+    )
+    target = SARReader(config=_reader_config(target_dir)).describe_stream()
+    reference = SARReader(config=_reader_config(reference_dir)).describe_stream()
+
+    with pytest.raises(ValueError, match="profilo radar diverso"):
+        _validate_background_reference_layout(target, reference)
+
+
+def test_source_resolution_ignores_unrelated_bin_files(tmp_path: Path) -> None:
+    (tmp_path / "diagnostic.bin").write_bytes(b"not a capture")
+    # This name matches the broad capture_pos*.bin glob but not the exact
+    # capture_pos<integer>.bin convention.
+    (tmp_path / "capture_position.bin").write_bytes(b"not a capture")
+    run_dir = tmp_path / "run_20260101_010101"
+    run_dir.mkdir()
+    _write_capture(run_dir / "capture_pos1.bin", position=1)
+
+    layout = SARReader(config=_reader_config(tmp_path)).describe_stream()
+
+    assert layout.source_dir == run_dir
+
+
+def test_reader_rejects_fractional_header_position(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_fractional_position"
+    run_dir.mkdir()
+    _write_capture(run_dir / "capture_pos1.bin", position=1.5)
+
+    with pytest.raises(ValueError, match="header 'position' non valido"):
+        SARReader(config=_reader_config(run_dir)).describe_stream()
+
+
+@pytest.mark.parametrize("raw", ["false", "off", "0"])
+def test_offline_filter_boolean_strings_are_parsed_strictly(raw: str) -> None:
+    cfg = _read_offline_sar_range_angle_cfg(
+        {"offline_sar_range_angle": {"use_realtime_filters": raw}},
+        {**_fallback_capture_cfg(), "fft": {"nfft_range": 64, "nfft_angle": 32}},
+    )
+    assert cfg.use_realtime_filters is False
+
+
+def test_offline_filter_boolean_rejects_non_boolean_integer() -> None:
+    with pytest.raises(ValueError, match="use_realtime_filters"):
+        _read_offline_sar_range_angle_cfg(
+            {"offline_sar_range_angle": {"use_realtime_filters": 2}},
+            {**_fallback_capture_cfg(), "fft": {"nfft_range": 64, "nfft_angle": 32}},
+        )
+
+
+@pytest.mark.parametrize("raw", [0, -4, "invalid", 4.5])
+def test_offline_fft_size_rejects_invalid_values(raw: object) -> None:
+    with pytest.raises(ValueError, match="nfft_range"):
+        _read_offline_sar_range_angle_cfg(
+            {"offline_sar_range_angle": {"nfft_range": raw}},
+            {**_fallback_capture_cfg(), "fft": {"nfft_angle": 32}},
+        )
+
+
+@pytest.mark.parametrize("raw", [-1, 1.5, True, "invalid"])
+def test_zeroed_range_bin_count_is_strict(raw: object) -> None:
+    with pytest.raises(ValueError, match="zero_after_range_fft_bins"):
+        _read_offline_sar_range_angle_cfg(
+            {"offline_sar_range_angle": {"zero_after_range_fft_bins": raw}},
+            {**_fallback_capture_cfg(), "fft": {"nfft_range": 64, "nfft_angle": 32}},
+        )
+
+
+def test_x_pitch_rejects_non_finite_values(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "offline.yaml"
+    _write_yaml(cfg_path, {"scan": {"x_pitch_m": float("nan")}})
+
+    with pytest.raises(ValueError, match="finito"):
+        _read_x_pitch_m(cfg_path)
+
+
+def test_sparse_position_interval_without_capture_is_rejected() -> None:
+    positions = np.asarray([2, 4, 6], dtype=np.int32)
+
+    assert _resolve_position_interval(positions, 3, 3) is None
+    assert _resolve_position_interval(positions, 3, 4) == (3, 4)
+
+
 def test_read_bp_runtime_cfg_rejects_invalid_reconstruction_algorithm(tmp_path: Path) -> None:
     offline_cfg = tmp_path / "offline_config.yaml"
     fallback_cfg = tmp_path / "realtime_config.yaml"
@@ -123,6 +269,110 @@ def test_read_bp_runtime_cfg_rejects_invalid_reconstruction_algorithm(tmp_path: 
 
     with pytest.raises(ValueError, match="synthetic_range_angle"):
         _read_bp_runtime_cfg(offline_cfg, fallback_cfg)
+
+
+def test_read_bp_runtime_cfg_parses_memory_cap(tmp_path: Path) -> None:
+    offline_cfg = tmp_path / "offline_config.yaml"
+    fallback_cfg = tmp_path / "realtime_config.yaml"
+    _write_yaml(
+        offline_cfg,
+        {"data": {"max_memory_gib": 0.5}, **_offline_reconstruction_cfg()},
+    )
+    _write_yaml(fallback_cfg, _fallback_capture_cfg())
+
+    runtime = _read_bp_runtime_cfg(offline_cfg, fallback_cfg)
+
+    assert runtime["max_memory_bytes"] == 512 * 1024 * 1024
+
+
+@pytest.mark.parametrize("raw", [0, -1, float("nan"), "invalid"])
+def test_read_bp_runtime_cfg_rejects_invalid_memory_cap(
+    tmp_path: Path,
+    raw: object,
+) -> None:
+    offline_cfg = tmp_path / "offline_config.yaml"
+    fallback_cfg = tmp_path / "realtime_config.yaml"
+    _write_yaml(
+        offline_cfg,
+        {"data": {"max_memory_gib": raw}, **_offline_reconstruction_cfg()},
+    )
+    _write_yaml(fallback_cfg, _fallback_capture_cfg())
+
+    with pytest.raises(ValueError, match="max_memory_gib"):
+        _read_bp_runtime_cfg(offline_cfg, fallback_cfg)
+
+
+def test_memory_estimate_and_configured_cap_use_cropped_shared_cube() -> None:
+    estimate = estimate_offline_processing_peak_bytes(
+        n_positions=150,
+        n_frames=2,
+        n_antennas=8,
+        input_samples=256,
+        chirps=256,
+        rx=4,
+        nfft_range=16384,
+        retained_range_bins=2048,
+        nfft_angle=4096,
+        algorithm="backprojection",
+        angle_mode="fft",
+    )
+
+    assert estimate["shared_bytes"] == 150 * 2 * 8 * 2048 * 8
+    assert estimate["peak_bytes"] >= estimate["shared_bytes"]
+    with pytest.raises(MemoryError, match="data.max_memory_gib"):
+        _validate_offline_memory_budget(
+            estimate,
+            configured_limit_bytes=int(estimate["peak_bytes"]) - 1,
+        )
+
+
+def test_synthetic_memory_mode_uses_measured_nonuniform_geometry() -> None:
+    effective = resolve_offline_synthetic_angle_mode(
+        stage_positions_m=np.asarray([0.0, 0.01, 0.021], dtype=np.float32),
+        x_tx_ant_m=np.asarray([0.0], dtype=np.float32),
+        x_rx_ant_m=np.asarray([0.0], dtype=np.float32),
+        c_m_s=3.0e8,
+        fc_hz=77.0e9,
+        requested_mode="fft",
+    )
+
+    assert effective == "bartlett"
+
+
+def test_synthetic_memory_estimate_accounts_for_steering_and_reference_batch() -> None:
+    common = dict(
+        n_positions=20,
+        n_frames=2,
+        n_antennas=8,
+        input_samples=256,
+        chirps=256,
+        rx=4,
+        nfft_range=4096,
+        retained_range_bins=512,
+        nfft_angle=2048,
+        algorithm="synthetic_range_angle",
+        image_h=128,
+        image_w=128,
+    )
+    fft_estimate = estimate_offline_processing_peak_bytes(
+        **common,
+        angle_mode="fft",
+    )
+    bartlett_estimate = estimate_offline_processing_peak_bytes(
+        **common,
+        angle_mode="bartlett",
+        max_position_frames=32,
+    )
+    full_loop_estimate = estimate_offline_processing_peak_bytes(
+        **common,
+        angle_mode="fft",
+        full_loop_range_fft=True,
+    )
+
+    assert bartlett_estimate["shared_bytes"] == fft_estimate["shared_bytes"]
+    assert bartlett_estimate["reader_peak_bytes"] > fft_estimate["reader_peak_bytes"]
+    assert bartlett_estimate["dsp_peak_bytes"] > fft_estimate["dsp_peak_bytes"]
+    assert full_loop_estimate["reader_peak_bytes"] > fft_estimate["reader_peak_bytes"]
 
 
 def test_read_bp_runtime_cfg_mimo_sar_keeps_physical_offset_overrides(tmp_path: Path) -> None:
@@ -289,14 +539,14 @@ def test_subtract_reference_background_is_complex_and_does_not_mutate_input() ->
 
     residual = _subtract_reference_background(target, reference, scale=0.5)
 
-    expected = target.mean(axis=0, dtype=np.complex64) - np.complex64(0.5) * reference
-    assert residual.shape == (1, 2, 2)
-    np.testing.assert_allclose(residual[0], expected)
+    expected = target - np.complex64(0.5) * reference[None, :, :]
+    assert residual.shape == target.shape
+    np.testing.assert_allclose(residual, expected)
     np.testing.assert_array_equal(target, original)
     assert residual.dtype == np.complex64
 
 
-def test_subtract_reference_background_identical_scene_means_are_zero() -> None:
+def test_subtract_reference_background_scale_zero_preserves_independent_frames() -> None:
     scene = np.array(
         [
             [[1.0 + 2.0j, 3.0 - 4.0j]],
@@ -304,12 +554,12 @@ def test_subtract_reference_background_identical_scene_means_are_zero() -> None:
         ],
         dtype=np.complex64,
     )
-    reference_mean = scene.mean(axis=0, dtype=np.complex64)
+    reference_mean = np.zeros_like(scene[0])
 
-    residual = _subtract_reference_background(scene, reference_mean, scale=1.0)
+    residual = _subtract_reference_background(scene, reference_mean, scale=0.0)
 
-    assert residual.shape == (1, 1, 2)
-    np.testing.assert_array_equal(residual, np.zeros_like(residual))
+    assert residual.shape == scene.shape
+    np.testing.assert_array_equal(residual, scene)
 
 
 def test_subtract_reference_background_validates_antenna_and_range_shape() -> None:
@@ -632,7 +882,7 @@ def test_stream_reader_rejects_v2_capture_header(tmp_path: Path) -> None:
         SARReader(offline_cfg).describe_stream()
 
 
-@pytest.mark.parametrize("nfft_range", [4, 8, 16])
+@pytest.mark.parametrize("nfft_range", [48, 64, 96])
 def test_offline_reader_worker_publishes_compact_zero_doppler_cube(
     tmp_path: Path,
     nfft_range: int,
@@ -649,7 +899,15 @@ def test_offline_reader_worker_publishes_compact_zero_doppler_cube(
             "data": {"input_dir": str(run_dir)},
             "capture": {"frames_per_position": 2},
             "scan": {"x_start": 1, "x_end": 2, "x_step": 1, "x_pitch_m": 0.01},
-            "reconstruction": {"algorithm": "backprojection"},
+            "reconstruction": {
+                "algorithm": "backprojection",
+                "map_bounds": {
+                    "x_min_m": -0.1,
+                    "x_max_m": 0.1,
+                    "y_min_m": 0.0,
+                    "y_max_m": 0.5,
+                },
+            },
             "bp": {},
             "offline_sar_range_angle": {
                 "use_realtime_filters": True,
@@ -680,7 +938,8 @@ def test_offline_reader_worker_publishes_compact_zero_doppler_cube(
     try:
         shape = tuple(int(v) for v in msg["range_fft_shape"])
         snapshots = np.ndarray(shape, dtype=np.complex64, buffer=shm.buf)
-        assert shape == (2, 2, 8, nfft_range)
+        assert shape == (2, 2, 8, int(msg["range_fft_bins_stored"]))
+        assert 1 <= shape[-1] < nfft_range
         assert np.all(np.isfinite(snapshots))
         np.testing.assert_allclose(msg["bp_x_pos_m"], [0.01, 0.02])
     finally:
@@ -694,6 +953,95 @@ def test_offline_reader_worker_publishes_compact_zero_doppler_cube(
             shm.unlink()
         except FileNotFoundError:
             pass
+        data_q.close()
+        status_q.close()
+
+
+def test_offline_reader_rejects_insufficient_bp_oversampling_before_allocation(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run_low_oversampling"
+    run_dir.mkdir()
+    _write_capture(run_dir / "capture_pos1.bin", position=1, samples=8)
+    offline_cfg = tmp_path / "offline_config.yaml"
+    fallback_cfg = tmp_path / "realtime_config.yaml"
+    _write_yaml(
+        offline_cfg,
+        {
+            "data": {"input_dir": str(run_dir)},
+            "capture": {"frames_per_position": 2},
+            "scan": {"x_start": 1, "x_end": 1, "x_step": 1},
+            "reconstruction": {"algorithm": "backprojection"},
+            "offline_sar_range_angle": {"nfft_range": 40, "nfft_angle": 16},
+        },
+    )
+    fallback = _fallback_capture_cfg()
+    fallback["capture"].update({"samples": 8, "chirps": 4})
+    _write_yaml(fallback_cfg, fallback)
+    data_q: Queue = Queue()
+    status_q: Queue = Queue()
+    stop_evt = Event()
+    worker = Process(
+        target=_offline_reader_worker,
+        args=(str(offline_cfg), str(fallback_cfg), 40, data_q, status_q, stop_evt),
+    )
+    worker.start()
+    try:
+        msg = data_q.get(timeout=3.0)
+        assert msg["type"] == "error"
+        assert "oversampling" in str(msg["error"])
+        assert "range_fft_shm_name" not in msg
+    finally:
+        stop_evt.set()
+        worker.join(timeout=2.0)
+        if worker.is_alive():
+            worker.terminate()
+            worker.join(timeout=1.0)
+        data_q.close()
+        status_q.close()
+
+
+def test_offline_reader_worker_rejects_capture_profile_different_from_fallback(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run_profile_mismatch"
+    run_dir.mkdir()
+    _write_capture(run_dir / "capture_pos1.bin", position=1)
+    offline_cfg = tmp_path / "offline_config.yaml"
+    fallback_cfg = tmp_path / "realtime_config.yaml"
+    _write_yaml(
+        offline_cfg,
+        {
+            "data": {"input_dir": str(run_dir)},
+            "capture": {"frames_per_position": 2},
+            "scan": {"x_start": 1, "x_end": 1, "x_step": 1, "x_pitch_m": 0.01},
+            "reconstruction": {"algorithm": "backprojection"},
+            "offline_sar_range_angle": {"nfft_range": 32, "nfft_angle": 16},
+        },
+    )
+    fallback = _fallback_capture_cfg()
+    fallback["radar"]["fs"] = 15e6
+    fallback["capture"].update({"samples": 8, "chirps": 4})
+    fallback["fft"] = {"workers": 1}
+    _write_yaml(fallback_cfg, fallback)
+    data_q: Queue = Queue()
+    status_q: Queue = Queue()
+    stop_evt = Event()
+    worker = Process(
+        target=_offline_reader_worker,
+        args=(str(offline_cfg), str(fallback_cfg), 32, data_q, status_q, stop_evt),
+    )
+    worker.start()
+    try:
+        msg = data_q.get(timeout=3.0)
+        assert msg["type"] == "error"
+        assert "fs_hz" in str(msg["error"])
+    finally:
+        stop_evt.set()
+        worker.join(timeout=2.0)
+        if worker.is_alive():
+            worker.terminate()
+            worker.join(timeout=1.0)
         data_q.close()
         status_q.close()
 
@@ -742,7 +1090,7 @@ def test_offline_reader_subtracts_empty_scene_reference_with_different_frame_cou
                 "window_range": "hanning",
                 "window_doppler": "rectangular",
                 "window_angle": "hanning",
-                "nfft_range": 8,
+                "nfft_range": 48,
             },
         },
     )
@@ -756,7 +1104,7 @@ def test_offline_reader_subtracts_empty_scene_reference_with_different_frame_cou
     stop_evt = Event()
     worker = Process(
         target=_offline_reader_worker,
-        args=(str(offline_cfg), str(fallback_cfg), 8, data_q, status_q, stop_evt),
+        args=(str(offline_cfg), str(fallback_cfg), 48, data_q, status_q, stop_evt),
     )
     worker.start()
     msg = data_q.get(timeout=3.0)
@@ -769,7 +1117,7 @@ def test_offline_reader_subtracts_empty_scene_reference_with_different_frame_cou
     try:
         shape = tuple(int(v) for v in msg["range_fft_shape"])
         snapshots = np.ndarray(shape, dtype=np.complex64, buffer=shm.buf)
-        assert shape == (2, 1, 8, 8)
+        assert shape == (2, 2, 8, int(msg["range_fft_bins_stored"]))
         np.testing.assert_allclose(snapshots, 0.0, atol=1e-5)
     finally:
         shm.close()

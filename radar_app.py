@@ -493,8 +493,16 @@ from offline_processing import (
     OfflineBPRuntime,
     OfflineSARConfig,
     SARReader,
+    _backprojection_viewport_max_bin,
+    _read_offline_background_reference_cfg,
+    _read_offline_sar_range_angle_cfg,
+    _reconstruction_algorithm_normalize,
+    _validate_background_reference_layout,
+    estimate_offline_processing_peak_bytes,
     offline_map_bounds_from_yaml_dict,
+    resolve_offline_synthetic_angle_mode,
 )
+from offline_dsp import build_mimo_geometry as build_offline_mimo_geometry
 from dca1000_bridge import DCA1000Config, MmwaveStudioBridge, MmwaveStudioError, RadarConnectionConfig
 from process_cleanup import cleanup_processes, close_queues
 from realtime_dsp import (
@@ -2730,7 +2738,7 @@ def main():
     def _estimate_offline_memory(cfg_source: dict | None = None) -> dict:
         """Estimate offline allocations using file sizes only; never read capture payloads."""
         source = cfg_source if isinstance(cfg_source, dict) else {}
-        fft_cfg = source.get("offline_sar_range_angle", {}) or {}
+        range_angle_memory_cfg = _read_offline_sar_range_angle_cfg(source, cfg)
         reader_cfg = OfflineSARConfig.from_mapping(
             source,
             base_dir=offline_config_boot_path.parent,
@@ -2744,46 +2752,123 @@ def main():
         rx_input = max(1, int(layout.rx))
         tx_input = max(1, int(layout.tx))
         frames_input = max(1, int(layout.n_frames_per_position))
+        max_position_frames = int(frames_input)
+        background_cfg = _read_offline_background_reference_cfg(
+            source,
+            config_path=offline_config_boot_path,
+        )
+        if background_cfg.enabled:
+            assert background_cfg.reference_dir is not None
+            reference_reader_cfg = OfflineSARConfig(
+                input_dir=background_cfg.reference_dir,
+                x_start=int(reader_cfg.x_start),
+                x_end=int(reader_cfg.x_end),
+                x_step=int(reader_cfg.x_step),
+                frames_per_position=None,
+            )
+            reference_layout = SARReader(config=reference_reader_cfg).describe_stream()
+            _validate_background_reference_layout(layout, reference_layout)
+            max_position_frames = max(
+                int(max_position_frames),
+                int(reference_layout.n_frames_per_position),
+            )
         # The reader loads only the first configured frames of each file.
         # Keep the estimate aligned with that bounded read rather than with
         # the complete capture file stored on disk.
-        max_position_bytes = int(frames_input) * int(layout.bytes_per_frame)
-        nfft_range_est = max(1, int(fft_cfg.get("nfft_range", NFFT_RANGE)))
-        # Streaming pipeline: only one capture payload and its complex64
-        # conversion are resident while the compact zero-Doppler snapshot cube
-        # for every configured position is filled directly in shared memory.
+        max_position_bytes = int(max_position_frames) * int(layout.bytes_per_frame)
+        nfft_range_est = int(range_angle_memory_cfg.nfft_range)
         iq_bytes = int(max_position_bytes) * 2
-        samples_used = min(int(samples_input), int(nfft_range_est))
-        range_window = str(fft_cfg.get("window_range", "none")).strip().lower()
-        preprocessing = bool(fft_cfg.get("use_realtime_filters", True))
-        window_copy_bytes = (
-            int(iq_bytes * samples_used / samples_input)
-            if preprocessing and range_window not in {"none", "rectangular"}
-            else 0
-        )
-        fft_bytes = int(iq_bytes * nfft_range_est / samples_input)
-        prepared_bytes = int(
-            len(selected_files)
-            * int(frames_input)
-            * int(tx_input)
-            * int(rx_input)
-            * int(nfft_range_est)
+        # The optimized reader reduces the loop axis before the Range FFT.
+        fft_bytes = int(
+            max_position_frames
+            * tx_input
+            * rx_input
+            * nfft_range_est
             * np.dtype(np.complex64).itemsize
         )
-        reader_peak_bytes = int(
-            prepared_bytes
-            + max_position_bytes
-            + iq_bytes
-            + window_copy_bytes
-            + fft_bytes
+
+        radar_profile = layout.radar_profile
+        bp_cfg = source.get("bp", {}) or {}
+        geometry_kwargs: dict[str, object] = {}
+        if bp_cfg.get("tx_offsets_m") is not None or bp_cfg.get("rx_offsets_m") is not None:
+            geometry_kwargs.update(
+                tx_offsets_m=bp_cfg.get("tx_offsets_m"),
+                rx_offsets_m=bp_cfg.get("rx_offsets_m"),
+            )
+        elif bp_cfg.get("tx_offsets_lambda") is not None or bp_cfg.get("rx_offsets_lambda") is not None:
+            geometry_kwargs.update(
+                tx_offsets_lambda=bp_cfg.get("tx_offsets_lambda"),
+                rx_offsets_lambda=bp_cfg.get("rx_offsets_lambda"),
+            )
+        x_tx_ant_m, x_rx_ant_m = build_offline_mimo_geometry(
+            tx_input,
+            rx_input,
+            fc_hz=float(radar_profile.fc_hz),
+            c_m_s=float(radar_profile.c_m_s),
+            **geometry_kwargs,
         )
-        display_pixels = int(offline_gui_h) * int(offline_gui_w)
-        bp_workspace_bytes = int(
-            int(frames_input) * display_pixels * np.dtype(np.complex64).itemsize
-            + 8 * display_pixels * np.dtype(np.float32).itemsize
+        dr_m = (
+            float(radar_profile.c_m_s)
+            * float(radar_profile.fs_hz)
+            / (2.0 * float(radar_profile.slope_hz_s) * float(nfft_range_est))
         )
-        dsp_peak_bytes = int((2 * prepared_bytes) + bp_workspace_bytes)
-        peak_bytes = max(reader_peak_bytes, dsp_peak_bytes)
+        bounds = offline_map_bounds_from_yaml_dict(source, cfg)
+        home = build_display_viewport(
+            x_min_m=float(bounds.x_min_m),
+            x_max_m=float(bounds.x_max_m),
+            y_min_m=float(bounds.y_min_m),
+            y_max_m=float(bounds.y_max_m),
+            dr_m=float(dr_m),
+            seq=0,
+        )
+        x_pos = np.asarray(layout.stage_positions_m, dtype=np.float32).reshape(-1)
+        x_pos -= np.mean(x_pos, dtype=np.float32)
+        retained_range_bins = _backprojection_viewport_max_bin(
+            home,
+            x_pos_m=x_pos,
+            x_tx_ant_m=x_tx_ant_m,
+            x_rx_ant_m=x_rx_ant_m,
+            dr_m=float(dr_m),
+            available_bins=int(nfft_range_est),
+        )
+        algorithm = _reconstruction_algorithm_normalize(
+            (source.get("reconstruction", {}) or {}).get("algorithm", "backprojection")
+        )
+        angle_mode = str(range_angle_memory_cfg.angle_processing.mode)
+        if algorithm == "synthetic_range_angle":
+            angle_mode = resolve_offline_synthetic_angle_mode(
+                stage_positions_m=layout.stage_positions_m,
+                x_tx_ant_m=x_tx_ant_m,
+                x_rx_ant_m=x_rx_ant_m,
+                c_m_s=float(radar_profile.c_m_s),
+                fc_hz=float(radar_profile.fc_hz),
+                requested_mode=str(angle_mode),
+            )
+        nfft_angle_est = int(range_angle_memory_cfg.nfft_angle)
+        full_loop_range_fft = bool(
+            algorithm == "synthetic_range_angle"
+            and range_angle_memory_cfg.use_realtime_filters
+            and range_angle_memory_cfg.post_range_fft_filters.mean_after_range_fft.enabled
+            and "loop"
+            in tuple(range_angle_memory_cfg.post_range_fft_filters.mean_after_range_fft.axes)
+        )
+        estimate = estimate_offline_processing_peak_bytes(
+            n_positions=len(selected_files),
+            n_frames=frames_input,
+            n_antennas=tx_input * rx_input,
+            input_samples=samples_input,
+            chirps=chirps_input,
+            rx=rx_input,
+            nfft_range=nfft_range_est,
+            retained_range_bins=retained_range_bins,
+            nfft_angle=nfft_angle_est,
+            algorithm=algorithm,
+            angle_mode=angle_mode,
+            max_position_frames=int(max_position_frames),
+            image_h=int(offline_gui_h),
+            image_w=int(offline_gui_w),
+            full_loop_range_fft=bool(full_loop_range_fft),
+        )
         return {
             "source_dir": str(source_dir),
             "files": int(len(selected_files)),
@@ -2792,8 +2877,12 @@ def main():
             "capture_bytes": int(capture_bytes),
             "iq_bytes": int(iq_bytes),
             "fft_bytes": int(fft_bytes),
-            "prepared_bytes": int(prepared_bytes),
-            "peak_bytes": int(peak_bytes),
+            "retained_range_bins": int(retained_range_bins),
+            "effective_angle_mode": str(angle_mode),
+            "max_position_frames": int(max_position_frames),
+            "full_loop_range_fft": bool(full_loop_range_fft),
+            "prepared_bytes": int(estimate["shared_bytes"]),
+            "peak_bytes": int(estimate["peak_bytes"]),
         }
 
     def _format_offline_memory_estimate(cfg_source: dict | None = None) -> str:
@@ -2807,7 +2896,11 @@ def main():
             )
             return (
                 f"Memory estimate (payload not loaded): {estimate['files']} files | "
-                f"Range {estimate['samples_input']} -> {estimate['nfft_range']} ({padding_note})\n"
+                f"Range {estimate['samples_input']} -> {estimate['nfft_range']} ({padding_note}), "
+                f"stored bins {estimate['retained_range_bins']}\n"
+                f"Angle memory mode {estimate['effective_angle_mode']} | "
+                f"largest target/reference batch {estimate['max_position_frames']} frames\n"
+                f"Loop-aware full Range FFT: {'yes' if estimate['full_loop_range_fft'] else 'no'}\n"
                 f"Per-position IQ {estimate['iq_bytes'] / gib:.2f} GiB | "
                 f"Range FFT workspace {estimate['fft_bytes'] / gib:.2f} GiB | "
                 f"Doppler-zero shared {estimate['prepared_bytes'] / gib:.2f} GiB | "
@@ -6134,7 +6227,13 @@ def main():
                         loading_info = {}
                     loading_phase = str(loading_info.get("phase", "starting offline workers"))
                     loading_text = f"Offline load/calculation in progress: {loading_phase}\n{offline_memory_estimate_text}"
-                    _render_offline_summary(state=f"Offline loading: {loading_phase}")
+                    loading_warning = str(loading_info.get("warning", "")).strip()
+                    if loading_warning:
+                        loading_text += f"\nWARNING: {loading_warning}"
+                    loading_state = f"Offline loading: {loading_phase}"
+                    if loading_warning:
+                        loading_state += f" | WARNING: {loading_warning}"
+                    _render_offline_summary(state=loading_state)
                     dpg.set_value(
                         TXT_OFFLINE_TUNING_INFO_TAG,
                         loading_text,
@@ -6162,12 +6261,15 @@ def main():
                         )
                     else:
                         background_text = "Reference background: OFF"
+                    runtime_warning = str(info_now.get("warning", "")).strip()
+                    warning_text = f"\nWARNING: {runtime_warning}" if runtime_warning else ""
                     dpg.set_value(
                         TXT_OFFLINE_TUNING_INFO_TAG,
                         f"Algorithm: {info_now.get('algorithm', 'n/a')} | "
                         f"Angle: {info_now.get('angle_mode', info_now.get('range_angle_angle_mode_requested', 'n/a'))} | "
                         f"Filters: {filters_text} | {background_text}\n"
-                        f"Range: input {range_input} -> used {range_used} -> FFT {range_nfft} | {angle_fft_text}",
+                        f"Range: input {range_input} -> used {range_used} -> FFT {range_nfft} | {angle_fft_text}"
+                        f"{warning_text}",
                     )
 
 

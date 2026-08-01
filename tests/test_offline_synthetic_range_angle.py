@@ -9,7 +9,7 @@ import pytest
 
 import offline_processing
 import realtime_dsp
-from offline_dsp import build_mimo_geometry
+from offline_dsp import build_mimo_geometry, prepare_mimo_snapshots
 from offline_processing import (
     OfflineSyntheticRangeAngleConfig,
     _apply_offline_backprojection_aperture_window,
@@ -17,6 +17,8 @@ from offline_processing import (
     _select_offline_range_fft_input,
     _apply_offline_sar_range_angle_pre_filters,
     _compute_synthetic_range_angle_image,
+    _compute_angle_heatmap_bounded,
+    _prepare_offline_zero_doppler_position,
 )
 
 
@@ -52,6 +54,91 @@ def _viewport() -> realtime_dsp.DisplayViewport:
 
 def _geometry() -> tuple[np.ndarray, np.ndarray]:
     return build_mimo_geometry(2, 4, fc_hz=77e9, c_m_s=3e8)
+
+
+def test_zero_doppler_reduction_precedes_range_fft_without_changing_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rng = np.random.default_rng(41)
+    iq = (
+        rng.normal(size=(2, 4, 8, 8))
+        + 1j * rng.normal(size=(2, 4, 8, 8))
+    ).astype(np.complex64)
+    nfft = 64
+    window = np.hanning(4).astype(np.float32)
+    cfg = _range_angle_cfg(use_realtime_filters=False, nfft_range=nfft)
+
+    full_fft = offline_processing.fft.fft(iq, n=nfft, axis=-1, workers=1).astype(np.complex64)
+    expected = prepare_mimo_snapshots(
+        full_fft.reshape(1, 2, 4, 2, 4, nfft),
+        n_tx=2,
+        window_doppler=window,
+        log_info=False,
+    )[0]
+
+    real_fft = offline_processing.fft.fft
+    observed_shapes: list[tuple[int, ...]] = []
+
+    def recording_fft(value, *args, **kwargs):
+        observed_shapes.append(tuple(int(v) for v in np.asarray(value).shape))
+        return real_fft(value, *args, **kwargs)
+
+    monkeypatch.setattr(offline_processing.fft, "fft", recording_fft)
+    actual = _prepare_offline_zero_doppler_position(
+        iq,
+        nfft_range=nfft,
+        chirps=8,
+        tx=2,
+        rx=4,
+        algorithm="backprojection",
+        range_angle_cfg=cfg,
+        fft_workers=1,
+        doppler_window=window,
+    )
+
+    assert observed_shapes == [(2, 2, 4, 8)]
+    np.testing.assert_allclose(actual, expected, atol=2e-5, rtol=2e-5)
+
+
+def test_angle_heatmap_is_processed_in_bounded_range_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cube = np.ones((2, 1, 11, 8), dtype=np.complex64)
+    geometry, _ = offline_processing._build_synthetic_virtual_array_geometry(
+        np.arange(8, dtype=np.float32) * np.float32(0.001),
+        wavelength_m=0.004,
+    )
+    cfg = _range_angle_cfg(nfft_angle=16)
+    dsp_cfg = offline_processing._build_synthetic_angle_dsp_cfg(
+        c_m_s=3e8,
+        fs_hz=10e6,
+        slope_hz_s=60e12,
+        nfft_range=64,
+        nfft_angle=16,
+        range_max_m=3.0,
+        synthetic_ant=8,
+        fft_workers=1,
+        frames_like=2,
+    )
+    calls: list[int] = []
+
+    def fake_heatmap(value, **_kwargs):
+        calls.append(int(value.shape[2]))
+        return np.full((int(value.shape[2]), 16), float(len(calls)), dtype=np.float32)
+
+    monkeypatch.setattr(offline_processing, "compute_angle_heatmap", fake_heatmap)
+    monkeypatch.setattr(offline_processing, "_OFFLINE_ANGLE_FFT_TARGET_BYTES", 256)
+    heatmap, chunk_bins = _compute_angle_heatmap_bounded(
+        cube,
+        angle_cfg=cfg.angle_processing,
+        dsp_cfg=dsp_cfg,
+        angle_steering=np.empty((0, 0), dtype=np.complex64),
+        geometry=geometry,
+    )
+
+    assert chunk_bins == 1
+    assert calls == [1] * 11
+    assert heatmap.shape == (11, 16)
 
 
 def test_offline_pre_filters_ignore_slow_time_even_if_supplied() -> None:

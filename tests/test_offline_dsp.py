@@ -616,6 +616,29 @@ def test_prepare_synthetic_aperture_data_preserves_noncontiguous_physical_spacin
     )
 
 
+def test_prepare_synthetic_aperture_data_prefers_measured_stage_coordinates() -> None:
+    zero_doppler = np.arange(2 * 2 * 8 * 3, dtype=np.float32).reshape(2, 2, 8, 3).astype(
+        np.complex64
+    )
+    selected_positions = np.asarray([1, 4], dtype=np.int32)
+    measured_positions_m = np.asarray([-0.012, 0.0175], dtype=np.float32)
+    x_tx_ant_m, x_rx_ant_m = build_mimo_geometry(2, 4, fc_hz=77e9, c_m_s=3e8)
+
+    synthetic = prepare_synthetic_aperture_data(
+        zero_doppler,
+        selected_positions=selected_positions,
+        x_pitch_m=0.05,
+        x_tx_ant_m=x_tx_ant_m,
+        x_rx_ant_m=x_rx_ant_m,
+        measured_positions_m=measured_positions_m,
+    )
+
+    np.testing.assert_allclose(synthetic.x_position_m, measured_positions_m, atol=0.0, rtol=0.0)
+    assert not np.shares_memory(synthetic.snapshot_cube, zero_doppler)
+    expected_cube = np.transpose(zero_doppler, (1, 3, 0, 2)).reshape(2, 1, 3, 16)
+    np.testing.assert_array_equal(synthetic.snapshot_cube, expected_cube)
+
+
 def test_tdm_compensation_static_target_survives_zero_bin() -> None:
     n_pos, n_frames, n_loops, n_tx, n_rx, n_bins, target_bin = 1, 1, 32, 2, 4, 64, 18
 
@@ -698,3 +721,159 @@ def test_cubic_vs_linear_interpolation() -> None:
     rms_linear = np.sqrt(err_linear_sq / np.float32(fractions.size)).astype(np.float32, copy=False)
     rms_cubic = np.sqrt(err_cubic_sq / np.float32(fractions.size)).astype(np.float32, copy=False)
     assert float(rms_cubic) <= float(rms_linear / np.float32(3.0))
+
+
+@pytest.mark.parametrize("fraction", [0.1, 0.3, 0.5, 0.7, 0.9])
+def test_phase_aware_cubic_interpolation_recovers_fractional_real_tone(
+    fraction: float,
+) -> None:
+    """A causal real tone must retain amplitude and phase between FFT bins."""
+    samples_used = 128
+    nfft = 6 * samples_used
+    bin_float = 27.0 + float(fraction)
+    sample_index = np.arange(samples_used, dtype=np.float64)
+    signal = np.cos(
+        (2.0 * np.pi * bin_float / float(nfft)) * sample_index
+    ).astype(np.float32)
+    spectrum = np.fft.fft(signal, n=nfft).astype(np.complex64, copy=False)
+    truth = np.sum(
+        signal.astype(np.float64, copy=False)
+        * np.exp(-2j * np.pi * bin_float * sample_index / float(nfft)),
+        dtype=np.complex128,
+    )
+
+    interpolated = _interp_cubic_complex(
+        spectrum,
+        np.asarray([bin_float], dtype=np.float32),
+        nfft,
+        samples_used=samples_used,
+        nfft=nfft,
+    )[0]
+    ratio = np.complex128(interpolated) / truth
+    amplitude_error_db = 20.0 * np.log10(abs(ratio))
+    phase_error_rad = float(np.angle(ratio))
+
+    assert abs(float(amplitude_error_db)) < 0.1
+    assert abs(phase_error_rad) < 5e-4
+
+
+def test_phase_aware_interpolation_rejects_insufficient_oversampling() -> None:
+    spectrum = np.ones(256, dtype=np.complex64)
+    bins = np.asarray([20.5], dtype=np.float32)
+
+    with pytest.raises(ValueError, match="oversampling.*insufficiente"):
+        _interp_cubic_complex(
+            spectrum,
+            bins,
+            spectrum.size,
+            samples_used=128,
+            nfft=5 * 128,
+        )
+
+
+def test_phase_aware_linear_dc_boundary_stays_within_point_one_db() -> None:
+    samples_used = 128
+    nfft = 6 * samples_used
+    bin_float = 0.5
+    sample_index = np.arange(samples_used, dtype=np.float64)
+    signal = np.exp(2j * np.pi * bin_float * sample_index / float(nfft))
+    spectrum = np.fft.fft(signal, n=nfft).astype(np.complex64)
+    truth = np.sum(
+        signal * np.exp(-2j * np.pi * bin_float * sample_index / float(nfft)),
+        dtype=np.complex128,
+    )
+
+    interpolated = _interp_cubic_complex(
+        spectrum,
+        np.asarray([bin_float], dtype=np.float32),
+        nfft,
+        samples_used=samples_used,
+        nfft=nfft,
+    )[0]
+    amplitude_error_db = 20.0 * np.log10(abs(np.complex128(interpolated) / truth))
+
+    assert abs(float(amplitude_error_db)) < 0.1
+
+
+def test_phase_aware_interpolation_rejects_single_bin_fft() -> None:
+    with pytest.raises(ValueError, match="nfft deve essere >= 2"):
+        _interp_cubic_complex(
+            np.ones(1, dtype=np.complex64),
+            np.asarray([0.0], dtype=np.float32),
+            1,
+            samples_used=1,
+            nfft=1,
+        )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"samples_used": 128},
+        {"nfft": 384},
+    ],
+)
+def test_phase_aware_interpolation_requires_complete_fft_metadata(
+    metadata: dict[str, int],
+) -> None:
+    with pytest.raises(ValueError, match="specificati insieme"):
+        _interp_cubic_complex(
+            np.ones(384, dtype=np.complex64),
+            np.asarray([20.5], dtype=np.float32),
+            384,
+            **metadata,
+        )
+
+
+def test_phase_aware_geometry_bp_numba_matches_numpy_on_fractional_tone() -> None:
+    import offline_dsp
+
+    if offline_dsp._back_projection_power_mimo_geometry_numba_kernel is None:
+        pytest.skip("Numba non installato")
+
+    samples_used = 128
+    nfft = 6 * samples_used
+    bin_float = 27.5
+    sample_index = np.arange(samples_used, dtype=np.float64)
+    signal = np.cos(
+        (2.0 * np.pi * bin_float / float(nfft)) * sample_index
+    ).astype(np.float32)
+    spectrum = np.fft.fft(signal, n=nfft).astype(np.complex64, copy=False)
+    truth = np.sum(
+        signal.astype(np.float64, copy=False)
+        * np.exp(-2j * np.pi * bin_float * sample_index / float(nfft)),
+        dtype=np.complex128,
+    )
+    snapshots = spectrum.reshape(1, 1, 1, nfft)
+    tx_global = np.zeros((1, 1, 3), dtype=np.float32)
+    rx_global = np.zeros((1, 1, 3), dtype=np.float32)
+    voxel_xyz = np.asarray([[bin_float, 0.0, 0.0]], dtype=np.float32)
+    kwargs = {
+        "dr_m": 1.0,
+        "fc_hz": 77e9,
+        "c_m_s": 3e8,
+        "max_bin": nfft,
+        "range_samples_used": samples_used,
+        "nfft_range": nfft,
+    }
+
+    reference = back_projection_power_mimo_geometry(
+        snapshots,
+        tx_global,
+        rx_global,
+        voxel_xyz,
+        use_numba=False,
+        **kwargs,
+    )
+    accelerated = back_projection_power_mimo_geometry(
+        snapshots,
+        tx_global,
+        rx_global,
+        voxel_xyz,
+        use_numba=True,
+        **kwargs,
+    )
+
+    np.testing.assert_allclose(accelerated, reference, atol=1e-2, rtol=2e-5)
+    amplitude_error_db = 10.0 * np.log10(float(reference[0]) / (abs(truth) ** 2))
+    assert abs(amplitude_error_db) < 0.1
