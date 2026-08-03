@@ -248,7 +248,12 @@ def test_mvdr_solve_matches_legacy_pinv_on_well_conditioned_input() -> None:
 
     assert getattr(realtime_dsp.compute_angle_heatmap, "_mvdr_total_bins") == 3
     assert getattr(realtime_dsp.compute_angle_heatmap, "_mvdr_fallback_bins") == 0
-    np.testing.assert_allclose(heatmap, legacy, atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(
+        heatmap,
+        legacy * np.float32(virtual_array.shape[-1]),
+        atol=1e-4,
+        rtol=1e-4,
+    )
 
 
 def test_mvdr_falls_back_to_bartlett_for_only_singular_range_bin() -> None:
@@ -279,7 +284,12 @@ def test_mvdr_falls_back_to_bartlett_for_only_singular_range_bin() -> None:
 
     assert getattr(realtime_dsp.compute_angle_heatmap, "_mvdr_total_bins") == 2
     assert getattr(realtime_dsp.compute_angle_heatmap, "_mvdr_fallback_bins") == 1
-    np.testing.assert_allclose(heatmap[0], bartlett_bin0, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(
+        heatmap[0],
+        bartlett_bin0 * np.float32(virtual_array.shape[-1]),
+        atol=1e-5,
+        rtol=1e-5,
+    )
     assert np.all(np.isfinite(heatmap[1]))
 
 

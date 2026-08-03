@@ -355,6 +355,9 @@ class DisplayZoomRuntime:
     steering_cache: dict[tuple[Any, ...], tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
     display_bg_state: BackgroundSubtractionState = field(default_factory=BackgroundSubtractionState)
     moving_bg_state: BackgroundSubtractionState = field(default_factory=BackgroundSubtractionState)
+    display_bg_state_cache: dict[tuple[int, ...], BackgroundSubtractionState] = field(default_factory=dict)
+    moving_bg_state_cache: dict[tuple[int, ...], BackgroundSubtractionState] = field(default_factory=dict)
+    heatmap_ema: np.ndarray | None = None
     last_view_db: np.ndarray | None = None
     last_view_alpha: np.ndarray | None = None
     last_fill_value: float = -120.0
@@ -363,6 +366,7 @@ class DisplayZoomRuntime:
     last_compute_ms: float = 0.0
     last_compute_t_s: float = 0.0
     last_mode: str = "power_xy"
+    last_error_signature: tuple[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -2042,6 +2046,9 @@ def compute_angle_heatmap(
         beam = np.einsum("ak,flra->flrk", np.conj(steering), snapshots, optimize=True)
         power = (beam.real * beam.real + beam.imag * beam.imag).astype(np.float32, copy=False)
         heatmap = _aggregate_angle_power(power)
+        # Steering columns are unit norm, while the FFT branch retains the
+        # coherent array gain. Preserve the established FFT dB calibration.
+        heatmap *= np.float32(max(1, num_ant))
         return heatmap.astype(np.float32, copy=False)
 
     # MVDR always uses every available frame/loop snapshot in the batch to estimate covariance.
@@ -2122,6 +2129,7 @@ def compute_angle_heatmap(
         if getattr(compute_angle_heatmap, "_mvdr_fallback_last_report", None) != report_key:
             print(f"[DSP WARN] MVDR local Bartlett fallback bins={mvdr_fallback_bins}/{num_range}")
             compute_angle_heatmap._mvdr_fallback_last_report = report_key
+    heatmap *= np.float32(max(1, num_ant))
     return heatmap.astype(np.float32, copy=False)
 
 
@@ -3646,10 +3654,18 @@ def compute_range_doppler(
     if excl > 0 and range_doppler_map.shape[1] > 0:
         # Lo zero-Doppler viene azzerato solo nella mappa di detection: il
         # cubo complesso resta integro per la successiva stima angolare.
-        zero_idx = int(range_doppler_map.shape[1] // 2) if moving_cfg.doppler_fft_shift else 0
-        d0 = max(0, zero_idx - excl)
-        d1 = min(int(range_doppler_map.shape[1]), zero_idx + excl + 1)
-        range_doppler_map[:, d0:d1] = 0.0
+        n_doppler = int(range_doppler_map.shape[1])
+        if moving_cfg.doppler_fft_shift:
+            zero_idx = n_doppler // 2
+            d0 = max(0, zero_idx - excl)
+            d1 = min(n_doppler, zero_idx + excl + 1)
+            range_doppler_map[:, d0:d1] = 0.0
+        else:
+            # Unshifted FFT is circular: negative bins nearest zero live at
+            # the end of the array, not next to index zero in memory.
+            range_doppler_map[:, : min(n_doppler, excl + 1)] = 0.0
+            if excl < n_doppler:
+                range_doppler_map[:, max(0, n_doppler - excl) :] = 0.0
     return doppler_cube, range_doppler_map
 
 
@@ -3960,15 +3976,15 @@ def _merge_two_detections(
         x_m = float(det_moving.x_m if det_moving.angle_bin is not None else det_static.x_m)
         y_m = float(det_moving.y_m if det_moving.angle_bin is not None else det_static.y_m)
     else:
-        w_static = max(float(det_static.power_lin), 1e-6)
-        w_moving = max(float(det_moving.power_lin), 1e-6)
-        w_sum = w_static + w_moving
-        x_m = (det_static.x_m * w_static + det_moving.x_m * w_moving) / w_sum
-        y_m = (det_static.y_m * w_static + det_moving.y_m * w_moving) / w_sum
-        range_m = float(np.hypot(x_m, y_m))
-        angle_deg = float(np.rad2deg(np.arctan2(np.float32(x_m), np.float32(max(y_m, 1e-6)))))
-        range_bin = int(round((det_static.range_bin * w_static + det_moving.range_bin * w_moving) / w_sum))
-        angle_bin = det_moving.angle_bin if det_moving.angle_bin is not None else det_static.angle_bin
+        # Le due branche hanno guadagni algoritmici differenti, quindi i raw
+        # power_lin non sono pesi confrontabili. "Prefer static" mantiene la
+        # geometria statica e aggiunge soltanto il Doppler della branca mobile.
+        range_bin = int(det_static.range_bin)
+        angle_bin = det_static.angle_bin
+        range_m = float(det_static.range_m)
+        angle_deg = float(det_static.angle_deg)
+        x_m = float(det_static.x_m)
+        y_m = float(det_static.y_m)
     return Detection(
         range_bin=range_bin,
         angle_bin=angle_bin,
@@ -4113,6 +4129,27 @@ def apply_background_subtraction(
 ) -> np.ndarray:
     if not bg_cfg.enabled:
         return range_fft
+
+    frame_shape = tuple(int(x) for x in range_fft.shape[1:])
+    state_shapes = [
+        tuple(int(x) for x in value.shape)
+        for value in (bg_state.model, bg_state.init_sum, bg_state.running_sum, bg_state.window_sum)
+        if value is not None
+    ]
+    if bg_state.window_ring is not None:
+        state_shapes.append(tuple(int(x) for x in bg_state.window_ring.shape[1:]))
+    if any(shape != frame_shape for shape in state_shapes):
+        # NFFT/ROI can change at runtime. Never combine a background learned
+        # on one cube geometry with another one.
+        bg_state.model = None
+        bg_state.init_sum = None
+        bg_state.init_count = 0
+        bg_state.running_sum = None
+        bg_state.running_count = 0
+        bg_state.window_ring = None
+        bg_state.window_sum = None
+        bg_state.window_count = 0
+        bg_state.window_head = 0
 
     mode = str(bg_cfg.mode)
     batch_frames = int(range_fft.shape[0])
@@ -4537,6 +4574,7 @@ def process_buffer(
     doppler_diag_out_buf: np.ndarray | None = None,
     display_normalization_reference_db_out: Synchronized | None = None,
     display_power_normalized_out: Synchronized | None = None,
+    publish_applied_viewport=None,
 ) -> tuple[np.ndarray | None, list[Detection]]:
     """Elabora un batch IQ e pubblica l'ultima immagine nella GUI.
 
@@ -5063,10 +5101,15 @@ def process_buffer(
                             if _branch_needs_copy(detection_moving_pre_doppler_filters)
                             else zoom_range_fft_common
                         )
+                        moving_bg_key = tuple(int(x) for x in zoom_range_fft_detection_in.shape[1:])
+                        zoom_moving_bg_state = display_zoom_runtime.moving_bg_state_cache.setdefault(
+                            moving_bg_key,
+                            BackgroundSubtractionState(),
+                        )
                         zoom_range_fft_detection = apply_post_range_fft_filters(
                             zoom_range_fft_detection_in,
                             detection_moving_pre_doppler_filters,
-                            bg_state=display_zoom_runtime.moving_bg_state,
+                            bg_state=zoom_moving_bg_state,
                             fft_workers=dsp_cfg.fft_workers,
                             apply_loop_average_after_background=False,
                         )
@@ -5132,8 +5175,12 @@ def process_buffer(
                     )
                     display_zoom_runtime.last_compute_ms = float((time.perf_counter() - zoom_t0) * 1000.0)
                     display_zoom_runtime.last_compute_t_s = time.perf_counter()
-                except Exception:
+                except Exception as exc:
                     fallback_used = True
+                    error_signature = (type(exc).__name__, str(exc))
+                    if display_zoom_runtime.last_error_signature != error_signature:
+                        print(f"[DSP WARN] moving display zoom fallback: {type(exc).__name__}: {exc}")
+                        display_zoom_runtime.last_error_signature = error_signature
             if view_display.size > 0 and dsp_cfg.debug_stats:
                 try:
                     valid_alpha = view_alpha > np.float32(0.0) if view_alpha is not None else np.ones(view_display.shape, dtype=bool)
@@ -5202,6 +5249,7 @@ def process_buffer(
                 heatmap_ema *= (1.0 - heatmap_ema_cfg.alpha)
                 heatmap_ema += (heatmap_ema_cfg.alpha * heatmap)
             heatmap_ema = apply_heatmap_spatial_filter(heatmap_ema, heatmap_spatial_filter_cfg)
+            debug_heatmap = heatmap_ema
 
             view_display = _project_view(
                 heatmap_ema,
@@ -5245,10 +5293,15 @@ def process_buffer(
                             if _branch_needs_copy(display_post_range_fft_filters)
                             else zoom_range_fft_common
                         )
+                        display_bg_key = tuple(int(x) for x in zoom_range_fft_display_in.shape[1:])
+                        zoom_display_bg_state = display_zoom_runtime.display_bg_state_cache.setdefault(
+                            display_bg_key,
+                            BackgroundSubtractionState(),
+                        )
                         zoom_range_fft_display = apply_post_range_fft_filters(
                             zoom_range_fft_display_in,
                             display_post_range_fft_filters,
-                            bg_state=display_zoom_runtime.display_bg_state,
+                            bg_state=zoom_display_bg_state,
                             fft_workers=dsp_cfg.fft_workers,
                             apply_loop_average_after_background=apply_display_loop_average_after_background,
                         )
@@ -5310,16 +5363,19 @@ def process_buffer(
                         )
                     debug_angle_axis = zoom_angle_axis
 
+                    zoom_heatmap_ema = display_zoom_runtime.heatmap_ema
                     if not heatmap_ema_cfg.enabled:
-                        heatmap_ema = zoom_heatmap
-                    elif heatmap_ema is None:
-                        heatmap_ema = zoom_heatmap
+                        zoom_heatmap_ema = zoom_heatmap
+                    elif zoom_heatmap_ema is None or zoom_heatmap_ema.shape != zoom_heatmap.shape:
+                        zoom_heatmap_ema = np.array(zoom_heatmap, dtype=np.float32, copy=True)
                     else:
-                        heatmap_ema *= (1.0 - heatmap_ema_cfg.alpha)
-                        heatmap_ema += (heatmap_ema_cfg.alpha * zoom_heatmap)
-                    heatmap_ema = apply_heatmap_spatial_filter(heatmap_ema, heatmap_spatial_filter_cfg)
+                        zoom_heatmap_ema *= (1.0 - heatmap_ema_cfg.alpha)
+                        zoom_heatmap_ema += (heatmap_ema_cfg.alpha * zoom_heatmap)
+                    zoom_heatmap_ema = apply_heatmap_spatial_filter(zoom_heatmap_ema, heatmap_spatial_filter_cfg)
+                    display_zoom_runtime.heatmap_ema = zoom_heatmap_ema
+                    debug_heatmap = zoom_heatmap_ema
                     view_display = _project_view(
-                        heatmap_ema,
+                        zoom_heatmap_ema,
                         angle_axis_local=zoom_angle_axis,
                         dr_local=zoom_range_bin_m,
                         projection_mode_local=display_projection_cfg.projection_mode,
@@ -5331,13 +5387,17 @@ def process_buffer(
                     view_display *= np.float32(10.0)
                     display_zoom_runtime.last_compute_ms = float((time.perf_counter() - zoom_t0) * 1000.0)
                     display_zoom_runtime.last_compute_t_s = time.perf_counter()
-                except Exception:
+                except Exception as exc:
                     fallback_used = True
+                    error_signature = (type(exc).__name__, str(exc))
+                    if display_zoom_runtime.last_error_signature != error_signature:
+                        print(f"[DSP WARN] power display zoom fallback: {type(exc).__name__}: {exc}")
+                        display_zoom_runtime.last_error_signature = error_signature
 
             if debug_print_top_peaks:
                 print(
                     _format_debug_top_peaks_range_angle(
-                        heatmap_ema,
+                        debug_heatmap,
                         angle_axis_deg=debug_angle_axis,
                         range_bin_m=(zoom_range_bin_m if debug_angle_axis is not angle_axis_deg else range_bin_m),
                         top_k=debug_top_peaks_count,
@@ -5406,6 +5466,8 @@ def process_buffer(
 
         # Latest-wins publish to the GUI double buffer.
         with gui_lock:
+            if publish_applied_viewport is not None and display_zoom_runtime is not None:
+                publish_applied_viewport(display_zoom_runtime.last_applied_meta)
             if display_normalization_reference_db_out is not None:
                 try:
                     with display_normalization_reference_db_out.get_lock():
@@ -5521,6 +5583,8 @@ def dsp_worker(
     doppler_diag_w: int = 0,
     display_normalization_reference_db: Synchronized | None = None,
     display_power_normalized: Synchronized | None = None,
+    slot_frame_time_s=None,
+    ready_evt=None,
 ) -> None:
     """Loop del processo DSP: consuma slot RX, elabora e rilascia lo slot.
 
@@ -5868,6 +5932,9 @@ def dsp_worker(
         if display_zoom_runtime is not None:
             display_zoom_runtime.display_bg_state = BackgroundSubtractionState()
             display_zoom_runtime.moving_bg_state = BackgroundSubtractionState()
+            display_zoom_runtime.display_bg_state_cache.clear()
+            display_zoom_runtime.moving_bg_state_cache.clear()
+            display_zoom_runtime.heatmap_ema = None
             display_zoom_runtime.last_view_db = None
             display_zoom_runtime.last_view_alpha = None
             display_zoom_runtime.last_viewport_signature = None
@@ -5922,6 +5989,12 @@ def dsp_worker(
         next_detection_moving_cfg = detection_moving_from_yaml_dict(next_cfg_dict)
         next_fusion_cfg = fusion_from_yaml_dict(next_cfg_dict)
         next_tracking_cfg = tracking_from_yaml_dict(next_cfg_dict)
+        if int(next_tracking_cfg.max_tracks) > tracks_capacity:
+            print(
+                f"[TRACK WARN] max_tracks={int(next_tracking_cfg.max_tracks)} exceeds shared GUI capacity "
+                f"{tracks_capacity}; clamped until pipeline restart."
+            )
+            next_tracking_cfg = replace(next_tracking_cfg, max_tracks=max(1, tracks_capacity))
         next_tracker_cfg = tracker_from_yaml_dict(next_cfg_dict)
         next_range_angle_moving_cfg = range_angle_moving_from_yaml_dict(next_cfg_dict)
         next_zero_after = max(0, _to_int((next_cfg_dict.get("dsp", {}) or {}).get("zero_after_range_fft_bins", 0), 0))
@@ -5946,13 +6019,17 @@ def dsp_worker(
             detection_moving_bg_state = BackgroundSubtractionState()
             if display_zoom_runtime is not None:
                 display_zoom_runtime.moving_bg_state = BackgroundSubtractionState()
+                display_zoom_runtime.moving_bg_state_cache.clear()
         if next_display_filters != display_post_range_fft_filters:
             display_bg_state = BackgroundSubtractionState()
             if display_zoom_runtime is not None:
                 display_zoom_runtime.display_bg_state = BackgroundSubtractionState()
+                display_zoom_runtime.display_bg_state_cache.clear()
             warned_display_loop_average_after_doppler = False
         if next_heatmap_ema_cfg != heatmap_ema_cfg:
             heatmap_ema = None
+            if display_zoom_runtime is not None:
+                display_zoom_runtime.heatmap_ema = None
 
         next_tracking_runtime_enabled = bool(getattr(next_tracking_cfg, "enabled", False))
         if next_tracking_runtime_enabled and int(dsp_cfg.x_frames) > 1:
@@ -6110,6 +6187,9 @@ def dsp_worker(
         except Exception:
             pass
 
+    if ready_evt is not None:
+        ready_evt.set()
+
     while True:
         _poll_dsp_commands()
         if stop_evt.is_set():
@@ -6143,7 +6223,13 @@ def dsp_worker(
                     continue
                 if (int(slot_usemask[s]) & 1) == 0:
                     continue
-                ready.append((seq, s, int(slot_ok[s])))
+                frame_time_s = 0.0
+                if slot_frame_time_s is not None:
+                    try:
+                        frame_time_s = float(slot_frame_time_s[s])
+                    except Exception:
+                        frame_time_s = 0.0
+                ready.append((seq, s, int(slot_ok[s]), frame_time_s))
 
         if not ready:
             continue
@@ -6151,7 +6237,7 @@ def dsp_worker(
         # Keep only the newest frames so the display stays real-time under load.
         drop_slots = []
         if len(ready) > dsp_cfg.x_frames:
-            drop_slots = [int(s) for _, s, _ in ready[:-dsp_cfg.x_frames]]
+            drop_slots = [int(s) for _, s, _, _ in ready[:-dsp_cfg.x_frames]]
             ready = ready[-dsp_cfg.x_frames :]
 
         if drop_slots:
@@ -6162,11 +6248,13 @@ def dsp_worker(
 
         proc_slots = []
         proc_seqs: list[int] = []
+        proc_frame_times_s: list[float] = []
         bad_slots = []
-        for seq, s, ok in ready:
+        for seq, s, ok, frame_time_s in ready:
             if ok == 1:
                 proc_slots.append(int(s))
                 proc_seqs.append(int(seq))
+                proc_frame_times_s.append(float(frame_time_s))
             else:
                 bad_slots.append(int(s))
         if bad_slots:
@@ -6177,6 +6265,7 @@ def dsp_worker(
         n_proc = min(len(proc_slots), dsp_cfg.x_frames)
         slots_to_process = proc_slots[:n_proc]
         proc_seqs = proc_seqs[:n_proc]
+        proc_frame_times_s = proc_frame_times_s[:n_proc]
 
         # Current packing is IIIIQQQQ for RX=4, converted in-place to complex64.
         n_cplx = n_proc * complex_per_frame
@@ -6306,11 +6395,17 @@ def dsp_worker(
             doppler_diag_out_buf=doppler_diag_out_buf,
             display_normalization_reference_db_out=display_normalization_reference_db,
             display_power_normalized_out=display_power_normalized,
+            publish_applied_viewport=_write_applied_viewport,
         )
-        _write_applied_viewport(display_zoom_runtime.last_applied_meta)
         if tracker is not None and tracking_runtime_enabled:
             tracker_timestamp_s: float | None
-            if tracker_nominal_frame_dt_s is not None and proc_seqs:
+            latest_frame_time_s = float(proc_frame_times_s[-1]) if proc_frame_times_s else 0.0
+            if np.isfinite(latest_frame_time_s) and latest_frame_time_s > 0.0:
+                tracker_timestamp_s = latest_frame_time_s
+                tracker_time_s = latest_frame_time_s
+                if proc_seqs:
+                    last_tracker_seq = int(proc_seqs[-1])
+            elif tracker_nominal_frame_dt_s is not None and proc_seqs:
                 latest_proc_seq = int(proc_seqs[-1])
                 if last_tracker_seq is None:
                     tracker_time_s = float(latest_proc_seq) * float(tracker_nominal_frame_dt_s)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 import realtime_dsp
 
@@ -132,6 +133,7 @@ def test_range_doppler_finds_known_bin_and_excludes_zero_doppler() -> None:
     assert rd_map.shape == (24, loops)
     assert int(np.argmax(rd_map[range_bin])) == doppler_bin
     np.testing.assert_allclose(rd_map[:, 0:2], 0.0, atol=1e-6)
+    np.testing.assert_allclose(rd_map[:, -1:], 0.0, atol=1e-6)
 
 
 def test_doppler_axis_and_tdm_compensation_are_physical_and_finite() -> None:
@@ -162,7 +164,13 @@ def test_fusion_merges_overlapping_static_and_moving_and_cleaning_dedups() -> No
     moving = realtime_dsp.Detection(10, 21, 6, 1.01, 5.5, 0.4, 0.11, 1.00, 10.0, 10.0, "moving")
     far = realtime_dsp.Detection(30, 22, None, 3.0, -10.0, None, -0.5, 2.9, 5.0, 7.0, "static")
     bad = realtime_dsp.Detection(0, None, None, float("nan"), float("nan"), float("inf"), float("nan"), 0.0, float("nan"), float("nan"), "static")
-    cfg = realtime_dsp.FusionConfig(enabled=True, merge_xy_m=0.20, merge_range_m=0.20, merge_angle_deg=2.0)
+    cfg = realtime_dsp.FusionConfig(
+        enabled=True,
+        merge_xy_m=0.20,
+        merge_range_m=0.20,
+        merge_angle_deg=2.0,
+        prefer_moving_when_doppler_valid=False,
+    )
 
     fused = realtime_dsp.fuse_detections([static, far], [moving], cfg)
     cleaned = realtime_dsp.clean_detections_for_tracking(fused + [bad, moving], cfg)
@@ -170,5 +178,37 @@ def test_fusion_merges_overlapping_static_and_moving_and_cleaning_dedups() -> No
     assert len(fused) == 2
     assert fused[0].source == "fused"
     assert fused[0].doppler_mps == 0.4
+    assert fused[0].x_m == static.x_m
+    assert fused[0].y_m == static.y_m
+    assert fused[0].range_m == static.range_m
+    assert fused[0].angle_deg == static.angle_deg
     assert len(cleaned) == 2
     assert all(np.isfinite([det.x_m, det.y_m, det.range_m, det.angle_deg, det.power_lin, det.power_db]).all() for det in cleaned)
+
+
+def test_angle_modes_share_the_fft_power_calibration() -> None:
+    dsp_cfg = _dsp_cfg(nfft_angle=256, loops=8)
+    geometry = _geometry()
+    angle_deg = float(realtime_dsp.build_angle_axis_deg(dsp_cfg.nfft_angle, geometry=geometry)[150])
+    snapshot = _snapshot(geometry, angle_deg)
+    virtual = np.broadcast_to(snapshot, (1, 8, 1, snapshot.size)).astype(np.complex64, copy=True)
+    steering = realtime_dsp.build_angle_steering_matrix(
+        dsp_cfg.virtual_ant,
+        dsp_cfg.nfft_angle,
+        geometry=geometry,
+    )
+
+    peaks = {}
+    for mode in ("fft", "bartlett", "mvdr"):
+        heatmap = realtime_dsp.compute_angle_heatmap(
+            virtual.copy(),
+            angle_cfg=realtime_dsp.AngleProcessingConfig(mode=mode, mvdr_diagonal_loading=0.01),
+            dsp_cfg=dsp_cfg,
+            angle_steering=steering,
+            geometry=geometry,
+            ant_spacing=geometry.uniform_spacing_lambda,
+        )
+        peaks[mode] = float(np.max(heatmap))
+
+    assert peaks["bartlett"] == pytest.approx(peaks["fft"], rel=0.08)
+    assert peaks["mvdr"] == pytest.approx(peaks["fft"], rel=0.20)

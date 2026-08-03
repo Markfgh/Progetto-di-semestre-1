@@ -59,6 +59,29 @@ def test_capture_waits_for_matching_completed_session() -> None:
     assert not manager.inflight
 
 
+def test_capture_poll_exposes_logger_failure_instead_of_reaping_it() -> None:
+    commands: queue.Queue = queue.Queue()
+    cap_id = Shared(20)
+    cap_done_id = Shared(19)
+    cap_result = Shared(0)
+    manager = CaptureSessionManager(
+        cmd_queue=commands,
+        cap_id=cap_id,
+        cap_done_id=cap_done_id,
+        cap_result=cap_result,
+    )
+    ticket = manager.request(5)
+    commands.get_nowait()
+
+    cap_id.value = 21
+    assert manager.poll_completion(ticket) is False
+    cap_result.value = -1
+    cap_done_id.value = 21
+    with pytest.raises(CaptureError, match="annullata"):
+        manager.poll_completion(ticket)
+    assert not manager.inflight
+
+
 def test_capture_header_and_offline_scan_config_include_stage_coordinates(tmp_path: Path) -> None:
     header = radar_app._build_capture_file_header(
         7,

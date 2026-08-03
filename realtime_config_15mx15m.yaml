@@ -221,7 +221,7 @@ detection_moving:
   threshold_db: -7
   localmax_range_bins: 2
   localmax_doppler_bins: 2
-  zero_doppler_exclusion_bins: 1 # Keep near-zero Doppler so a moving target can be retained when it stops.
+  zero_doppler_exclusion_bins: 0 # Keep near-zero Doppler; slow-time mean subtraction already removes exact DC clutter.
   min_power_db: 6
   max_detections: 12
   cfar_train_range_bins: 8 # CFAR training cells before/after the CUT on range.
@@ -236,7 +236,7 @@ fusion:
   merge_xy_m: 0.50
   merge_range_m: 0.40
   merge_angle_deg: 8.0
-  prefer_moving_when_doppler_valid: false # If true, the fused track state is set to moving when the moving branch has a valid detection, even if the static branch has a stronger detection.
+  prefer_moving_when_doppler_valid: false # True: moving geometry. False: static geometry plus valid moving-branch Doppler.
 
 rx:
   stall_timeout_s: 2.0

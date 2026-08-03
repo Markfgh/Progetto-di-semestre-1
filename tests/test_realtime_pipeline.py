@@ -566,7 +566,11 @@ def test_power_xy_zoom_keeps_fixed_texture_size_and_tracks_applied_viewport() ->
     assert realtime_dsp.display_viewport_signature(zoom_runtime.last_applied_meta) == realtime_dsp.display_viewport_signature(zoom_viewport)
     assert not zoom_runtime.last_applied_meta.fallback_used
     assert zoom_runtime.last_compute_t_s > 0.0
-    assert zoom_heatmap.shape[0] > full_heatmap.shape[0]
+    # L'EMA base restituita resta separata da quella zoomata, così un cambio
+    # NFFT non può contaminare il frame successivo.
+    assert zoom_runtime.heatmap_ema is not None
+    assert zoom_runtime.heatmap_ema.shape[0] > zoom_heatmap.shape[0]
+    assert zoom_runtime.heatmap_ema.shape[0] > full_heatmap.shape[0]
     assert not np.allclose(full_view, zoom_view)
 
 

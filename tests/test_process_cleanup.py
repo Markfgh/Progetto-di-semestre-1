@@ -199,7 +199,7 @@ def test_offline_runtime_poll_detects_worker_hard_exit(tmp_path: Path) -> None:
     assert runtime.ready is False
 
 
-def test_logger_flushes_pending_buffer_on_stop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_logger_flushes_pending_buffer_to_partial_file_on_stop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(radar_app, "BYTES_PER_FRAME", 4)
     monkeypatch.setattr(radar_app, "_build_capture_file_header", lambda pos_id, **_kwargs: b"HDR")
 
@@ -283,7 +283,8 @@ def test_logger_flushes_pending_buffer_on_stop(tmp_path: Path, monkeypatch: pyte
     worker.join(timeout=2.0)
 
     assert not worker.is_alive()
-    assert (tmp_path / "capture_pos7.bin").read_bytes() == b"HDRABCD"
+    assert not (tmp_path / "capture_pos7.bin").exists()
+    assert (tmp_path / "capture_pos7.bin.part").read_bytes() == b"HDRABCD"
     assert list(free_slots.queue) == [0]
 
 

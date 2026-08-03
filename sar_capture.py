@@ -169,7 +169,6 @@ class CaptureSessionManager:
     @property
     def inflight(self) -> bool:
         with self._lock:
-            self._reap_completed_locked()
             return self._ticket is not None
 
     def request(
@@ -183,7 +182,6 @@ class CaptureSessionManager:
     ) -> CaptureTicket:
         """Invia una richiesta CAPTURE e restituisce il ticket da attendere."""
         with self._lock:
-            self._reap_completed_locked()
             if self._ticket is not None:
                 raise CaptureError("Una cattura SAR è già in corso.")
             if position_id is None and capture_id is None:
@@ -237,36 +235,40 @@ class CaptureSessionManager:
     def wait(self, ticket: CaptureTicket, timeout_seconds: float, cancel_event: threading.Event) -> None:
         """Attende esclusivamente il completamento della sessione del ticket."""
         deadline = time.monotonic() + max(0.001, float(timeout_seconds))
-        session_id: int | None = None
         while True:
             if cancel_event.is_set():
                 self.cancel()
                 raise CaptureError("Cattura SAR annullata.")
-
-            current_id = _read_shared(self._cap_id)
-            if session_id is None and current_id != int(ticket.previous_session_id):
-                # RX assegna qui l'ID di sessione reale: il valore del ticket
-                # resta un riferimento stabile anche se cap_id continua a vivere
-                # in memoria condivisa tra processi.
-                session_id = current_id
-
-            if session_id is not None and _read_shared(self._cap_done_id) == session_id:
-                # cap_done_id viene pubblicato dal logger soltanto dopo
-                # flush/close: un risultato positivo garantisce il file su disco.
-                result = _read_shared(self._cap_result)
-                with self._lock:
-                    if self._ticket == ticket:
-                        self._ticket = None
-                if result == 1:
-                    return
-                if result == -1:
-                    raise CaptureError("Cattura SAR annullata prima del completamento.")
-                raise CaptureError(f"Cattura SAR terminata con stato non valido ({result}).")
+            if self.poll_completion(ticket):
+                return
 
             if time.monotonic() >= deadline:
                 self.cancel()
                 raise CaptureError("Timeout in attesa del completamento cattura SAR.")
             cancel_event.wait(0.01)
+
+    def poll_completion(self, ticket: CaptureTicket) -> bool:
+        """Controlla senza bloccare se il logger ha chiuso la cattura.
+
+        Restituisce ``False`` finché la sessione è pendente e ``True`` solo
+        dopo flush/close riuscito. Gli esiti negativi vengono esposti come
+        ``CaptureError`` invece di essere eliminati silenziosamente.
+        """
+        with self._lock:
+            if self._ticket != ticket:
+                raise CaptureError("Il ticket di cattura non è più quello attivo.")
+            current_id = _read_shared(self._cap_id)
+            if current_id == int(ticket.previous_session_id):
+                return False
+            if _read_shared(self._cap_done_id) != current_id:
+                return False
+            result = _read_shared(self._cap_result)
+            self._ticket = None
+        if result == 1:
+            return True
+        if result == -1:
+            raise CaptureError("Cattura SAR annullata prima del completamento.")
+        raise CaptureError(f"Cattura SAR terminata con stato non valido ({result}).")
 
     def cancel(self) -> None:
         """Richiede a RX/logger di chiudere la cattura corrente.
@@ -281,15 +283,3 @@ class CaptureSessionManager:
                 self._cmd_queue.put_nowait(("CAPTURE_STOP",))
             except Exception:
                 pass
-
-    def _reap_completed_locked(self) -> None:
-        ticket = self._ticket
-        if ticket is None:
-            return
-        current_id = _read_shared(self._cap_id)
-        if current_id == int(ticket.previous_session_id):
-            return
-        # Libera il ticket solo per l'ID effettivamente osservato dopo la
-        # richiesta; una vecchia conferma non deve sbloccare una nuova cattura.
-        if _read_shared(self._cap_done_id) == current_id:
-            self._ticket = None

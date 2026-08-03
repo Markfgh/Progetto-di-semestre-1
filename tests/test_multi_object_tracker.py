@@ -142,6 +142,47 @@ def test_tracker_stopped_then_resume_uses_stop_anchor_and_motion_classification(
     assert tracks[0].classification == "dynamic"
 
 
+def test_radial_target_faster_than_doppler_gate_keeps_one_confirmed_id() -> None:
+    tracker = _tracker(
+        min_hits=3,
+        max_missed_tentative=1,
+        gating_xy_m=0.4,
+        gating_doppler_mps=0.5,
+        birth_min_separation_m=0.0,
+    )
+
+    track_id = None
+    for frame_idx in range(8):
+        tracks = tracker.step(
+            [_det(0.0, 2.0 + 0.06 * frame_idx, doppler=0.6, source="moving")],
+            timestamp_s=0.1 * frame_idx,
+        )
+        assert len(tracks) == 1
+        track_id = tracks[0].track_id if track_id is None else track_id
+        assert tracks[0].track_id == track_id
+
+    assert tracker.tracks[0].confirmed
+    assert tracker.tracks[0].hits == 8
+
+
+def test_stopped_track_can_resume_even_when_doppler_exceeds_normal_gate() -> None:
+    tracker = _tracker(
+        min_hits=1,
+        gating_xy_m=0.3,
+        gating_doppler_mps=0.2,
+        motion_confirm_frames_stopped=1,
+    )
+    tracker.step([_det(0.0, 2.0, doppler=0.0, source="static")], timestamp_s=0.0)
+    tracker.step([_det(0.0, 2.0, doppler=0.0, source="static")], timestamp_s=0.1)
+    stopped_id = tracker.tracks[0].track_id
+
+    tracks = tracker.step([_det(0.04, 2.03, doppler=0.7, source="moving")], timestamp_s=0.2)
+
+    assert len(tracks) == 1
+    assert tracks[0].track_id == stopped_id
+    assert tracks[0].motion_state == "moving"
+
+
 def test_tracker_max_tracks_birth_order_prefers_moving_and_filters_invalid() -> None:
     tracker = _tracker(max_tracks=2, min_hits=1)
     invalid = SimpleNamespace(x_m=np.nan, y_m=0.0, range_m=0.0, angle_deg=0.0, doppler_mps=None, power_lin=1.0, power_db=0.0, source="static")

@@ -22,7 +22,59 @@ import os
 import json
 import re
 import struct
+import traceback
 from datetime import datetime
+
+
+def _guarded_worker_entry(worker_name, status_queue, target, args, kwargs) -> None:
+    """Esegue un worker e rende visibile al processo GUI ogni uscita fatale."""
+    try:
+        status_queue.put_nowait(("starting", str(worker_name), int(os.getpid()), ""))
+    except Exception:
+        pass
+    try:
+        target(*args, **kwargs)
+    except BaseException:
+        error_text = traceback.format_exc()
+        try:
+            status_queue.put_nowait(("error", str(worker_name), int(os.getpid()), error_text))
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            status_queue.put_nowait(("exit", str(worker_name), int(os.getpid()), ""))
+        except Exception:
+            pass
+
+
+def _guarded_radar_rx(status_queue, *args, **kwargs) -> None:
+    _guarded_worker_entry("RX", status_queue, radar_rx, args, kwargs)
+
+
+def _guarded_logger_worker(status_queue, *args, **kwargs) -> None:
+    _guarded_worker_entry("LOGGER", status_queue, logger_worker, args, kwargs)
+
+
+def _guarded_dsp_worker(status_queue, *args, **kwargs) -> None:
+    _guarded_worker_entry("DSP", status_queue, dsp_worker, args, kwargs)
+
+
+def _rx_frame_offset(byte_count: int, bytes_per_frame: int) -> int:
+    if int(bytes_per_frame) <= 0:
+        raise ValueError("bytes_per_frame must be positive")
+    return int(byte_count) % int(bytes_per_frame)
+
+
+def _rx_gap_alignment(write_offset: int, missing_bytes: int, bytes_per_frame: int) -> tuple[int, int]:
+    """Restituisce frame completati e nuovo offset dopo un gap, in O(1)."""
+    frame_bytes = int(bytes_per_frame)
+    if frame_bytes <= 0:
+        raise ValueError("bytes_per_frame must be positive")
+    cursor = int(write_offset) % frame_bytes
+    remaining = max(0, int(missing_bytes))
+    total = cursor + remaining
+    return int(total // frame_bytes), int(total % frame_bytes)
 
 
 def display_matrix_index_from_xy(
@@ -1075,6 +1127,7 @@ def radar_rx(
     slot_pos_id,
     slot_usemask,
     slot_pub_seq,
+    slot_frame_time_s,
     publish_lock,
     cap_active: Synchronized,
     cap_pos_id: Synchronized,
@@ -1093,6 +1146,7 @@ def radar_rx(
     stream_resets: Synchronized,
     stop_evt,
     settling_delay_s: float,
+    ready_evt=None,
 ):
     """
     RX UDP (DCA1000 RAW mode).
@@ -1142,8 +1196,13 @@ def radar_rx(
         except Exception:
             pass
         raise
+    if ready_evt is not None:
+        ready_evt.set()
 
-    packet_buf = bytearray(2048)
+    # ``recvfrom_into`` on Windows raises WSAEMSGSIZE when the datagram is
+    # larger than the destination buffer.  A full UDP payload avoids killing
+    # the RX worker if packetization/MTU is changed from the usual DCA setup.
+    packet_buf = bytearray(65535)
     packet_mv = memoryview(packet_buf)
     packet_view = packet_mv.cast("B")
 
@@ -1166,7 +1225,10 @@ def radar_rx(
     pkts_local = 0
     t_flush = time.perf_counter()
     last_packet_perf = t_flush
-    publish_seq = 0
+    # Physical frame sequence: advances at every stream frame boundary,
+    # including corrupted frames and frames dropped because the ring is full.
+    # DSP can therefore reconstruct elapsed frame time under overload.
+    physical_frame_seq = 0
     RX_RUNNING = 1
     RX_STALLED = 0
     rx_state = RX_RUNNING
@@ -1313,7 +1375,7 @@ def radar_rx(
         last_byte_count = None
         _bump_counter(stream_resets)
 
-    def _hard_resync_from_byte_count(byte_count: int) -> None:
+    def _hard_resync_from_byte_count(byte_count: int, *, count_reset: bool = True) -> None:
         """
         Realign the local frame cursor to the absolute stream position carried by byte_count.
 
@@ -1321,12 +1383,13 @@ def radar_rx(
         publication until the next physical frame boundary.
         """
         nonlocal w, frame_ok
-        frame_offset = int(byte_count % BYTES_PER_FRAME)
+        frame_offset = _rx_frame_offset(byte_count, BYTES_PER_FRAME)
         _discard_partial_frame()
         if frame_offset > 0:
             w = frame_offset
             frame_ok = False
-        _bump_counter(stream_resets)
+        if count_reset:
+            _bump_counter(stream_resets)
 
     def _acquire_slot_nonblocking() -> bool:
         """Prende uno slot senza mai bloccare. Se non disponibile -> drop frame (have_slot=False)."""
@@ -1352,8 +1415,9 @@ def radar_rx(
         _acquire_slot_nonblocking()
 
     def _publish_frame() -> None:
-        nonlocal w, frame_ok, publish_seq
+        nonlocal w, frame_ok, physical_frame_seq
         # frame completo (w==BYTES_PER_FRAME)
+        physical_frame_seq += 1
         if have_slot and (curr_slot is not None):
             if frame_ok:
                 slot = int(curr_slot)
@@ -1369,12 +1433,12 @@ def radar_rx(
                         m |= 2  # LOGGER also consumes during capture
                     else:
                         slot_pos_id[slot] = -1
-                    next_seq = int(publish_seq) + 1
+                    next_seq = int(physical_frame_seq)
                     slot_ok[slot] = 1
                     slot_usemask[slot] = m
                     slot_pub_seq[slot] = next_seq
+                    slot_frame_time_s[slot] = float(time.perf_counter())
                     slot_state[slot] = 1  # READY (set before seq bump)
-                    publish_seq = next_seq
                 try:
                     dsp_ready_queue.put_nowait((int(next_seq), int(slot)))
                 except Exception:
@@ -1432,6 +1496,12 @@ def radar_rx(
                     rx_state = RX_STALLED
                     _bump_counter(stall_events)
                 continue
+            except OSError as exc:
+                if stop_evt.is_set():
+                    break
+                print(f"[RX ERR] UDP receive failed: {exc}")
+                _soft_reset_stream()
+                continue
     
             if n_bytes <= HEADER_LEN:
                 continue
@@ -1477,7 +1547,12 @@ def radar_rx(
     
             # --- byte_count check (absolute stream alignment) ---
             hard_resync = False
-            if last_byte_count is not None and payload_len_ref is not None:
+            if last_byte_count is None:
+                # byte_count is authoritative also for the first packet after
+                # startup, a stall or a stream restart.  Starting mid-frame
+                # must discard that partial physical frame.
+                _hard_resync_from_byte_count(bc, count_reset=False)
+            elif payload_len_ref is not None:
                 expected = (last_byte_count + ((int(seq_gap_pkts) + 1) * int(payload_len_ref))) % MOD48
                 if bc != expected:
                     _hard_resync_from_byte_count(bc)
@@ -1487,17 +1562,17 @@ def radar_rx(
     
             # --- GAP handling (consume missing bytes to keep frame alignment) ---
             if (not hard_resync) and seq_gap_pkts > 0 and payload_len_ref is not None:
-                frame_ok = False
-    
                 bytes_missing = int(seq_gap_pkts) * int(payload_len_ref)
-                while bytes_missing > 0 and (not stop_evt.is_set()):
-                    _ensure_slot()
-                    take = min(bytes_missing, BYTES_PER_FRAME - w)
-                    # consume without writing (keep alignment)
-                    w += take
-                    bytes_missing -= take
-                    if w == BYTES_PER_FRAME:
-                        _publish_frame()
+                crossed_frames, next_offset = _rx_gap_alignment(w, bytes_missing, BYTES_PER_FRAME)
+                # Drop the current partial slot and jump directly to the byte
+                # counter position. Iterating over a very large sequence gap
+                # would stall the receive loop and is unnecessary.
+                _discard_partial_frame()
+                physical_frame_seq += int(crossed_frames)
+                w = int(next_offset)
+                frame_ok = bool(w == 0)
+                if w == 0:
+                    _maybe_enable_capture(time.perf_counter())
     
             last_seq = seq
     
@@ -1624,6 +1699,8 @@ def logger_worker(
     saved_local = 0
     pos_local = -1
     file_cap_id: int | None = None
+    capture_final_path: Path | None = None
+    capture_part_path: Path | None = None
 
     # scan pointer to avoid always starting at 0
     scan_i = 0
@@ -1639,8 +1716,9 @@ def logger_worker(
         with cap_done_id.get_lock():
             cap_done_id.value = int(session_id)
 
-    def _close_file() -> tuple[int | None, bool]:
+    def _close_file(*, commit: bool = False) -> tuple[int | None, bool]:
         nonlocal fbin, buf, buf_used, saved_local, pos_local, file_cap_id
+        nonlocal capture_final_path, capture_part_path
         closed_cap_id = file_cap_id
         io_ok = True
         if fbin is not None:
@@ -1660,16 +1738,24 @@ def logger_worker(
                 fbin.close()
             except Exception:
                 io_ok = False
+        if commit and io_ok and capture_part_path is not None and capture_final_path is not None:
+            try:
+                capture_part_path.replace(capture_final_path)
+            except Exception:
+                io_ok = False
         fbin = None
         buf = None
         buf_used = 0
         saved_local = 0
         pos_local = -1
         file_cap_id = None
+        capture_final_path = None
+        capture_part_path = None
         return closed_cap_id, io_ok
 
     def _open_file(capture_file_id: int, session_id: int):
         nonlocal fbin, buf, buf_used, saved_local, pos_local, file_cap_id
+        nonlocal capture_final_path, capture_part_path
         _close_file()
         metadata = read_capture_metadata(capture_metadata, int(session_id))
         if metadata is None:
@@ -1680,7 +1766,10 @@ def logger_worker(
             carriage_microsteps=metadata.get("carriage_microsteps"),
         )
         p = _current_output_dir() / f"capture_pos{int(capture_file_id)}.bin"
-        opened_file = open(p, "wb", buffering=1024 * 1024)
+        if p.exists():
+            raise RuntimeError(f"capture file already exists: {p}")
+        part_path = p.with_name(p.name + ".part")
+        opened_file = open(part_path, "wb", buffering=1024 * 1024)
         try:
             opened_file.write(header_blob)
         except Exception:
@@ -1689,6 +1778,8 @@ def logger_worker(
         fbin = opened_file
         pos_local = int(capture_file_id)
         file_cap_id = int(session_id)
+        capture_final_path = p
+        capture_part_path = part_path
         saved_local = 0
         buf_used = 0
         buf = bytearray(BYTES_PER_FRAME * int(block_frames))
@@ -1852,7 +1943,7 @@ def logger_worker(
             # stop condition: reached target
             if saved_local >= int(frames_per_position):
                 _stop_capture_and_release_logger_slots()
-                closed_id, close_ok = _close_file()
+                closed_id, close_ok = _close_file(commit=True)
                 # cap_done_id e' una conferma di persistenza: un errore di
                 # write/flush/close non puo' essere pubblicato come successo.
                 _mark_capture_finished(closed_id, 1 if close_ok else -1)
@@ -2015,9 +2106,11 @@ def main():
     # slot_usemask: bit0=DSP, bit1=LOGGER (capture)
     slot_usemask = _track_mp_ref(RawArray("B", N_SLOTS))
     slot_pub_seq = _track_mp_ref(RawArray("Q", N_SLOTS))
+    slot_frame_time_s = _track_mp_ref(RawArray("d", N_SLOTS))
     for i in range(N_SLOTS):
         slot_usemask[i] = 0
         slot_pub_seq[i] = 0
+        slot_frame_time_s[i] = 0.0
 
     publish_lock = _track_mp_ref(mp.Lock())  # atomic publish lock (seq+slot+state)
 
@@ -2108,9 +2201,12 @@ def main():
 
     cmd_q = _track_queue(Queue(maxsize=16))
     dsp_cmd_q = _track_queue(Queue(maxsize=16))
+    worker_status_q = _track_queue(Queue(maxsize=64))
 
     stop_evt = _track_mp_ref(mp.Event())
+    rx_ready_evt = _track_mp_ref(mp.Event())
     logger_ready_evt = _track_mp_ref(mp.Event())
+    dsp_ready_evt = _track_mp_ref(mp.Event())
     shutdown_resources["stop_evt"] = stop_evt
     sar_pos_counter = _track_mp_ref(Value("L", 0))  # GUI-only counter (pos id generator)
     capture_sessions = CaptureSessionManager(
@@ -2119,6 +2215,18 @@ def main():
         cap_done_id=cap_done_id,
         cap_result=cap_result,
     )
+    manual_capture_timeout_s = max(
+        10.0,
+        float(SETTLING_DELAY_S)
+        + (4.0 * float(FRAMES_PER_POSITION) * float((cfg.get("tracking", {}) or {}).get("dt_s", 0.1))),
+    )
+    manual_capture_state = {
+        "ticket": None,
+        "deadline_s": 0.0,
+        "message": "Ready for a manual capture in the current run.",
+        "cancel_requested": False,
+    }
+    pipeline_health = {"fatal": False, "message": "", "reported": set()}
     mmwave_bridge = MmwaveStudioBridge()
     shutdown_resources["mmwave_bridge"] = mmwave_bridge
     mmwave_radar_cfg = RadarConnectionConfig(
@@ -2182,8 +2290,9 @@ def main():
 
     # --- AVVIO PROCESSI ---
     p_rx = Process(
-        target=radar_rx,
+        target=_guarded_radar_rx,
         args=(
+            worker_status_q,
             cmd_q,
             free_slots,
             dsp_ready_queue,
@@ -2193,6 +2302,7 @@ def main():
             slot_pos_id,
             slot_usemask,
             slot_pub_seq,
+            slot_frame_time_s,
             publish_lock,
             cap_active,
             cap_pos_id,
@@ -2211,13 +2321,15 @@ def main():
             rx_stream_resets,
             stop_evt,
             SETTLING_DELAY_S,
+            rx_ready_evt,
         ),
     )
     _track_process(p_rx)
 
     p_log = Process(
-        target=logger_worker,
+        target=_guarded_logger_worker,
         args=(
+            worker_status_q,
             free_slots,
             shm_frames,
             slot_state,
@@ -2244,8 +2356,9 @@ def main():
     _track_process(p_log)
 
     p_dsp = Process(
-        target=dsp_worker,
+        target=_guarded_dsp_worker,
         args=(
+            worker_status_q,
             free_slots,
             dsp_ready_queue,
             dsp_cmd_q,
@@ -2301,6 +2414,8 @@ def main():
             "doppler_diag_w": int(DOPPLERFFT_BINS),
             "display_normalization_reference_db": display_normalization_reference_db,
             "display_power_normalized": display_power_normalized,
+            "slot_frame_time_s": slot_frame_time_s,
+            "ready_evt": dsp_ready_evt,
         },
     )
     _track_process(p_dsp)
@@ -2311,8 +2426,84 @@ def main():
     p_rx.start()
     p_log.start()
     p_dsp.start()
+    if not rx_ready_evt.wait(timeout=5.0):
+        print("[RX WARN] processo RX non pronto entro 5 s.")
     if not logger_ready_evt.wait(timeout=5.0):
         print("[LOGGER WARN] processo logger non pronto entro 5 s; catture temporaneamente non affidabili.")
+    if not dsp_ready_evt.wait(timeout=10.0):
+        print("[DSP WARN] processo DSP non pronto entro 10 s.")
+
+    worker_processes = {"RX": p_rx, "LOGGER": p_log, "DSP": p_dsp}
+
+    def _poll_worker_health() -> None:
+        fatal_messages: list[str] = []
+        while True:
+            try:
+                event, worker_name, _pid, detail = worker_status_q.get_nowait()
+            except pyqueue.Empty:
+                break
+            except Exception:
+                break
+            if str(event) == "error":
+                last_line = next(
+                    (line.strip() for line in reversed(str(detail).splitlines()) if line.strip()),
+                    "unknown worker error",
+                )
+                fatal_messages.append(f"{worker_name}: {last_line}")
+        if not stop_evt.is_set():
+            for worker_name, proc in worker_processes.items():
+                if not proc.is_alive():
+                    key = (worker_name, proc.exitcode)
+                    if key not in pipeline_health["reported"]:
+                        pipeline_health["reported"].add(key)
+                        fatal_messages.append(f"{worker_name} exited (code {proc.exitcode})")
+        if not fatal_messages or bool(pipeline_health["fatal"]):
+            return
+
+        pipeline_health["fatal"] = True
+        pipeline_health["message"] = "Realtime pipeline stopped: " + " | ".join(fatal_messages)
+        print(f"[PIPELINE FATAL] {pipeline_health['message']}")
+        stop_evt.set()
+        capture_sessions.cancel()
+        try:
+            if sar_scan is not None:
+                sar_scan.cancel()
+        except Exception:
+            pass
+        try:
+            mmwave_bridge.set_status(error=str(pipeline_health["message"]))
+        except Exception:
+            pass
+
+        def _stop_failed_pipeline_hardware() -> None:
+            try:
+                if mmwave_bridge.is_streaming:
+                    mmwave_bridge.stop_streaming(stop_delay_s=0.25)
+            except Exception:
+                pass
+
+        threading.Thread(
+            target=_stop_failed_pipeline_hardware,
+            name="pipeline-fatal-hardware-stop",
+            daemon=True,
+        ).start()
+        try:
+            _set_scan_status(str(pipeline_health["message"]))
+        except Exception:
+            pass
+        for tag in (BTN_CAPTURE_TAG, BTN_MMWAVE_CONNECT_TAG, BTN_MMWAVE_STREAM_TAG):
+            try:
+                if dpg.does_item_exist(tag):
+                    dpg.configure_item(tag, enabled=False)
+            except Exception:
+                pass
+        try:
+            for spec in TUNING_FIELD_SPECS:
+                tag = _tune_tag(spec["path"])
+                if dpg.does_item_exist(tag):
+                    dpg.configure_item(tag, enabled=False)
+        except Exception:
+            pass
 
     _apply_process_priority("MAIN", os.getpid(), PRIO_MAIN, PRIO_ENABLED)
     _apply_process_priority("RX", int(p_rx.pid or 0), PRIO_RX, PRIO_ENABLED)
@@ -2415,6 +2606,9 @@ def main():
     heatmap_mode_init = int(heatmap_view_mode.value)
     if heatmap_mode_init not in (0, 1):
         heatmap_mode_init = 0
+    velocity_dead_zone_runtime = float(HEATMAP_VELOCITY_DEAD_ZONE)
+    velocity_min_opacity_runtime = float(HEATMAP_VELOCITY_MIN_OPACITY)
+    velocity_lut: np.ndarray | None = None
     dr_plot = float(dr_shared)
     if heatmap_mode_init == 1:
         vis_vmin = float(HEATMAP_VELOCITY_VMIN_MPS)
@@ -3140,13 +3334,13 @@ def main():
         a = np.ones_like(x, dtype=np.float32)
         return np.stack((r, g, b, a), axis=-1).astype(np.float32, copy=False)
 
-    def _build_velocity_lut(size: int = 2048):
+    def _build_velocity_lut(size: int = 2048, dead_zone_value: float | None = None):
         x = np.linspace(0.0, 1.0, int(size), dtype=np.float32)
         signed = (x - np.float32(0.5)) * np.float32(2.0)
-        dead_zone_value = float(HEATMAP_VELOCITY_DEAD_ZONE)
-        if not np.isfinite(dead_zone_value):
-            dead_zone_value = 0.08
-        dead_zone = np.float32(min(0.99, max(0.0, dead_zone_value)))
+        dead_zone_raw = velocity_dead_zone_runtime if dead_zone_value is None else float(dead_zone_value)
+        if not np.isfinite(dead_zone_raw):
+            dead_zone_raw = 0.08
+        dead_zone = np.float32(min(0.99, max(0.0, dead_zone_raw)))
         mag = (np.abs(signed) - dead_zone) / (np.float32(1.0) - dead_zone)
         np.clip(mag, 0.0, 1.0, out=mag)
         mag = np.power(mag, np.float32(0.70), dtype=np.float32)
@@ -3270,7 +3464,7 @@ def main():
         # callback ultraleggera: salva valori e setta flag
         # Nota:
         #  - vmin/vmax sono "base values" (non hard limit). Li lasciamo liberi.
-        #  - rmax/xmax sono HARD LIMIT: 0 .. (range_max/crossrange_max da config)
+        #  - rmax/xmax sono HARD LIMIT con almeno un bin fisico visibile.
         try:
             vmin = float(dpg.get_value(IN_VMIN))
             vmax = float(dpg.get_value(IN_VMAX))
@@ -3291,8 +3485,9 @@ def main():
             dpg.set_value(IN_VMAX, vmax)
 
         # HARD clamp su Rmax/Xmax
-        rmax_cl = max(0.0, min(rmax, RMAX_HARD_MAX))
-        xmax_cl = max(0.0, min(xmax, XMAX_HARD_MAX))
+        viewport_min_span_m = max(1e-3, float(dr_shared))
+        rmax_cl = max(viewport_min_span_m, min(rmax, RMAX_HARD_MAX))
+        xmax_cl = max(viewport_min_span_m, min(xmax, XMAX_HARD_MAX))
 
         if rmax_cl != rmax:
             dpg.set_value(IN_RMAX, rmax_cl)
@@ -3381,20 +3576,77 @@ def main():
             return None, None
 
     def _on_capture():
+        if bool(pipeline_health["fatal"]):
+            _set_scan_status(str(pipeline_health["message"]))
+            return
         if _any_scan_active():
             _set_scan_status("Manual capture is disabled during a SAR scan.")
             return
         try:
+            radar_state = mmwave_bridge.get_gui_state()
+            if not radar_state.connected or not radar_state.streaming:
+                raise CaptureError("Connect and start the radar before a manual capture.")
+            with rx_pkts.get_lock():
+                received_packets = int(rx_pkts.value)
+            with rx_last_packet_time_s.get_lock():
+                udp_idle_s = max(0.0, time.time() - float(rx_last_packet_time_s.value))
+            if received_packets <= 0 or udp_idle_s > 2.0:
+                raise CaptureError("UDP radar data is not active; wait for fresh packets.")
             position_mm, position_steps = _motor_metadata_for_capture()
             with sar_pos_counter.get_lock():
                 next_pid = int(sar_pos_counter.value) + 1
-            capture_sessions.request(next_pid, position_mm, position_steps)
+            ticket = capture_sessions.request(next_pid, position_mm, position_steps)
+            manual_capture_state.update(
+                {
+                    "ticket": ticket,
+                    "deadline_s": time.monotonic() + float(manual_capture_timeout_s),
+                    "message": f"Manual capture {next_pid} in progress...",
+                    "cancel_requested": False,
+                }
+            )
             with sar_pos_counter.get_lock():
                 sar_pos_counter.value = int(next_pid)
             dpg.set_value(TXT_POS_TAG, f"Last position: {next_pid} | next ID: {next_pid + 1}")
             _set_scan_status(f"Manual capture for position {next_pid} is running")
         except Exception as exc:
+            manual_capture_state["message"] = f"Capture did not start: {exc}"
             _set_scan_status(f"Capture did not start: {exc}")
+
+    def _poll_manual_capture() -> None:
+        ticket = manual_capture_state.get("ticket")
+        if ticket is None:
+            return
+        try:
+            if capture_sessions.poll_completion(ticket):
+                path = out_dir / f"capture_pos{int(ticket.capture_id)}.bin"
+                manual_capture_state.update(
+                    {
+                        "ticket": None,
+                        "message": (
+                            f"Capture completed: {int(FRAMES_PER_POSITION)} frames | {path}"
+                        ),
+                        "cancel_requested": False,
+                    }
+                )
+                _set_scan_status(str(manual_capture_state["message"]))
+                return
+            if (
+                time.monotonic() >= float(manual_capture_state.get("deadline_s", 0.0))
+                and not bool(manual_capture_state.get("cancel_requested", False))
+            ):
+                capture_sessions.cancel()
+                manual_capture_state["cancel_requested"] = True
+                manual_capture_state["message"] = "Manual capture timed out; cancellation requested."
+                _set_scan_status(str(manual_capture_state["message"]))
+        except CaptureError as exc:
+            manual_capture_state.update(
+                {
+                    "ticket": None,
+                    "message": f"Manual capture failed: {exc}",
+                    "cancel_requested": False,
+                }
+            )
+            _set_scan_status(str(manual_capture_state["message"]))
 
     def _on_new_sar_session() -> None:
         """Passa a una cartella di acquisizione vuota senza riavviare la GUI."""
@@ -3418,6 +3670,7 @@ def main():
                 dpg.set_value(TXT_POS_TAG, "Next ID: 1")
             if dpg.does_item_exist(TXT_RUN_DIR_TAG):
                 dpg.set_value(TXT_RUN_DIR_TAG, f"Current run: {out_dir.name}")
+            manual_capture_state["message"] = "Ready for a manual capture in the current run."
             _set_scan_status(f"New session ready: {out_dir.name}")
         except Exception as exc:
             _set_scan_status(f"New session was not created: {exc}")
@@ -3467,6 +3720,8 @@ def main():
             return
         if capture_sessions.inflight:
             capture_sessions.cancel()
+            manual_capture_state["cancel_requested"] = True
+            manual_capture_state["message"] = "Capture cancellation requested..."
             _set_scan_status("Capture cancellation requested...")
             return
         if stepper_controller is not None:
@@ -3476,6 +3731,9 @@ def main():
                 stepper_controller.log(f"STOP failed: {exc}")
 
     def _on_start_sar_scan() -> None:
+        if bool(pipeline_health["fatal"]):
+            _set_scan_status(str(pipeline_health["message"]))
+            return
         if sar_scan is None or stepper_controller is None:
             _set_scan_status(f"Scan unavailable: {stepper_error or 'Phidget not configured'}")
             return
@@ -3644,20 +3902,29 @@ def main():
                     f"{int(cap_saved.value)}/{int(FRAMES_PER_POSITION)} frame"
                 )
             else:
-                capture_detail = "Ready for a manual capture in the current run."
+                capture_detail = str(manual_capture_state.get("message") or "Ready for a manual capture in the current run.")
             dpg.set_value(TXT_CAPTURE_STATUS_TAG, capture_detail)
         if dpg.does_item_exist(BTN_CAPTURE_TAG):
-            dpg.configure_item(BTN_CAPTURE_TAG, enabled=not active and not busy_capture)
+            dpg.configure_item(
+                BTN_CAPTURE_TAG,
+                enabled=not bool(pipeline_health["fatal"]) and not active and not busy_capture,
+            )
         if dpg.does_item_exist(BTN_NEW_SESSION_TAG):
             dpg.configure_item(
                 BTN_NEW_SESSION_TAG,
-                enabled=not active and not busy_capture and scan_pending_run["start_position_id"] is None,
+                enabled=(
+                    not bool(pipeline_health["fatal"])
+                    and not active
+                    and not busy_capture
+                    and scan_pending_run["start_position_id"] is None
+                ),
             )
         if dpg.does_item_exist(BTN_SCAN_START_TAG):
             dpg.configure_item(
                 BTN_SCAN_START_TAG,
                 enabled=(
                     sar_scan is not None
+                    and not bool(pipeline_health["fatal"])
                     and not active
                     and not busy_capture
                     and scan_pending_run["start_position_id"] is None
@@ -3681,6 +3948,30 @@ def main():
     MMWAVE_CONNECT_SETTLE_S = 3.0
     MMWAVE_RX_IDLE_DCA_REARM_S = 1.00
     MMWAVE_RX_IDLE_HEAVY_REARM_S = 3.0
+    mmwave_control_busy = threading.Event()
+
+    def _start_mmwave_control(operation_name: str, operation) -> bool:
+        """Serializza le chiamate lente a RSTD/DCA fuori dal thread GUI."""
+        if mmwave_control_busy.is_set() or bool(pipeline_health["fatal"]):
+            return False
+        mmwave_control_busy.set()
+
+        def _run() -> None:
+            try:
+                operation()
+            except MmwaveStudioError as exc:
+                mmwave_bridge.set_status(error=f"{operation_name} failed: {exc}")
+            except Exception as exc:
+                mmwave_bridge.set_status(error=f"Unexpected {operation_name} error: {exc}")
+            finally:
+                mmwave_control_busy.clear()
+
+        threading.Thread(
+            target=_run,
+            name=f"mmwave-{operation_name.lower().replace(' ', '-')}",
+            daemon=True,
+        ).start()
+        return True
 
     def _sync_mmwave_udp_activity(now_wall: float | None = None) -> float:
         nonlocal mmwave_last_rx_pkt_t, mmwave_outage_dca_done, mmwave_outage_heavy_done
@@ -3700,7 +3991,11 @@ def main():
     def _refresh_mmwave_controls() -> None:
         state = mmwave_bridge.get_gui_state()
         if dpg.does_item_exist(BTN_MMWAVE_CONNECT_TAG):
-            dpg.configure_item(BTN_MMWAVE_CONNECT_TAG, label=_mmwave_connect_label(state.connected))
+            dpg.configure_item(
+                BTN_MMWAVE_CONNECT_TAG,
+                label=_mmwave_connect_label(state.connected),
+                enabled=not bool(pipeline_health["fatal"]) and not mmwave_control_busy.is_set(),
+            )
         if dpg.does_item_exist(BTN_MMWAVE_STREAM_TAG):
             dpg.configure_item(BTN_MMWAVE_STREAM_TAG, label=_mmwave_stream_label(state.streaming))
             connect_wait_remaining = 0.0
@@ -3711,7 +4006,12 @@ def main():
                 )
             dpg.configure_item(
                 BTN_MMWAVE_STREAM_TAG,
-                enabled=bool(state.connected) and (state.streaming or connect_wait_remaining <= 0.0),
+                enabled=(
+                    not bool(pipeline_health["fatal"])
+                    and not mmwave_control_busy.is_set()
+                    and bool(state.connected)
+                    and (state.streaming or connect_wait_remaining <= 0.0)
+                ),
             )
         if dpg.does_item_exist(TXT_MMWAVE_STATUS_TAG):
             status_text = state.last_error if state.last_error else state.last_message
@@ -3743,48 +4043,54 @@ def main():
     def _maybe_rearm_mmwave_stream(now_perf: float) -> None:
         nonlocal mmwave_last_rx_pkt_t, mmwave_outage_dca_done, mmwave_outage_heavy_done, mmwave_auto_rearm_armed
         state = mmwave_bridge.get_gui_state()
-        if not mmwave_auto_rearm_armed or not state.connected or not state.streaming:
+        if (
+            mmwave_control_busy.is_set()
+            or not mmwave_auto_rearm_armed
+            or not state.connected
+            or not state.streaming
+        ):
             return
         _ = now_perf
         idle_s = max(0.0, _sync_mmwave_udp_activity())
         if (not mmwave_outage_dca_done) and idle_s >= MMWAVE_RX_IDLE_DCA_REARM_S:
-            mmwave_outage_dca_done = True
             print(f"[gui] mmWave auto-rearm (DCA ARM): UDP idle for {idle_s:.3f}s", flush=True)
-            try:
+
+            def _rearm_dca() -> None:
                 mmwave_bridge.rearm_dca_only(
                     mmwave_dca_cfg.adc_data_path,
                     capture_mode=1,
                     arm_delay_s=0.10,
                 )
-            except MmwaveStudioError as exc:
-                mmwave_bridge.set_status(error=f"Auto DCA-arm failed: {exc}")
-            except Exception as exc:
-                mmwave_bridge.set_status(error=f"Unexpected auto DCA-arm error: {exc}")
-            _refresh_mmwave_controls()
-            return
+
+            if _start_mmwave_control("auto DCA-arm", _rearm_dca):
+                mmwave_outage_dca_done = True
+                return
         if mmwave_outage_dca_done and (not mmwave_outage_heavy_done) and idle_s >= MMWAVE_RX_IDLE_HEAVY_REARM_S:
-            mmwave_outage_heavy_done = True
             print(f"[gui] mmWave auto-rearm (heavy): UDP idle for {idle_s:.3f}s", flush=True)
-            try:
+
+            def _rearm_heavy() -> None:
                 mmwave_bridge.rearm_streaming(
                     mmwave_dca_cfg.adc_data_path,
                     capture_mode=1,
                     arm_delay_s=0.25,
                     stop_delay_s=0.25,
                 )
-            except MmwaveStudioError as exc:
-                mmwave_bridge.set_status(error=f"Auto heavy rearm failed: {exc}")
-            except Exception as exc:
-                mmwave_bridge.set_status(error=f"Unexpected auto heavy rearm error: {exc}")
-            _refresh_mmwave_controls()
+
+            if _start_mmwave_control("auto heavy rearm", _rearm_heavy):
+                mmwave_outage_heavy_done = True
 
     def _on_mmwave_connect_toggle():
         nonlocal mmwave_last_rx_pkt_t, mmwave_outage_dca_done, mmwave_outage_heavy_done
         nonlocal mmwave_auto_rearm_armed, mmwave_connected_since_perf
+        if bool(pipeline_health["fatal"]) or mmwave_control_busy.is_set():
+            return
         if dpg.does_item_exist(TXT_MMWAVE_STATUS_TAG):
             dpg.set_value(TXT_MMWAVE_STATUS_TAG, "mmWave connect/disconnect in progress...")
         print("[gui] mmWave connect button pressed", flush=True)
-        try:
+
+        def _toggle_connection() -> None:
+            nonlocal mmwave_last_rx_pkt_t, mmwave_outage_dca_done, mmwave_outage_heavy_done
+            nonlocal mmwave_auto_rearm_armed, mmwave_connected_since_perf
             was_connected = bool(mmwave_bridge.get_gui_state().connected)
             new_state = mmwave_bridge.toggle_connection(radar=mmwave_radar_cfg, dca=mmwave_dca_cfg)
             mmwave_last_rx_pkt_t = time.time()
@@ -3795,33 +4101,27 @@ def main():
             elif not new_state.connected:
                 mmwave_connected_since_perf = None
                 mmwave_auto_rearm_armed = False
-        except MmwaveStudioError as exc:
-            state = mmwave_bridge.get_gui_state()
-            mmwave_bridge.set_status(
-                message=state.last_message or "mmWave connect failed",
-                error=str(exc),
-            )
-        except Exception as exc:
-            mmwave_bridge.set_status(error=f"Unexpected mmWave error: {exc}")
-        _refresh_mmwave_controls()
+
+        _start_mmwave_control("mmWave connection", _toggle_connection)
 
     def _on_mmwave_stream_toggle():
         nonlocal mmwave_last_rx_pkt_t, mmwave_outage_dca_done, mmwave_outage_heavy_done, mmwave_auto_rearm_armed
+        if bool(pipeline_health["fatal"]) or mmwave_control_busy.is_set():
+            return
         if dpg.does_item_exist(TXT_MMWAVE_STATUS_TAG):
             dpg.set_value(TXT_MMWAVE_STATUS_TAG, "Radar start/stop in progress...")
         print("[gui] Radar start/stop button pressed", flush=True)
-        try:
-            state_before = mmwave_bridge.get_gui_state()
-            if state_before.connected and not state_before.streaming and mmwave_connected_since_perf is not None:
-                remaining = MMWAVE_CONNECT_SETTLE_S - (
-                    time.perf_counter() - mmwave_connected_since_perf
-                )
-                if remaining > 0.0:
-                    mmwave_bridge.set_status(
-                        message=f"Wait another {remaining:.1f} s before starting the radar"
-                    )
-                    _refresh_mmwave_controls()
-                    return
+        state_before = mmwave_bridge.get_gui_state()
+        if state_before.connected and not state_before.streaming and mmwave_connected_since_perf is not None:
+            remaining = MMWAVE_CONNECT_SETTLE_S - (
+                time.perf_counter() - mmwave_connected_since_perf
+            )
+            if remaining > 0.0:
+                mmwave_bridge.set_status(message=f"Wait another {remaining:.1f} s before starting the radar")
+                return
+
+        def _toggle_streaming() -> None:
+            nonlocal mmwave_last_rx_pkt_t, mmwave_outage_dca_done, mmwave_outage_heavy_done, mmwave_auto_rearm_armed
             mmwave_bridge.toggle_streaming(
                 mmwave_dca_cfg.adc_data_path,
                 capture_mode=1,
@@ -3832,18 +4132,8 @@ def main():
             mmwave_outage_dca_done = False
             mmwave_outage_heavy_done = False
             mmwave_auto_rearm_armed = bool(mmwave_bridge.get_gui_state().streaming)
-        except MmwaveStudioError as exc:
-            error_message = str(exc)
-            if not mmwave_bridge.is_hw_connected:
-                mmwave_bridge.set_status(
-                    message="Connect hardware before starting the radar",
-                    error=error_message,
-                )
-            else:
-                mmwave_bridge.set_status(error=error_message)
-        except Exception as exc:
-            mmwave_bridge.set_status(error=f"Unexpected radar streaming error: {exc}")
-        _refresh_mmwave_controls()
+
+        _start_mmwave_control("radar streaming", _toggle_streaming)
 
     def _norm_toggle_label(enabled: bool) -> str:
         return "NORM: ON" if enabled else "NORM: OFF"
@@ -4791,7 +5081,7 @@ def main():
         {"section": "DSP", "group": "Spatial filter", "path": "dsp.heatmap_spatial_filter.enabled", "label": "Enabled", "kind": "bool", "default": False},
         {"section": "DSP", "group": "Spatial filter", "path": "dsp.heatmap_spatial_filter.mode", "label": "Mode", "kind": "combo", "items": TUNING_SPATIAL_FILTER_MODES, "default": "none"},
         {"section": "Tracking", "group": "Lifecycle", "path": "tracking.enabled", "label": "Enabled", "kind": "bool", "default": True},
-        {"section": "Tracking", "group": "Lifecycle", "path": "tracking.max_tracks", "label": "Max tracks", "kind": "int", "default": 8, "min": 1, "step": 1},
+        {"section": "Tracking", "group": "Lifecycle", "path": "tracking.max_tracks", "label": "Max tracks", "kind": "int", "default": 8, "min": 1, "max": track_max_shared, "step": 1},
         {"section": "Tracking", "group": "Lifecycle", "path": "tracking.min_hits_to_confirm", "label": "Min hits", "kind": "int", "default": 3, "min": 1, "step": 1},
         {"section": "Tracking", "group": "Lifecycle", "path": "tracking.max_missed_tentative", "label": "Miss tentative", "kind": "int", "default": 3, "min": 0, "step": 1},
         {"section": "Tracking", "group": "Lifecycle", "path": "tracking.max_missed_confirmed", "label": "Miss confirmed", "kind": "int", "default": 18, "min": 0, "step": 1},
@@ -4885,6 +5175,11 @@ def main():
         return str(value)
 
     def _apply_tuning_params(sender=None, app_data=None):
+        nonlocal velocity_dead_zone_runtime, velocity_min_opacity_runtime, velocity_lut
+        if bool(pipeline_health["fatal"]):
+            if dpg.does_item_exist(TXT_TUNING_STATUS_TAG):
+                dpg.set_value(TXT_TUNING_STATUS_TAG, str(pipeline_health["message"]))
+            return
         patch = {}
         for spec in TUNING_FIELD_SPECS:
             tag = _tune_tag(spec["path"])
@@ -4896,6 +5191,15 @@ def main():
                 continue
         try:
             dsp_cmd_q.put_nowait({"type": "update_runtime_config", "cfg_patch": patch, "reset_runtime_state": True})
+            moving_patch = ((patch.get("dsp", {}) or {}).get("range_angle_moving", {}) or {})
+            velocity_dead_zone_runtime = float(
+                moving_patch.get("velocity_dead_zone", velocity_dead_zone_runtime)
+            )
+            velocity_min_opacity_runtime = min(
+                1.0,
+                max(0.0, float(moving_patch.get("min_opacity", velocity_min_opacity_runtime))),
+            )
+            velocity_lut = _build_velocity_lut(2048, velocity_dead_zone_runtime)
             if dpg.does_item_exist(TXT_TUNING_STATUS_TAG):
                 dpg.set_value(TXT_TUNING_STATUS_TAG, "Runtime update and DSP soft reset sent")
         except Exception as e:
@@ -5003,10 +5307,10 @@ def main():
                         dpg.add_input_float(label=("Vmin (m/s)" if vis_heatmap_mode == 1 else "Vmin (dB)"), tag=IN_VMIN, default_value=vis_vmin, step=1.0, width=CTRL_W,callback=_apply_params, on_enter=False)
                         dpg.add_input_float(label=("Vmax (m/s)" if vis_heatmap_mode == 1 else "Vmax (dB)"), tag=IN_VMAX, default_value=vis_vmax, step=1.0, width=CTRL_W,callback=_apply_params, on_enter=False)
                         dpg.add_input_float(label="Rmax (m)", tag=IN_RMAX, default_value=vis_rmax, step=0.5, width=CTRL_W,
-                                          min_value=0.0, max_value=RMAX_HARD_MAX, min_clamped=True, max_clamped=True,
+                                          min_value=max(1e-3, float(dr_shared)), max_value=RMAX_HARD_MAX, min_clamped=True, max_clamped=True,
                                           callback=_apply_params, on_enter=False)
                         dpg.add_input_float(label="Xmax (m)", tag=IN_XMAX, default_value=vis_xmax, step=0.5, width=CTRL_W,
-                                          min_value=0.0, max_value=HEATMAP_XMAX_HARD_MAX, min_clamped=True, max_clamped=True,
+                                          min_value=max(1e-3, float(dr_shared)), max_value=HEATMAP_XMAX_HARD_MAX, min_clamped=True, max_clamped=True,
                                           callback=_apply_params, on_enter=False)
                         dpg.add_spacer(height=8)
                         dpg.add_button(
@@ -5863,6 +6167,7 @@ def main():
         stream_resets_prev = 0
         log_bytes_prev = 0
     gui_last_seq = 0
+    housekeeping_last_t = 0.0
     realtime_frame_valid = False
     rt_power_normalization_reference_db = float("nan")
     rt_power_display_normalized = False
@@ -5880,7 +6185,7 @@ def main():
     proc_frame = np.full((proc_tex_h, proc_tex_w), off_vmin, dtype=np.float32)
     x_range_cache = {}
     jet_lut = _build_jet_lut(2048)
-    velocity_lut = _build_velocity_lut(2048)
+    velocity_lut = _build_velocity_lut(2048, velocity_dead_zone_runtime)
     velocity_nodata_rgba = np.asarray([0.015, 0.015, 0.018, 1.0], dtype=np.float32)
     norm_frame = np.empty((gui_h, gui_w), dtype=np.float32)
     lut_idx = np.empty((gui_h, gui_w), dtype=np.int32)
@@ -6081,6 +6386,10 @@ def main():
     try:
         while dpg.is_dearpygui_running():
             now = time.perf_counter()
+            if (now - housekeeping_last_t) >= 0.25:
+                housekeeping_last_t = now
+                _poll_worker_health()
+                _refresh_mmwave_controls()
             refresh_offline_display = bool(off_texture_upload_requested)
             off_texture_upload_requested = False
             # The DSP result is copied before the texture upload.  Defer its
@@ -6089,6 +6398,7 @@ def main():
             offline_frame_summary_pending = None
 
             _drain_motor_events()
+            _poll_manual_capture()
             scan_state_now = _refresh_sar_scan_ui()
             if scan_state_now not in {ScanState.COMPLETED, ScanState.CANCELLED, ScanState.FAILED}:
                 last_scan_terminal_state = None
@@ -6631,13 +6941,12 @@ def main():
             # 2. GUI TEXTURE UPDATE (double-buffer latest-wins)
             seq_now = int(gui_latest_seq.value)
             if seq_now != gui_last_seq:
-                rt_applied_meta_current = _read_realtime_applied_meta()
-                if int(rt_applied_meta_current.seq) != int(rt_applied_seq_local):
-                    _configure_image_bounds(IMG_SERIES_TAG, rt_applied_meta_current)
-                    rt_applied_seq_local = int(rt_applied_meta_current.seq)
                 with gui_lock:
                     seq_locked = int(gui_latest_seq.value)
                     idx = int(gui_latest_idx.value)
+                    # Viewport metadata and raster are committed by DSP under
+                    # this same lock; read both as one coherent frame.
+                    rt_applied_meta_current = _read_realtime_applied_meta()
                     if idx in (0, 1):
                         base = idx * gui_h * gui_w
                         src_flat = np.frombuffer(gui_dbuf, dtype=np.float32, count=gui_h * gui_w, offset=base * 4)
@@ -6688,6 +6997,9 @@ def main():
                             rt_power_display_normalized = False
                         realtime_frame_valid = True
                     gui_last_seq = seq_locked
+                if int(rt_applied_meta_current.seq) != int(rt_applied_seq_local):
+                    _configure_image_bounds(IMG_SERIES_TAG, rt_applied_meta_current)
+                    rt_applied_seq_local = int(rt_applied_meta_current.seq)
 
                 denom = (vis_vmax - vis_vmin)
                 if denom < 1e-6:
@@ -6717,7 +7029,7 @@ def main():
                     valid_alpha = alpha_display > np.float32(0.0)
                     alpha_out = rgba_frame[:, :, 3]
                     alpha_out.fill(np.float32(0.0))
-                    min_opacity = np.float32(HEATMAP_VELOCITY_MIN_OPACITY)
+                    min_opacity = np.float32(velocity_min_opacity_runtime)
                     np.multiply(alpha_display, np.float32(1.0) - min_opacity, out=alpha_out, where=valid_alpha)
                     alpha_out[valid_alpha] += min_opacity
                     rgba_frame[~valid_alpha, :3] = velocity_nodata_rgba[:3]

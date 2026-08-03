@@ -92,6 +92,20 @@ def test_disabled_background_subtraction_ignores_existing_model() -> None:
     np.testing.assert_allclose(out, data)
 
 
+def test_background_subtraction_resets_all_state_when_nfft_shape_changes() -> None:
+    state = realtime_dsp.BackgroundSubtractionState()
+    cfg = realtime_dsp.BackgroundSubtractionConfig(enabled=True, mode="frozen", init_frames=1)
+    first = np.ones((1, 2, 1, 8, 1), dtype=np.complex64)
+    resized = np.full((1, 2, 1, 16, 1), 3.0 + 0.0j, dtype=np.complex64)
+
+    realtime_dsp.apply_background_subtraction(first, cfg, state)
+    out = realtime_dsp.apply_background_subtraction(resized, cfg, state)
+
+    assert state.model is not None
+    assert state.model.shape == resized.shape[1:]
+    np.testing.assert_allclose(out, 0.0, atol=1e-6)
+
+
 def test_post_range_filters_can_loop_average_after_background() -> None:
     data = np.ones((2, 4, 1, 3, 1), dtype=np.complex64)
     data[:, 2:, :, :, :] = 3.0 + 0.0j

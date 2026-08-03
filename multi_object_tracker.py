@@ -563,22 +563,31 @@ class MultiObjectTracker:
                     reject_xy += 1
                     continue
 
+                d_stop: float | None = None
+                stopped_resume_candidate = False
+                if track.motion_state == "stopped" and track.stop_x_m is not None and track.stop_y_m is not None:
+                    d_stop = float(math.hypot(meas.x_m - track.stop_x_m, meas.y_m - track.stop_y_m))
+                    if d_stop > max(gate_xy, float(self.tracker_cfg.stopped_resume_gate_m)):
+                        reject_xy += 1
+                        continue
+                    stopped_resume_candidate = bool(
+                        meas.motion_hint == "moving"
+                        or (
+                            meas.doppler_mps is not None
+                            and abs(float(meas.doppler_mps))
+                            >= float(self.tracker_cfg.doppler_moving_threshold_mps)
+                        )
+                    )
+
                 if (
-                    self.tracker_cfg.gating_doppler_mps > 0.0
+                    not stopped_resume_candidate
+                    and self.tracker_cfg.gating_doppler_mps > 0.0
                     and meas.doppler_mps is not None
                     and track_doppler is not None
                     and abs(float(meas.doppler_mps) - float(track_doppler)) > self.tracker_cfg.gating_doppler_mps
                 ):
                     reject_doppler += 1
                     continue
-
-                d_stop: float | None = None
-                if track.motion_state == "stopped" and track.stop_x_m is not None and track.stop_y_m is not None:
-                    resume_gate = gate_xy
-                    d_stop = float(math.hypot(meas.x_m - track.stop_x_m, meas.y_m - track.stop_y_m))
-                    if d_stop > resume_gate:
-                        reject_xy += 1
-                        continue
 
                 cost_matrix[track_idx, meas_idx] = self._association_cost(
                     track,
@@ -846,8 +855,16 @@ class MultiObjectTracker:
         return track
 
     def _initial_velocity(self, meas: Measurement) -> tuple[float, float]:
-        # Single-frame radial Doppler is insufficient to infer the full 2D velocity vector.
-        return 0.0, 0.0
+        # Il Doppler non determina la componente tangenziale, ma fornisce una
+        # stima iniziale affidabile della componente radiale. Inizializzarla a
+        # zero rendeva il gate Doppler incoerente già dal secondo/terzo frame.
+        if meas.doppler_mps is None or not math.isfinite(float(meas.doppler_mps)):
+            return 0.0, 0.0
+        range_m = float(math.hypot(meas.x_m, meas.y_m))
+        if range_m <= _EPS:
+            return 0.0, 0.0
+        radial = float(meas.doppler_mps)
+        return radial * float(meas.x_m) / range_m, radial * float(meas.y_m) / range_m
 
     def _refresh_track_measurement(self, track: Track, meas: Measurement) -> None:
         track.doppler_mps = meas.doppler_mps
@@ -868,18 +885,13 @@ class MultiObjectTracker:
     def _expected_track_doppler(self, track: Track) -> float | None:
         if track.motion_state == "stopped":
             return 0.0
-        radial_velocity = track.radial_velocity_mps
-        if (
-            radial_velocity is not None
-            and (
-                track.hits > 1
-                or track.speed_mps > max(self.tracker_cfg.stopped_speed_threshold_mps, _EPS)
-            )
-        ):
-            return float(radial_velocity)
+        # Il filtro cartesiano assimila solo x/y; la sua velocità radiale può
+        # quindi convergere più lentamente del Doppler misurato. Per il gate
+        # duro usiamo l'ultima misura Doppler valida e lasciamo la velocità del
+        # Kalman come fallback.
         if track.doppler_mps is not None:
             return float(track.doppler_mps)
-        return radial_velocity
+        return track.radial_velocity_mps
 
     def _update_motion_state(self, track: Track, meas: Measurement, now_s: float) -> None:
         """Conferma i passaggi moving/stopped con evidenza su più frame.
