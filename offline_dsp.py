@@ -29,6 +29,7 @@ if _numba is not None:
         voxel_flat,
         max_bin_eff,
         inv_dr,
+        range_offset_m,
         phase_scale,
         rvp_phase_scale,
         range_phase_step,
@@ -88,7 +89,10 @@ if _numba is not None:
                     r_tx = np.sqrt(tx_dx * tx_dx + tx_dy * tx_dy + tx_dz * tx_dz)
                     r_rx = np.sqrt(rx_dx * rx_dx + rx_dy * rx_dy + rx_dz * rx_dz)
                     r_total = r_tx + r_rx
-                    range_bin = half * r_total * inv_dr
+                    # ``range_offset_m`` is an equivalent one-way range
+                    # calibration.  It moves only the FFT sample addressed by
+                    # BP; the propagation phase below remains geometric.
+                    range_bin = (half * r_total + range_offset_m) * inv_dr
                     if not (range_bin >= zero and range_bin < np.float32(max_bin_eff - 1)):
                         continue
 
@@ -608,6 +612,7 @@ def back_projection_power_mimo_geometry(
     fc_hz: float,
     c_m_s: float,
     max_bin: int,
+    range_offset_m: float = 0.0,
     phase_sign: int = -1,
     residual_video_phase: int | str = 0,
     slope_hz_s: float | None = None,
@@ -634,6 +639,9 @@ def back_projection_power_mimo_geometry(
     Pass ``range_samples_used`` and ``nfft_range`` together to enable the
     phase-aware interpolation required for a causal, zero-padded Range FFT.
     Omitting both retains the historical interpolation for API compatibility.
+    ``range_offset_m`` is an optional signed equivalent one-way range bias:
+    it is added only while addressing the range FFT bins, leaving physical
+    voxel geometry and propagation-phase compensation unchanged.
     """
     snapshots = np.asarray(snapshot_frame_ant_range, dtype=np.complex64)
     if snapshots.ndim != 4:
@@ -670,6 +678,13 @@ def back_projection_power_mimo_geometry(
     if not np.isfinite(c_f) or c_f <= 0.0:
         raise ValueError("c_m_s deve essere > 0")
 
+    try:
+        range_offset_f = float(range_offset_m)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("range_offset_m deve essere un numero finito") from exc
+    if not np.isfinite(range_offset_f):
+        raise ValueError("range_offset_m deve essere un numero finito")
+
     phase_sign_i = phase_sign_normalize(phase_sign, field_name="phase_sign")
     rvp_sign_i = residual_video_phase_sign_normalize(
         residual_video_phase,
@@ -700,7 +715,10 @@ def back_projection_power_mimo_geometry(
         return np.zeros(output_shape, dtype=np.float32)
 
     # Per un percorso bistatico il bin di range corrisponde a metà della
-    # distanza TX→voxel→RX: bin = (r_tx + r_rx) / (2 * dr_m).
+    # distanza TX→voxel→RX: bin = ((r_tx + r_rx) / 2 + offset) / dr_m.
+    # ``range_offset_m`` calibra il riferimento della Range FFT (ritardo
+    # fisso di catena/cavo o zero-range); non altera la geometria né la fase
+    # di propagazione, che devono restare quelle fisiche del voxel.
     voxel_flat = voxels.reshape(-1, 3).astype(np.float32, copy=False)
     k = np.float32((2.0 * np.pi * fc_f) / c_f)
     phase_scale = np.float32(float(phase_sign_i)) * k
@@ -724,6 +742,7 @@ def back_projection_power_mimo_geometry(
             voxel_flat,
             int(max_bin_eff),
             inv_dr,
+            np.float32(range_offset_f),
             phase_scale,
             rvp_phase_scale,
             range_phase_step,
@@ -768,7 +787,9 @@ def back_projection_power_mimo_geometry(
                     + delta_rx[:, 2] * delta_rx[:, 2]
                 ).astype(np.float32, copy=False)
                 r_total = (r_tx + r_rx).astype(np.float32, copy=False)
-                bins = (np.float32(0.5) * r_total * inv_dr).astype(np.float32, copy=False)
+                bins = (
+                    (np.float32(0.5) * r_total + np.float32(range_offset_f)) * inv_dr
+                ).astype(np.float32, copy=False)
                 valid = np.isfinite(bins) & (bins >= 0.0) & (bins < np.float32(max_bin_eff - 1))
                 valid_idx = np.flatnonzero(valid)
                 if valid_idx.size == 0:
@@ -816,6 +837,7 @@ def back_projection_power_mimo_frames(
     fc_hz: float,
     c_m_s: float,
     max_bin: int,
+    range_offset_m: float = 0.0,
     phase_sign: int = -1,
     residual_video_phase: int | str = 0,
     slope_hz_s: float | None = None,
@@ -829,7 +851,8 @@ def back_projection_power_mimo_frames(
     The general geometry kernel above is also used by the linear path through
     this adapter and evaluated in parallel. ``use_numba=False`` retains the
     original X-only loop/chunk traversal as a numerical reference
-    implementation.
+    implementation.  ``range_offset_m`` has the same signed equivalent
+    one-way range convention as the general geometry function.
     """
     snapshots = np.asarray(snapshot_frame_ant_range, dtype=np.complex64)
     if snapshots.ndim != 4:
@@ -847,6 +870,13 @@ def back_projection_power_mimo_frames(
         raise ValueError("x_grid e y_grid devono avere stessa shape")
     if float(dr_m) <= 0.0:
         raise ValueError("dr_m deve essere > 0")
+
+    try:
+        range_offset_f = float(range_offset_m)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("range_offset_m deve essere un numero finito") from exc
+    if not np.isfinite(range_offset_f):
+        raise ValueError("range_offset_m deve essere un numero finito")
 
     phase_sign_i = phase_sign_normalize(phase_sign, field_name="phase_sign")
     rvp_sign_i = residual_video_phase_sign_normalize(
@@ -889,6 +919,7 @@ def back_projection_power_mimo_frames(
             fc_hz=float(fc_hz),
             c_m_s=float(c_m_s),
             max_bin=int(max_bin_eff),
+            range_offset_m=range_offset_f,
             phase_sign=phase_sign_i,
             residual_video_phase=rvp_sign_i,
             slope_hz_s=slope_hz_s,
@@ -922,7 +953,9 @@ def back_projection_power_mimo_frames(
             r_tx = np.sqrt(dx_tx * dx_tx + y_sq).astype(np.float32, copy=False)
             r_rx = np.sqrt(dx_rx * dx_rx + y_sq).astype(np.float32, copy=False)
             r_total = (r_tx + r_rx).astype(np.float32, copy=False)
-            b = (np.float32(0.5) * r_total * inv_dr).astype(np.float32, copy=False)
+            b = (
+                (np.float32(0.5) * r_total + np.float32(range_offset_f)) * inv_dr
+            ).astype(np.float32, copy=False)
             valid = np.isfinite(b) & (b >= 0.0) & (b < np.float32(max_bin_eff - 1))
             valid_idx = np.flatnonzero(valid)
             if valid_idx.size == 0:
@@ -1065,6 +1098,7 @@ def back_projection_image_mimo(
     fc_hz: float,
     c_m_s: float,
     max_bin: int,
+    range_offset_m: float = 0.0,
     phase_sign: int = -1,
     residual_video_phase: int | str = 0,
     slope_hz_s: float | None = None,
@@ -1096,6 +1130,7 @@ def back_projection_image_mimo(
         fc_hz=fc_hz,
         c_m_s=c_m_s,
         max_bin=max_bin,
+        range_offset_m=range_offset_m,
         phase_sign=phase_sign,
         residual_video_phase=residual_video_phase,
         slope_hz_s=slope_hz_s,

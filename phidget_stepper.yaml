@@ -16,7 +16,7 @@ mechanics:
 motor:
   velocity_microsteps_s: 400.0
   acceleration_microsteps_s2: 10000.0
-  current_limit_a: 2.0
+  current_limit_a: 2.4
 # Ricerca del riferimento MIN: questa procedura definisce lo zero logico.
 homing:
   search_distance_mm: 1000.0

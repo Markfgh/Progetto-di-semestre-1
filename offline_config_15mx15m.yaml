@@ -38,6 +38,10 @@ reconstruction:
 
 bp:
   phase_sign: -1
+  # Calibrazione di range solo per backprojection, in metri di range
+  # equivalente one-way.  Se un bersaglio noto a R_true appare a R_meas,
+  # imposta R_meas - R_true (es.: +0.012 per 12 mm troppo lontano).
+  range_offset_m: 0.0
   # FMCW residual-video-phase correction during backprojection.  Leave "off"
   # unless a point-target test confirms a benefit; the sign depends on the
   # dechirp/IQ convention. Options: "off", "+", "-".

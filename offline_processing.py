@@ -903,6 +903,7 @@ def _backprojection_viewport_max_bin(
     x_rx_ant_m: np.ndarray,
     dr_m: float,
     available_bins: int,
+    range_offset_m: float = 0.0,
 ) -> int:
     """Return the highest FMCW bin that can be addressed by an active BP ROI.
 
@@ -913,6 +914,13 @@ def _backprojection_viewport_max_bin(
     available = max(1, int(available_bins))
     if not np.isfinite(float(dr_m)) or float(dr_m) <= 0.0:
         return available
+    range_offset_f = _to_float(
+        "bp.range_offset_m",
+        range_offset_m,
+        0.0,
+    )
+    if not np.isfinite(range_offset_f):
+        raise ValueError("bp.range_offset_m deve essere finito")
 
     x_positions = np.asarray(x_pos_m, dtype=np.float64).reshape(-1)
     x_tx_offsets = np.asarray(x_tx_ant_m, dtype=np.float64).reshape(-1)
@@ -933,8 +941,9 @@ def _backprojection_viewport_max_bin(
     max_one_way_m = 0.5 * float(np.max(r_total))
     if not np.isfinite(max_one_way_m):
         return available
+    max_sample_range_m = max(0.0, max_one_way_m + float(range_offset_f))
     # Two guard samples cover the cubic complex interpolation used by BP.
-    needed = int(np.ceil(max_one_way_m / float(dr_m))) + 2
+    needed = int(np.ceil(max_sample_range_m / float(dr_m))) + 2
     return max(1, min(needed, available))
 
 
@@ -966,6 +975,22 @@ def _read_residual_video_phase(offline_config_path: str | Path) -> int:
         raw,
         field_name="offline_config: bp.residual_video_phase",
     )
+
+
+def _read_bp_range_offset_m(offline_config_path: str | Path) -> float:
+    """Read the equivalent one-way range calibration used only by BP."""
+    cfg = _load_yaml_file(Path(offline_config_path))
+    bp_cfg = cfg.get("bp", {}) or {}
+    if not isinstance(bp_cfg, Mapping):
+        raise ValueError("offline_config: bp deve essere una mappa")
+    offset_m = _to_float(
+        "offline_config: bp.range_offset_m",
+        _pick(bp_cfg.get("range_offset_m"), 0.0),
+        0.0,
+    )
+    if not np.isfinite(offset_m):
+        raise ValueError("offline_config: bp.range_offset_m deve essere finito")
+    return float(offset_m)
 
 
 def _read_fft_workers(fallback_capture_cfg: str | Path) -> int:
@@ -1400,6 +1425,27 @@ def offline_map_bounds_from_yaml_dict(
     )
 
 
+def offline_mirror_x_from_yaml_dict(cfg: dict[str, Any]) -> bool:
+    """Read the display-only left/right convention for offline images."""
+    reconstruction_cfg = cfg.get("reconstruction", {}) or {}
+    if not isinstance(reconstruction_cfg, dict):
+        raise ValueError("offline_config: reconstruction deve essere una mappa")
+    return _to_bool(
+        "offline_config: reconstruction.mirror_x",
+        _pick(reconstruction_cfg.get("mirror_x"), False),
+    )
+
+
+def _mirror_offline_image_x(image_db: np.ndarray, *, mirror_x: bool) -> np.ndarray:
+    """Mirror only the published offline raster, never the SAR geometry."""
+    image = np.asarray(image_db)
+    if image.ndim != 2:
+        raise ValueError("immagine offline deve avere forma [y, x]")
+    if not mirror_x:
+        return image
+    return np.ascontiguousarray(image[:, ::-1])
+
+
 def _read_bp_runtime_cfg(offline_config_path: str | Path, fallback_capture_cfg: str | Path) -> dict[str, Any]:
     """Compone i parametri di ricostruzione da YAML offline e config di cattura."""
     cfg = _load_yaml_file(Path(offline_config_path))
@@ -1440,7 +1486,9 @@ def _read_bp_runtime_cfg(offline_config_path: str | Path, fallback_capture_cfg: 
     return {
         "tx_offsets_m": None if tx_offsets_m is None else tx_offsets_m.astype(np.float32, copy=False),
         "rx_offsets_m": None if rx_offsets_m is None else rx_offsets_m.astype(np.float32, copy=False),
+        "range_offset_m": _read_bp_range_offset_m(offline_config_path),
         "algorithm": str(algorithm),
+        "mirror_x": offline_mirror_x_from_yaml_dict(cfg),
         "residual_video_phase": _read_residual_video_phase(offline_config_path),
         "map_bounds": offline_map_bounds_from_yaml_dict(cfg, fallback_cfg),
         "range_angle": _read_offline_sar_range_angle_cfg(cfg, fallback_cfg),
@@ -2049,6 +2097,7 @@ def _offline_retained_range_bins(
     x_tx_ant_m: np.ndarray,
     x_rx_ant_m: np.ndarray,
     nfft_range: int,
+    range_offset_m: float = 0.0,
 ) -> int:
     """Bound persisted spectra to the configured physical reconstruction map."""
     profile = layout.radar_profile
@@ -2074,6 +2123,7 @@ def _offline_retained_range_bins(
         x_rx_ant_m=np.asarray(x_rx_ant_m, dtype=np.float32),
         dr_m=float(dr_m),
         available_bins=int(nfft_range),
+        range_offset_m=float(range_offset_m),
     )
 
 
@@ -2323,6 +2373,13 @@ def _offline_reader_worker(
         bp_runtime_cfg = _read_bp_runtime_cfg(offline_config_path, fallback_capture_cfg)
         fft_workers = _read_fft_workers(fallback_capture_cfg)
         algorithm = str(bp_runtime_cfg.get("algorithm", "backprojection"))
+        # The calibration belongs exclusively to the BP range sampler.  Keep
+        # the synthetic range-angle branch bit-for-bit independent from it.
+        range_offset_m = (
+            float(bp_runtime_cfg["range_offset_m"])
+            if algorithm == "backprojection"
+            else 0.0
+        )
         range_angle_cfg: OfflineSyntheticRangeAngleConfig = bp_runtime_cfg["range_angle"]
         background_reference: OfflineReferenceBackgroundConfig = bp_runtime_cfg["background_reference"]
         nfft_range = max(1, int(nfft_range))
@@ -2428,6 +2485,7 @@ def _offline_reader_worker(
             x_tx_ant_m=np.asarray(mimo_geometry["x_tx_ant_m"], dtype=np.float32),
             x_rx_ant_m=np.asarray(mimo_geometry["x_rx_ant_m"], dtype=np.float32),
             nfft_range=int(nfft_range),
+            range_offset_m=float(range_offset_m),
         )
         effective_angle_mode = str(range_angle_cfg.angle_processing.mode)
         if algorithm == "synthetic_range_angle":
@@ -2623,6 +2681,7 @@ def _offline_reader_worker(
             "bp_x_rx_ant_m": np.asarray(mimo_geometry["x_rx_ant_m"], dtype=np.float32),
             "bp_x_pos_m": np.asarray(stream_layout.stage_positions_m, dtype=np.float32),
             "bp_geometry_source": geometry_source,
+            "bp_range_offset_m": float(range_offset_m),
         }
         _queue_put_latest(reader_to_dsp_q, msg)
         shm_cleanup_transferred = True
@@ -2654,6 +2713,7 @@ def _offline_reader_worker(
                 "full_loop_range_fft": bool(full_loop_range_fft),
                 "range_angle_nfft_angle": int(range_angle_cfg.nfft_angle),
                 "geometry_source": geometry_source,
+                "bp_range_offset_m": float(range_offset_m),
                 "background_reference_enabled": bool(background_reference.enabled),
                 "background_reference_dir": (
                     None if reference_layout is None else str(reference_layout.source_dir)
@@ -2773,11 +2833,13 @@ def _offline_dsp_worker(
     x_pitch_m: float,
     phase_sign: int,
     residual_video_phase: int,
+    mirror_x: bool = False,
 ) -> None:
     """Worker consumatore: ricostruisce e pubblica immagini nel double buffer."""
     shm_range_fft = None
     try:
         phase_sign_i = _phase_sign_normalize(phase_sign, field_name="phase_sign")
+        mirror_x = _to_bool("mirror_x", mirror_x)
         residual_video_phase_i = _residual_video_phase_sign_normalize(
             residual_video_phase,
             field_name="residual_video_phase",
@@ -2853,6 +2915,13 @@ def _offline_dsp_worker(
         background_reference_dir = init_msg.get("background_reference_dir", None)
         background_reference_frames = max(0, int(_pick(init_msg.get("background_reference_frames"), 0)))
         background_reference_scale = float(_pick(init_msg.get("background_reference_scale"), 1.0))
+        range_offset_m = _to_float(
+            "init.bp_range_offset_m",
+            _pick(init_msg.get("bp_range_offset_m"), 0.0),
+            0.0,
+        )
+        if not np.isfinite(range_offset_m):
+            raise ValueError("init.bp_range_offset_m deve essere finito")
 
         # Preserve the configured position-major × antenna-minor aperture
         # taper.  It changes sidelobes/gain exactly as before; no new gain
@@ -2914,6 +2983,7 @@ def _offline_dsp_worker(
                 "x_start": x_start,
                 "x_end": x_end,
                 "phase_sign": int(phase_sign_i),
+                "mirror_x": bool(mirror_x),
                 "residual_video_phase": int(residual_video_phase_i),
                 "img_h": int(gui_h),
                 "img_w": int(gui_w),
@@ -2923,6 +2993,7 @@ def _offline_dsp_worker(
                 "range_samples_used": int(range_samples_used),
                 "virtual_antennas": int(n_ant_used),
                 "geometry_source": str(geometry_source),
+                "bp_range_offset_m": float(range_offset_m),
                 "doppler_bins_used": 1,
                 "range_angle_use_realtime_filters": bool(range_angle_cfg.use_realtime_filters),
                 "range_angle_enabled_filters": _offline_sar_range_angle_filters_enabled(
@@ -2943,6 +3014,7 @@ def _offline_dsp_worker(
             f"[OFFLINE INFO] algorithm={algorithm} "
             f"default_positions={x_start}:{x_end} angle_mode={range_angle_cfg.angle_processing.mode} "
             f"range={range_input_samples}->{nfft_range} used={range_samples_used} "
+            f"bp_range_offset_m={range_offset_m:.6g} "
             f"filters={_offline_sar_range_angle_filters_enabled(range_angle_cfg, algorithm=str(algorithm))} "
             f"bp_windows={bp_window_stages} "
             f"reference_background={'on' if background_reference_enabled else 'off'}"
@@ -3043,6 +3115,7 @@ def _offline_dsp_worker(
                     x_rx_ant_m=x_rx_ant_m,
                     dr_m=float(dr_m),
                     available_bins=int(n_bins_total),
+                    range_offset_m=float(range_offset_m),
                 )
                 if algorithm == "synthetic_range_angle":
                     selected_positions = positions[sel_idx].astype(np.int32, copy=False)
@@ -3163,6 +3236,7 @@ def _offline_dsp_worker(
                         fc_hz=fc_hz,
                         c_m_s=c_m_s,
                         max_bin=viewport_max_bin,
+                        range_offset_m=float(range_offset_m),
                         phase_sign=phase_sign_i,
                         residual_video_phase=residual_video_phase_i,
                         slope_hz_s=float(slope_hz_s),
@@ -3171,6 +3245,11 @@ def _offline_dsp_worker(
                         nfft_range=int(nfft_range),
                     )
                     doppler_bins_used = 1
+
+                # This is intentionally the final display-only operation.
+                # Reconstruction geometry, raw snapshots and stage metadata
+                # retain their physical orientation for repeatability.
+                img_db = _mirror_offline_image_x(img_db, mirror_x=bool(mirror_x))
 
                 # Il writer riempie il buffer inattivo e pubblica indice+seq
                 # solo alla fine; la GUI può quindi leggere un frame completo.
@@ -3201,6 +3280,7 @@ def _offline_dsp_worker(
                     f"angle_used={frame_meta.get('angle_elements_used', 'n/a')} "
                     f"angle_mode={frame_meta.get('angle_mode', range_angle_cfg.angle_processing.mode)} "
                     f"nfft_range={nfft_range} "
+                    f"mirror_x={bool(mirror_x)} "
                     f"nfft_angle={frame_meta.get('nfft_angle_effective', range_angle_cfg.nfft_angle)} "
                     f"filters={frame_meta.get('enabled_filters', _offline_sar_range_angle_filters_enabled(range_angle_cfg, algorithm=str(algorithm)))} "
                     f"fft_uniform={frame_meta.get('fft_uniform_geometry', 'n/a')}"
@@ -3210,10 +3290,12 @@ def _offline_dsp_worker(
                     {
                         "type": "frame",
                         "algorithm": str(algorithm),
+                        "mirror_x": bool(mirror_x),
                         "x_start": int(x_start),
                         "x_end": int(x_end),
                         "n_pos_used": int(sel_idx.size),
                         "geometry_source": str(geometry_source),
+                        "bp_range_offset_m": float(range_offset_m),
                         "doppler_bins_used": int(doppler_bins_used),
                         "bp_range_bins_used": int(viewport_max_bin),
                         "nfft_range": int(nfft_range),
@@ -3308,6 +3390,7 @@ class OfflineBPRuntime:
         offline_cfg_dict = _load_yaml_file(Path(self.offline_config_path))
         fallback_cfg_dict = _load_yaml_file(Path(self.fallback_capture_cfg))
         self.map_bounds = offline_map_bounds_from_yaml_dict(offline_cfg_dict, fallback_cfg_dict)
+        self.mirror_x = offline_mirror_x_from_yaml_dict(offline_cfg_dict)
         self.range_angle_cfg = _read_offline_sar_range_angle_cfg(offline_cfg_dict, fallback_cfg_dict)
         offline_fft_branch = offline_cfg_dict.get("offline_sar_range_angle", {}) or {}
         self.nfft_range = int(
@@ -3440,6 +3523,7 @@ class OfflineBPRuntime:
                     "x_pitch_m": float(self.x_pitch_m),
                     "phase_sign": int(self.phase_sign),
                     "residual_video_phase": int(self.residual_video_phase),
+                    "mirror_x": bool(self.mirror_x),
                 },
             )
             self._reader_p.daemon = True

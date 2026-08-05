@@ -190,6 +190,81 @@ def test_bistatic_bp_point_target() -> None:
     assert float(img_db[target_row, target_col]) >= float(np.mean(img_db, dtype=np.float32)) + 6.0
 
 
+def test_backprojection_range_offset_refocuses_shifted_range_fft() -> None:
+    """A fixed FFT range bias must be corrected without changing geometry."""
+    c_m_s = 3e8
+    fc_hz = 77e9
+    dr_m = 0.01
+    range_offset_m = 0.14
+    n_bins = 256
+    x_pos_m = np.linspace(-0.12, 0.12, 17, dtype=np.float32)
+    x_tx_ant_m = np.zeros(1, dtype=np.float32)
+    x_rx_ant_m = np.zeros(1, dtype=np.float32)
+    target_x = np.float32(0.04)
+    target_y = np.float32(1.20)
+    carrier_scale = np.float32((2.0 * np.pi * fc_hz) / c_m_s)
+
+    snapshots = np.zeros((x_pos_m.size, 1, 1, n_bins), dtype=np.complex64)
+    for pos_i, x_pos in enumerate(x_pos_m):
+        r_total = np.float32(2.0) * np.hypot(target_x - x_pos, target_y)
+        measured_range_m = np.float32(0.5) * r_total + np.float32(range_offset_m)
+        snapshots[pos_i, 0, 0, :] = _target_profile(
+            n_bins,
+            float(measured_range_m / np.float32(dr_m)),
+            np.exp(-1j * carrier_scale * r_total),
+        )
+
+    x_axis = np.linspace(-0.20, 0.20, 81, dtype=np.float32)
+    y_axis = np.linspace(0.90, 1.50, 121, dtype=np.float32)
+    x_grid, y_grid = np.meshgrid(x_axis, y_axis)
+    common = dict(
+        dr_m=dr_m,
+        fc_hz=fc_hz,
+        c_m_s=c_m_s,
+        max_bin=n_bins,
+        phase_sign=1,
+        use_numba=False,
+    )
+    uncorrected = back_projection_power_mimo_frames(
+        snapshots,
+        x_pos_m,
+        x_tx_ant_m,
+        x_rx_ant_m,
+        x_grid,
+        y_grid,
+        **common,
+    )
+    corrected = back_projection_power_mimo_frames(
+        snapshots,
+        x_pos_m,
+        x_tx_ant_m,
+        x_rx_ant_m,
+        x_grid,
+        y_grid,
+        range_offset_m=range_offset_m,
+        **common,
+    )
+    import offline_dsp
+    if offline_dsp._back_projection_power_mimo_geometry_numba_kernel is not None:
+        accelerated = back_projection_power_mimo_frames(
+            snapshots,
+            x_pos_m,
+            x_tx_ant_m,
+            x_rx_ant_m,
+            x_grid,
+            y_grid,
+            range_offset_m=range_offset_m,
+            **(common | {"use_numba": True}),
+        )
+        np.testing.assert_allclose(accelerated, corrected, atol=3e-4, rtol=2e-5)
+
+    target_row, target_col = _target_cell(x_axis, y_axis, float(target_x), float(target_y))
+    peak_row, peak_col = np.unravel_index(int(np.argmax(corrected)), corrected.shape)
+    assert abs(int(peak_row) - int(target_row)) <= 1
+    assert abs(int(peak_col) - int(target_col)) <= 1
+    assert float(corrected[target_row, target_col]) > float(uncorrected[target_row, target_col]) * 1e4
+
+
 def test_bistatic_bp_point_target_at_30deg() -> None:
     c_m_s = np.float32(3e8)
     fc_hz = np.float32(77e9)

@@ -4591,6 +4591,7 @@ def main():
         {"section": "Data and scan", "path": "scan.x_step", "label": "Position step (use every Nth)", "kind": "int", "default": 1, "min": 1, "step": 1, "mode": "linear"},
         {"section": "Data and scan", "path": "scan.x_pitch_m", "label": "X pitch (m)", "kind": "float", "default": 0.01, "min": 0.000001, "step": 0.001, "format": "%.6f", "mode": "linear"},
         {"section": "Reconstruction", "path": "reconstruction.algorithm", "label": "Algorithm", "kind": "combo", "items": OFFLINE_TUNING_ALGORITHMS, "default": "synthetic_range_angle", "mode": "linear"},
+        {"section": "Reconstruction", "path": "reconstruction.mirror_x", "label": "Mirror X (left/right display)", "kind": "bool", "default": False, "mode": "linear"},
         {"section": "Reconstruction", "path": "bp.phase_sign", "label": "Phase sign", "kind": "combo", "items": ["-1", "1"], "default": "-1", "mode": "shared"},
         {"section": "Map reconstruction bounds", "path": "reconstruction.map_bounds.x_min_m", "label": "Map X min (m)", "kind": "float", "default": -25.0, "step": 0.5, "mode": "linear"},
         {"section": "Map reconstruction bounds", "path": "reconstruction.map_bounds.x_max_m", "label": "Map X max (m)", "kind": "float", "default": 25.0, "step": 0.5, "mode": "linear"},

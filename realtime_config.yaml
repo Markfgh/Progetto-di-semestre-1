@@ -21,8 +21,8 @@ fft:
   workers: 4      # Bounded with Numba below: keeps realtime responsive without saturating all CPU cores.
 
 display:
-  vmax: 94           # Color scale max in RAW mode.
-  vmin: 77           # Color scale min in RAW mode.
+  vmax: 170.0          # Color scale max in RAW mode.
+  vmin: 160.0           # Color scale min in RAW mode.
   vmin_norm: -20     # Normalized mode: typical clean range -25..-15 dB.
   vmax_norm: 0       # Normalized mode peak.
   velocity_vmin_mps: -0.70 # Default mode-1 signed-velocity scale min [m/s].
@@ -40,12 +40,12 @@ display:
   # are allocated when the application starts.
   image_resolution:
     realtime: { width: 256, height: 256 }
-    offline:  { width: 512, height: 512 }
+    offline:  { width: 1024, height: 1024 }
 
 display_zoom:
   enabled: true
-  max_zoom_nfft_range: 1024
-  max_zoom_nfft_angle: 256
+  max_zoom_nfft_range: 65536
+  max_zoom_nfft_angle: 65536
   max_update_hz: 22.0
   dsp_budget_ms: 8.0 
   fallback_mode: baseline_projection #
@@ -261,7 +261,7 @@ debug:
 
 sar:
   frames_per_position: 2
-  settling_delay_s: 1
+  settling_delay_s: 3
   # Timeout usati dal coordinatore della scansione SAR automatica in main.
   scan_motion_timeout_s: 120.0
   scan_capture_timeout_s: 120.0

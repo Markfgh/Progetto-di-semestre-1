@@ -18,6 +18,7 @@ from offline_processing import (
     SARReader,
     _backprojection_viewport_max_bin,
     _apply_offline_backprojection_aperture_window,
+    _mirror_offline_image_x,
     _offline_reader_worker,
     _read_bp_runtime_cfg,
     _read_offline_sar_range_angle_cfg,
@@ -29,6 +30,7 @@ from offline_processing import (
     _viewport_from_cmd_payload,
     estimate_offline_processing_peak_bytes,
     offline_map_bounds_from_yaml_dict,
+    offline_mirror_x_from_yaml_dict,
     resolve_offline_synthetic_angle_mode,
 )
 from realtime_dsp import build_display_viewport
@@ -254,6 +256,24 @@ def test_x_pitch_rejects_non_finite_values(tmp_path: Path) -> None:
         _read_x_pitch_m(cfg_path)
 
 
+def test_offline_mirror_x_is_strict_and_defaults_to_disabled() -> None:
+    assert offline_mirror_x_from_yaml_dict({}) is False
+    assert offline_mirror_x_from_yaml_dict({"reconstruction": {"mirror_x": True}}) is True
+    with pytest.raises(ValueError, match="mirror_x"):
+        offline_mirror_x_from_yaml_dict({"reconstruction": {"mirror_x": 2}})
+
+
+def test_offline_mirror_x_reverses_only_the_output_columns() -> None:
+    image = np.asarray([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32)
+
+    unchanged = _mirror_offline_image_x(image, mirror_x=False)
+    mirrored = _mirror_offline_image_x(image, mirror_x=True)
+
+    np.testing.assert_array_equal(unchanged, image)
+    np.testing.assert_array_equal(mirrored, image[:, ::-1])
+    np.testing.assert_array_equal(image, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+
+
 def test_sparse_position_interval_without_capture_is_rejected() -> None:
     positions = np.asarray([2, 4, 6], dtype=np.int32)
 
@@ -393,6 +413,28 @@ def test_read_bp_runtime_cfg_mimo_sar_keeps_physical_offset_overrides(tmp_path: 
 
     np.testing.assert_allclose(runtime["tx_offsets_m"], np.asarray(tx_offsets, dtype=np.float32))
     np.testing.assert_allclose(runtime["rx_offsets_m"], np.asarray(rx_offsets, dtype=np.float32))
+
+
+def test_read_bp_runtime_cfg_reads_signed_range_offset_for_backprojection(tmp_path: Path) -> None:
+    offline_cfg = tmp_path / "offline_config.yaml"
+    fallback_cfg = tmp_path / "realtime_config.yaml"
+    _write_yaml(offline_cfg, _offline_reconstruction_cfg(range_offset_m=-0.0125))
+    _write_yaml(fallback_cfg, _fallback_capture_cfg())
+
+    runtime = _read_bp_runtime_cfg(offline_cfg, fallback_cfg)
+
+    assert runtime["range_offset_m"] == pytest.approx(-0.0125)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), "not-a-number"])
+def test_read_bp_runtime_cfg_rejects_non_finite_range_offset(tmp_path: Path, value: object) -> None:
+    offline_cfg = tmp_path / "offline_config.yaml"
+    fallback_cfg = tmp_path / "realtime_config.yaml"
+    _write_yaml(offline_cfg, _offline_reconstruction_cfg(range_offset_m=value))
+    _write_yaml(fallback_cfg, _fallback_capture_cfg())
+
+    with pytest.raises(ValueError, match="range_offset_m"):
+        _read_bp_runtime_cfg(offline_cfg, fallback_cfg)
 
 
 @pytest.mark.parametrize(("configured", "expected"), [("off", 0), ("+", 1), ("-", -1)])
@@ -722,6 +764,20 @@ def test_backprojection_roi_reads_only_bins_reachable_by_selected_geometry() -> 
     # Farthest point is x=-2 m from a sensor at x=3 m and y=4 m:
     # ceil(hypot(5, 4)) plus two cubic-interpolation guard bins.
     assert max_bin == 9
+
+    offset_max_bin = _backprojection_viewport_max_bin(
+        viewport,
+        x_pos_m=np.asarray([3.0], dtype=np.float32),
+        x_tx_ant_m=np.asarray([0.0], dtype=np.float32),
+        x_rx_ant_m=np.asarray([0.0], dtype=np.float32),
+        dr_m=1.0,
+        available_bins=128,
+        range_offset_m=0.75,
+    )
+
+    # A positive range calibration samples farther FFT bins, so the retained
+    # spectrum must cover it as well.
+    assert offset_max_bin == 10
 
 
 def test_stream_reader_validates_without_loading_full_cube(tmp_path: Path) -> None:
