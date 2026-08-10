@@ -1,7 +1,7 @@
 data:
   # Puoi mettere direttamente una run: logs/run_YYYYMMDD_HHMMSS
   # Se lasci "logs", SARReader prende automaticamente l'ultima run con capture_pos*.bin.
-  input_dir: "logs\\run_20260805_164359"
+  input_dir: "logs\\doppio_cilindro_30cm_separati(1,72-1,75)"
   # Maximum time allowed to prepare all offline data before reporting a timeout.
   startup_timeout_s: 3600
   # Optional hard cap for the preflight memory estimate; null uses only the
@@ -31,10 +31,10 @@ reconstruction:
   # constrained to this domain and reconstruct their selected sector on the
   # fixed offline image grid.
   map_bounds:
-    x_min_m: -1.5
-    x_max_m: 1.5
+    x_min_m: -6.0
+    x_max_m: 6.0
     y_min_m: 0.0
-    y_max_m: 3.0
+    y_max_m: 12.0
 
 bp:
   phase_sign: -1
@@ -76,7 +76,7 @@ offline_sar_range_angle:
   # in Bartlett/MVDR indica invece il numero di punti della griglia angolare.
   nfft_range: 32768
   nfft_angle: 32768
-  window_range: "hamming"
+  window_range: "blackman"
   window_doppler: "blackman"
   window_angle: "blackman"
   zero_after_range_fft_bins: 0

@@ -116,12 +116,16 @@ def _run_display_process(
     normalize_to_peak: bool = True,
     doppler_bin: int = 1,
     amplitude: float = 30.0,
+    detection_static_cfg: realtime_dsp.DetectionConfigStatic | None = None,
+    detection_moving_cfg: realtime_dsp.DetectionConfigMoving | None = None,
     detection_moving_pre_doppler_filters: realtime_dsp.PostRangeFftFilterConfig | None = None,
     display_post_range_fft_filters: realtime_dsp.PostRangeFftFilterConfig | None = None,
     display_projection_cfg: realtime_dsp.DisplayProjectionConfig | None = None,
     range_angle_moving_cfg: realtime_dsp.RangeAngleMovingConfig | None = None,
     gui_h: int = 32,
     gui_w: int | None = None,
+    processing_max_bin: int = 20,
+    display_max_bin: int = 20,
     angle_processing: realtime_dsp.AngleProcessingConfig | None = None,
     display_viewport: realtime_dsp.DisplayViewport | None = None,
     display_zoom_cfg: realtime_dsp.DisplayZoomConfig | None = None,
@@ -204,8 +208,8 @@ def _run_display_process(
         1.5,
         doppler_axis,
         realtime_dsp.build_tdm_mimo_doppler_compensation_table(loops, dsp_cfg.tx, doppler_fft_shift=True),
-        realtime_dsp.DetectionConfigStatic(enabled=False),
-        realtime_dsp.DetectionConfigMoving(enabled=False, doppler_fft_shift=True),
+        detection_static_cfg or realtime_dsp.DetectionConfigStatic(enabled=False),
+        detection_moving_cfg or realtime_dsp.DetectionConfigMoving(enabled=False, doppler_fft_shift=True),
         realtime_dsp.FusionConfig(enabled=True),
         realtime_dsp.BackgroundSubtractionState(),
         realtime_dsp.BackgroundSubtractionState(),
@@ -230,8 +234,8 @@ def _run_display_process(
         mp.Value("d", 0.0),
         mp.Value("d", 0.0),
         dsp_cfg,
-        20,
-        20,
+        processing_max_bin,
+        display_max_bin,
         gui_heat_alpha_views=gui_heat_alpha_views,
         **process_kwargs,
     )
@@ -274,7 +278,7 @@ def _build_home_and_zoom_viewports(
     return home_viewport, zoom_viewport
 
 
-def test_process_buffer_publishes_angle_and_doppler_diagnostics():
+def test_process_buffer_reuses_detection_maps_for_angle_and_doppler_diagnostics(monkeypatch):
     samples = 32
     loops = 8
     n_frames = 1
@@ -305,6 +309,24 @@ def test_process_buffer_publishes_angle_and_doppler_diagnostics():
     )
     gui_latest_idx = mp.Value("i", 0)
     gui_latest_seq = mp.Value("i", 0)
+
+    angle_calls = 0
+    range_doppler_calls = 0
+    original_angle_heatmap = realtime_dsp.compute_angle_heatmap
+    original_range_doppler = realtime_dsp.compute_range_doppler
+
+    def counted_angle_heatmap(*args, **kwargs):
+        nonlocal angle_calls
+        angle_calls += 1
+        return original_angle_heatmap(*args, **kwargs)
+
+    def counted_range_doppler(*args, **kwargs):
+        nonlocal range_doppler_calls
+        range_doppler_calls += 1
+        return original_range_doppler(*args, **kwargs)
+
+    monkeypatch.setattr(realtime_dsp, "compute_angle_heatmap", counted_angle_heatmap)
+    monkeypatch.setattr(realtime_dsp, "compute_range_doppler", counted_range_doppler)
 
     realtime_dsp.process_buffer(
         _raw_target(
@@ -341,7 +363,12 @@ def test_process_buffer_publishes_angle_and_doppler_diagnostics():
         (np.fft.fftshift(np.fft.fftfreq(loops, d=1.0)) * 4.0).astype(np.float32),
         realtime_dsp.build_tdm_mimo_doppler_compensation_table(loops, dsp_cfg.tx, doppler_fft_shift=True),
         realtime_dsp.DetectionConfigStatic(enabled=False),
-        realtime_dsp.DetectionConfigMoving(enabled=False, doppler_fft_shift=True),
+        realtime_dsp.DetectionConfigMoving(
+            enabled=True,
+            threshold_mode="absolute",
+            min_power_db=300.0,
+            doppler_fft_shift=True,
+        ),
         realtime_dsp.FusionConfig(enabled=True),
         realtime_dsp.BackgroundSubtractionState(),
         realtime_dsp.BackgroundSubtractionState(),
@@ -366,8 +393,8 @@ def test_process_buffer_publishes_angle_and_doppler_diagnostics():
         mp.Value("d", 0.0),
         mp.Value("d", 0.0),
         dsp_cfg,
-        20,
-        20,
+        samples,
+        samples,
         gui_angle_diag_views=gui_angle_diag_views,
         gui_doppler_diag_views=gui_doppler_diag_views,
         angle_diag_out_buf=angle_diag,
@@ -381,6 +408,127 @@ def test_process_buffer_publishes_angle_and_doppler_diagnostics():
     assert np.isfinite(published_doppler).all()
     assert float(np.max(published_angle[range_bin])) > -120.0
     assert float(np.max(published_doppler[range_bin])) > -120.0
+    assert angle_calls == 1
+    assert range_doppler_calls == 1
+
+
+def test_process_buffer_shares_static_and_display_heatmap_when_filters_are_identical(monkeypatch):
+    angle_calls = 0
+    original_angle_heatmap = realtime_dsp.compute_angle_heatmap
+
+    def counted_angle_heatmap(*args, **kwargs):
+        nonlocal angle_calls
+        angle_calls += 1
+        return original_angle_heatmap(*args, **kwargs)
+
+    monkeypatch.setattr(realtime_dsp, "compute_angle_heatmap", counted_angle_heatmap)
+
+    heatmap, view, _, _ = _run_display_process(
+        angle_processing=realtime_dsp.AngleProcessingConfig(mode="fft"),
+        processing_max_bin=32,
+        display_max_bin=32,
+        detection_static_cfg=realtime_dsp.DetectionConfigStatic(
+            enabled=True,
+            threshold_mode="absolute",
+            min_power_db=300.0,
+        ),
+    )
+
+    assert heatmap is not None
+    assert np.isfinite(view).all()
+    assert angle_calls == 1
+
+
+def test_process_buffer_keeps_static_and_display_heatmaps_separate_for_different_filters(monkeypatch):
+    angle_calls = 0
+    original_angle_heatmap = realtime_dsp.compute_angle_heatmap
+
+    def counted_angle_heatmap(*args, **kwargs):
+        nonlocal angle_calls
+        angle_calls += 1
+        return original_angle_heatmap(*args, **kwargs)
+
+    monkeypatch.setattr(realtime_dsp, "compute_angle_heatmap", counted_angle_heatmap)
+
+    _run_display_process(
+        angle_processing=realtime_dsp.AngleProcessingConfig(mode="fft"),
+        processing_max_bin=32,
+        display_max_bin=32,
+        detection_static_cfg=realtime_dsp.DetectionConfigStatic(
+            enabled=True,
+            threshold_mode="absolute",
+            min_power_db=300.0,
+        ),
+        display_post_range_fft_filters=realtime_dsp.PostRangeFftFilterConfig(
+            slow_time=realtime_dsp.SlowTimeConfig(enabled=True, mode="mean_subtraction")
+        ),
+    )
+
+    assert angle_calls == 2
+
+
+def test_virtual_array_alias_guard_detects_degenerate_one_tx_layout() -> None:
+    samples = 32
+    loops = 8
+    geometry = realtime_dsp.VirtualArrayGeometry(
+        order_flat=np.arange(4, dtype=np.int32),
+        phase_centers_lambda=np.arange(4, dtype=np.float32) * np.float32(0.25),
+        identity_order=True,
+        uniform_half_lambda=False,
+        uniform_spacing_lambda=0.25,
+        angle_axis_sign=1.0,
+        angle_u_to_sin_scale=2.0,
+    )
+    range_fft = np.zeros((1, loops, 1, samples, 4), dtype=np.complex64)
+
+    assert realtime_dsp._virtual_array_may_alias_range_fft(
+        range_fft,
+        max_bin=samples,
+        geometry=geometry,
+        work_buf=None,
+    )
+    assert not realtime_dsp._virtual_array_may_alias_range_fft(
+        range_fft,
+        max_bin=samples - 1,
+        geometry=geometry,
+        work_buf=None,
+    )
+    assert not realtime_dsp._virtual_array_may_alias_range_fft(
+        range_fft,
+        max_bin=samples,
+        geometry=geometry,
+        work_buf=np.empty((1, loops, samples, 1, 4), dtype=np.complex64),
+    )
+
+
+def test_process_buffer_preserves_branch_isolation_when_virtual_array_may_alias(monkeypatch):
+    angle_calls = 0
+    original_angle_heatmap = realtime_dsp.compute_angle_heatmap
+
+    def counted_angle_heatmap(*args, **kwargs):
+        nonlocal angle_calls
+        angle_calls += 1
+        return original_angle_heatmap(*args, **kwargs)
+
+    monkeypatch.setattr(realtime_dsp, "compute_angle_heatmap", counted_angle_heatmap)
+    monkeypatch.setattr(
+        realtime_dsp,
+        "_virtual_array_may_alias_range_fft",
+        lambda *args, **kwargs: True,
+    )
+
+    _run_display_process(
+        angle_processing=realtime_dsp.AngleProcessingConfig(mode="fft"),
+        processing_max_bin=32,
+        display_max_bin=32,
+        detection_static_cfg=realtime_dsp.DetectionConfigStatic(
+            enabled=True,
+            threshold_mode="absolute",
+            min_power_db=300.0,
+        ),
+    )
+
+    assert angle_calls == 2
 
 
 def test_process_buffer_synthetic_static_target_outputs_detection_and_finite_views() -> None:

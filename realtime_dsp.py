@@ -2801,12 +2801,79 @@ def _build_virtual_array_from_range_fft(
     return np.take(va_flat, geometry.order_flat, axis=-1).astype(np.complex64, copy=False)
 
 
+def _virtual_array_may_alias_range_fft(
+    range_fft: np.ndarray,
+    *,
+    max_bin: int,
+    geometry: VirtualArrayGeometry,
+    work_buf: np.ndarray | None = None,
+) -> bool:
+    """Return whether the virtual-array builder can hand out a source view.
+
+    Normally the transpose from ``[frame, loop, tx, range, rx]`` forces a
+    contiguous copy.  Degenerate dimensions (notably ``tx == 1``) can make
+    that transpose already contiguous, however.  With identity geometry and
+    no valid work buffer, the returned virtual array can then share memory
+    with ``range_fft`` and downstream in-place angle processing may alter it.
+
+    This is only needed to decide whether static/display branch reuse is safe;
+    it intentionally mirrors the allocation choices in
+    :func:`_build_virtual_array_from_range_fft` without allocating an array.
+    """
+    if range_fft.ndim != 5 or int(max_bin) <= 0:
+        return False
+    available_bins = int(range_fft.shape[3])
+    if int(max_bin) > available_bins:
+        return False
+
+    trimmed = range_fft[:, :, :, : int(max_bin), :]
+    va_src = trimmed.transpose(0, 1, 3, 2, 4)
+    work_is_valid = bool(
+        work_buf is not None
+        and work_buf.shape == va_src.shape
+        and work_buf.dtype == np.complex64
+        and work_buf.flags.c_contiguous
+    )
+    if work_is_valid:
+        return False
+
+    # A non-identity antenna order always uses ``np.take`` (or its dedicated
+    # output buffer), both of which produce a separate virtual array.
+    if not geometry.identity_order:
+        return False
+
+    return bool(va_src.flags.c_contiguous)
+
+
 def _power_to_db(power_lin: np.ndarray) -> np.ndarray:
     out = np.array(power_lin, dtype=np.float32, copy=True)
     np.add(out, np.float32(1e-12), out=out)
     np.log10(out, out=out)
     out *= np.float32(10.0)
     return out
+
+
+def _write_diagnostic_power_db(source_power: np.ndarray, out: np.ndarray) -> None:
+    """Publish a linear-power diagnostic map as dB without touching its source.
+
+    The source maps are also consumed by detection or the display path.  The
+    previous diagnostic path converted a freshly recomputed map in-place; when
+    the same map is reused, conversion must instead happen only in the
+    diagnostic output buffer.
+    """
+    out.fill(np.float32(-120.0))
+    source = np.asarray(source_power, dtype=np.float32)
+    if source.ndim != 2 or out.ndim != 2:
+        return
+    rows = min(int(out.shape[0]), int(source.shape[0]))
+    cols = min(int(out.shape[1]), int(source.shape[1]))
+    if rows <= 0 or cols <= 0:
+        return
+    target = out[:rows, :cols]
+    np.copyto(target, source[:rows, :cols], casting="unsafe")
+    np.add(target, np.float32(1e-12), out=target)
+    np.log10(target, out=target)
+    target *= np.float32(10.0)
 
 
 def _normalization_reference_db(
@@ -4693,27 +4760,101 @@ def process_buffer(
                 apply_loop_average_after_background=False,
             )
 
-        range_fft_display_in = (
-            range_fft_common.copy()
-            if _branch_needs_copy(display_post_range_fft_filters)
-            else range_fft_common
+        static_virtual_array_work_buf = None
+        static_virtual_array_flat_work_buf = None
+        static_virtual_array_may_alias_source = False
+        if detection_static_cfg.enabled:
+            static_virtual_array_work_buf = (
+                None
+                if virtual_array_work_buf is None
+                else virtual_array_work_buf[
+                    :n_frames,
+                    : int(range_fft_detection_static.shape[1]),
+                    :processing_max_bin,
+                    :,
+                    :,
+                ]
+            )
+            static_virtual_array_flat_work_buf = (
+                None
+                if virtual_array_flat_work_buf is None
+                else virtual_array_flat_work_buf[
+                    :n_frames,
+                    : int(range_fft_detection_static.shape[1]),
+                    :processing_max_bin,
+                    :,
+                ]
+            )
+            static_virtual_array_may_alias_source = _virtual_array_may_alias_range_fft(
+                range_fft_detection_static,
+                max_bin=processing_max_bin,
+                geometry=virtual_array_geometry,
+                work_buf=static_virtual_array_work_buf,
+            )
+
+        # A post-range branch with no background state is deterministic for a
+        # frame.  When static detection and display request that exact branch,
+        # calculate it once and let the per-frame angle-map cache reuse its
+        # result below.  Background subtraction deliberately stays isolated:
+        # its state belongs to a branch even if two configurations look alike.
+        # The whole reuse is also disabled when the static virtual array can
+        # alias its source: in that rare layout, the angular path may process
+        # the cube in place, so preserving the two historical branches is the
+        # only result-invariant behaviour.
+        share_static_display_branch = bool(
+            detection_static_cfg.enabled
+            and detection_static_post_range_fft_filters == display_post_range_fft_filters
+            and bool(apply_detection_loop_average_after_background)
+            == bool(apply_display_loop_average_after_background)
+            and not detection_static_post_range_fft_filters.background_subtraction.enabled
+            and not static_virtual_array_may_alias_source
         )
-        # chain of filters that are executed pn the Range FFT for the display branch.
-        # range_fft_in -> slow_time_filter -> subtract_selected_mean -> background_subtraction -> loop_average -> range_fft_display
-        range_fft_display = apply_post_range_fft_filters(
-            range_fft_display_in,
-            display_post_range_fft_filters,
-            bg_state=display_bg_state,
-            fft_workers=dsp_cfg.fft_workers,
-            apply_loop_average_after_background=apply_display_loop_average_after_background,
-        )
+        if share_static_display_branch:
+            range_fft_display = range_fft_detection_static
+        else:
+            range_fft_display_in = (
+                range_fft_common.copy()
+                if _branch_needs_copy(display_post_range_fft_filters)
+                else range_fft_common
+            )
+            # range_fft_in -> slow-time_filter -> selected mean -> background
+            # subtraction -> optional loop average -> range_fft_display.
+            range_fft_display = apply_post_range_fft_filters(
+                range_fft_display_in,
+                display_post_range_fft_filters,
+                bg_state=display_bg_state,
+                fft_workers=dsp_cfg.fft_workers,
+                apply_loop_average_after_background=apply_display_loop_average_after_background,
+            )
+
+        # The cache exists only for this batch.  An entry is valid exclusively
+        # when both users hold the very same post-filter cube; object identity
+        # deliberately prevents sharing results from branches with independent
+        # background states or different filters.
+        angle_heatmap_frame_cache: list[tuple[np.ndarray, int, np.ndarray]] = []
+
+        def _cache_angle_heatmap(source_cube: np.ndarray, max_bin: int, heatmap: np.ndarray) -> None:
+            if heatmap.ndim != 2 or int(max_bin) <= 0:
+                return
+            angle_heatmap_frame_cache.append((source_cube, int(max_bin), heatmap))
+
+        def _cached_angle_heatmap(source_cube: np.ndarray, max_bin: int) -> np.ndarray | None:
+            required_bins = max(0, int(max_bin))
+            for cached_cube, cached_bins, cached_heatmap in angle_heatmap_frame_cache:
+                if cached_cube is not source_cube or cached_bins < required_bins:
+                    continue
+                if cached_heatmap.shape[0] < required_bins:
+                    continue
+                return cached_heatmap[:required_bins, :]
+            return None
 
         # Tracking path (physical data): no display EMA/blur/normalization.
         detections_static: list[Detection] = []
         detections_moving: list[Detection] = []
+        range_doppler_detection: np.ndarray | None = None
         # If enabled, detect static targets from the range-FFT cube and estimate their angle/range.
         if detection_static_cfg.enabled:
-            detections_static, _ = detect_static_targets(
+            detections_static, static_detection_heatmap = detect_static_targets(
                 range_fft_detection_static,
                 static_cfg=detection_static_cfg,
                 angle_cfg=angle_processing,
@@ -4725,31 +4866,17 @@ def process_buffer(
                 range_bin_m=range_bin_m,
                 max_bin=processing_max_bin,
                 apply_angle_window=apply_angle_window,
-                virtual_array_work_buf=(
-                    None
-                    if virtual_array_work_buf is None
-                    else virtual_array_work_buf[
-                        :n_frames,
-                        : int(range_fft_detection_static.shape[1]),
-                        :processing_max_bin,
-                        :,
-                        :,
-                    ]
-                ),
-                virtual_array_flat_work_buf=(
-                    None
-                    if virtual_array_flat_work_buf is None
-                    else virtual_array_flat_work_buf[
-                        :n_frames,
-                        : int(range_fft_detection_static.shape[1]),
-                        :processing_max_bin,
-                        :,
-                    ]
-                ),
+                virtual_array_work_buf=static_virtual_array_work_buf,
+                virtual_array_flat_work_buf=static_virtual_array_flat_work_buf,
+            )
+            _cache_angle_heatmap(
+                range_fft_detection_static,
+                processing_max_bin,
+                static_detection_heatmap,
             )
         
         if detection_moving_cfg.enabled:
-            doppler_cube, range_doppler_map = compute_range_doppler(
+            doppler_cube, range_doppler_detection = compute_range_doppler(
                 range_fft_detection_moving,
                 max_bin=processing_max_bin,
                 dsp_cfg=dsp_cfg,
@@ -4763,7 +4890,7 @@ def process_buffer(
                 ),
             )
             detections_moving = detect_moving_targets(
-                range_doppler_map,
+                range_doppler_detection,
                 moving_cfg=detection_moving_cfg,
                 range_bin_m=range_bin_m,
                 doppler_axis_mps=doppler_axis_mps,
@@ -4835,96 +4962,6 @@ def process_buffer(
             )
 
         active_display_max_bin = _viewport_max_bin_for(range_bin_m, int(range_fft_display.shape[3]))
-
-        if angle_diag_out_buf is not None:
-            angle_diag_out_buf.fill(np.float32(-120.0))
-            diag_range_bins = min(
-                int(active_display_max_bin),
-                int(angle_diag_out_buf.shape[0]),
-                int(range_fft_display.shape[3]),
-            )
-            if diag_range_bins > 0:
-                diag_virtual_array = _build_virtual_array_from_range_fft(
-                    range_fft_display,
-                    max_bin=diag_range_bins,
-                    dsp_cfg=dsp_cfg,
-                    geometry=virtual_array_geometry,
-                    work_buf=(
-                        None
-                        if virtual_array_work_buf is None
-                        else virtual_array_work_buf[
-                            :n_frames,
-                            : int(range_fft_display.shape[1]),
-                            :diag_range_bins,
-                            :,
-                            :,
-                        ]
-                    ),
-                    flat_work_buf=(
-                        None
-                        if virtual_array_flat_work_buf is None
-                        else virtual_array_flat_work_buf[
-                            :n_frames,
-                            : int(range_fft_display.shape[1]),
-                            :diag_range_bins,
-                            :,
-                        ]
-                    ),
-                )
-                if apply_angle_window:
-                    diag_virtual_array *= w_angle
-                diag_angle_pow = compute_angle_heatmap(
-                    diag_virtual_array,
-                    angle_cfg=angle_processing,
-                    dsp_cfg=replace(dsp_cfg, nfft_angle=int(angle_diag_out_buf.shape[1])),
-                    angle_steering=angle_steering,
-                    geometry=virtual_array_geometry,
-                    ant_spacing=virtual_array_geometry.uniform_spacing_lambda,
-                )
-                diag_copy_rows = min(int(angle_diag_out_buf.shape[0]), int(diag_angle_pow.shape[0]))
-                diag_copy_cols = min(int(angle_diag_out_buf.shape[1]), int(diag_angle_pow.shape[1]))
-                if diag_copy_rows > 0 and diag_copy_cols > 0:
-                    diag_angle_db = diag_angle_pow[:diag_copy_rows, :diag_copy_cols].astype(np.float32, copy=False)
-                    np.add(diag_angle_db, np.float32(1e-12), out=diag_angle_db)
-                    np.log10(diag_angle_db, out=diag_angle_db)
-                    diag_angle_db *= np.float32(10.0)
-                    angle_diag_out_buf[:diag_copy_rows, :diag_copy_cols] = diag_angle_db
-
-        if doppler_diag_out_buf is not None:
-            doppler_diag_out_buf.fill(np.float32(-120.0))
-            diag_range_bins = min(
-                int(active_display_max_bin),
-                int(doppler_diag_out_buf.shape[0]),
-                int(range_fft_detection_moving.shape[3]),
-            )
-            if diag_range_bins > 0:
-                _, diag_range_doppler = compute_range_doppler(
-                    range_fft_detection_moving,
-                    max_bin=diag_range_bins,
-                    dsp_cfg=dsp_cfg,
-                    moving_cfg=detection_moving_cfg,
-                    w_doppler=w_doppler,
-                    apply_doppler_window=apply_doppler_window,
-                    doppler_work_buf=(
-                        None
-                        if doppler_work_buf is None
-                        else doppler_work_buf[
-                            :n_frames,
-                            : int(range_fft_detection_moving.shape[1]),
-                            :,
-                            :diag_range_bins,
-                            :,
-                        ]
-                    ),
-                )
-                diag_copy_rows = min(int(doppler_diag_out_buf.shape[0]), int(diag_range_doppler.shape[0]))
-                diag_copy_cols = min(int(doppler_diag_out_buf.shape[1]), int(diag_range_doppler.shape[1]))
-                if diag_copy_rows > 0 and diag_copy_cols > 0:
-                    diag_doppler_db = diag_range_doppler[:diag_copy_rows, :diag_copy_cols].astype(np.float32, copy=False)
-                    np.add(diag_doppler_db, np.float32(1e-12), out=diag_doppler_db)
-                    np.log10(diag_doppler_db, out=diag_doppler_db)
-                    diag_doppler_db *= np.float32(10.0)
-                    doppler_diag_out_buf[:diag_copy_rows, :diag_copy_cols] = diag_doppler_db
 
         def _projection_lut_for(
             angle_axis_local: np.ndarray,
@@ -5002,6 +5039,11 @@ def process_buffer(
                 display_zoom_cfg=display_zoom_cfg_eff,
                 now_s=time.perf_counter(),
             )
+
+        # This is the un-smoothed base display map.  The angle diagnostic is
+        # defined from exactly this map, not from the optional EMA/blur or a
+        # zoomed replacement.
+        display_angle_heatmap_raw: np.ndarray | None = None
 
         if display_mode == "range_angle_moving":
             moving_display_max_bin = max(
@@ -5201,45 +5243,53 @@ def process_buffer(
             # Build the virtual array after trimming range bins to limit memory traffic.
             # [frame, loop, range_bin, virtual_ant]
             debug_angle_axis = angle_axis_deg
-            virtual_array = _build_virtual_array_from_range_fft(
-                range_fft_display,
-                max_bin=active_display_max_bin,
-                dsp_cfg=dsp_cfg,
-                geometry=virtual_array_geometry,
-                work_buf=(
-                    None
-                    if virtual_array_work_buf is None
-                    else virtual_array_work_buf[
-                        :n_frames,
-                        : int(range_fft_display.shape[1]),
-                        :active_display_max_bin,
-                        :,
-                        :,
-                    ]
-                ),
-                flat_work_buf=(
-                    None
-                    if virtual_array_flat_work_buf is None
-                    else virtual_array_flat_work_buf[
-                        :n_frames,
-                        : int(range_fft_display.shape[1]),
-                        :active_display_max_bin,
-                        :,
-                    ]
-                ),
+            heatmap = (
+                _cached_angle_heatmap(range_fft_display, active_display_max_bin)
+                if share_static_display_branch
+                else None
             )
+            if heatmap is None:
+                virtual_array = _build_virtual_array_from_range_fft(
+                    range_fft_display,
+                    max_bin=active_display_max_bin,
+                    dsp_cfg=dsp_cfg,
+                    geometry=virtual_array_geometry,
+                    work_buf=(
+                        None
+                        if virtual_array_work_buf is None
+                        else virtual_array_work_buf[
+                            :n_frames,
+                            : int(range_fft_display.shape[1]),
+                            :active_display_max_bin,
+                            :,
+                            :,
+                        ]
+                    ),
+                    flat_work_buf=(
+                        None
+                        if virtual_array_flat_work_buf is None
+                        else virtual_array_flat_work_buf[
+                            :n_frames,
+                            : int(range_fft_display.shape[1]),
+                            :active_display_max_bin,
+                            :,
+                        ]
+                    ),
+                )
 
-            if apply_angle_window:
-                virtual_array *= w_angle
+                if apply_angle_window:
+                    virtual_array *= w_angle
 
-            heatmap = compute_angle_heatmap(
-                virtual_array,
-                angle_cfg=angle_processing,
-                dsp_cfg=replace(dsp_cfg, nfft_angle=int(dsp_cfg.nfft_angle)),
-                angle_steering=angle_steering,
-                geometry=virtual_array_geometry,
-                ant_spacing=virtual_array_geometry.uniform_spacing_lambda,
-            )
+                heatmap = compute_angle_heatmap(
+                    virtual_array,
+                    angle_cfg=angle_processing,
+                    dsp_cfg=replace(dsp_cfg, nfft_angle=int(dsp_cfg.nfft_angle)),
+                    angle_steering=angle_steering,
+                    geometry=virtual_array_geometry,
+                    ant_spacing=virtual_array_geometry.uniform_spacing_lambda,
+                )
+                _cache_angle_heatmap(range_fft_display, active_display_max_bin, heatmap)
+            display_angle_heatmap_raw = heatmap
 
             if not heatmap_ema_cfg.enabled:
                 heatmap_ema = heatmap
@@ -5448,6 +5498,107 @@ def process_buffer(
                 if normalize_to_peak:
                     view_display -= normalization_reference_db
                     power_display_normalized = True
+
+        # The normal power display and its angle diagnostic consume the same
+        # un-smoothed range-angle map.  Reuse it whenever its FFT grid matches
+        # the diagnostic grid.  Moving-velocity display has no such map, and
+        # non-standard diagnostic widths retain the original independent path.
+        if angle_diag_out_buf is not None:
+            diag_range_bins = min(
+                int(active_display_max_bin),
+                int(angle_diag_out_buf.shape[0]),
+                int(range_fft_display.shape[3]),
+            )
+            diag_angle_power: np.ndarray | None = None
+            if (
+                display_angle_heatmap_raw is not None
+                and int(display_angle_heatmap_raw.shape[1]) == int(angle_diag_out_buf.shape[1])
+                and int(display_angle_heatmap_raw.shape[0]) >= diag_range_bins
+            ):
+                diag_angle_power = display_angle_heatmap_raw[:diag_range_bins, :]
+            elif diag_range_bins > 0:
+                diag_virtual_array = _build_virtual_array_from_range_fft(
+                    range_fft_display,
+                    max_bin=diag_range_bins,
+                    dsp_cfg=dsp_cfg,
+                    geometry=virtual_array_geometry,
+                    work_buf=(
+                        None
+                        if virtual_array_work_buf is None
+                        else virtual_array_work_buf[
+                            :n_frames,
+                            : int(range_fft_display.shape[1]),
+                            :diag_range_bins,
+                            :,
+                            :,
+                        ]
+                    ),
+                    flat_work_buf=(
+                        None
+                        if virtual_array_flat_work_buf is None
+                        else virtual_array_flat_work_buf[
+                            :n_frames,
+                            : int(range_fft_display.shape[1]),
+                            :diag_range_bins,
+                            :,
+                        ]
+                    ),
+                )
+                if apply_angle_window:
+                    diag_virtual_array *= w_angle
+                diag_angle_power = compute_angle_heatmap(
+                    diag_virtual_array,
+                    angle_cfg=angle_processing,
+                    dsp_cfg=replace(dsp_cfg, nfft_angle=int(angle_diag_out_buf.shape[1])),
+                    angle_steering=angle_steering,
+                    geometry=virtual_array_geometry,
+                    ant_spacing=virtual_array_geometry.uniform_spacing_lambda,
+                )
+            if diag_angle_power is None:
+                angle_diag_out_buf.fill(np.float32(-120.0))
+            else:
+                _write_diagnostic_power_db(diag_angle_power, angle_diag_out_buf)
+
+        # Moving detection already computes this exact range-Doppler map.  Its
+        # range rows are independent, so the visual diagnostic can safely use
+        # a prefix of the detection map.  If moving detection is disabled (or
+        # has a smaller processing range), preserve the standalone diagnostic.
+        if doppler_diag_out_buf is not None:
+            diag_range_bins = min(
+                int(active_display_max_bin),
+                int(doppler_diag_out_buf.shape[0]),
+                int(range_fft_detection_moving.shape[3]),
+            )
+            diag_range_doppler: np.ndarray | None = None
+            if (
+                range_doppler_detection is not None
+                and int(range_doppler_detection.shape[0]) >= diag_range_bins
+            ):
+                diag_range_doppler = range_doppler_detection[:diag_range_bins, :]
+            elif diag_range_bins > 0:
+                _, diag_range_doppler = compute_range_doppler(
+                    range_fft_detection_moving,
+                    max_bin=diag_range_bins,
+                    dsp_cfg=dsp_cfg,
+                    moving_cfg=detection_moving_cfg,
+                    w_doppler=w_doppler,
+                    apply_doppler_window=apply_doppler_window,
+                    doppler_work_buf=(
+                        None
+                        if doppler_work_buf is None
+                        else doppler_work_buf[
+                            :n_frames,
+                            : int(range_fft_detection_moving.shape[1]),
+                            :,
+                            :diag_range_bins,
+                            :,
+                        ]
+                    ),
+                )
+            if diag_range_doppler is None:
+                doppler_diag_out_buf.fill(np.float32(-120.0))
+            else:
+                _write_diagnostic_power_db(diag_range_doppler, doppler_diag_out_buf)
 
         if display_zoom_runtime is not None:
             display_zoom_runtime.last_viewport_signature = active_viewport_sig

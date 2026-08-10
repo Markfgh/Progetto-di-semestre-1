@@ -9,14 +9,14 @@ radar:
   chirp_period_s: 160e-6 # PRI [s] = idle 100 us + ramp 60 us; must match mmWave Studio.
 
 capture:
-  samples: 256   # ADC samples/chirp; 25.6 us at 10 Msps; must match mmWave Studio.
+  samples: 512   # ADC samples/chirp; 25.6 us at 10 Msps; must match mmWave Studio.
   chirps: 256    # Chirps/frame.
   rx: 4          # Current IQ conversion assumes RX=4.
   tx: 2          # Uniform TDM-MIMO TX count; Doppler axis/compensation assume equal chirp spacing across TX.
   x_frames: 1    # Frames processed per DSP batch.
 
 fft:
-  nfft_range: 256 # FFT length matches the 256 acquired ADC samples.
+  nfft_range: 512 # FFT length matches the 256 acquired ADC samples.
   nfft_angle: 256 # Typical: 128/256/512. Higher = finer angular grid, more CPU.
   workers: 4      # Bounded with Numba below: keeps realtime responsive without saturating all CPU cores.
 
@@ -261,7 +261,7 @@ debug:
 
 sar:
   frames_per_position: 2
-  settling_delay_s: 3
+  settling_delay_s: 1
   # Timeout usati dal coordinatore della scansione SAR automatica in main.
   scan_motion_timeout_s: 120.0
   scan_capture_timeout_s: 120.0
