@@ -79,6 +79,35 @@ def test_background_subtraction_clamp_positive_only_preserves_negative_residual_
     np.testing.assert_allclose(out, 0.0 + 0.0j, atol=1e-6)
 
 
+def test_background_subtraction_clamp_positive_only_matches_phase_reference() -> None:
+    """Il clamp di magnitudine conserva la fase ed è definito anche per x=0."""
+    state = realtime_dsp.BackgroundSubtractionState(
+        model=np.asarray(
+            [[[[2.0 + 0.0j], [1.0 + 1.0j], [3.0 + 4.0j], [0.0 + 0.0j]]]],
+            dtype=np.complex64,
+        )
+    )
+    cfg = realtime_dsp.BackgroundSubtractionConfig(
+        enabled=True,
+        mode="frozen",
+        init_frames=1,
+        clamp_positive_only=True,
+    )
+    data = np.asarray(
+        [[[[[3.0 + 4.0j], [0.0 + 0.0j], [-3.0 + 4.0j], [1.0 - 1.0j]]]]],
+        dtype=np.complex64,
+    )
+
+    out = realtime_dsp.apply_background_subtraction(data.copy(), cfg, state)
+
+    current_mag = np.abs(data)
+    background_mag = np.abs(state.model.reshape((1,) + state.model.shape))
+    expected_mag = np.maximum(current_mag - background_mag, 0.0).astype(np.float32, copy=False)
+    expected = (expected_mag * np.exp(1j * np.angle(data))).astype(np.complex64, copy=False)
+    np.testing.assert_allclose(out, expected, rtol=2e-6, atol=2e-6)
+    assert out[0, 0, 0, 1, 0] == np.complex64(0.0 + 0.0j)
+
+
 def test_disabled_background_subtraction_ignores_existing_model() -> None:
     state = realtime_dsp.BackgroundSubtractionState(
         model=np.full((1, 1, 2, 1), 10.0 + 0.0j, dtype=np.complex64)

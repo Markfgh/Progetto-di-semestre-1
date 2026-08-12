@@ -121,7 +121,7 @@ class DCA1000Config:
     capture_card_mac: str = "12:34:56:78:90:12"
     config_port: int = 4096
     record_port: int = 4098
-    packet_delay: int = 25
+    packet_delay: int = 10
     mode_recording: int = 1
     mode_device_type: int = 1
     mode_data_format: int = 1

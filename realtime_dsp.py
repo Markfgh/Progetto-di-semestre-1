@@ -4305,9 +4305,16 @@ def apply_background_subtraction(
         # floor visivo/non coerente, non una cancellazione complessa del clutter.
         current_mag = np.abs(range_fft)
         bg_mag = np.abs(bg_broadcast)
-        out_mag = np.maximum(current_mag - bg_mag, 0.0).astype(np.float32, copy=False)
-        phase = np.exp(1j * np.angle(range_fft)).astype(np.complex64, copy=False)
-        range_fft_out = (out_mag * phase).astype(np.complex64, copy=False)
+        # Per x != 0 vale exp(j*angle(x)) == x / abs(x).  Usiamo quindi il
+        # guadagno radiale max(abs(x) - abs(bg), 0) / abs(x): conserva
+        # matematicamente la fase di x (entro l'arrotondamento float), ma evita
+        # angle() ed exp() per ogni cella.
+        # Quando abs(x) è zero il numeratore è già zero; ``where`` lascia il
+        # guadagno a zero e evita la divisione per zero.
+        gain = np.maximum(current_mag - bg_mag, 0.0).astype(np.float32, copy=False)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            np.divide(gain, current_mag, out=gain, where=current_mag > np.float32(0.0))
+        range_fft_out = (range_fft * gain).astype(np.complex64, copy=False)
     else:
         range_fft_out = range_fft - bg_broadcast
     # Avoid double counting the batch that completed background initialization.

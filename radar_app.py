@@ -77,6 +77,22 @@ def _rx_gap_alignment(write_offset: int, missing_bytes: int, bytes_per_frame: in
     return int(total // frame_bytes), int(total % frame_bytes)
 
 
+_RX_SOCKET_RCVBUF_DEFAULT_BYTES = 16 * 1024 * 1024
+_RX_SOCKET_RCVBUF_MIN_BYTES = 1 * 1024 * 1024
+_RX_SOCKET_RCVBUF_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _resolve_rx_socket_rcvbuf_bytes(rx_cfg: dict | None) -> tuple[int, int]:
+    """Return requested and bounded UDP receive-buffer sizes in bytes."""
+    block = rx_cfg if isinstance(rx_cfg, dict) else {}
+    try:
+        requested = int(block.get("socket_rcvbuf_bytes", _RX_SOCKET_RCVBUF_DEFAULT_BYTES))
+    except (TypeError, ValueError):
+        requested = _RX_SOCKET_RCVBUF_DEFAULT_BYTES
+    resolved = max(_RX_SOCKET_RCVBUF_MIN_BYTES, min(requested, _RX_SOCKET_RCVBUF_MAX_BYTES))
+    return int(requested), int(resolved)
+
+
 def display_matrix_index_from_xy(
     matrix_shape: tuple[int, int],
     *,
@@ -1175,7 +1191,15 @@ def radar_rx(
     PC_IP = "192.168.33.30"
     PORT = 4098
     HEADER_LEN = 10
-    RCVBUF_BYTES = 256 * 1024 * 1024
+    # In a real-time view, stale frames are worse than occasional packet drops:
+    # a 256 MiB UDP queue stores several seconds of this 40--50 MiB/s stream.
+    # Keep the default bounded and let the YAML tune the jitter/latency tradeoff.
+    rcvbuf_requested, RCVBUF_BYTES = _resolve_rx_socket_rcvbuf_bytes(cfg.get("rx", {}))
+    if RCVBUF_BYTES != rcvbuf_requested:
+        print(
+            "[RX WARN] socket_rcvbuf_bytes outside the supported "
+            f"{_RX_SOCKET_RCVBUF_MIN_BYTES}..{_RX_SOCKET_RCVBUF_MAX_BYTES} byte range; using {RCVBUF_BYTES}."
+        )
     STALL_TIMEOUT_S = float(cfg.get("rx", {}).get("stall_timeout_s", 2.0))
     if STALL_TIMEOUT_S <= 0.0:
         STALL_TIMEOUT_S = 2.0
@@ -1188,6 +1212,12 @@ def radar_rx(
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF_BYTES)
+        effective_rcvbuf_bytes = int(sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF))
+        print(
+            "[RX] UDP receive buffer "
+            f"requested={RCVBUF_BYTES / (1024.0 * 1024.0):.1f} MiB, "
+            f"effective={effective_rcvbuf_bytes / (1024.0 * 1024.0):.1f} MiB."
+        )
         sock.bind((PC_IP, PORT))
         sock.settimeout(0.2)
     except Exception:
@@ -1225,6 +1255,14 @@ def radar_rx(
     pkts_local = 0
     t_flush = time.perf_counter()
     last_packet_perf = t_flush
+    # RX receives about 28k UDP datagrams/s at 20 Hz.  Polling an empty
+    # multiprocessing queue and taking a shared-value lock for every packet
+    # burns a substantial fraction of one CPU core without improving latency.
+    # A 10 ms command cadence remains far below a radar frame period; packet
+    # health/UI statistics only need a 100 ms cadence.
+    RX_CONTROL_POLL_INTERVAL_S = 0.010
+    RX_STATS_FLUSH_INTERVAL_S = 0.100
+    last_control_poll_s = t_flush - RX_CONTROL_POLL_INTERVAL_S
     # Physical frame sequence: advances at every stream frame boundary,
     # including corrupted frames and frames dropped because the ring is full.
     # DSP can therefore reconstruct elapsed frame time under overload.
@@ -1474,21 +1512,23 @@ def radar_rx(
     try:
         while not stop_evt.is_set():
             now_perf = time.perf_counter()
-            _poll_commands(now_perf)
-            _maybe_enable_capture(now_perf)
+            if (now_perf - last_control_poll_s) >= RX_CONTROL_POLL_INTERVAL_S:
+                _poll_commands(now_perf)
+                _maybe_enable_capture(now_perf)
+                last_control_poll_s = now_perf
     
             try:
                 n_bytes, _ = sock.recvfrom_into(packet_mv)
                 pkts_local += 1
                 recv_perf = time.perf_counter()
-                try:
-                    with rx_last_packet_time_s.get_lock():
-                        rx_last_packet_time_s.value = time.time()
-                except Exception:
-                    pass
-                if recv_perf - t_flush >= 0.1:
+                if recv_perf - t_flush >= RX_STATS_FLUSH_INTERVAL_S:
                     with rx_pkts.get_lock():
                         rx_pkts.value += pkts_local
+                    try:
+                        with rx_last_packet_time_s.get_lock():
+                            rx_last_packet_time_s.value = time.time()
+                    except Exception:
+                        pass
                     pkts_local = 0
                     t_flush = recv_perf
             except socket.timeout:

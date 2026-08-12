@@ -391,6 +391,55 @@ def test_geometry_bp_matches_pre_generalization_linear_reference(phase_sign: int
     np.testing.assert_allclose(core, reference, atol=3e-4, rtol=2e-5)
 
 
+def test_geometry_bp_keeps_static_coordinates_on_singleton_frame_axis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Static geometry must not be expanded or recomputed once per frame."""
+    import offline_dsp
+
+    calls: list[tuple[tuple[int, ...], bool]] = []
+
+    def fake_kernel(*args):
+        calls.append((tuple(args[1].shape), bool(args[-1])))
+        return np.zeros(int(args[3].shape[0]), dtype=np.float32)
+
+    monkeypatch.setattr(
+        offline_dsp,
+        "_back_projection_power_mimo_geometry_numba_kernel",
+        fake_kernel,
+    )
+    snapshots = np.zeros((2, 4, 3, 8), dtype=np.complex64)
+    static_tx = np.zeros((2, 3, 3), dtype=np.float32)
+    static_rx = np.zeros((2, 3, 3), dtype=np.float32)
+    frame_tx = np.zeros((2, 4, 3, 3), dtype=np.float32)
+    frame_rx = np.zeros((2, 4, 3, 3), dtype=np.float32)
+    voxels = np.zeros((5, 3), dtype=np.float32)
+    kwargs = {
+        "dr_m": 0.04,
+        "fc_hz": 77e9,
+        "c_m_s": 3e8,
+        "max_bin": 8,
+        "use_numba": True,
+    }
+
+    back_projection_power_mimo_geometry(
+        snapshots,
+        static_tx,
+        static_rx,
+        voxels,
+        **kwargs,
+    )
+    back_projection_power_mimo_geometry(
+        snapshots,
+        frame_tx,
+        frame_rx,
+        voxels,
+        **kwargs,
+    )
+
+    assert calls == [((2, 1, 3, 3), True), ((2, 4, 3, 3), False)]
+
+
 def test_geometry_bp_numba_matches_numpy_reference_with_frames_weights_and_rvp() -> None:
     """The accelerated physical BP must retain the pre-Numba calculation."""
     import offline_dsp
@@ -643,6 +692,72 @@ def test_multi_frame_backprojection_matches_single_frame_batches(
     )
 
     np.testing.assert_allclose(optimized, frame_batches, atol=3e-4, rtol=2e-5)
+
+
+def test_multi_frame_backprojection_accepts_independent_position_per_frame() -> None:
+    rng = np.random.default_rng(20260810)
+    snapshots = (
+        rng.standard_normal((3, 3, 2, 24), dtype=np.float32)
+        + 1j * rng.standard_normal((3, 3, 2, 24), dtype=np.float32)
+    ).astype(np.complex64)
+    x_pos_m = np.asarray([-0.03, 0.0, 0.03], dtype=np.float32)
+    x_pos_by_frame = (
+        x_pos_m[:, None]
+        + rng.uniform(-0.001, 0.001, size=(3, 3)).astype(np.float32)
+    ).astype(np.float32)
+    x_tx_ant_m = np.asarray([-0.004, 0.004], dtype=np.float32)
+    x_rx_ant_m = np.asarray([-0.002, 0.002], dtype=np.float32)
+    x_grid, y_grid = np.meshgrid(
+        np.linspace(-0.08, 0.08, 9, dtype=np.float32),
+        np.linspace(0.2, 0.7, 11, dtype=np.float32),
+    )
+    common = {
+        "dr_m": 0.04,
+        "fc_hz": 77e9,
+        "c_m_s": 3e8,
+        "max_bin": 24,
+        "phase_sign": -1,
+    }
+
+    expected = np.zeros_like(x_grid, dtype=np.float32)
+    for frame_i in range(snapshots.shape[1]):
+        expected += back_projection_power_mimo_frames(
+            snapshots[:, frame_i : frame_i + 1],
+            x_pos_by_frame[:, frame_i],
+            x_tx_ant_m,
+            x_rx_ant_m,
+            x_grid,
+            y_grid,
+            use_numba=False,
+            **common,
+        )
+    reference = back_projection_power_mimo_frames(
+        snapshots,
+        x_pos_by_frame,
+        x_tx_ant_m,
+        x_rx_ant_m,
+        x_grid,
+        y_grid,
+        use_numba=False,
+        **common,
+    )
+
+    np.testing.assert_allclose(reference, expected, atol=3e-4, rtol=2e-5)
+
+    import offline_dsp
+
+    if offline_dsp._back_projection_power_mimo_geometry_numba_kernel is not None:
+        accelerated = back_projection_power_mimo_frames(
+            snapshots,
+            x_pos_by_frame,
+            x_tx_ant_m,
+            x_rx_ant_m,
+            x_grid,
+            y_grid,
+            use_numba=True,
+            **common,
+        )
+        np.testing.assert_allclose(accelerated, reference, atol=4e-4, rtol=3e-5)
 
 
 def test_prepare_synthetic_aperture_data_flattens_selected_positions_and_antennas() -> None:

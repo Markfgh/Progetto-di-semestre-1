@@ -211,6 +211,17 @@ class OfflineReferenceBackgroundConfig:
 
 
 @dataclass(frozen=True)
+class OfflineBPFramePositionErrorConfig:
+    """Optional simulated X-position error applied to BP geometry."""
+
+    enabled: bool = False
+    mode: str = "random_uniform"
+    max_abs_m: float = 0.001
+    static_step_error_m: float = 0.001
+    seed: int | None = None
+
+
+@dataclass(frozen=True)
 class OfflineMapBounds:
     """Physical rectangle available to the offline reconstruction and ROI."""
 
@@ -1446,6 +1457,140 @@ def _mirror_offline_image_x(image_db: np.ndarray, *, mirror_x: bool) -> np.ndarr
     return np.ascontiguousarray(image[:, ::-1])
 
 
+def _read_bp_frame_position_error_cfg(
+    bp_cfg: Mapping[str, Any],
+) -> OfflineBPFramePositionErrorConfig:
+    """Read the optional per-frame X-position uncertainty simulation for BP."""
+    block = bp_cfg.get("frame_position_error", {}) or {}
+    if not isinstance(block, Mapping):
+        raise ValueError("offline_config: bp.frame_position_error deve essere una mappa")
+
+    enabled = _to_bool(
+        "offline_config: bp.frame_position_error.enabled",
+        _pick(block.get("enabled"), False),
+    )
+    mode_raw = str(_pick(block.get("mode"), "random_uniform")).strip().lower()
+    mode_aliases = {
+        "random": "random_uniform",
+        "random_uniform": "random_uniform",
+        "static_step": "static_step",
+        "fixed_step": "static_step",
+    }
+    if mode_raw not in mode_aliases:
+        raise ValueError(
+            "offline_config: bp.frame_position_error.mode non valido: "
+            "usa random_uniform oppure static_step"
+        )
+    mode = mode_aliases[mode_raw]
+    max_abs_mm = _to_float(
+        "offline_config: bp.frame_position_error.max_abs_mm",
+        _pick(block.get("max_abs_mm"), 1.0),
+        1.0,
+    )
+    if not np.isfinite(max_abs_mm) or max_abs_mm < 0.0:
+        raise ValueError(
+            "offline_config: bp.frame_position_error.max_abs_mm "
+            "deve essere finito e >= 0"
+        )
+    static_step_error_mm = _to_float(
+        "offline_config: bp.frame_position_error.static_step_error_mm",
+        _pick(block.get("static_step_error_mm"), max_abs_mm),
+        max_abs_mm,
+    )
+    if not np.isfinite(static_step_error_mm):
+        raise ValueError(
+            "offline_config: bp.frame_position_error.static_step_error_mm "
+            "deve essere finito"
+        )
+
+    seed_raw = block.get("seed")
+    if seed_raw is None:
+        seed = None
+    else:
+        seed = _to_int("offline_config: bp.frame_position_error.seed", seed_raw)
+        if seed < 0:
+            raise ValueError("offline_config: bp.frame_position_error.seed deve essere >= 0")
+
+    return OfflineBPFramePositionErrorConfig(
+        enabled=bool(enabled),
+        mode=mode,
+        max_abs_m=float(max_abs_mm) / 1000.0,
+        static_step_error_m=float(static_step_error_mm) / 1000.0,
+        seed=seed,
+    )
+
+
+def _sample_bp_frame_position_errors(
+    config: OfflineBPFramePositionErrorConfig,
+    *,
+    n_positions: int,
+    n_frames: int,
+) -> np.ndarray:
+    """Return independent uniform X errors in metres for ``[position, frame]``."""
+    shape = (max(0, int(n_positions)), max(0, int(n_frames)))
+    errors_m = np.zeros(shape, dtype=np.float32)
+    if not config.enabled or float(config.max_abs_m) == 0.0 or not all(shape):
+        return errors_m
+    rng = np.random.default_rng(config.seed)
+    return rng.uniform(
+        -float(config.max_abs_m),
+        float(config.max_abs_m),
+        size=shape,
+    ).astype(np.float32, copy=False)
+
+
+def _build_bp_frame_position_errors(
+    config: OfflineBPFramePositionErrorConfig,
+    *,
+    stage_positions_m: np.ndarray,
+    n_frames: int,
+) -> np.ndarray:
+    """Build ``[position, frame]`` errors for the configured BP experiment.
+
+    ``static_step`` keeps the error *per step* constant.  For example, a
+    measured 8 mm pitch with ``static_step_error_mm=2`` is reconstructed with
+    a 10 mm pitch at every consecutive measurement.  The resulting absolute
+    coordinate difference naturally grows away from the aperture centre.
+    """
+    stage_positions = np.asarray(stage_positions_m, dtype=np.float32).reshape(-1)
+    n_positions = int(stage_positions.size)
+    if n_positions <= 0 or not np.all(np.isfinite(stage_positions)):
+        raise ValueError("Coordinate stage non valide per errore di posizione BP")
+    n_frames_i = max(0, int(n_frames))
+    if config.mode == "random_uniform":
+        return _sample_bp_frame_position_errors(
+            config,
+            n_positions=n_positions,
+            n_frames=n_frames_i,
+        )
+
+    errors_m = np.zeros((n_positions, n_frames_i), dtype=np.float32)
+    if not config.enabled or n_positions <= 1 or n_frames_i <= 0:
+        return errors_m
+    diffs = np.diff(stage_positions.astype(np.float64, copy=False))
+    direction = float(np.sign(np.median(diffs)))
+    if not np.isfinite(direction) or direction == 0.0:
+        raise ValueError("Coordinate stage non monotone per errore statico del passo BP")
+    centred_measure_index = np.arange(n_positions, dtype=np.float32) - np.float32(
+        0.5 * float(n_positions - 1)
+    )
+    error_per_position = (
+        np.float32(direction * float(config.static_step_error_m)) * centred_measure_index
+    ).astype(np.float32, copy=False)
+    errors_m[:] = error_per_position[:, None]
+    return errors_m
+
+
+def _compact_bp_frame_positions(frame_positions_m: np.ndarray) -> np.ndarray:
+    """Collapse frame-invariant BP positions to the static ``[position]`` form."""
+    positions = np.asarray(frame_positions_m, dtype=np.float32)
+    if positions.ndim != 2 or int(positions.shape[1]) <= 0:
+        raise ValueError("Coordinate BP per frame non valide")
+    if np.array_equal(positions, np.broadcast_to(positions[:, :1], positions.shape)):
+        return positions[:, 0].copy()
+    return positions
+
+
 def _read_bp_runtime_cfg(offline_config_path: str | Path, fallback_capture_cfg: str | Path) -> dict[str, Any]:
     """Compone i parametri di ricostruzione da YAML offline e config di cattura."""
     cfg = _load_yaml_file(Path(offline_config_path))
@@ -1494,6 +1639,7 @@ def _read_bp_runtime_cfg(offline_config_path: str | Path, fallback_capture_cfg: 
         "range_angle": _read_offline_sar_range_angle_cfg(cfg, fallback_cfg),
         "background_reference": background_reference,
         "max_memory_bytes": max_memory_bytes,
+        "frame_position_error": _read_bp_frame_position_error_cfg(bp_cfg),
     }
 
 
@@ -2098,6 +2244,7 @@ def _offline_retained_range_bins(
     x_rx_ant_m: np.ndarray,
     nfft_range: int,
     range_offset_m: float = 0.0,
+    x_pos_m: np.ndarray | None = None,
 ) -> int:
     """Bound persisted spectra to the configured physical reconstruction map."""
     profile = layout.radar_profile
@@ -2114,7 +2261,12 @@ def _offline_retained_range_bins(
         dr_m=float(dr_m),
         seq=0,
     )
-    x_pos = np.asarray(layout.stage_positions_m, dtype=np.float32).reshape(-1)
+    x_pos = np.asarray(
+        layout.stage_positions_m if x_pos_m is None else x_pos_m,
+        dtype=np.float32,
+    ).reshape(-1)
+    if x_pos.size <= 0 or not np.all(np.isfinite(x_pos)):
+        raise ValueError("Coordinate X non valide per il bound dei bin BP")
     x_pos = (x_pos - np.mean(x_pos, dtype=np.float32)).astype(np.float32, copy=False)
     return _backprojection_viewport_max_bin(
         home_viewport,
@@ -2382,6 +2534,9 @@ def _offline_reader_worker(
         )
         range_angle_cfg: OfflineSyntheticRangeAngleConfig = bp_runtime_cfg["range_angle"]
         background_reference: OfflineReferenceBackgroundConfig = bp_runtime_cfg["background_reference"]
+        frame_position_error_cfg: OfflineBPFramePositionErrorConfig = bp_runtime_cfg[
+            "frame_position_error"
+        ]
         nfft_range = max(1, int(nfft_range))
         if int(range_angle_cfg.nfft_range) != int(nfft_range):
             range_angle_cfg = replace(range_angle_cfg, nfft_range=int(nfft_range))
@@ -2479,6 +2634,38 @@ def _offline_reader_worker(
         target_frames = int(stream_layout.n_frames_per_position)
         n_frames = int(target_frames)
         n_ant = int(stream_layout.tx) * int(stream_layout.rx)
+        frame_position_errors_m = np.zeros((n_pos, n_frames), dtype=np.float32)
+        bp_x_pos_m = np.asarray(stream_layout.stage_positions_m, dtype=np.float32)
+        frame_position_error_applied = bool(
+            algorithm == "backprojection" and frame_position_error_cfg.enabled
+        )
+        if frame_position_error_applied:
+            frame_position_errors_m = _build_bp_frame_position_errors(
+                frame_position_error_cfg,
+                stage_positions_m=stream_layout.stage_positions_m,
+                n_frames=n_frames,
+            )
+            # Keep the capture headers untouched: this is an assumed-position
+            # error injected solely in the reconstruction geometry.
+            bp_x_pos_by_frame_m = (
+                np.asarray(stream_layout.stage_positions_m, dtype=np.float32)[:, None]
+                + frame_position_errors_m
+            ).astype(np.float32, copy=False)
+            # ``static_step`` (and zero-amplitude random error) has identical
+            # coordinates in every frame.  Publish it as static geometry so BP
+            # can reuse range-bin and propagation-phase calculations.
+            bp_x_pos_m = _compact_bp_frame_positions(bp_x_pos_by_frame_m)
+        elif frame_position_error_cfg.enabled:
+            _queue_put_latest(
+                status_q,
+                {
+                    "type": "warning",
+                    "warning": (
+                        "bp.frame_position_error e' ignorato: e' supportato "
+                        "solo da reconstruction.algorithm=backprojection"
+                    ),
+                },
+            )
         retained_range_bins = _offline_retained_range_bins(
             stream_layout,
             map_bounds=bp_runtime_cfg["map_bounds"],
@@ -2486,6 +2673,7 @@ def _offline_reader_worker(
             x_rx_ant_m=np.asarray(mimo_geometry["x_rx_ant_m"], dtype=np.float32),
             nfft_range=int(nfft_range),
             range_offset_m=float(range_offset_m),
+            x_pos_m=bp_x_pos_m if frame_position_error_applied else None,
         )
         effective_angle_mode = str(range_angle_cfg.angle_processing.mode)
         if algorithm == "synthetic_range_angle":
@@ -2679,9 +2867,21 @@ def _offline_reader_worker(
             "background_reference_scale": float(background_reference.scale),
             "bp_x_tx_ant_m": np.asarray(mimo_geometry["x_tx_ant_m"], dtype=np.float32),
             "bp_x_rx_ant_m": np.asarray(mimo_geometry["x_rx_ant_m"], dtype=np.float32),
-            "bp_x_pos_m": np.asarray(stream_layout.stage_positions_m, dtype=np.float32),
+            "bp_x_pos_m": bp_x_pos_m,
             "bp_geometry_source": geometry_source,
             "bp_range_offset_m": float(range_offset_m),
+            "bp_frame_position_error_enabled": bool(frame_position_error_applied),
+            "bp_frame_position_error_mode": str(frame_position_error_cfg.mode),
+            "bp_frame_position_error_max_abs_m": float(frame_position_error_cfg.max_abs_m),
+            "bp_frame_position_error_static_step_error_m": float(
+                frame_position_error_cfg.static_step_error_m
+            ),
+            "bp_frame_position_error_seed": frame_position_error_cfg.seed,
+            "bp_frame_position_error_min_m": float(np.min(frame_position_errors_m)),
+            "bp_frame_position_error_max_m": float(np.max(frame_position_errors_m)),
+            "bp_frame_position_error_rms_m": float(
+                np.sqrt(np.mean(frame_position_errors_m * frame_position_errors_m, dtype=np.float32))
+            ),
         }
         _queue_put_latest(reader_to_dsp_q, msg)
         shm_cleanup_transferred = True
@@ -2714,6 +2914,18 @@ def _offline_reader_worker(
                 "range_angle_nfft_angle": int(range_angle_cfg.nfft_angle),
                 "geometry_source": geometry_source,
                 "bp_range_offset_m": float(range_offset_m),
+                "bp_frame_position_error_enabled": bool(frame_position_error_applied),
+                "bp_frame_position_error_mode": str(frame_position_error_cfg.mode),
+                "bp_frame_position_error_max_abs_m": float(frame_position_error_cfg.max_abs_m),
+                "bp_frame_position_error_static_step_error_m": float(
+                    frame_position_error_cfg.static_step_error_m
+                ),
+                "bp_frame_position_error_seed": frame_position_error_cfg.seed,
+                "bp_frame_position_error_min_m": float(np.min(frame_position_errors_m)),
+                "bp_frame_position_error_max_m": float(np.max(frame_position_errors_m)),
+                "bp_frame_position_error_rms_m": float(
+                    np.sqrt(np.mean(frame_position_errors_m * frame_position_errors_m, dtype=np.float32))
+                ),
                 "background_reference_enabled": bool(background_reference.enabled),
                 "background_reference_dir": (
                     None if reference_layout is None else str(reference_layout.source_dir)
@@ -2922,6 +3134,55 @@ def _offline_dsp_worker(
         )
         if not np.isfinite(range_offset_m):
             raise ValueError("init.bp_range_offset_m deve essere finito")
+        frame_position_error_enabled = bool(
+            init_msg.get("bp_frame_position_error_enabled", False)
+        )
+        frame_position_error_mode = str(
+            _pick(init_msg.get("bp_frame_position_error_mode"), "random_uniform")
+        ).strip().lower()
+        if frame_position_error_mode not in {"random_uniform", "static_step"}:
+            raise ValueError("init.bp_frame_position_error_mode non valido")
+        frame_position_error_max_abs_m = _to_float(
+            "init.bp_frame_position_error_max_abs_m",
+            _pick(init_msg.get("bp_frame_position_error_max_abs_m"), 0.0),
+            0.0,
+        )
+        frame_position_error_static_step_error_m = _to_float(
+            "init.bp_frame_position_error_static_step_error_m",
+            _pick(init_msg.get("bp_frame_position_error_static_step_error_m"), 0.0),
+            0.0,
+        )
+        frame_position_error_seed = init_msg.get("bp_frame_position_error_seed")
+        frame_position_error_min_m = _to_float(
+            "init.bp_frame_position_error_min_m",
+            _pick(init_msg.get("bp_frame_position_error_min_m"), 0.0),
+            0.0,
+        )
+        frame_position_error_max_m = _to_float(
+            "init.bp_frame_position_error_max_m",
+            _pick(init_msg.get("bp_frame_position_error_max_m"), 0.0),
+            0.0,
+        )
+        frame_position_error_rms_m = _to_float(
+            "init.bp_frame_position_error_rms_m",
+            _pick(init_msg.get("bp_frame_position_error_rms_m"), 0.0),
+            0.0,
+        )
+        if (
+            frame_position_error_max_abs_m < 0.0
+            or frame_position_error_rms_m < 0.0
+            or not all(
+                np.isfinite(value)
+                for value in (
+                    frame_position_error_max_abs_m,
+                    frame_position_error_static_step_error_m,
+                    frame_position_error_min_m,
+                    frame_position_error_max_m,
+                    frame_position_error_rms_m,
+                )
+            )
+        ):
+            raise ValueError("Metadati errore di posizione BP non validi")
 
         # Preserve the configured position-major × antenna-minor aperture
         # taper.  It changes sidelobes/gain exactly as before; no new gain
@@ -2941,12 +3202,28 @@ def _offline_dsp_worker(
         x_rx_ant_m = np.asarray(init_msg.get("bp_x_rx_ant_m"), dtype=np.float32).reshape(-1)
         if x_tx_ant_m.size != n_ant_data or x_rx_ant_m.size != n_ant_data:
             raise ValueError("bp_x_tx_ant_m/bp_x_rx_ant_m size != asse antenna range_fft")
-        x_pos_m_full = np.asarray(init_msg.get("bp_x_pos_m"), dtype=np.float32).reshape(-1)
-        if x_pos_m_full.size != int(positions.size) or not np.all(np.isfinite(x_pos_m_full)):
-            raise ValueError("bp_x_pos_m non coerente con le posizioni della scansione lineare")
+        x_pos_m_full = np.asarray(init_msg.get("bp_x_pos_m"), dtype=np.float32)
+        expected_pos_shape = (int(positions.size),)
+        expected_pos_frame_shape = (int(positions.size), int(range_fft_data.shape[1]))
+        if algorithm == "backprojection" and x_pos_m_full.shape == expected_pos_frame_shape:
+            pass
+        elif x_pos_m_full.shape == expected_pos_shape:
+            pass
+        else:
+            expected = (
+                f"{expected_pos_shape!r} oppure {expected_pos_frame_shape!r}"
+                if algorithm == "backprojection"
+                else repr(expected_pos_shape)
+            )
+            raise ValueError(
+                "bp_x_pos_m non coerente con le posizioni della scansione lineare: "
+                f"atteso {expected}, trovato {x_pos_m_full.shape!r}"
+            )
+        if not np.all(np.isfinite(x_pos_m_full)):
+            raise ValueError("bp_x_pos_m deve contenere coordinate finite")
         # BP is invariant to a common X translation.  Center only the
-        # measured trajectory, preserving its real pitch and any carriage
-        # positioning error captured in the headers.
+        # measured trajectory, preserving its real pitch and any physical or
+        # simulated per-frame carriage positioning error.
         x_pos_m_full = (
             x_pos_m_full - np.mean(x_pos_m_full, dtype=np.float32)
         ).astype(np.float32, copy=False)
@@ -2994,6 +3271,16 @@ def _offline_dsp_worker(
                 "virtual_antennas": int(n_ant_used),
                 "geometry_source": str(geometry_source),
                 "bp_range_offset_m": float(range_offset_m),
+                "bp_frame_position_error_enabled": bool(frame_position_error_enabled),
+                "bp_frame_position_error_mode": str(frame_position_error_mode),
+                "bp_frame_position_error_max_abs_m": float(frame_position_error_max_abs_m),
+                "bp_frame_position_error_static_step_error_m": float(
+                    frame_position_error_static_step_error_m
+                ),
+                "bp_frame_position_error_seed": frame_position_error_seed,
+                "bp_frame_position_error_min_m": float(frame_position_error_min_m),
+                "bp_frame_position_error_max_m": float(frame_position_error_max_m),
+                "bp_frame_position_error_rms_m": float(frame_position_error_rms_m),
                 "doppler_bins_used": 1,
                 "range_angle_use_realtime_filters": bool(range_angle_cfg.use_realtime_filters),
                 "range_angle_enabled_filters": _offline_sar_range_angle_filters_enabled(
@@ -3015,6 +3302,10 @@ def _offline_dsp_worker(
             f"default_positions={x_start}:{x_end} angle_mode={range_angle_cfg.angle_processing.mode} "
             f"range={range_input_samples}->{nfft_range} used={range_samples_used} "
             f"bp_range_offset_m={range_offset_m:.6g} "
+            f"bp_frame_position_error={'on' if frame_position_error_enabled else 'off'} "
+            f"bp_frame_position_error_mode={frame_position_error_mode} "
+            f"bp_static_step_error_mm={frame_position_error_static_step_error_m * 1000.0:.4g} "
+            f"bp_frame_position_error_rms_mm={frame_position_error_rms_m * 1000.0:.4g} "
             f"filters={_offline_sar_range_angle_filters_enabled(range_angle_cfg, algorithm=str(algorithm))} "
             f"bp_windows={bp_window_stages} "
             f"reference_background={'on' if background_reference_enabled else 'off'}"
@@ -3296,6 +3587,16 @@ def _offline_dsp_worker(
                         "n_pos_used": int(sel_idx.size),
                         "geometry_source": str(geometry_source),
                         "bp_range_offset_m": float(range_offset_m),
+                        "bp_frame_position_error_enabled": bool(frame_position_error_enabled),
+                        "bp_frame_position_error_mode": str(frame_position_error_mode),
+                        "bp_frame_position_error_max_abs_m": float(frame_position_error_max_abs_m),
+                        "bp_frame_position_error_static_step_error_m": float(
+                            frame_position_error_static_step_error_m
+                        ),
+                        "bp_frame_position_error_seed": frame_position_error_seed,
+                        "bp_frame_position_error_min_m": float(frame_position_error_min_m),
+                        "bp_frame_position_error_max_m": float(frame_position_error_max_m),
+                        "bp_frame_position_error_rms_m": float(frame_position_error_rms_m),
                         "doppler_bins_used": int(doppler_bins_used),
                         "bp_range_bins_used": int(viewport_max_bin),
                         "nfft_range": int(nfft_range),

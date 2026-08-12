@@ -21,6 +21,77 @@ except Exception:  # pragma: no cover - Numba is an optional local dependency
 
 if _numba is not None:
 
+    @_numba.njit(cache=True, fastmath=False, inline="always")
+    def _interp_cubic_complex_numba_scalar(
+        spectrum,
+        b0,
+        frac,
+        max_bin_eff,
+        phase_aware,
+        range_phase_step,
+        step_cos,
+        step_sin,
+        step_2_cos,
+        step_2_sin,
+    ):
+        """Scalar complex interpolation shared by static and per-frame BP."""
+        half = np.float32(0.5)
+        two = np.float32(2.0)
+        three = np.float32(3.0)
+        four = np.float32(4.0)
+        five = np.float32(5.0)
+
+        p1 = spectrum[b0]
+        p2 = spectrum[b0 + 1]
+        p1_real = p1.real
+        p1_imag = p1.imag
+        if phase_aware:
+            p2_real = p2.real * step_cos - p2.imag * step_sin
+            p2_imag = p2.real * step_sin + p2.imag * step_cos
+        else:
+            p2_real = p2.real
+            p2_imag = p2.imag
+        if b0 >= 1 and b0 <= max_bin_eff - 3:
+            p0 = spectrum[b0 - 1]
+            p3 = spectrum[b0 + 2]
+            if phase_aware:
+                p0_real = p0.real * step_cos + p0.imag * step_sin
+                p0_imag = p0.imag * step_cos - p0.real * step_sin
+                p3_real = p3.real * step_2_cos - p3.imag * step_2_sin
+                p3_imag = p3.real * step_2_sin + p3.imag * step_2_cos
+            else:
+                p0_real = p0.real
+                p0_imag = p0.imag
+                p3_real = p3.real
+                p3_imag = p3.imag
+            frac2 = frac * frac
+            frac3 = frac2 * frac
+            interp_real = half * (
+                two * p1_real
+                + (-p0_real + p2_real) * frac
+                + (two * p0_real - five * p1_real + four * p2_real - p3_real) * frac2
+                + (-p0_real + three * p1_real - three * p2_real + p3_real) * frac3
+            )
+            interp_imag = half * (
+                two * p1_imag
+                + (-p0_imag + p2_imag) * frac
+                + (two * p0_imag - five * p1_imag + four * p2_imag - p3_imag) * frac2
+                + (-p0_imag + three * p1_imag - three * p2_imag + p3_imag) * frac3
+            )
+        else:
+            interp_real = p1_real + (p2_real - p1_real) * frac
+            interp_imag = p1_imag + (p2_imag - p1_imag) * frac
+
+        if phase_aware:
+            restore_argument = range_phase_step * frac
+            restore_cos = np.cos(restore_argument)
+            restore_sin = np.sin(restore_argument)
+            restored_real = interp_real * restore_cos + interp_imag * restore_sin
+            restored_imag = interp_imag * restore_cos - interp_real * restore_sin
+            interp_real = restored_real
+            interp_imag = restored_imag
+        return interp_real, interp_imag
+
     @_numba.njit(cache=True, fastmath=False, parallel=True)
     def _back_projection_power_mimo_geometry_numba_kernel(
         snapshots,
@@ -35,6 +106,7 @@ if _numba is not None:
         range_phase_step,
         pose_weight,
         channel_weight,
+        geometry_is_static,
     ):
         """Parallel scalar form of the physical bistatic BP accumulation.
 
@@ -53,9 +125,6 @@ if _numba is not None:
 
         half = np.float32(0.5)
         two = np.float32(2.0)
-        three = np.float32(3.0)
-        four = np.float32(4.0)
-        five = np.float32(5.0)
         zero = np.float32(0.0)
         phase_aware = range_phase_step != zero
         step_cos = np.cos(range_phase_step)
@@ -79,85 +148,86 @@ if _numba is not None:
                     coherent_weight = current_pose_weight * channel_weight[ant_i]
                     if coherent_weight == zero:
                         continue
+                    if geometry_is_static:
+                        tx_dx = vx - tx_global[pos_i, 0, ant_i, 0]
+                        tx_dy = vy - tx_global[pos_i, 0, ant_i, 1]
+                        tx_dz = vz - tx_global[pos_i, 0, ant_i, 2]
+                        rx_dx = vx - rx_global[pos_i, 0, ant_i, 0]
+                        rx_dy = vy - rx_global[pos_i, 0, ant_i, 1]
+                        rx_dz = vz - rx_global[pos_i, 0, ant_i, 2]
+                        r_tx = np.sqrt(tx_dx * tx_dx + tx_dy * tx_dy + tx_dz * tx_dz)
+                        r_rx = np.sqrt(rx_dx * rx_dx + rx_dy * rx_dy + rx_dz * rx_dz)
+                        r_total = r_tx + r_rx
+                        range_bin = (half * r_total + range_offset_m) * inv_dr
+                        if not (range_bin >= zero and range_bin < np.float32(max_bin_eff - 1)):
+                            continue
 
-                    tx_dx = vx - tx_global[pos_i, ant_i, 0]
-                    tx_dy = vy - tx_global[pos_i, ant_i, 1]
-                    tx_dz = vz - tx_global[pos_i, ant_i, 2]
-                    rx_dx = vx - rx_global[pos_i, ant_i, 0]
-                    rx_dy = vy - rx_global[pos_i, ant_i, 1]
-                    rx_dz = vz - rx_global[pos_i, ant_i, 2]
-                    r_tx = np.sqrt(tx_dx * tx_dx + tx_dy * tx_dy + tx_dz * tx_dz)
-                    r_rx = np.sqrt(rx_dx * rx_dx + rx_dy * rx_dy + rx_dz * rx_dz)
-                    r_total = r_tx + r_rx
-                    # ``range_offset_m`` is an equivalent one-way range
-                    # calibration.  It moves only the FFT sample addressed by
-                    # BP; the propagation phase below remains geometric.
-                    range_bin = (half * r_total + range_offset_m) * inv_dr
-                    if not (range_bin >= zero and range_bin < np.float32(max_bin_eff - 1)):
+                        b0 = int(range_bin)
+                        frac = range_bin - np.float32(b0)
+                        phase_argument = phase_scale * r_total
+                        if rvp_phase_scale != zero:
+                            phase_argument = phase_argument + rvp_phase_scale * r_total * r_total
+                        phase_real = np.cos(phase_argument)
+                        phase_imag = np.sin(phase_argument)
+                        for frame_i in range(n_frames):
+                            interp_real, interp_imag = _interp_cubic_complex_numba_scalar(
+                                snapshots[pos_i, frame_i, ant_i],
+                                b0,
+                                frac,
+                                max_bin_eff,
+                                phase_aware,
+                                range_phase_step,
+                                step_cos,
+                                step_sin,
+                                step_2_cos,
+                                step_2_sin,
+                            )
+                            contribution_real = (
+                                interp_real * phase_real - interp_imag * phase_imag
+                            ) * coherent_weight
+                            contribution_imag = (
+                                interp_real * phase_imag + interp_imag * phase_real
+                            ) * coherent_weight
+                            frame_real[voxel_i, frame_i] += contribution_real
+                            frame_imag[voxel_i, frame_i] += contribution_imag
                         continue
 
-                    b0 = int(range_bin)
-                    frac = range_bin - np.float32(b0)
-                    phase_argument = phase_scale * r_total
-                    if rvp_phase_scale != zero:
-                        phase_argument = phase_argument + rvp_phase_scale * r_total * r_total
-                    phase_real = np.cos(phase_argument)
-                    phase_imag = np.sin(phase_argument)
-
                     for frame_i in range(n_frames):
-                        spectrum = snapshots[pos_i, frame_i, ant_i]
-                        p1 = spectrum[b0]
-                        p2 = spectrum[b0 + 1]
-                        p1_real = p1.real
-                        p1_imag = p1.imag
-                        if phase_aware:
-                            # Remove the causal DFT phase relative to b0.  The
-                            # common integer-bin phase cancels in the final
-                            # restoration, leaving constant neighbour rotations.
-                            p2_real = p2.real * step_cos - p2.imag * step_sin
-                            p2_imag = p2.real * step_sin + p2.imag * step_cos
-                        else:
-                            p2_real = p2.real
-                            p2_imag = p2.imag
-                        if b0 >= 1 and b0 <= max_bin_eff - 3:
-                            p0 = spectrum[b0 - 1]
-                            p3 = spectrum[b0 + 2]
-                            if phase_aware:
-                                p0_real = p0.real * step_cos + p0.imag * step_sin
-                                p0_imag = p0.imag * step_cos - p0.real * step_sin
-                                p3_real = p3.real * step_2_cos - p3.imag * step_2_sin
-                                p3_imag = p3.real * step_2_sin + p3.imag * step_2_cos
-                            else:
-                                p0_real = p0.real
-                                p0_imag = p0.imag
-                                p3_real = p3.real
-                                p3_imag = p3.imag
-                            frac2 = frac * frac
-                            frac3 = frac2 * frac
-                            interp_real = half * (
-                                two * p1_real
-                                + (-p0_real + p2_real) * frac
-                                + (two * p0_real - five * p1_real + four * p2_real - p3_real) * frac2
-                                + (-p0_real + three * p1_real - three * p2_real + p3_real) * frac3
-                            )
-                            interp_imag = half * (
-                                two * p1_imag
-                                + (-p0_imag + p2_imag) * frac
-                                + (two * p0_imag - five * p1_imag + four * p2_imag - p3_imag) * frac2
-                                + (-p0_imag + three * p1_imag - three * p2_imag + p3_imag) * frac3
-                            )
-                        else:
-                            interp_real = p1_real + (p2_real - p1_real) * frac
-                            interp_imag = p1_imag + (p2_imag - p1_imag) * frac
+                        tx_dx = vx - tx_global[pos_i, frame_i, ant_i, 0]
+                        tx_dy = vy - tx_global[pos_i, frame_i, ant_i, 1]
+                        tx_dz = vz - tx_global[pos_i, frame_i, ant_i, 2]
+                        rx_dx = vx - rx_global[pos_i, frame_i, ant_i, 0]
+                        rx_dy = vy - rx_global[pos_i, frame_i, ant_i, 1]
+                        rx_dz = vz - rx_global[pos_i, frame_i, ant_i, 2]
+                        r_tx = np.sqrt(tx_dx * tx_dx + tx_dy * tx_dy + tx_dz * tx_dz)
+                        r_rx = np.sqrt(rx_dx * rx_dx + rx_dy * rx_dy + rx_dz * rx_dz)
+                        r_total = r_tx + r_rx
+                        # ``range_offset_m`` is an equivalent one-way range
+                        # calibration.  It moves only the FFT sample addressed by
+                        # BP; the propagation phase below remains geometric.
+                        range_bin = (half * r_total + range_offset_m) * inv_dr
+                        if not (range_bin >= zero and range_bin < np.float32(max_bin_eff - 1)):
+                            continue
 
-                        if phase_aware:
-                            restore_argument = range_phase_step * frac
-                            restore_cos = np.cos(restore_argument)
-                            restore_sin = np.sin(restore_argument)
-                            restored_real = interp_real * restore_cos + interp_imag * restore_sin
-                            restored_imag = interp_imag * restore_cos - interp_real * restore_sin
-                            interp_real = restored_real
-                            interp_imag = restored_imag
+                        b0 = int(range_bin)
+                        frac = range_bin - np.float32(b0)
+                        phase_argument = phase_scale * r_total
+                        if rvp_phase_scale != zero:
+                            phase_argument = phase_argument + rvp_phase_scale * r_total * r_total
+                        phase_real = np.cos(phase_argument)
+                        phase_imag = np.sin(phase_argument)
+                        interp_real, interp_imag = _interp_cubic_complex_numba_scalar(
+                            snapshots[pos_i, frame_i, ant_i],
+                            b0,
+                            frac,
+                            max_bin_eff,
+                            phase_aware,
+                            range_phase_step,
+                            step_cos,
+                            step_sin,
+                            step_2_cos,
+                            step_2_sin,
+                        )
 
                         contribution_real = (
                             interp_real * phase_real - interp_imag * phase_imag
@@ -179,6 +249,7 @@ if _numba is not None:
 
 
 else:
+    _interp_cubic_complex_numba_scalar = None
     _back_projection_power_mimo_geometry_numba_kernel = None
 
 @dataclass(frozen=True)
@@ -626,9 +697,12 @@ def back_projection_power_mimo_geometry(
     """Backproject physical bistatic TX/RX coordinates into an arbitrary 3-D grid.
 
     ``snapshot_frame_ant_range`` has shape ``[pose, frame, antenna, range_bin]``.
-    ``tx_global_m`` and ``rx_global_m`` have shape ``[pose, antenna, 3]`` and
-    contain the *physical* transmitter and receiver coordinates in the same
-    world frame as ``voxel_xyz``.  The output has shape ``voxel_xyz.shape[:-1]``.
+    ``tx_global_m`` and ``rx_global_m`` normally have shape
+    ``[pose, antenna, 3]`` and contain the *physical* transmitter and receiver
+    coordinates in the same world frame as ``voxel_xyz``.  They may instead
+    have shape ``[pose, frame, antenna, 3]`` when each frame must be
+    reconstructed with a distinct sensor pose.  The output has shape
+    ``voxel_xyz.shape[:-1]``.
 
     The coherent sum is evaluated independently for each frame and the frame
     powers are summed, as in the legacy linear implementation.  ``pose_weights``
@@ -651,13 +725,22 @@ def back_projection_power_mimo_geometry(
         )
 
     n_pos, n_frames, n_ant, n_bins_avail = (int(v) for v in snapshots.shape)
-    expected_geometry_shape = (n_pos, n_ant, 3)
     tx_global = np.asarray(tx_global_m, dtype=np.float32)
     rx_global = np.asarray(rx_global_m, dtype=np.float32)
-    if tx_global.shape != expected_geometry_shape or rx_global.shape != expected_geometry_shape:
+    static_geometry_shape = (n_pos, n_ant, 3)
+    frame_geometry_shape = (n_pos, n_frames, n_ant, 3)
+    geometry_is_static = False
+    if tx_global.shape == static_geometry_shape and rx_global.shape == static_geometry_shape:
+        # Keep a singleton frame axis: static BP can reuse range and phase
+        # geometry for every frame without duplicating the coordinate arrays.
+        geometry_is_static = True
+        tx_global = tx_global[:, None, :, :]
+        rx_global = rx_global[:, None, :, :]
+    elif tx_global.shape != frame_geometry_shape or rx_global.shape != frame_geometry_shape:
         raise ValueError(
             "tx_global_m e rx_global_m devono avere shape "
-            f"{expected_geometry_shape!r}; trovate {tx_global.shape!r}/{rx_global.shape!r}"
+            f"{static_geometry_shape!r} oppure {frame_geometry_shape!r}; "
+            f"trovate {tx_global.shape!r}/{rx_global.shape!r}"
         )
     if not np.all(np.isfinite(tx_global)) or not np.all(np.isfinite(rx_global)):
         raise ValueError("tx_global_m e rx_global_m devono contenere coordinate finite")
@@ -748,6 +831,7 @@ def back_projection_power_mimo_geometry(
             range_phase_step,
             pose_weight,
             channel_weight,
+            bool(geometry_is_static),
         )
         return total_power.reshape(output_shape).astype(np.float32, copy=False)
 
@@ -763,48 +847,99 @@ def back_projection_power_mimo_geometry(
             coherent_weight = np.float32(current_pose_weight * channel_weight[ant_i])
             if coherent_weight == np.float32(0.0):
                 continue
+            if geometry_is_static:
+                tx = tx_global[pos_i, 0, ant_i]
+                rx = rx_global[pos_i, 0, ant_i]
+                for start in range(0, int(voxel_flat.shape[0]), chunk_n):
+                    stop = min(start + chunk_n, int(voxel_flat.shape[0]))
+                    voxel_chunk = voxel_flat[start:stop]
+                    if voxel_chunk.size == 0:
+                        continue
 
-            tx = tx_global[pos_i, ant_i]
-            rx = rx_global[pos_i, ant_i]
-            for start in range(0, int(voxel_flat.shape[0]), chunk_n):
-                # Il chunking limita soltanto la memoria temporanea dei voxel;
-                # non cambia la somma coerente su pose, canali o frame.
-                stop = min(start + chunk_n, int(voxel_flat.shape[0]))
-                voxel_chunk = voxel_flat[start:stop]
-                if voxel_chunk.size == 0:
-                    continue
+                    delta_tx = (voxel_chunk - tx).astype(np.float32, copy=False)
+                    delta_rx = (voxel_chunk - rx).astype(np.float32, copy=False)
+                    r_tx = np.sqrt(
+                        delta_tx[:, 0] * delta_tx[:, 0]
+                        + delta_tx[:, 1] * delta_tx[:, 1]
+                        + delta_tx[:, 2] * delta_tx[:, 2]
+                    ).astype(np.float32, copy=False)
+                    r_rx = np.sqrt(
+                        delta_rx[:, 0] * delta_rx[:, 0]
+                        + delta_rx[:, 1] * delta_rx[:, 1]
+                        + delta_rx[:, 2] * delta_rx[:, 2]
+                    ).astype(np.float32, copy=False)
+                    r_total = (r_tx + r_rx).astype(np.float32, copy=False)
+                    bins = (
+                        (np.float32(0.5) * r_total + np.float32(range_offset_f)) * inv_dr
+                    ).astype(np.float32, copy=False)
+                    valid = np.isfinite(bins) & (bins >= 0.0) & (bins < np.float32(max_bin_eff - 1))
+                    valid_idx = np.flatnonzero(valid)
+                    if valid_idx.size == 0:
+                        continue
 
-                delta_tx = (voxel_chunk - tx).astype(np.float32, copy=False)
-                delta_rx = (voxel_chunk - rx).astype(np.float32, copy=False)
-                r_tx = np.sqrt(
-                    delta_tx[:, 0] * delta_tx[:, 0]
-                    + delta_tx[:, 1] * delta_tx[:, 1]
-                    + delta_tx[:, 2] * delta_tx[:, 2]
-                ).astype(np.float32, copy=False)
-                r_rx = np.sqrt(
-                    delta_rx[:, 0] * delta_rx[:, 0]
-                    + delta_rx[:, 1] * delta_rx[:, 1]
-                    + delta_rx[:, 2] * delta_rx[:, 2]
-                ).astype(np.float32, copy=False)
-                r_total = (r_tx + r_rx).astype(np.float32, copy=False)
-                bins = (
-                    (np.float32(0.5) * r_total + np.float32(range_offset_f)) * inv_dr
-                ).astype(np.float32, copy=False)
-                valid = np.isfinite(bins) & (bins >= 0.0) & (bins < np.float32(max_bin_eff - 1))
-                valid_idx = np.flatnonzero(valid)
-                if valid_idx.size == 0:
-                    continue
+                    valid_bins = bins[valid_idx]
+                    phase_argument = phase_scale * r_total[valid_idx]
+                    if rvp_sign_i != 0:
+                        phase_argument = (
+                            phase_argument
+                            + rvp_phase_scale * r_total[valid_idx] * r_total[valid_idx]
+                        )
+                    phase = np.exp(1j * phase_argument).astype(np.complex64, copy=False)
+                    output_idx = (start + valid_idx).astype(np.intp, copy=False)
+                    for frame_i in range(n_frames):
+                        interp = _interp_cubic_complex_impl(
+                            snapshots[pos_i, frame_i, ant_i],
+                            valid_bins,
+                            max_bin_eff,
+                            range_phase_step,
+                        )
+                        contribution = interp * phase
+                        if coherent_weight != np.float32(1.0):
+                            contribution = contribution * coherent_weight
+                        frame_acc[frame_i, output_idx] += contribution
+                continue
 
-                valid_bins = bins[valid_idx]
-                phase_argument = phase_scale * r_total[valid_idx]
-                if rvp_sign_i != 0:
-                    phase_argument = (
-                        phase_argument
-                        + rvp_phase_scale * r_total[valid_idx] * r_total[valid_idx]
-                    )
-                phase = np.exp(1j * phase_argument).astype(np.complex64, copy=False)
-                output_idx = (start + valid_idx).astype(np.intp, copy=False)
-                for frame_i in range(n_frames):
+            for frame_i in range(n_frames):
+                tx = tx_global[pos_i, frame_i, ant_i]
+                rx = rx_global[pos_i, frame_i, ant_i]
+                for start in range(0, int(voxel_flat.shape[0]), chunk_n):
+                    # Il chunking limita soltanto la memoria temporanea dei voxel;
+                    # non cambia la somma coerente su pose, canali o frame.
+                    stop = min(start + chunk_n, int(voxel_flat.shape[0]))
+                    voxel_chunk = voxel_flat[start:stop]
+                    if voxel_chunk.size == 0:
+                        continue
+
+                    delta_tx = (voxel_chunk - tx).astype(np.float32, copy=False)
+                    delta_rx = (voxel_chunk - rx).astype(np.float32, copy=False)
+                    r_tx = np.sqrt(
+                        delta_tx[:, 0] * delta_tx[:, 0]
+                        + delta_tx[:, 1] * delta_tx[:, 1]
+                        + delta_tx[:, 2] * delta_tx[:, 2]
+                    ).astype(np.float32, copy=False)
+                    r_rx = np.sqrt(
+                        delta_rx[:, 0] * delta_rx[:, 0]
+                        + delta_rx[:, 1] * delta_rx[:, 1]
+                        + delta_rx[:, 2] * delta_rx[:, 2]
+                    ).astype(np.float32, copy=False)
+                    r_total = (r_tx + r_rx).astype(np.float32, copy=False)
+                    bins = (
+                        (np.float32(0.5) * r_total + np.float32(range_offset_f)) * inv_dr
+                    ).astype(np.float32, copy=False)
+                    valid = np.isfinite(bins) & (bins >= 0.0) & (bins < np.float32(max_bin_eff - 1))
+                    valid_idx = np.flatnonzero(valid)
+                    if valid_idx.size == 0:
+                        continue
+
+                    valid_bins = bins[valid_idx]
+                    phase_argument = phase_scale * r_total[valid_idx]
+                    if rvp_sign_i != 0:
+                        phase_argument = (
+                            phase_argument
+                            + rvp_phase_scale * r_total[valid_idx] * r_total[valid_idx]
+                        )
+                    phase = np.exp(1j * phase_argument).astype(np.complex64, copy=False)
+                    output_idx = (start + valid_idx).astype(np.intp, copy=False)
                     interp = _interp_cubic_complex_impl(
                         snapshots[pos_i, frame_i, ant_i],
                         valid_bins,
@@ -851,8 +986,10 @@ def back_projection_power_mimo_frames(
     The general geometry kernel above is also used by the linear path through
     this adapter and evaluated in parallel. ``use_numba=False`` retains the
     original X-only loop/chunk traversal as a numerical reference
-    implementation.  ``range_offset_m`` has the same signed equivalent
-    one-way range convention as the general geometry function.
+    implementation. ``x_pos_m`` accepts either one X coordinate per position
+    or a ``[position, frame]`` matrix for frame-specific sensor geometry.
+    ``range_offset_m`` has the same signed equivalent one-way range convention
+    as the general geometry function.
     """
     snapshots = np.asarray(snapshot_frame_ant_range, dtype=np.complex64)
     if snapshots.ndim != 4:
@@ -860,8 +997,21 @@ def back_projection_power_mimo_frames(
             "snapshot_frame_ant_range shape non valido: "
             f"{snapshots.shape!r}; atteso [pos, frame, ant, bin]."
         )
-    if x_pos_m.ndim != 1 or int(x_pos_m.size) != int(snapshots.shape[0]):
-        raise ValueError("x_pos_m non coerente con asse posizione")
+    n_pos, n_frames, n_ant, n_bins_avail = (int(v) for v in snapshots.shape)
+    x_pos = np.asarray(x_pos_m, dtype=np.float32)
+    if x_pos.ndim == 1 and int(x_pos.size) == n_pos:
+        position_geometry_is_static = True
+        x_pos_by_frame = np.broadcast_to(x_pos[:, None], (n_pos, n_frames))
+    elif x_pos.ndim == 2 and x_pos.shape == (n_pos, n_frames):
+        position_geometry_is_static = False
+        x_pos_by_frame = x_pos
+    else:
+        raise ValueError(
+            "x_pos_m non coerente: atteso [pos] oppure [pos, frame], "
+            f"trovato {x_pos.shape!r}"
+        )
+    if not np.all(np.isfinite(x_pos_by_frame)):
+        raise ValueError("x_pos_m deve contenere coordinate finite")
     if x_tx_ant_m.ndim != 1 or x_rx_ant_m.ndim != 1:
         raise ValueError("x_tx_ant_m e x_rx_ant_m devono essere vettori 1D")
     if int(x_tx_ant_m.size) != int(snapshots.shape[2]) or int(x_rx_ant_m.size) != int(snapshots.shape[2]):
@@ -887,7 +1037,6 @@ def back_projection_power_mimo_frames(
         samples_used=range_samples_used,
         nfft=nfft_range,
     )
-    n_pos, n_frames, n_ant, n_bins_avail = (int(v) for v in snapshots.shape)
     if nfft_range is not None and int(nfft_range) < n_bins_avail:
         raise ValueError(
             f"nfft_range={int(nfft_range)} inferiore ai bin disponibili={n_bins_avail}"
@@ -900,13 +1049,18 @@ def back_projection_power_mimo_frames(
     y_flat = y_grid.reshape(-1).astype(np.float32, copy=False)
 
     if bool(use_numba) and _back_projection_power_mimo_geometry_numba_kernel is not None:
-        x_pos = np.asarray(x_pos_m, dtype=np.float32).reshape(-1)
         x_tx = np.asarray(x_tx_ant_m, dtype=np.float32).reshape(-1)
         x_rx = np.asarray(x_rx_ant_m, dtype=np.float32).reshape(-1)
-        tx_global = np.zeros((n_pos, n_ant, 3), dtype=np.float32)
-        rx_global = np.zeros((n_pos, n_ant, 3), dtype=np.float32)
-        tx_global[:, :, 0] = x_pos[:, None] + x_tx[None, :]
-        rx_global[:, :, 0] = x_pos[:, None] + x_rx[None, :]
+        if position_geometry_is_static:
+            tx_global = np.zeros((n_pos, n_ant, 3), dtype=np.float32)
+            rx_global = np.zeros((n_pos, n_ant, 3), dtype=np.float32)
+            tx_global[:, :, 0] = x_pos[:, None] + x_tx[None, :]
+            rx_global[:, :, 0] = x_pos[:, None] + x_rx[None, :]
+        else:
+            tx_global = np.zeros((n_pos, n_frames, n_ant, 3), dtype=np.float32)
+            rx_global = np.zeros((n_pos, n_frames, n_ant, 3), dtype=np.float32)
+            tx_global[:, :, :, 0] = x_pos_by_frame[:, :, None] + x_tx[None, None, :]
+            rx_global[:, :, :, 0] = x_pos_by_frame[:, :, None] + x_rx[None, None, :]
         voxel_flat = np.zeros((int(x_flat.size), 3), dtype=np.float32)
         voxel_flat[:, 0] = x_flat
         voxel_flat[:, 1] = y_flat
@@ -944,33 +1098,68 @@ def back_projection_power_mimo_frames(
     frame_acc = np.zeros((n_frames, int(x_flat.size)), dtype=np.complex64)
 
     for pos_i in range(n_pos):
-        x_pos = np.float32(x_pos_m[pos_i])
         for ant_i in range(n_ant):
-            x_tx = x_pos + np.float32(x_tx_ant_m[ant_i])
-            x_rx = x_pos + np.float32(x_rx_ant_m[ant_i])
-            dx_tx = x_flat - x_tx
-            dx_rx = x_flat - x_rx
-            r_tx = np.sqrt(dx_tx * dx_tx + y_sq).astype(np.float32, copy=False)
-            r_rx = np.sqrt(dx_rx * dx_rx + y_sq).astype(np.float32, copy=False)
-            r_total = (r_tx + r_rx).astype(np.float32, copy=False)
-            b = (
-                (np.float32(0.5) * r_total + np.float32(range_offset_f)) * inv_dr
-            ).astype(np.float32, copy=False)
-            valid = np.isfinite(b) & (b >= 0.0) & (b < np.float32(max_bin_eff - 1))
-            valid_idx = np.flatnonzero(valid)
-            if valid_idx.size == 0:
+            if position_geometry_is_static:
+                x_tx = np.float32(x_pos[pos_i]) + np.float32(x_tx_ant_m[ant_i])
+                x_rx = np.float32(x_pos[pos_i]) + np.float32(x_rx_ant_m[ant_i])
+                dx_tx = x_flat - x_tx
+                dx_rx = x_flat - x_rx
+                r_tx = np.sqrt(dx_tx * dx_tx + y_sq).astype(np.float32, copy=False)
+                r_rx = np.sqrt(dx_rx * dx_rx + y_sq).astype(np.float32, copy=False)
+                r_total = (r_tx + r_rx).astype(np.float32, copy=False)
+                b = (
+                    (np.float32(0.5) * r_total + np.float32(range_offset_f)) * inv_dr
+                ).astype(np.float32, copy=False)
+                valid = np.isfinite(b) & (b >= 0.0) & (b < np.float32(max_bin_eff - 1))
+                valid_idx = np.flatnonzero(valid)
+                if valid_idx.size == 0:
+                    continue
+
+                for start in range(0, int(valid_idx.size), chunk_n):
+                    idx = valid_idx[start : start + chunk_n]
+                    if idx.size == 0:
+                        continue
+                    bins = b[idx]
+                    phase_argument = phase_scale * r_total[idx]
+                    if rvp_sign_i != 0:
+                        phase_argument = phase_argument + rvp_phase_scale * r_total[idx] * r_total[idx]
+                    phase = np.exp(1j * phase_argument).astype(np.complex64, copy=False)
+                    for frame_i in range(n_frames):
+                        interp = _interp_cubic_complex_impl(
+                            snapshots[pos_i, frame_i, ant_i],
+                            bins,
+                            max_bin_eff,
+                            range_phase_step,
+                        )
+                        frame_acc[frame_i, idx] += interp * phase
                 continue
 
-            for start in range(0, int(valid_idx.size), chunk_n):
-                idx = valid_idx[start : start + chunk_n]
-                if idx.size == 0:
+            for frame_i in range(n_frames):
+                x_pos_frame = np.float32(x_pos_by_frame[pos_i, frame_i])
+                x_tx = x_pos_frame + np.float32(x_tx_ant_m[ant_i])
+                x_rx = x_pos_frame + np.float32(x_rx_ant_m[ant_i])
+                dx_tx = x_flat - x_tx
+                dx_rx = x_flat - x_rx
+                r_tx = np.sqrt(dx_tx * dx_tx + y_sq).astype(np.float32, copy=False)
+                r_rx = np.sqrt(dx_rx * dx_rx + y_sq).astype(np.float32, copy=False)
+                r_total = (r_tx + r_rx).astype(np.float32, copy=False)
+                b = (
+                    (np.float32(0.5) * r_total + np.float32(range_offset_f)) * inv_dr
+                ).astype(np.float32, copy=False)
+                valid = np.isfinite(b) & (b >= 0.0) & (b < np.float32(max_bin_eff - 1))
+                valid_idx = np.flatnonzero(valid)
+                if valid_idx.size == 0:
                     continue
-                bins = b[idx]
-                phase_argument = phase_scale * r_total[idx]
-                if rvp_sign_i != 0:
-                    phase_argument = phase_argument + rvp_phase_scale * r_total[idx] * r_total[idx]
-                phase = np.exp(1j * phase_argument).astype(np.complex64, copy=False)
-                for frame_i in range(n_frames):
+
+                for start in range(0, int(valid_idx.size), chunk_n):
+                    idx = valid_idx[start : start + chunk_n]
+                    if idx.size == 0:
+                        continue
+                    bins = b[idx]
+                    phase_argument = phase_scale * r_total[idx]
+                    if rvp_sign_i != 0:
+                        phase_argument = phase_argument + rvp_phase_scale * r_total[idx] * r_total[idx]
+                    phase = np.exp(1j * phase_argument).astype(np.complex64, copy=False)
                     interp = _interp_cubic_complex_impl(
                         snapshots[pos_i, frame_i, ant_i],
                         bins,

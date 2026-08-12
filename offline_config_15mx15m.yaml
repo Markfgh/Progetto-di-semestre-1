@@ -46,6 +46,16 @@ bp:
   # unless a point-target test confirms a benefit; the sign depends on the
   # dechirp/IQ convention. Options: "off", "+", "-".
   residual_video_phase: "off"
+  # Simula un errore sulla coordinata X usata dalla backprojection.
+  # random_uniform: errore indipendente per ogni frame in [-max_abs_mm, +max_abs_mm].
+  # static_step: errore costante aggiunto a ogni passo: 8 mm + 2 mm = 10 mm.
+  # Non modifica IQ o header ed e' ignorato da synthetic_range_angle.
+  frame_position_error:
+    enabled: false
+    mode: "random_uniform" # random_uniform | static_step
+    max_abs_mm: 1.0
+    static_step_error_mm: 2.0
+    seed: 12345 # null genera una nuova estrazione a ogni elaborazione
   tx_offsets_lambda:  null
   rx_offsets_lambda:  null
   tx_offsets_m: null

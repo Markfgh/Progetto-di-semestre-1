@@ -23,6 +23,9 @@ from offline_processing import (
     _read_bp_runtime_cfg,
     _read_offline_sar_range_angle_cfg,
     _read_x_pitch_m,
+    _build_bp_frame_position_errors,
+    _compact_bp_frame_positions,
+    _sample_bp_frame_position_errors,
     _resolve_position_interval,
     _subtract_reference_background,
     _validate_background_reference_layout,
@@ -424,6 +427,111 @@ def test_read_bp_runtime_cfg_reads_signed_range_offset_for_backprojection(tmp_pa
     runtime = _read_bp_runtime_cfg(offline_cfg, fallback_cfg)
 
     assert runtime["range_offset_m"] == pytest.approx(-0.0125)
+
+
+def test_read_bp_runtime_cfg_reads_seeded_uniform_frame_position_error(tmp_path: Path) -> None:
+    offline_cfg = tmp_path / "offline_config.yaml"
+    fallback_cfg = tmp_path / "realtime_config.yaml"
+    _write_yaml(
+        offline_cfg,
+        _offline_reconstruction_cfg(
+            frame_position_error={
+                "enabled": True,
+                "max_abs_mm": 1.0,
+                "seed": 20260810,
+            }
+        ),
+    )
+    _write_yaml(fallback_cfg, _fallback_capture_cfg())
+
+    runtime = _read_bp_runtime_cfg(offline_cfg, fallback_cfg)
+    error_cfg = runtime["frame_position_error"]
+    errors = _sample_bp_frame_position_errors(
+        error_cfg,
+        n_positions=3,
+        n_frames=2,
+    )
+    expected = np.random.default_rng(20260810).uniform(
+        -0.001,
+        0.001,
+        size=(3, 2),
+    ).astype(np.float32)
+
+    assert error_cfg.enabled is True
+    assert error_cfg.max_abs_m == pytest.approx(0.001)
+    assert error_cfg.seed == 20260810
+    np.testing.assert_array_equal(errors, expected)
+    assert np.all(errors >= -0.001)
+    assert np.all(errors <= 0.001)
+
+
+def test_static_step_error_changes_every_reconstructed_pitch_by_fixed_amount(
+    tmp_path: Path,
+) -> None:
+    offline_cfg = tmp_path / "offline_config.yaml"
+    fallback_cfg = tmp_path / "realtime_config.yaml"
+    _write_yaml(
+        offline_cfg,
+        _offline_reconstruction_cfg(
+            frame_position_error={
+                "enabled": True,
+                "mode": "static_step",
+                "static_step_error_mm": 2.0,
+            }
+        ),
+    )
+    _write_yaml(fallback_cfg, _fallback_capture_cfg())
+
+    error_cfg = _read_bp_runtime_cfg(offline_cfg, fallback_cfg)["frame_position_error"]
+    stage_positions_m = np.asarray([0.0, 0.008, 0.016, 0.024], dtype=np.float32)
+    errors_m = _build_bp_frame_position_errors(
+        error_cfg,
+        stage_positions_m=stage_positions_m,
+        n_frames=2,
+    )
+    bp_positions_m = stage_positions_m[:, None] + errors_m
+
+    assert error_cfg.mode == "static_step"
+    assert error_cfg.static_step_error_m == pytest.approx(0.002)
+    np.testing.assert_allclose(errors_m[:, 0], [-0.003, -0.001, 0.001, 0.003])
+    np.testing.assert_allclose(errors_m[:, 0], errors_m[:, 1])
+    np.testing.assert_allclose(np.diff(bp_positions_m[:, 0]), 0.010)
+
+
+def test_static_frame_positions_are_compacted_but_random_positions_are_not() -> None:
+    static_positions = np.asarray(
+        [[-0.003, -0.003], [0.007, 0.007], [0.017, 0.017]],
+        dtype=np.float32,
+    )
+    dynamic_positions = static_positions.copy()
+    dynamic_positions[1, 1] += np.float32(0.0005)
+
+    compact = _compact_bp_frame_positions(static_positions)
+    dynamic = _compact_bp_frame_positions(dynamic_positions)
+
+    assert compact.shape == (3,)
+    np.testing.assert_array_equal(compact, static_positions[:, 0])
+    assert dynamic.shape == (3, 2)
+    assert dynamic is dynamic_positions
+
+
+@pytest.mark.parametrize("max_abs_mm", [-0.001, float("nan"), float("inf")])
+def test_read_bp_runtime_cfg_rejects_invalid_frame_position_error_amplitude(
+    tmp_path: Path,
+    max_abs_mm: float,
+) -> None:
+    offline_cfg = tmp_path / "offline_config.yaml"
+    fallback_cfg = tmp_path / "realtime_config.yaml"
+    _write_yaml(
+        offline_cfg,
+        _offline_reconstruction_cfg(
+            frame_position_error={"enabled": True, "max_abs_mm": max_abs_mm}
+        ),
+    )
+    _write_yaml(fallback_cfg, _fallback_capture_cfg())
+
+    with pytest.raises(ValueError, match="frame_position_error.max_abs_mm"):
+        _read_bp_runtime_cfg(offline_cfg, fallback_cfg)
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), "not-a-number"])
@@ -998,6 +1106,81 @@ def test_offline_reader_worker_publishes_compact_zero_doppler_cube(
         assert 1 <= shape[-1] < nfft_range
         assert np.all(np.isfinite(snapshots))
         np.testing.assert_allclose(msg["bp_x_pos_m"], [0.01, 0.02])
+    finally:
+        shm.close()
+        stop_evt.set()
+        worker.join(timeout=2.0)
+        if worker.is_alive():
+            worker.terminate()
+            worker.join(timeout=1.0)
+        try:
+            shm.unlink()
+        except FileNotFoundError:
+            pass
+        data_q.close()
+        status_q.close()
+
+
+def test_offline_reader_worker_injects_seeded_position_error_per_frame(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_position_error"
+    run_dir.mkdir()
+    _write_capture(run_dir / "capture_pos1.bin", position=1)
+    _write_capture(run_dir / "capture_pos2.bin", position=2)
+    offline_cfg = tmp_path / "offline_config.yaml"
+    fallback_cfg = tmp_path / "realtime_config.yaml"
+    _write_yaml(
+        offline_cfg,
+        {
+            "data": {"input_dir": str(run_dir)},
+            "capture": {"frames_per_position": 2},
+            "scan": {"x_start": 1, "x_end": 2, "x_step": 1},
+            "reconstruction": {
+                "algorithm": "backprojection",
+                "map_bounds": {
+                    "x_min_m": -0.1,
+                    "x_max_m": 0.1,
+                    "y_min_m": 0.0,
+                    "y_max_m": 0.5,
+                },
+            },
+            "bp": {
+                "frame_position_error": {
+                    "enabled": True,
+                    "max_abs_mm": 1.0,
+                    "seed": 20260810,
+                }
+            },
+            "offline_sar_range_angle": {"nfft_range": 48, "nfft_angle": 32},
+        },
+    )
+    fallback_payload = _fallback_capture_cfg()
+    fallback_payload["capture"].update({"samples": 8, "chirps": 4})
+    fallback_payload["fft"] = {"workers": 1}
+    _write_yaml(fallback_cfg, fallback_payload)
+
+    data_q: Queue = Queue()
+    status_q: Queue = Queue()
+    stop_evt = Event()
+    worker = Process(
+        target=_offline_reader_worker,
+        args=(str(offline_cfg), str(fallback_cfg), 48, data_q, status_q, stop_evt),
+    )
+    worker.start()
+    msg = data_q.get(timeout=2.0)
+    assert msg.get("type") == "data", msg
+    shm = shared_memory.SharedMemory(name=str(msg["range_fft_shm_name"]))
+    try:
+        expected_errors = np.random.default_rng(20260810).uniform(
+            -0.001,
+            0.001,
+            size=(2, 2),
+        ).astype(np.float32)
+        expected_x = np.asarray([0.01, 0.02], dtype=np.float32)[:, None] + expected_errors
+        assert msg["bp_frame_position_error_enabled"] is True
+        assert msg["bp_frame_position_error_seed"] == 20260810
+        np.testing.assert_array_equal(msg["bp_x_pos_m"], expected_x)
+        assert float(msg["bp_frame_position_error_min_m"]) >= -0.001
+        assert float(msg["bp_frame_position_error_max_m"]) <= 0.001
     finally:
         shm.close()
         stop_evt.set()
