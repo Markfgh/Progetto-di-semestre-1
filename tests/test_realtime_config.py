@@ -520,8 +520,8 @@ def test_config_parsers_sanitize_invalid_values() -> None:
     static_filters = realtime_dsp.detection_static_post_range_fft_filters_from_yaml_dict(cfg)
     static_filters, static_warnings = realtime_dsp.sanitize_detection_static_post_range_fft_filters(static_filters)
     assert static_filters.loop_average_after_background.enabled
-    assert not static_filters.background_subtraction.clamp_positive_only
-    assert any("display-only" in warning for warning in static_warnings)
+    assert static_filters.background_subtraction.clamp_positive_only
+    assert not any("display-only" in warning for warning in static_warnings)
 
     display_filters = realtime_dsp.display_post_range_fft_filters_from_yaml_dict(cfg)
     display_filters, display_warnings = realtime_dsp.sanitize_display_post_range_fft_filters(display_filters)

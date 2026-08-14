@@ -154,3 +154,66 @@ def test_post_range_filters_can_loop_average_after_background() -> None:
 
     assert out.shape == (2, 1, 1, 3, 1)
     np.testing.assert_allclose(out, 2.0 + 0.0j)
+
+
+def test_frozen_static_and_display_filters_can_share_one_background_model() -> None:
+    frozen = realtime_dsp.PostRangeFftFilterConfig(
+        background_subtraction=realtime_dsp.BackgroundSubtractionConfig(
+            enabled=True,
+            mode="frozen",
+            init_frames=80,
+            window_frames=80,
+            clamp_positive_only=True,
+        )
+    )
+    adaptive = realtime_dsp.PostRangeFftFilterConfig(
+        background_subtraction=realtime_dsp.BackgroundSubtractionConfig(
+            enabled=True,
+            mode="ema",
+            init_frames=80,
+            clamp_positive_only=True,
+        )
+    )
+
+    assert realtime_dsp.can_share_static_display_branch(
+        frozen,
+        frozen,
+        static_loop_average=False,
+        display_loop_average=False,
+        source_may_alias=False,
+    )
+    assert not realtime_dsp.can_share_static_display_branch(
+        adaptive,
+        adaptive,
+        static_loop_average=False,
+        display_loop_average=False,
+        source_may_alias=False,
+    )
+    assert not realtime_dsp.can_share_static_display_branch(
+        frozen,
+        frozen,
+        static_loop_average=False,
+        display_loop_average=False,
+        source_may_alias=True,
+    )
+
+
+def test_background_calibration_progress_blocks_exactly_configured_frames() -> None:
+    filters = realtime_dsp.PostRangeFftFilterConfig(
+        background_subtraction=realtime_dsp.BackgroundSubtractionConfig(
+            enabled=True,
+            mode="frozen",
+            init_frames=3,
+            clamp_positive_only=True,
+        )
+    )
+    state = realtime_dsp.BackgroundSubtractionState()
+    batch = np.ones((1, 2, 1, 4, 1), dtype=np.complex64)
+
+    assert realtime_dsp.background_calibration_progress(filters, state) == (0, 3, True)
+    realtime_dsp.apply_background_subtraction(batch.copy(), filters.background_subtraction, state)
+    assert realtime_dsp.background_calibration_progress(filters, state) == (1, 3, True)
+    realtime_dsp.apply_background_subtraction(batch.copy(), filters.background_subtraction, state)
+    assert realtime_dsp.background_calibration_progress(filters, state) == (2, 3, True)
+    realtime_dsp.apply_background_subtraction(batch.copy(), filters.background_subtraction, state)
+    assert realtime_dsp.background_calibration_progress(filters, state) == (3, 3, False)

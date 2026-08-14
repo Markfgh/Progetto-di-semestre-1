@@ -7,6 +7,7 @@ frame coerenti con la configurazione di cattura, senza usare hardware.
 from __future__ import annotations
 
 import argparse
+import copy
 import multiprocessing as mp
 from pathlib import Path
 import threading
@@ -17,6 +18,7 @@ import numpy as np
 import scipy.fft as fft
 
 import realtime_dsp
+from capture_file_inspector import read_capture_header
 
 
 def _load_config(path: Path) -> dict[str, Any]:
@@ -124,6 +126,73 @@ def benchmark_ca_cfar(*, repeats: int = 10) -> None:
             jit_ms = _median_ms(lambda: realtime_dsp.compute_cfar_threshold_db_map(power, **kwargs), repeats=repeats)
             speedup = py_ms / max(jit_ms, 1e-9)
             print(f"[BENCH] {name} numba_ms={jit_ms:.3f} speedup={speedup:.2f}x")
+
+
+def benchmark_realtime_cfar_profiles(cfg: dict[str, Any], shape: dict[str, int], *, repeats: int = 10) -> None:
+    """Measure CA and OS JIT on the configured static and moving map geometries."""
+    status = realtime_dsp.cfar_numba_runtime_status()
+    if not status.get("enabled") or not status.get("os_enabled"):
+        print("[BENCH] realtime CFAR profiles skipped: CA/OS Numba backends are not both enabled.")
+        return
+
+    radar = cfg.get("radar", {}) or {}
+    processing = cfg.get("processing", {}) or {}
+    dr_m = (
+        float(radar.get("c", 3e8))
+        * float(radar.get("fs", 10e6))
+        / (2.0 * float(radar.get("slope", 39.01e12)) * float(shape["nfft_range"]))
+    )
+    processing_bins = min(
+        int(shape["nfft_range"]) // 2,
+        max(1, int(np.floor(float(processing.get("range_max_m", 18.0)) / dr_m))),
+    )
+    static_cfg = cfg.get("detection_static", {}) or {}
+    moving_cfg = cfg.get("detection_moving", {}) or {}
+    rng = np.random.default_rng(20260812)
+    profiles = [
+        (
+            "static_range_angle",
+            rng.lognormal(2.0, 0.9, size=(processing_bins, int(shape["nfft_angle"]))).astype(np.float32),
+            static_cfg,
+            "cfar_train_col_bins",
+            "cfar_guard_col_bins",
+        ),
+        (
+            "moving_range_doppler",
+            rng.lognormal(2.0, 0.9, size=(processing_bins, int(shape["loops"]))).astype(np.float32),
+            moving_cfg,
+            "cfar_train_col_bins",
+            "cfar_guard_col_bins",
+        ),
+    ]
+    print(f"[BENCH] configured realtime CFAR maps range_bins={processing_bins}")
+    for name, power, block, train_col_key, guard_col_key in profiles:
+        kwargs = dict(
+            train_range_bins=int(block.get("cfar_train_range_bins", 8)),
+            guard_range_bins=int(block.get("cfar_guard_range_bins", 2)),
+            train_col_bins=int(block.get(train_col_key, 4)),
+            guard_col_bins=int(block.get(guard_col_key, 1)),
+            threshold_offset_db=float(block.get("cfar_threshold_db", 9.0)),
+            min_power_db=float(block.get("min_power_db", 4.0)),
+            os_cfar_rank=int(block.get("os_cfar_rank", 0)),
+        )
+        for mode in ("ca_cfar", "os_cfar"):
+            fn = lambda mode=mode: realtime_dsp.compute_cfar_threshold_db_map(
+                power,
+                threshold_mode=mode,
+                **kwargs,
+            )
+            fn()
+            timings = []
+            for _ in range(max(1, repeats)):
+                t0 = time.perf_counter()
+                fn()
+                timings.append((time.perf_counter() - t0) * 1000.0)
+            values = np.asarray(timings, dtype=np.float64)
+            print(
+                f"[BENCH] {name} {mode} shape={power.shape} "
+                f"median_ms={float(np.median(values)):.3f} p95_ms={float(np.percentile(values, 95)):.3f}"
+            )
 
 
 def benchmark_fft(shape: dict[str, int], *, repeats: int = 10) -> None:
@@ -345,17 +414,280 @@ def benchmark_process_buffer(*, workers: int) -> None:
     print(f"[BENCH] process_buffer synthetic equivalence OK detections={len(py_detections)}")
 
 
+def _pre_person_profile(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Recreate the previous committed realtime tuning for a relative benchmark."""
+    baseline = copy.deepcopy(cfg)
+    dsp = baseline.setdefault("dsp", {})
+    dsp["window_angle"] = "hanning"
+    dsp["heatmap_ema"] = {"enabled": False, "alpha": 0.10}
+    display_filters = dsp.setdefault("display_filters", {})
+    display_filters.setdefault("slow_time", {})["mode"] = "mean_subtraction"
+    display_filters["background_subtraction"] = {
+        "enabled": True,
+        "mode": "frozen",
+        "alpha": 0.02,
+        "init_frames": 40,
+        "window_frames": 40,
+        "clamp_positive_only": True,
+    }
+    static_filters = dsp.setdefault("detection_static_filters", {})
+    static_filters["background_subtraction"] = {
+        "enabled": True,
+        "mode": "frozen",
+        "alpha": 0.02,
+        "init_frames": 40,
+        "window_frames": 40,
+        "clamp_positive_only": False,
+    }
+    baseline["detection_static"] = {
+        "enabled": True,
+        "threshold_mode": "relative",
+        "threshold_db": -10,
+        "localmax_range_bins": 1,
+        "localmax_angle_bins": 1,
+        "min_power_db": 6,
+        "max_detections": 12,
+        "cfar_train_range_bins": 8,
+        "cfar_guard_range_bins": 2,
+        "cfar_train_col_bins": 8,
+        "cfar_guard_col_bins": 2,
+        "cfar_threshold_db": 10,
+        "os_cfar_rank": 0,
+    }
+    baseline["detection_moving"] = {
+        "enabled": True,
+        "threshold_mode": "ca_cfar",
+        "threshold_db": -7,
+        "localmax_range_bins": 2,
+        "localmax_doppler_bins": 2,
+        "zero_doppler_exclusion_bins": 0,
+        "min_power_db": 6,
+        "max_detections": 12,
+        "cfar_train_range_bins": 8,
+        "cfar_guard_range_bins": 2,
+        "cfar_train_col_bins": 4,
+        "cfar_guard_col_bins": 1,
+        "cfar_threshold_db": 10,
+        "os_cfar_rank": 0,
+    }
+    return baseline
+
+
+def _capture_benchmark_runner(cfg: dict[str, Any], raw_frame: np.ndarray):
+    capture = cfg.get("capture", {}) or {}
+    radar = cfg.get("radar", {}) or {}
+    fft_cfg = cfg.get("fft", {}) or {}
+    display = cfg.get("display", {}) or {}
+    samples = int(capture["samples"])
+    chirps = int(capture["chirps"])
+    tx = int(capture["tx"])
+    rx = int(capture["rx"])
+    loops = chirps // tx
+    virtual_ant = tx * rx
+    nfft_range = int(fft_cfg["nfft_range"])
+    nfft_angle = int(fft_cfg["nfft_angle"])
+    workers = int(fft_cfg.get("workers", 1))
+    image_cfg = realtime_dsp.display_image_resolutions_from_yaml_dict(cfg).realtime
+    gui_h = int(image_cfg.height)
+    gui_w = int(image_cfg.width)
+    fft_plot_h = nfft_range
+    range_max_display = float(display.get("range_max", 15.0))
+    range_max_processing = float(realtime_dsp.resolve_processing_range_max_m(cfg))
+    dsp_cfg = realtime_dsp.RealtimeDSPConfig(
+        c=float(radar["c"]),
+        fs=float(radar["fs"]),
+        slope=float(radar["slope"]),
+        samples=samples,
+        chirps=chirps,
+        rx=rx,
+        tx=tx,
+        x_frames=1,
+        bytes_per_frame=chirps * samples * rx * 4,
+        nfft_range=nfft_range,
+        nfft_angle=nfft_angle,
+        range_max_display=range_max_display,
+        range_profile_count=virtual_ant,
+        virtual_ant=virtual_ant,
+        fft_workers=workers,
+        debug_stats=False,
+        range_max_processing_m=range_max_processing,
+        normalize_skip_range_bins=0,
+        zero_after_range_fft_bins=0,
+        range_angle_moving=realtime_dsp.range_angle_moving_from_yaml_dict(cfg),
+        display_zoom=realtime_dsp.display_zoom_from_yaml_dict(cfg),
+    )
+    selection = realtime_dsp.selection_from_yaml_dict(cfg)
+    w_range, w_doppler, w_angle = realtime_dsp.build_windows(selection, samples, loops, virtual_ant)
+    static_filters, _ = realtime_dsp.sanitize_detection_static_post_range_fft_filters(
+        realtime_dsp.detection_static_post_range_fft_filters_from_yaml_dict(cfg)
+    )
+    moving_filters, _ = realtime_dsp.sanitize_detection_moving_pre_doppler_filters(
+        realtime_dsp.detection_moving_pre_doppler_filters_from_yaml_dict(cfg)
+    )
+    display_filters, _ = realtime_dsp.sanitize_display_post_range_fft_filters(
+        realtime_dsp.display_post_range_fft_filters_from_yaml_dict(cfg)
+    )
+    angle_cfg = realtime_dsp.angle_processing_from_yaml_dict(cfg)
+    projection_cfg = realtime_dsp.display_projection_from_yaml_dict(cfg)
+    geometry, _ = realtime_dsp.build_virtual_array_geometry_from_yaml_dict(cfg, dsp_cfg)
+    angle_axis = realtime_dsp.build_angle_axis_deg(nfft_angle, geometry=geometry)
+    steering = realtime_dsp.build_angle_steering_matrix(virtual_ant, nfft_angle, geometry=geometry)
+    display_x_max = float(display.get("crossrange_max", 7.5))
+    dr_m = dsp_cfg.c * dsp_cfg.fs / (2.0 * dsp_cfg.slope * dsp_cfg.nfft_range)
+    projection_lut = realtime_dsp.build_display_projection_lut(
+        gui_h,
+        gui_w,
+        display_x_max,
+        range_max_display,
+        dr_m,
+        angle_axis,
+        projection_cfg.projection_mode,
+        projection_cfg.projection_interp,
+    )
+    static_cfg = realtime_dsp.detection_static_from_yaml_dict(cfg)
+    moving_cfg = realtime_dsp.detection_moving_from_yaml_dict(cfg)
+    doppler_axis = realtime_dsp.build_doppler_axis_mps(
+        cfg,
+        dsp_cfg,
+        loops,
+        doppler_fft_shift=moving_cfg.doppler_fft_shift,
+    )
+    compensation = realtime_dsp.build_tdm_mimo_doppler_compensation_table(
+        loops,
+        tx,
+        doppler_fft_shift=moving_cfg.doppler_fft_shift,
+    )
+    processing_max_bin = max(1, min(int(np.floor(range_max_processing / dr_m)), nfft_range // 2))
+    display_max_bin = max(1, min(int(np.ceil(range_max_display / dr_m)), nfft_range // 2))
+
+    bg_shape = (loops, tx, nfft_range, rx)
+    static_bg = realtime_dsp.BackgroundSubtractionState(model=np.zeros(bg_shape, dtype=np.complex64))
+    moving_bg = realtime_dsp.BackgroundSubtractionState()
+    display_bg = realtime_dsp.BackgroundSubtractionState(model=np.zeros(bg_shape, dtype=np.complex64))
+    heatmap_ema = None
+    gui_heat_views = (
+        np.full(gui_h * gui_w, -120.0, dtype=np.float32),
+        np.full(gui_h * gui_w, -120.0, dtype=np.float32),
+    )
+    gui_profile_views = (
+        np.full(virtual_ant * fft_plot_h, -120.0, dtype=np.float32),
+        np.full(virtual_ant * fft_plot_h, -120.0, dtype=np.float32),
+    )
+    latest_idx = mp.Value("i", 0)
+    latest_seq = mp.Value("i", 0)
+    gui_lock = threading.Lock()
+    stats = [mp.Value("d", 0.0) for _ in range(4)]
+    profiles_out = np.empty((virtual_ant, fft_plot_h), dtype=np.float32)
+    virtual_work = np.empty((1, loops, processing_max_bin, tx, rx), dtype=np.complex64)
+    virtual_flat_work = np.empty((1, loops, processing_max_bin, virtual_ant), dtype=np.complex64)
+    doppler_work = np.empty((1, loops, tx, processing_max_bin, rx), dtype=np.complex64)
+    profiles_db_work = np.empty((tx, fft_plot_h, rx), dtype=np.float32)
+    heatmap_db_work = np.empty((gui_h, gui_w), dtype=np.float32)
+
+    def run_once() -> int:
+        nonlocal heatmap_ema
+        heatmap_ema, detections = realtime_dsp.process_buffer(
+            raw_frame.copy(),
+            1,
+            w_range,
+            w_doppler,
+            w_angle,
+            not realtime_dsp._window_is_identity(selection.window_range),
+            not realtime_dsp._window_is_identity(selection.window_doppler),
+            not realtime_dsp._window_is_identity(selection.window_angle),
+            realtime_dsp.mean_before_range_fft_from_yaml_dict(cfg),
+            static_filters,
+            moving_filters,
+            display_filters,
+            bool(static_filters.loop_average_after_background.enabled),
+            bool(display_filters.loop_average_after_background.enabled),
+            angle_cfg,
+            realtime_dsp.heatmap_ema_from_yaml_dict(cfg),
+            realtime_dsp.heatmap_spatial_filter_from_yaml_dict(cfg),
+            projection_cfg,
+            geometry,
+            steering,
+            angle_axis,
+            projection_lut,
+            range_max_display,
+            display_x_max,
+            doppler_axis,
+            compensation,
+            static_cfg,
+            moving_cfg,
+            realtime_dsp.fusion_from_yaml_dict(cfg),
+            static_bg,
+            moving_bg,
+            display_bg,
+            heatmap_ema,
+            virtual_work,
+            virtual_flat_work,
+            doppler_work,
+            profiles_db_work,
+            heatmap_db_work,
+            gui_h,
+            gui_w,
+            gui_heat_views,
+            gui_profile_views,
+            latest_idx,
+            latest_seq,
+            gui_lock,
+            True,
+            profiles_out,
+            stats[0],
+            stats[1],
+            stats[2],
+            stats[3],
+            dsp_cfg,
+            processing_max_bin,
+            display_max_bin,
+        )
+        return len(detections)
+
+    return run_once
+
+
+def benchmark_capture_frame(path: Path, cfg: dict[str, Any], *, repeats: int) -> None:
+    header, data_offset = read_capture_header(path)
+    capture = header["capture"]
+    frame_i16 = int(capture["chirps"]) * int(capture["samples"]) * int(capture["rx"]) * 2
+    packed = np.fromfile(path, dtype=np.int16, count=frame_i16, offset=int(data_offset))
+    raw = np.empty(frame_i16 // 2, dtype=np.complex64)
+    realtime_dsp._convert_rx4_iiiiqqqq_to_complex64(raw, packed)
+
+    profiles = [("previous", _pre_person_profile(cfg)), ("person", cfg)]
+    print(f"[BENCH] captured process_buffer frame={path}")
+    for name, profile in profiles:
+        run_once = _capture_benchmark_runner(profile, raw)
+        for _ in range(4):
+            run_once()
+        timings = []
+        detection_counts = []
+        for _ in range(max(1, repeats)):
+            t0 = time.perf_counter()
+            detection_counts.append(run_once())
+            timings.append((time.perf_counter() - t0) * 1000.0)
+        values = np.asarray(timings, dtype=np.float64)
+        print(
+            f"[BENCH] captured {name} median_ms={float(np.median(values)):.3f} "
+            f"p95_ms={float(np.percentile(values, 95)):.3f} "
+            f"detections_median={float(np.median(detection_counts)):.1f}"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Manual realtime DSP benchmarks.")
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("realtime_config.yaml"))
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--fft-workers", type=int, nargs="+", default=None, help="Optional FFT worker counts to sweep.")
     parser.add_argument("--skip-e2e", action="store_true")
+    parser.add_argument("--capture", type=Path, default=None, help="Optional rt_capture_v1 frame for relative end-to-end timing.")
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
     shape = _shape_cfg(cfg)
     benchmark_ca_cfar(repeats=args.repeats)
+    benchmark_realtime_cfar_profiles(cfg, shape, repeats=args.repeats)
     worker_counts = args.fft_workers if args.fft_workers is not None else [shape["workers"]]
     for workers in worker_counts:
         shape_for_workers = dict(shape)
@@ -363,6 +695,8 @@ def main() -> None:
         benchmark_fft(shape_for_workers, repeats=args.repeats)
     if not args.skip_e2e:
         benchmark_process_buffer(workers=shape["workers"])
+    if args.capture is not None:
+        benchmark_capture_frame(args.capture, cfg, repeats=args.repeats)
 
 
 if __name__ == "__main__":

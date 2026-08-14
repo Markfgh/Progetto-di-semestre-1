@@ -89,6 +89,11 @@ _CFAR_NUMBA_ENABLED = False
 _CFAR_NUMBA_SELF_CHECKED = False
 _CFAR_NUMBA_DISABLED_REASON = "not configured"
 _CFAR_NUMBA_LAST_ERROR = ""
+_CFAR_NUMBA_REQUESTED = False
+_OS_CFAR_NUMBA_ENABLED = False
+_OS_CFAR_NUMBA_DISABLED_REASON = "not configured"
+_OS_CFAR_NUMBA_LAST_ERROR = ""
+_OS_CFAR_FALLBACK_WARNED = False
 # The angle-power reduction is called for every realtime frame.  Unlike the
 # optional CFAR JIT, this kernel uses ``prange`` and therefore needs an
 # explicit runtime limit: otherwise Numba defaults to every logical CPU.
@@ -99,6 +104,34 @@ _DSP_RUNTIME_DIAGNOSTICS_LOGGED = False
 
 
 if _numba is not None:
+
+    @_numba.njit(cache=True, fastmath=False)
+    def _quickselect_float32_inplace(values, length, kth):
+        """Return the zero-based kth value while reordering only ``values``."""
+        left = 0
+        right = length - 1
+        while left < right:
+            pivot = values[(left + right) // 2]
+            i = left
+            j = right
+            while i <= j:
+                while values[i] < pivot:
+                    i += 1
+                while values[j] > pivot:
+                    j -= 1
+                if i <= j:
+                    tmp = values[i]
+                    values[i] = values[j]
+                    values[j] = tmp
+                    i += 1
+                    j -= 1
+            if kth <= j:
+                right = j
+            elif kth >= i:
+                left = i
+            else:
+                break
+        return values[kth]
 
     @_numba.njit(cache=True, fastmath=False)
     def _ca_cfar_threshold_db_map_numba_kernel(
@@ -154,6 +187,73 @@ if _numba is not None:
 
 
     @_numba.njit(cache=True, fastmath=False, parallel=True)
+    def _os_cfar_threshold_db_map_numba_kernel(
+        power,
+        threshold_map,
+        train_row,
+        guard_row,
+        train_col,
+        guard_col,
+        offset_lin,
+        min_lin,
+        os_cfar_rank,
+    ):
+        """Dense OS-CFAR with one reusable selection buffer per range row."""
+        n_rows = power.shape[0]
+        n_cols = power.shape[1]
+        row_margin = train_row + guard_row
+        col_margin = train_col + guard_col
+        win_rows = (2 * row_margin) + 1
+        win_cols = (2 * col_margin) + 1
+        guard_rows = (2 * guard_row) + 1
+        guard_cols = (2 * guard_col) + 1
+        max_training = (win_rows * win_cols) - (guard_rows * guard_cols)
+        r_guard0_off = train_row
+        r_guard1_off = train_row + guard_rows
+        c_guard0_off = train_col
+        c_guard1_off = train_col + guard_cols
+
+        for row in _numba.prange(row_margin, n_rows - row_margin):
+            # ``row`` iterations are independent under prange, so every worker
+            # owns its scratch buffer and reuses it across all Doppler/angle cells.
+            training = np.empty(max_training, dtype=np.float32)
+            r0 = row - row_margin
+            for col in range(col_margin, n_cols - col_margin):
+                c0 = col - col_margin
+                count = 0
+                for wr in range(win_rows):
+                    in_guard_row = r_guard0_off <= wr < r_guard1_off
+                    rr = r0 + wr
+                    for wc in range(win_cols):
+                        if in_guard_row and c_guard0_off <= wc < c_guard1_off:
+                            continue
+                        value = power[rr, c0 + wc]
+                        if np.isfinite(value):
+                            training[count] = value
+                            count += 1
+                if count <= 0:
+                    continue
+
+                rank = os_cfar_rank
+                if rank <= 0:
+                    # ceil(0.75 * count), expressed with integers for exact
+                    # agreement with the Python reference on every count.
+                    rank = ((3 * count) + 3) // 4
+                if rank < 1:
+                    rank = 1
+                elif rank > count:
+                    rank = count
+                noise_lin = _quickselect_float32_inplace(training, count, rank - 1)
+                threshold_lin = float(min_lin)
+                candidate_lin = float(noise_lin) * float(offset_lin)
+                if candidate_lin > threshold_lin:
+                    threshold_lin = candidate_lin
+                if threshold_lin < 1e-12:
+                    threshold_lin = 1e-12
+                threshold_map[row, col] = np.float32(10.0 * math.log10(threshold_lin))
+
+
+    @_numba.njit(cache=True, fastmath=False, parallel=True)
     def _angle_power_frame_loop_numba_kernel(angle_fft, heatmap):
         """Collapse angle-FFT power over frame/loop without a full power cube."""
         n_frames = angle_fft.shape[0]
@@ -173,7 +273,9 @@ if _numba is not None:
                 heatmap[range_bin, angle_bin] = total * scale
 
 else:
+    _quickselect_float32_inplace = None
     _ca_cfar_threshold_db_map_numba_kernel = None
+    _os_cfar_threshold_db_map_numba_kernel = None
     _angle_power_frame_loop_numba_kernel = None
 
 
@@ -252,6 +354,21 @@ class BackgroundSubtractionState:
     window_sum: np.ndarray | None = None
     window_count: int = 0
     window_head: int = 0
+
+
+def background_calibration_progress(
+    filters_cfg: "PostRangeFftFilterConfig",
+    state: BackgroundSubtractionState,
+) -> tuple[int, int, bool]:
+    """Return completed frames, target frames and whether frozen calibration is active."""
+    bg_cfg = filters_cfg.background_subtraction
+    target = int(max(0, bg_cfg.init_frames))
+    if not bg_cfg.enabled or str(bg_cfg.mode) != "frozen" or target <= 0:
+        return 0, 0, False
+    if state.model is not None:
+        return target, target, False
+    done = min(target, max(0, int(state.init_count)))
+    return done, target, True
 
 
 @dataclass(frozen=True)
@@ -457,6 +574,15 @@ class Detection:
     power_lin: float
     power_db: float
     source: DetectionSource
+
+
+def suppress_detections_during_background_calibration(
+    detections: list[Detection],
+    *,
+    calibration_was_active: bool,
+) -> list[Detection]:
+    """Keep calibration frames out of tracking even when the model completes on this frame."""
+    return [] if calibration_was_active else detections
 
 
 @dataclass(frozen=True)
@@ -956,7 +1082,10 @@ def sanitize_detection_static_post_range_fft_filters(
         filters_cfg,
         branch_label="detection_static_filters",
         allow_doppler_fft=True,
-        detection_safe_background=True,
+        # Magnitude-floor subtraction is safe after the range FFT and avoids
+        # negative residual ghosts when a person leaves the calibrated room.
+        # It remains forbidden in the pre-Doppler moving branch above.
+        detection_safe_background=False,
         allow_loop_average_after_background=True,
     )
 
@@ -1863,6 +1992,25 @@ def _build_angle_u_axis(nfft_angle: int, spacing_lambda: float = 0.25) -> np.nda
         copy=False,
     )
     return u
+
+
+def can_share_static_display_branch(
+    static_filters: PostRangeFftFilterConfig,
+    display_filters: PostRangeFftFilterConfig,
+    *,
+    static_loop_average: bool,
+    display_loop_average: bool,
+    source_may_alias: bool,
+) -> bool:
+    """Whether static detection and display may share one post-range cube/model."""
+    bg_cfg = static_filters.background_subtraction
+    background_shareable = bool((not bg_cfg.enabled) or str(bg_cfg.mode) == "frozen")
+    return bool(
+        static_filters == display_filters
+        and bool(static_loop_average) == bool(display_loop_average)
+        and background_shareable
+        and not source_may_alias
+    )
 
 
 def build_angle_steering_matrix(
@@ -3190,6 +3338,50 @@ def _compute_ca_cfar_threshold_db_map_numba(
         return None
 
 
+def _compute_os_cfar_threshold_db_map_numba(
+    power: np.ndarray,
+    *,
+    train_row: int,
+    guard_row: int,
+    train_col: int,
+    guard_col: int,
+    threshold_offset_db: float,
+    min_power_db: float,
+    os_cfar_rank: int,
+) -> np.ndarray | None:
+    global _OS_CFAR_NUMBA_ENABLED, _OS_CFAR_NUMBA_DISABLED_REASON, _OS_CFAR_NUMBA_LAST_ERROR
+
+    if not _OS_CFAR_NUMBA_ENABLED or _os_cfar_threshold_db_map_numba_kernel is None:
+        return None
+    threshold_map = np.full(power.shape, np.float32(np.inf), dtype=np.float32)
+    if power.ndim != 2 or power.size <= 0:
+        return threshold_map
+    if train_row <= 0 and train_col <= 0:
+        return threshold_map
+
+    offset_lin = np.float32(10.0 ** (float(threshold_offset_db) / 10.0))
+    min_lin = np.float32(10.0 ** (float(min_power_db) / 10.0))
+    try:
+        _os_cfar_threshold_db_map_numba_kernel(
+            power,
+            threshold_map,
+            int(train_row),
+            int(guard_row),
+            int(train_col),
+            int(guard_col),
+            offset_lin,
+            min_lin,
+            int(os_cfar_rank),
+        )
+        return threshold_map
+    except Exception as exc:  # pragma: no cover - defensive fallback for local JIT/runtime issues
+        _OS_CFAR_NUMBA_ENABLED = False
+        _OS_CFAR_NUMBA_DISABLED_REASON = f"runtime failure: {exc}"
+        _OS_CFAR_NUMBA_LAST_ERROR = str(exc)
+        print(f"[DSP NUMBA WARN] OS-CFAR JIT disabled; CA-CFAR fallback active ({exc})")
+        return None
+
+
 def _candidate_mask_from_threshold_map(power_lin: np.ndarray, threshold_map: np.ndarray) -> np.ndarray:
     with np.errstate(divide="ignore", invalid="ignore"):
         power_db = compute_detection_power_db_map(power_lin)
@@ -3266,42 +3458,131 @@ def self_check_ca_cfar_numba() -> tuple[bool, str]:
     return True, f"{len(cases)} deterministic cases passed"
 
 
+def self_check_os_cfar_numba() -> tuple[bool, str]:
+    if _numba is None or _os_cfar_threshold_db_map_numba_kernel is None:
+        return False, f"numba unavailable: {_NUMBA_IMPORT_ERROR}"
+
+    rng = np.random.default_rng(20260812)
+    cases: list[tuple[np.ndarray, tuple[int, int, int, int], float, float, int]] = []
+
+    # Includes invalid training samples and an explicit rank.
+    edge = np.arange(121, dtype=np.float32).reshape(11, 11) + np.float32(1.0)
+    edge[2, 7] = np.inf
+    edge[7, 2] = np.nan
+    cases.append((edge, (2, 1, 2, 1), 3.0, -110.0, 7))
+
+    # Range-only OS-CFAR is used by the static person detector.
+    one_dimensional = rng.lognormal(mean=1.0, sigma=0.7, size=(31, 17)).astype(np.float32)
+    one_dimensional[15, 8] = np.float32(1e5)
+    one_dimensional[4, 8] = -np.inf
+    cases.append((one_dimensional, (8, 2, 0, 0), 8.0, 4.0, 0))
+
+    # Multiple strong training outliers exercise the automatic 75% rank.
+    clutter = rng.lognormal(mean=2.0, sigma=0.9, size=(41, 37)).astype(np.float32)
+    clutter[20, 18] = np.float32(1e6)
+    clutter[16:19, 14:17] *= np.float32(100.0)
+    cases.append((clutter, (6, 2, 4, 2), 9.0, 4.0, 0))
+
+    for idx, (power, params, offset_db, min_db, rank) in enumerate(cases, start=1):
+        train_row, guard_row, train_col, guard_col = params
+        py_map = _compute_cfar_threshold_db_map_python(
+            power,
+            threshold_mode="os_cfar",
+            train_range_bins=train_row,
+            guard_range_bins=guard_row,
+            train_col_bins=train_col,
+            guard_col_bins=guard_col,
+            threshold_offset_db=offset_db,
+            min_power_db=min_db,
+            os_cfar_rank=rank,
+        )
+        jit_map = np.full(power.shape, np.float32(np.inf), dtype=np.float32)
+        try:
+            _os_cfar_threshold_db_map_numba_kernel(
+                np.asarray(power, dtype=np.float32),
+                jit_map,
+                int(train_row),
+                int(guard_row),
+                int(train_col),
+                int(guard_col),
+                np.float32(10.0 ** (float(offset_db) / 10.0)),
+                np.float32(10.0 ** (float(min_db) / 10.0)),
+                int(rank),
+            )
+        except Exception as exc:
+            return False, f"case {idx} JIT failed: {exc}"
+        if jit_map.dtype != np.float32:
+            return False, f"case {idx} dtype changed: {jit_map.dtype}"
+        if not np.allclose(py_map, jit_map, rtol=2e-5, atol=2e-4, equal_nan=True):
+            finite = np.isfinite(py_map) & np.isfinite(jit_map)
+            diff = float(np.max(np.abs(py_map[finite] - jit_map[finite]))) if np.any(finite) else 0.0
+            return False, f"case {idx} threshold mismatch max_abs_diff={diff:.6g}"
+        if not np.array_equal(
+            _candidate_mask_from_threshold_map(power, py_map),
+            _candidate_mask_from_threshold_map(power, jit_map),
+        ):
+            return False, f"case {idx} candidate_mask mismatch"
+    return True, f"{len(cases)} deterministic cases passed"
+
+
 def configure_cfar_numba_runtime(
     cfg: CfarNumbaConfig,
     *,
     log: bool = True,
 ) -> None:
     global _CFAR_NUMBA_ENABLED, _CFAR_NUMBA_SELF_CHECKED, _CFAR_NUMBA_DISABLED_REASON, _CFAR_NUMBA_LAST_ERROR
+    global _CFAR_NUMBA_REQUESTED, _OS_CFAR_NUMBA_ENABLED, _OS_CFAR_NUMBA_DISABLED_REASON
+    global _OS_CFAR_NUMBA_LAST_ERROR, _OS_CFAR_FALLBACK_WARNED
 
     _CFAR_NUMBA_SELF_CHECKED = False
     _CFAR_NUMBA_LAST_ERROR = ""
+    _OS_CFAR_NUMBA_LAST_ERROR = ""
+    _OS_CFAR_FALLBACK_WARNED = False
+    _CFAR_NUMBA_REQUESTED = bool(cfg.enabled)
     if not cfg.enabled:
         _CFAR_NUMBA_ENABLED = False
+        _OS_CFAR_NUMBA_ENABLED = False
         _CFAR_NUMBA_DISABLED_REASON = "disabled by config"
+        _OS_CFAR_NUMBA_DISABLED_REASON = "disabled by config"
         if log:
-            print("[DSP NUMBA] CA-CFAR JIT disabled by config; Python CFAR path active.")
+            print("[DSP NUMBA] CFAR JIT disabled by config; Python reference paths active.")
         return
     if _numba is None or _ca_cfar_threshold_db_map_numba_kernel is None:
         _CFAR_NUMBA_ENABLED = False
+        _OS_CFAR_NUMBA_ENABLED = False
         _CFAR_NUMBA_DISABLED_REASON = f"numba unavailable: {_NUMBA_IMPORT_ERROR}"
+        _OS_CFAR_NUMBA_DISABLED_REASON = _CFAR_NUMBA_DISABLED_REASON
         if log:
-            print(f"[DSP NUMBA WARN] CA-CFAR JIT requested but unavailable ({_NUMBA_IMPORT_ERROR}); Python fallback active.")
+            print(f"[DSP NUMBA WARN] CFAR JIT requested but unavailable ({_NUMBA_IMPORT_ERROR}); CA Python fallback active.")
         return
 
     _CFAR_NUMBA_ENABLED = True
+    _OS_CFAR_NUMBA_ENABLED = bool(_os_cfar_threshold_db_map_numba_kernel is not None)
     _CFAR_NUMBA_DISABLED_REASON = ""
+    _OS_CFAR_NUMBA_DISABLED_REASON = "" if _OS_CFAR_NUMBA_ENABLED else "OS-CFAR kernel unavailable"
     if cfg.self_check_on_start:
-        ok, msg = self_check_ca_cfar_numba()
+        ok_ca, msg_ca = self_check_ca_cfar_numba()
         _CFAR_NUMBA_SELF_CHECKED = True
-        if not ok:
+        if not ok_ca:
             _CFAR_NUMBA_ENABLED = False
-            _CFAR_NUMBA_DISABLED_REASON = f"self-check failed: {msg}"
-            _CFAR_NUMBA_LAST_ERROR = msg
+            _OS_CFAR_NUMBA_ENABLED = False
+            _CFAR_NUMBA_DISABLED_REASON = f"self-check failed: {msg_ca}"
+            _OS_CFAR_NUMBA_DISABLED_REASON = "CA-CFAR prerequisite failed"
+            _CFAR_NUMBA_LAST_ERROR = msg_ca
             if log:
-                print(f"[DSP NUMBA WARN] CA-CFAR JIT self-check failed; Python fallback active ({msg})")
+                print(f"[DSP NUMBA WARN] CA-CFAR JIT self-check failed; CA Python fallback active ({msg_ca})")
             return
+        ok_os, msg_os = self_check_os_cfar_numba()
+        if not ok_os:
+            _OS_CFAR_NUMBA_ENABLED = False
+            _OS_CFAR_NUMBA_DISABLED_REASON = f"self-check failed: {msg_os}"
+            _OS_CFAR_NUMBA_LAST_ERROR = msg_os
+            if log:
+                print(f"[DSP NUMBA WARN] OS-CFAR JIT self-check failed; CA-CFAR JIT fallback active ({msg_os})")
+        elif log:
+            print(f"[DSP NUMBA] OS-CFAR JIT enabled; self-check OK ({msg_os}).")
         if log:
-            print(f"[DSP NUMBA] CA-CFAR JIT enabled; self-check OK ({msg}).")
+            print(f"[DSP NUMBA] CA-CFAR JIT enabled; self-check OK ({msg_ca}).")
     elif cfg.warmup_on_start:
         warmup = np.ones((9, 9), dtype=np.float32)
         maybe_map = _compute_ca_cfar_threshold_db_map_numba(
@@ -3317,10 +3598,22 @@ def configure_cfar_numba_runtime(
             if log:
                 print(f"[DSP NUMBA WARN] CA-CFAR JIT warmup failed; Python fallback active ({_CFAR_NUMBA_DISABLED_REASON})")
             return
+        maybe_os_map = _compute_os_cfar_threshold_db_map_numba(
+            warmup,
+            train_row=1,
+            guard_row=1,
+            train_col=1,
+            guard_col=1,
+            threshold_offset_db=6.0,
+            min_power_db=-120.0,
+            os_cfar_rank=0,
+        )
+        if maybe_os_map is None and log:
+            print(f"[DSP NUMBA WARN] OS-CFAR JIT warmup failed; CA-CFAR JIT fallback active ({_OS_CFAR_NUMBA_DISABLED_REASON})")
         if log:
-            print("[DSP NUMBA] CA-CFAR JIT enabled; warmup OK.")
+            print("[DSP NUMBA] CA/OS-CFAR JIT warmup completed.")
     elif log:
-        print("[DSP NUMBA] CA-CFAR JIT enabled; first CA-CFAR call will compile if cache is cold.")
+        print("[DSP NUMBA] CA/OS-CFAR JIT enabled; first call will compile if cache is cold.")
 
 
 def cfar_numba_runtime_status() -> dict[str, Any]:
@@ -3330,6 +3623,10 @@ def cfar_numba_runtime_status() -> dict[str, Any]:
         "self_checked": bool(_CFAR_NUMBA_SELF_CHECKED),
         "disabled_reason": str(_CFAR_NUMBA_DISABLED_REASON),
         "last_error": str(_CFAR_NUMBA_LAST_ERROR),
+        "os_enabled": bool(_OS_CFAR_NUMBA_ENABLED),
+        "os_available": bool(_numba is not None and _os_cfar_threshold_db_map_numba_kernel is not None),
+        "os_disabled_reason": str(_OS_CFAR_NUMBA_DISABLED_REASON),
+        "os_last_error": str(_OS_CFAR_NUMBA_LAST_ERROR),
         "numba_version": None if _numba is None else str(getattr(_numba, "__version__", "unknown")),
     }
 
@@ -3399,12 +3696,32 @@ def compute_cfar_threshold_db_map(
     min_power_db: float,
     os_cfar_rank: int,
 ) -> np.ndarray:
+    global _OS_CFAR_FALLBACK_WARNED
     power = np.asarray(power_lin, dtype=np.float32)
-    if threshold_mode == "ca_cfar":
+    if threshold_mode in {"ca_cfar", "os_cfar"}:
         train_row = int(max(0, train_range_bins))
         guard_row = int(max(0, guard_range_bins))
         train_col = int(max(0, train_col_bins))
         guard_col = int(max(0, guard_col_bins))
+        if threshold_mode == "os_cfar":
+            maybe_os_map = _compute_os_cfar_threshold_db_map_numba(
+                power,
+                train_row=train_row,
+                guard_row=guard_row,
+                train_col=train_col,
+                guard_col=guard_col,
+                threshold_offset_db=threshold_offset_db,
+                min_power_db=min_power_db,
+                os_cfar_rank=os_cfar_rank,
+            )
+            if maybe_os_map is not None:
+                return maybe_os_map
+            if _CFAR_NUMBA_REQUESTED and not _OS_CFAR_FALLBACK_WARNED:
+                print(
+                    "[DSP NUMBA WARN] OS-CFAR requested but JIT is unavailable; "
+                    "using CA-CFAR for realtime instead of the Python OS path."
+                )
+                _OS_CFAR_FALLBACK_WARNED = True
         maybe_map = _compute_ca_cfar_threshold_db_map_numba(
             power,
             train_row=train_row,
@@ -3416,6 +3733,11 @@ def compute_cfar_threshold_db_map(
         )
         if maybe_map is not None:
             return maybe_map
+        if threshold_mode == "os_cfar" and _CFAR_NUMBA_REQUESTED:
+            # Realtime safety: when JIT was requested, never enter the very
+            # expensive Python rank loop. Preserve the configured geometry and
+            # offset while degrading only the noise estimator from OS to CA.
+            threshold_mode = "ca_cfar"
     return _compute_cfar_threshold_db_map_python(
         power,
         threshold_mode=threshold_mode,
@@ -4547,10 +4869,12 @@ def _log_dsp_runtime_diagnostics_once(
             f"numba_version={status['numba_version']} numba_threads={num_threads} "
             f"threading_layer={threading_layer} cpu_name={cpu_name or 'auto'} "
             f"cpu_features={cpu_features or 'auto'} cfar_jit_enabled={status['enabled']} "
+            f"os_cfar_jit_enabled={status['os_enabled']} "
             f"cfar_self_checked={status['self_checked']} "
             f"angle_power_jit_enabled={angle_power_status['enabled']} "
             f"angle_power_threads={angle_power_status['threads']} "
-            f"cfar_disabled_reason={status['disabled_reason'] or 'none'}"
+            f"cfar_disabled_reason={status['disabled_reason'] or 'none'} "
+            f"os_cfar_disabled_reason={status['os_disabled_reason'] or 'none'}"
         )
 
     show_runtime = getattr(np, "show_runtime", None)
@@ -4799,22 +5123,23 @@ def process_buffer(
                 work_buf=static_virtual_array_work_buf,
             )
 
-        # A post-range branch with no background state is deterministic for a
-        # frame.  When static detection and display request that exact branch,
-        # calculate it once and let the per-frame angle-map cache reuse its
-        # result below.  Background subtraction deliberately stays isolated:
-        # its state belongs to a branch even if two configurations look alike.
+        # When static detection and display request identical processing, use
+        # one cube, one frozen background model and one angle heatmap.  Adaptive
+        # background modes remain isolated because updating the same state twice
+        # (or sharing it between different consumers) would change their model.
         # The whole reuse is also disabled when the static virtual array can
         # alias its source: in that rare layout, the angular path may process
         # the cube in place, so preserving the two historical branches is the
         # only result-invariant behaviour.
         share_static_display_branch = bool(
             detection_static_cfg.enabled
-            and detection_static_post_range_fft_filters == display_post_range_fft_filters
-            and bool(apply_detection_loop_average_after_background)
-            == bool(apply_display_loop_average_after_background)
-            and not detection_static_post_range_fft_filters.background_subtraction.enabled
-            and not static_virtual_array_may_alias_source
+            and can_share_static_display_branch(
+                detection_static_post_range_fft_filters,
+                display_post_range_fft_filters,
+                static_loop_average=apply_detection_loop_average_after_background,
+                display_loop_average=apply_display_loop_average_after_background,
+                source_may_alias=static_virtual_array_may_alias_source,
+            )
         )
         if share_static_display_branch:
             range_fft_display = range_fft_detection_static
@@ -5684,7 +6009,10 @@ def process_buffer(
 
     except Exception as e:
         print(f"[DSP ERR] {e}")
-        return heatmap_ema, []
+        # A frame-level DSP failure invalidates the processing pipeline.  Let
+        # the guarded worker report it to the GUI instead of publishing stale
+        # data and silently continuing with an empty detection list.
+        raise
 
 
 def dsp_worker(
@@ -5743,6 +6071,9 @@ def dsp_worker(
     display_power_normalized: Synchronized | None = None,
     slot_frame_time_s=None,
     ready_evt=None,
+    calibration_frames_done: Synchronized | None = None,
+    calibration_frames_target: Synchronized | None = None,
+    calibration_active: Synchronized | None = None,
 ) -> None:
     """Loop del processo DSP: consuma slot RX, elabora e rilascia lo slot.
 
@@ -5755,8 +6086,10 @@ def dsp_worker(
     cfar_numba_cfg = cfar_numba_from_yaml_dict(cfg_dict)
     angle_power_numba_cfg = angle_power_numba_from_yaml_dict(cfg_dict)
     diagnostics_cfg = dsp_diagnostics_from_yaml_dict(cfg_dict)
-    configure_cfar_numba_runtime(cfar_numba_cfg, log=("cfar_numba" in dsp_block))
     configure_angle_power_numba_runtime(angle_power_numba_cfg, log=("angle_power_numba" in dsp_block))
+    # The OS kernel uses prange too. Configure the shared Numba worker pool
+    # before its warm-up/self-check so both reductions obey the same thread cap.
+    configure_cfar_numba_runtime(cfar_numba_cfg, log=("cfar_numba" in dsp_block))
     if warmup_angle_power_numba():
         print("[DSP NUMBA] angle-power reduction JIT warmed up.")
     mean_before_range_fft = mean_before_range_fft_from_yaml_dict(cfg_dict)
@@ -5976,11 +6309,9 @@ def dsp_worker(
     detection_static_bg_state = BackgroundSubtractionState()
     detection_moving_bg_state = BackgroundSubtractionState()
     display_bg_state = BackgroundSubtractionState()
-    tracker: MultiObjectTracker | None
-    if tracking_runtime_enabled:
-        tracker = MultiObjectTracker(tracking_cfg=tracking_cfg, tracker_cfg=tracker_cfg)
-    else:
-        tracker = None
+    # A frozen background makes any tracker instance unusable until calibration
+    # completes.  Keep it absent instead of constructing and later discarding it.
+    tracker: MultiObjectTracker | None = None
     tracker_nominal_frame_dt_s = resolve_nominal_frame_period_s(cfg_dict, dsp_cfg, tracking_cfg)
     tracker_time_s: float | None = None
     last_tracker_seq: int | None = None
@@ -6076,6 +6407,44 @@ def dsp_worker(
             except Exception:
                 pass
 
+    def _current_background_calibration() -> tuple[int, int, bool]:
+        if detection_static_cfg.enabled:
+            status = background_calibration_progress(
+                detection_static_post_range_fft_filters,
+                detection_static_bg_state,
+            )
+            if status[1] > 0:
+                return status
+        return background_calibration_progress(display_post_range_fft_filters, display_bg_state)
+
+    def _publish_calibration_status() -> bool:
+        done, target, active = _current_background_calibration()
+        for shared, value in (
+            (calibration_frames_done, int(done)),
+            (calibration_frames_target, int(target)),
+            (calibration_active, 1 if active else 0),
+        ):
+            if shared is None:
+                continue
+            try:
+                lock_getter = getattr(shared, "get_lock", None)
+                if callable(lock_getter):
+                    with lock_getter():
+                        shared.value = value
+                else:
+                    shared.value = value
+            except Exception:
+                pass
+        return bool(active)
+
+    def _reinitialize_tracker_if_ready() -> None:
+        nonlocal tracker, tracker_time_s, last_tracker_seq
+        tracker = None
+        tracker_time_s = None
+        last_tracker_seq = None
+        if tracking_runtime_enabled and not _current_background_calibration()[2]:
+            tracker = MultiObjectTracker(tracking_cfg=tracking_cfg, tracker_cfg=tracker_cfg)
+
     def _reset_runtime_processing_state(*, reset_tracker: bool) -> None:
         nonlocal detection_static_bg_state, detection_moving_bg_state, display_bg_state
         nonlocal heatmap_ema, tracker, tracker_time_s, last_tracker_seq
@@ -6099,13 +6468,8 @@ def dsp_worker(
             display_zoom_runtime.last_applied_meta = None
             display_zoom_runtime.last_mode = "power_xy"
         if reset_tracker:
-            tracker = (
-                MultiObjectTracker(tracking_cfg=tracking_cfg, tracker_cfg=tracker_cfg)
-                if tracking_runtime_enabled
-                else None
-            )
-            tracker_time_s = None
-            last_tracker_seq = None
+            _reinitialize_tracker_if_ready()
+        _publish_calibration_status()
 
     def _apply_runtime_config_patch(cfg_patch: dict[str, Any], *, reset_runtime_state: bool = False) -> None:
         nonlocal cfg_dict, dsp_cfg
@@ -6196,18 +6560,11 @@ def dsp_worker(
                 "Current tracker expects x_frames=1."
             )
             next_tracking_runtime_enabled = False
-        if (
+        tracker_config_changed = bool(
             next_tracking_runtime_enabled != tracking_runtime_enabled
             or next_tracking_cfg != tracking_cfg
             or next_tracker_cfg != tracker_cfg
-        ):
-            tracker = (
-                MultiObjectTracker(tracking_cfg=next_tracking_cfg, tracker_cfg=next_tracker_cfg)
-                if next_tracking_runtime_enabled
-                else None
-            )
-            tracker_time_s = None
-            last_tracker_seq = None
+        )
 
         for warn_msg in detection_static_filter_warnings + detection_moving_filter_warnings + display_filter_warnings:
             print(f"[DSP WARN] runtime config: {warn_msg}")
@@ -6239,6 +6596,10 @@ def dsp_worker(
             display_zoom_runtime.last_viewport_signature = None
         if reset_runtime_state:
             _reset_runtime_processing_state(reset_tracker=True)
+        else:
+            calibration_now_active = _publish_calibration_status()
+            if tracker_config_changed or calibration_now_active:
+                _reinitialize_tracker_if_ready()
         print("[DSP CFG] runtime config updated from GUI.")
 
     def _poll_dsp_commands() -> None:
@@ -6345,6 +6706,8 @@ def dsp_worker(
         except Exception:
             pass
 
+    _publish_calibration_status()
+    _reinitialize_tracker_if_ready()
     if ready_evt is not None:
         ready_evt.set()
 
@@ -6480,6 +6843,7 @@ def dsp_worker(
                 print("[DSP WARN] detection_static_filters.loop_average_after_background skipped because detection_static_filters.slow_time.mode=doppler_fft.")
                 warned_detection_loop_average_after_doppler = True
             apply_detection_loop_average_after_background = False
+        calibration_was_active = _publish_calibration_status()
         heatmap_ema, tracking_detections = process_buffer(
             complex_view,
             n_proc,
@@ -6555,7 +6919,16 @@ def dsp_worker(
             display_power_normalized_out=display_power_normalized,
             publish_applied_viewport=_write_applied_viewport,
         )
-        if tracker is not None and tracking_runtime_enabled:
+        calibration_is_active = _publish_calibration_status()
+        calibration_blocked = bool(calibration_was_active)
+        tracking_detections = suppress_detections_during_background_calibration(
+            tracking_detections,
+            calibration_was_active=calibration_blocked,
+        )
+        if calibration_was_active and not calibration_is_active:
+            _reinitialize_tracker_if_ready()
+            print("[DSP CAL] empty-room background ready; detections enabled from the next frame.")
+        if tracker is not None and tracking_runtime_enabled and not calibration_blocked:
             tracker_timestamp_s: float | None
             latest_frame_time_s = float(proc_frame_times_s[-1]) if proc_frame_times_s else 0.0
             if np.isfinite(latest_frame_time_s) and latest_frame_time_s > 0.0:

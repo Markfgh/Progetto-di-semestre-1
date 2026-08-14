@@ -319,7 +319,6 @@ class MmwaveStudioBridge:
         dca: DCA1000Config | None = None,
     ) -> GuiBridgeState:
         """Connette nell'ordine necessario: RSTD, radar UART, poi DCA1000."""
-        """Connette nell'ordine necessario: RSTD, radar UART, poi DCA1000."""
         radar_cfg = radar or RadarConnectionConfig()
         dca_cfg = dca or DCA1000Config()
         with self._lock:
@@ -328,24 +327,45 @@ class MmwaveStudioBridge:
                 return self.get_gui_state()
             # RSTD deve essere collegato prima; Studio associa poi radar e DCA1000
             # alla sessione nell'ordine selezione scheda -> UART radar -> rete DCA1000.
-            self.connect()
-            self.select_capture_device(dca_cfg.capture_device)
-            self.radar_connect(
-                uart_com_port=radar_cfg.uart_com_port,
-                baudrate=radar_cfg.baudrate,
-                timeout_ms=radar_cfg.timeout_ms,
-            )
-            self._radar_connected = True
-            self.setup_dca1000(dca_cfg)
-            self._hw_connected = True
-            self._streaming = False
-            self._last_error = ""
-            self._last_message = (
-                f"Connected DCA1000 + radar on COM{int(radar_cfg.uart_com_port)} | "
-                f"PC {dca_cfg.pc_ip} -> FPGA {dca_cfg.capture_card_ip}"
-            )
-            print(f"[mmwave] {self._last_message}", flush=True)
-            return self.get_gui_state()
+            try:
+                self.connect()
+                self.select_capture_device(dca_cfg.capture_device)
+                self.radar_connect(
+                    uart_com_port=radar_cfg.uart_com_port,
+                    baudrate=radar_cfg.baudrate,
+                    timeout_ms=radar_cfg.timeout_ms,
+                )
+                self._radar_connected = True
+                self.setup_dca1000(dca_cfg)
+                self._hw_connected = True
+                self._streaming = False
+                self._last_error = ""
+                self._last_message = (
+                    f"Connected DCA1000 + radar on COM{int(radar_cfg.uart_com_port)} | "
+                    f"PC {dca_cfg.pc_ip} -> FPGA {dca_cfg.capture_card_ip}"
+                )
+                print(f"[mmwave] {self._last_message}", flush=True)
+                return self.get_gui_state()
+            except Exception as exc:
+                # Connection is transactional from the GUI point of view.  A
+                # failure after RSTD or UART setup must not leave a partially
+                # connected bridge that the next Connect cannot recover.
+                if self._radar_connected:
+                    try:
+                        self.radar_disconnect()
+                    except Exception:
+                        pass
+                self._streaming = False
+                self._hw_connected = False
+                self._radar_connected = False
+                self._dca_ready = False
+                try:
+                    self.disconnect()
+                except Exception:
+                    pass
+                self._last_error = f"Hardware connection failed: {exc}"
+                self._last_message = "Hardware disconnected after connection failure"
+                raise
 
     def disconnect_hardware(self, *, stop_delay_s: float = 2.0) -> GuiBridgeState:
         with self._lock:
@@ -358,17 +378,27 @@ class MmwaveStudioBridge:
                     # Lo shutdown prosegue anche se lo stato locale e quello hardware
                     # sono già divergenti: le risorse rimanenti vanno comunque rilasciate.
                     pass
-            if self._hw_connected:
-                try:
-                    if self._radar_connected:
-                        self.radar_disconnect()
-                finally:
-                    # Aggiorniamo sempre lo stato locale, anche quando la disconnessione
-                    # UART fallisce, per non lasciare la GUI in uno stato fittiziamente attivo.
-                    self._hw_connected = False
-                    self._radar_connected = False
-                    self._dca_ready = False
-            self.disconnect()
+            radar_disconnect_error: Exception | None = None
+            try:
+                if self._radar_connected:
+                    self.radar_disconnect()
+            except Exception as exc:
+                radar_disconnect_error = exc
+            finally:
+                # Aggiorniamo sempre lo stato locale, anche quando la disconnessione
+                # UART fallisce, per non lasciare la GUI in uno stato fittiziamente attivo.
+                self._hw_connected = False
+                self._radar_connected = False
+                self._dca_ready = False
+            try:
+                self.disconnect()
+            except Exception:
+                if radar_disconnect_error is None:
+                    raise
+            if radar_disconnect_error is not None:
+                self._last_error = f"Radar disconnect failed: {radar_disconnect_error}"
+                self._last_message = "Local hardware state cleared after disconnect failure"
+                raise radar_disconnect_error
             self._last_error = ""
             self._last_message = "Hardware disconnected"
             print(f"[mmwave] {self._last_message}", flush=True)

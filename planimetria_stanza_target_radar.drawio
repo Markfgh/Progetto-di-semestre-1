@@ -1,0 +1,181 @@
+<mxfile host="Electron" agent="Codex" compressed="false">
+  <diagram id="room-radar-plan" name="Room layout + radar">
+    <mxGraphModel dx="417" dy="286" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" parent="1" style="text;html=1;align=left;verticalAlign=middle;fontSize=25;fontStyle=1;fontColor=#183153;fontFamily=Helvetica;" value="ROOM LAYOUT" vertex="1">
+          <mxGeometry height="40" width="189" x="431" y="20" as="geometry" />
+        </mxCell>
+        <mxCell id="room" parent="1" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F8FAFC;gradientColor=#EEF3F7;gradientDirection=south;strokeColor=#20364B;strokeWidth=4;shadow=1;" value="" vertex="1">
+          <mxGeometry height="900" width="1000" x="20" y="80" as="geometry" />
+        </mxCell>
+        <mxCell id="vx1" parent="1" style="shape=line;strokeColor=#D8E1E8;strokeWidth=1;dashed=1;dashPattern=3 5;opacity=65;" value="" vertex="1">
+          <mxGeometry height="900" width="1" x="170" y="80" as="geometry" />
+        </mxCell>
+        <mxCell id="vx2" parent="1" style="shape=line;strokeColor=#D8E1E8;strokeWidth=1;dashed=1;dashPattern=3 5;opacity=65;" value="" vertex="1">
+          <mxGeometry height="900" width="1" x="320" y="80" as="geometry" />
+        </mxCell>
+        <mxCell id="vx3" parent="1" style="shape=line;strokeColor=#8EA4B7;strokeWidth=2;dashed=1;dashPattern=5 5;opacity=75;" value="" vertex="1">
+          <mxGeometry height="900" width="1" x="470" y="80" as="geometry" />
+        </mxCell>
+        <mxCell id="vx4" parent="1" style="shape=line;strokeColor=#D8E1E8;strokeWidth=1;dashed=1;dashPattern=3 5;opacity=65;" value="" vertex="1">
+          <mxGeometry height="900" width="1" x="620" y="80" as="geometry" />
+        </mxCell>
+        <mxCell id="vx5" parent="1" style="shape=line;strokeColor=#D8E1E8;strokeWidth=1;dashed=1;dashPattern=3 5;opacity=65;" value="" vertex="1">
+          <mxGeometry height="900" width="1" x="770" y="80" as="geometry" />
+        </mxCell>
+        <mxCell id="x3" parent="1" style="text;html=1;align=center;fontSize=11;fontColor=#546E7A;" value="0" vertex="1">
+          <mxGeometry height="20" width="30" x="455" y="988" as="geometry" />
+        </mxCell>
+        <mxCell id="echo_main_halo_outer" parent="1" style="ellipse;whiteSpace=wrap;html=1;fillColor=#FFD54F;strokeColor=none;opacity=20;" value="" vertex="1">
+          <mxGeometry height="92" width="164" x="392" y="558" as="geometry" />
+        </mxCell>
+        <mxCell id="echo_main_halo_inner" parent="1" style="ellipse;whiteSpace=wrap;html=1;fillColor=#FF8F00;strokeColor=none;opacity=27;" value="" vertex="1">
+          <mxGeometry height="58" width="102" x="422" y="575" as="geometry" />
+        </mxCell>
+        <mxCell id="echo_main_core" parent="1" style="ellipse;whiteSpace=wrap;html=1;fillColor=#E53935;strokeColor=#B71C1C;strokeWidth=1;opacity=52;shadow=1;" value="" vertex="1">
+          <mxGeometry height="32" width="54" x="447" y="588" as="geometry" />
+        </mxCell>
+        <mxCell id="back_glass_left" parent="1" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#DFF3FA;gradientColor=#F5FBFD;strokeColor=#6E98AA;strokeWidth=2;fontSize=11;fontColor=#315466;fontFamily=Helvetica;" value="Glazed partition / rear bench" vertex="1">
+          <mxGeometry height="44" width="285" x="50" y="95" as="geometry" />
+        </mxCell>
+        <mxCell id="door" parent="1" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#E8EDF1;gradientColor=#FFFFFF;strokeColor=#52697A;strokeWidth=2;fontSize=11;fontStyle=1;fontColor=#2F4555;fontFamily=Helvetica;" value="DOOR" vertex="1">
+          <mxGeometry height="90" width="120" x="345" y="82" as="geometry" />
+        </mxCell>
+        <mxCell id="back_glass_right" parent="1" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#DFF3FA;gradientColor=#F5FBFD;strokeColor=#6E98AA;strokeWidth=2;fontSize=11;fontColor=#315466;fontFamily=Helvetica;" value="Glazed partition" vertex="1">
+          <mxGeometry height="44" width="535" x="475" y="95" as="geometry" />
+        </mxCell>
+        <mxCell id="f_back_left" parent="1" style="rounded=1;arcSize=6;whiteSpace=wrap;html=1;fillColor=#D9E6EF;gradientColor=#EDF3F7;strokeColor=#3F6485;strokeWidth=2;fontSize=11;fontColor=#183153;fontFamily=Helvetica;shadow=1;" value="F1&lt;br&gt;Workbench with monitor and metal frame" vertex="1">
+          <mxGeometry height="350" width="90" x="40" y="150" as="geometry" />
+        </mxCell>
+        <mxCell id="f_back_mid" parent="1" style="rounded=1;arcSize=6;whiteSpace=wrap;html=1;fillColor=#D9E6EF;gradientColor=#EDF3F7;strokeColor=#3F6485;strokeWidth=2;fontSize=11;fontColor=#183153;fontFamily=Helvetica;shadow=1;" value="F2 • Central workbench / cabinet" vertex="1">
+          <mxGeometry height="40" width="535" x="475" y="150" as="geometry" />
+        </mxCell>
+        <mxCell id="m_left_front" parent="1" style="rounded=1;arcSize=6;whiteSpace=wrap;html=1;fillColor=#C8D2D9;gradientColor=#EEF2F4;strokeColor=#4D626F;strokeWidth=3;fontSize=11;fontStyle=1;fontColor=#263D48;fontFamily=Helvetica;shadow=1;" value="F6 • Aluminium frame / rails" vertex="1">
+          <mxGeometry height="195" width="155" x="140" y="720" as="geometry" />
+        </mxCell>
+        <mxCell id="m_left_cart" parent="1" style="rounded=1;arcSize=6;whiteSpace=wrap;html=1;fillColor=#CBD7DE;gradientColor=#EEF3F6;strokeColor=#4D626F;strokeWidth=3;fontSize=11;fontStyle=1;fontColor=#263D48;fontFamily=Helvetica;shadow=1;" value="F3 • Metal trolley with shelves" vertex="1">
+          <mxGeometry height="150" width="180" x="155" y="350" as="geometry" />
+        </mxCell>
+        <mxCell id="m_right_cabinet" parent="1" style="rounded=1;arcSize=5;whiteSpace=wrap;html=1;fillColor=#294E7A;gradientColor=#1C3557;gradientDirection=east;strokeColor=#102D52;strokeWidth=4;fontSize=12;fontStyle=1;fontColor=#FFFFFF;shadow=1;" value="" vertex="1">
+          <mxGeometry height="650" width="160" x="630" y="320" as="geometry" />
+        </mxCell>
+        <mxCell id="target_green" parent="1" style="rounded=1;arcSize=18;whiteSpace=wrap;html=1;fillColor=#66A852;gradientColor=#A7D88A;strokeColor=#2F6F3E;strokeWidth=3;fontSize=12;fontStyle=1;fontColor=#163A22;fontFamily=Helvetica;shadow=1;" value="Wrapped&amp;nbsp;&lt;div&gt;support&lt;/div&gt;" vertex="1">
+          <mxGeometry height="92" width="168" x="389" y="612" as="geometry" />
+        </mxCell>
+        <mxCell id="target_green_strap1" parent="1" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#C6A66B;strokeColor=#8D6E3F;strokeWidth=1;" value="" vertex="1">
+          <mxGeometry height="92" width="18" x="422" y="610" as="geometry" />
+        </mxCell>
+        <mxCell id="target_green_strap2" parent="1" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#C6A66B;strokeColor=#8D6E3F;strokeWidth=1;" value="" vertex="1">
+          <mxGeometry height="92" width="18" x="508" y="610" as="geometry" />
+        </mxCell>
+        <mxCell id="target_main" parent="1" style="ellipse;whiteSpace=wrap;html=1;fillColor=#DCE3E7;gradientColor=#778D99;strokeColor=#3F535E;strokeWidth=3;fontSize=10;fontStyle=1;fontColor=#1E3038;fontFamily=Helvetica;shadow=1;" value="T1&#xa;Metal cylinder" vertex="1">
+          <mxGeometry height="74" width="54" x="446" y="572" as="geometry" />
+        </mxCell>
+        <mxCell id="t5" parent="1" style="ellipse;whiteSpace=wrap;html=1;fillColor=#C87941;gradientColor=#F4BC8A;strokeColor=#713B20;strokeWidth=2;fontSize=10;fontStyle=1;fontColor=#FFFFFF;shadow=1;" value="T4" vertex="1">
+          <mxGeometry height="28" width="26" x="640" y="612" as="geometry" />
+        </mxCell>
+        <mxCell id="t6" parent="1" style="ellipse;whiteSpace=wrap;html=1;fillColor=#C87941;gradientColor=#F4BC8A;strokeColor=#713B20;strokeWidth=2;fontSize=10;fontStyle=1;fontColor=#FFFFFF;shadow=1;" value="T5" vertex="1">
+          <mxGeometry height="29" width="26" x="640" y="670" as="geometry" />
+        </mxCell>
+        <mxCell id="t7" parent="1" style="ellipse;whiteSpace=wrap;html=1;fillColor=#C87941;gradientColor=#F4BC8A;strokeColor=#713B20;strokeWidth=2;fontSize=10;fontStyle=1;fontColor=#FFFFFF;shadow=1;" value="T6" vertex="1">
+          <mxGeometry height="30" width="26" x="640" y="742.5" as="geometry" />
+        </mxCell>
+        <mxCell id="sar_rail" parent="1" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#334A5E;gradientColor=#60798D;strokeColor=#1E3344;strokeWidth=3;fontSize=11;fontStyle=1;fontColor=#FFFFFF;fontFamily=Helvetica;shadow=1;" value="LINEAR SAR • ACQUISITION PATH" vertex="1">
+          <mxGeometry height="28" width="300" x="320" y="934" as="geometry" />
+        </mxCell>
+        <mxCell id="fov" edge="1" parent="1" source="radar" style="endArrow=block;endFill=1;html=1;rounded=0;strokeColor=#E6483D;strokeWidth=3;fontSize=11;fontStyle=1;fontColor=#A92E27;labelBackgroundColor=#FFFFFF;fontFamily=Helvetica;" value="LOOK DIRECTION">
+          <mxGeometry height="50" relative="1" width="50" as="geometry">
+            <mxPoint x="471" y="902" as="sourcePoint" />
+            <mxPoint x="471" y="785" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="9PGKrg4TCNIw0GSwYiTm-2" parent="1" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;fontSize=11;fontStyle=1;fontColor=#FFFFFF;fontFamily=Helvetica;" value="F4 • Right-side cabinets&lt;br&gt;and metal workbench" vertex="1">
+          <mxGeometry height="30" width="110" x="655" y="500" as="geometry" />
+        </mxCell>
+        <mxCell id="9PGKrg4TCNIw0GSwYiTm-3" parent="1" style="ellipse;whiteSpace=wrap;html=1;fillColor=#C87941;gradientColor=#F4BC8A;strokeColor=#713B20;strokeWidth=2;fontSize=10;fontStyle=1;fontColor=#FFFFFF;shadow=1;" value="T2" vertex="1">
+          <mxGeometry height="29" width="26" x="250" y="772.5" as="geometry" />
+        </mxCell>
+        <mxCell id="9PGKrg4TCNIw0GSwYiTm-4" parent="1" style="ellipse;whiteSpace=wrap;html=1;fillColor=#C87941;gradientColor=#F4BC8A;strokeColor=#713B20;strokeWidth=2;fontSize=10;fontStyle=1;fontColor=#FFFFFF;shadow=1;" value="T3" vertex="1">
+          <mxGeometry height="30" width="26" x="250" y="845" as="geometry" />
+        </mxCell>
+        <mxCell id="9PGKrg4TCNIw0GSwYiTm-5" parent="1" style="rounded=1;arcSize=6;whiteSpace=wrap;html=1;fillColor=#D9E6EF;gradientColor=#EDF3F7;strokeColor=#3F6485;strokeWidth=2;fontSize=11;fontColor=#183153;fontFamily=Helvetica;shadow=1;" value="F7&lt;br&gt;Instrument bench with metal frame" vertex="1">
+          <mxGeometry height="350" width="90" x="40" y="620" as="geometry" />
+        </mxCell>
+        <mxCell id="9PGKrg4TCNIw0GSwYiTm-7" parent="1" style="rounded=1;arcSize=6;whiteSpace=wrap;html=1;fillColor=#D9E6EF;gradientColor=#EDF3F7;strokeColor=#3F6485;strokeWidth=2;fontSize=11;fontColor=#183153;fontFamily=Helvetica;shadow=1;" value="F8&lt;br&gt;Measurement bench" vertex="1">
+          <mxGeometry height="102" width="90" x="40" y="510" as="geometry" />
+        </mxCell>
+        <mxCell id="9PGKrg4TCNIw0GSwYiTm-8" parent="1" style="rounded=1;arcSize=6;whiteSpace=wrap;html=1;fillColor=#D9E6EF;gradientColor=#EDF3F7;strokeColor=#3F6485;strokeWidth=2;fontSize=11;fontColor=#183153;fontFamily=Helvetica;shadow=1;" value="F5&lt;br&gt;Workbench with monitor, instruments and metal frame" vertex="1">
+          <mxGeometry height="650" width="90" x="920" y="320" as="geometry" />
+        </mxCell>
+        <mxCell id="9PGKrg4TCNIw0GSwYiTm-10" parent="1" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#FFF3B0;strokeColor=#E5B94E;strokeWidth=2;dashed=1;dashPattern=8 4;opacity=58;fontSize=11;fontStyle=2;fontColor=#6B581F;fontFamily=Helvetica;" value="CEILING LIGHTS" vertex="1">
+          <mxGeometry height="30" width="860" x="150" y="210" as="geometry" />
+        </mxCell>
+        <mxCell id="9PGKrg4TCNIw0GSwYiTm-11" parent="1" style="rounded=1;arcSize=5;whiteSpace=wrap;html=1;fillColor=#A9B7C2;gradientColor=#D5DEE5;strokeColor=#617786;strokeWidth=2;dashed=1;dashPattern=3 3;opacity=62;fontSize=11;fontStyle=2;fontColor=#314752;fontFamily=Helvetica;" value="CEILING AIR GRILLES" vertex="1">
+          <mxGeometry height="40" width="860" x="150" y="260" as="geometry" />
+        </mxCell>
+        <mxCell id="9PGKrg4TCNIw0GSwYiTm-12" parent="1" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#FFF3B0;strokeColor=#E5B94E;strokeWidth=2;dashed=1;dashPattern=8 4;opacity=58;fontSize=11;fontStyle=2;fontColor=#6B581F;fontFamily=Helvetica;" value="CEILING LIGHTS" vertex="1">
+          <mxGeometry height="40" width="860" x="150" y="320" as="geometry" />
+        </mxCell>
+        <mxCell id="9PGKrg4TCNIw0GSwYiTm-13" edge="1" parent="1" style="endArrow=block;html=1;rounded=0;strokeColor=#E53935;strokeWidth=3;fontSize=11;fontStyle=1;fontColor=#B71C1C;" target="radar" value="">
+          <mxGeometry height="50" relative="1" width="50" as="geometry">
+            <mxPoint x="471" y="902" as="sourcePoint" />
+            <mxPoint x="471" y="785" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="radar" parent="1" style="shape=hexagon;perimeter=hexagonPerimeter2;whiteSpace=wrap;html=1;fixedSize=1;fillColor=#E6483D;gradientColor=#FF796F;strokeColor=#8E211A;strokeWidth=3;fontSize=11;fontStyle=1;fontColor=#FFFFFF;fontFamily=Helvetica;shadow=1;" value="RADAR" vertex="1">
+          <mxGeometry height="42" width="56" x="444" y="892" as="geometry" />
+        </mxCell>
+        <mxCell id="rear_wall_label" parent="1" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#20364B;strokeColor=none;fontSize=10;fontStyle=1;fontColor=#FFFFFF;fontFamily=Helvetica;" value="REAR WALL" vertex="1">
+          <mxGeometry height="24" width="100" x="895" y="85" as="geometry" />
+        </mxCell>
+        <mxCell id="sar_side_label" parent="1" style="text;html=1;whiteSpace=wrap;align=center;fontSize=10;fontStyle=1;fontColor=#60758A;fontFamily=Helvetica;" value="SAR / CAMERA SIDE" vertex="1">
+          <mxGeometry height="20" width="150" x="745" y="955" as="geometry" />
+        </mxCell>
+        <mxCell id="overhead_badge" parent="1" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#F3C75F;strokeColor=#A77B18;strokeWidth=1;fontSize=9;fontStyle=1;fontColor=#59430D;fontFamily=Helvetica;opacity=80;" value="OVERHEAD LAYER" vertex="1">
+          <mxGeometry height="22" width="112" x="883" y="215" as="geometry" />
+        </mxCell>
+        <mxCell id="legend_panel_en" parent="1" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#FFFFFF;gradientColor=#F4F7FA;gradientDirection=south;strokeColor=#A7B7C4;strokeWidth=2;shadow=1;" value="" vertex="1">
+          <mxGeometry height="195" width="1000" x="20" y="1008" as="geometry" />
+        </mxCell>
+        <mxCell id="legend_header_en" parent="1" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#183153;gradientColor=#2E5277;strokeColor=#183153;strokeWidth=1;align=left;spacingLeft=18;fontSize=17;fontStyle=1;fontColor=#FFFFFF;fontFamily=Helvetica;" value="SCENE KEY" vertex="1">
+          <mxGeometry height="48" width="955" x="40" y="1028" as="geometry" />
+        </mxCell>
+        <mxCell id="legend_target_icon" parent="1" style="ellipse;whiteSpace=wrap;html=1;fillColor=#C87941;gradientColor=#F4BC8A;strokeColor=#713B20;strokeWidth=2;fontSize=9;fontStyle=1;fontColor=#FFFFFF;shadow=1;" value="T" vertex="1">
+          <mxGeometry height="30" width="30" x="50" y="1098" as="geometry" />
+        </mxCell>
+        <mxCell id="legend_target_text" parent="1" style="text;html=1;whiteSpace=wrap;align=left;verticalAlign=middle;fontSize=11;fontColor=#30485A;fontFamily=Helvetica;" value="T1–T6  •  metallic test targets" vertex="1">
+          <mxGeometry height="30" width="280" x="95" y="1098" as="geometry" />
+        </mxCell>
+        <mxCell id="legend_furniture_icon" parent="1" style="rounded=1;arcSize=6;whiteSpace=wrap;html=1;fillColor=#D9E6EF;gradientColor=#EDF3F7;strokeColor=#3F6485;strokeWidth=2;fontSize=9;fontStyle=1;fontColor=#183153;shadow=1;" value="F" vertex="1">
+          <mxGeometry height="28" width="32" x="295" y="1101" as="geometry" />
+        </mxCell>
+        <mxCell id="legend_furniture_text" parent="1" style="text;html=1;whiteSpace=wrap;align=left;verticalAlign=middle;fontSize=11;fontColor=#30485A;fontFamily=Helvetica;" value="F1–F8  •  furniture and metal frames" vertex="1">
+          <mxGeometry height="30" width="280" x="341" y="1100" as="geometry" />
+        </mxCell>
+        <mxCell id="legend_radar_icon_outer" parent="1" style="ellipse;whiteSpace=wrap;html=1;fillColor=#FFD54F;strokeColor=none;opacity=35;" value="" vertex="1">
+          <mxGeometry height="32" width="44" x="556" y="1101" as="geometry" />
+        </mxCell>
+        <mxCell id="legend_radar_icon_inner" parent="1" style="ellipse;whiteSpace=wrap;html=1;fillColor=#E53935;strokeColor=#B71C1C;strokeWidth=1;opacity=60;" value="" vertex="1">
+          <mxGeometry height="18" width="25" x="566" y="1108" as="geometry" />
+        </mxCell>
+        <mxCell id="legend_radar_text" parent="1" style="text;html=1;whiteSpace=wrap;align=left;verticalAlign=middle;fontSize=11;fontColor=#30485A;fontFamily=Helvetica;" value="strong radar-return region" vertex="1">
+          <mxGeometry height="30" width="280" x="608" y="1103" as="geometry" />
+        </mxCell>
+        <mxCell id="legend_ceiling_icon" parent="1" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#FFF3B0;strokeColor=#E5B94E;strokeWidth=2;dashed=1;opacity=70;" value="" vertex="1">
+          <mxGeometry height="16" width="40" x="50" y="1156.5" as="geometry" />
+        </mxCell>
+        <mxCell id="legend_ceiling_text" parent="1" style="text;html=1;whiteSpace=wrap;align=left;verticalAlign=middle;fontSize=11;fontColor=#30485A;fontFamily=Helvetica;" value="ceiling lights — overhead reference" vertex="1">
+          <mxGeometry height="30" width="280" x="100" y="1148.5" as="geometry" />
+        </mxCell>
+        <mxCell id="legend_grille_icon" parent="1" style="rounded=1;arcSize=5;whiteSpace=wrap;html=1;fillColor=#A9B7C2;strokeColor=#617786;strokeWidth=2;dashed=1;dashPattern=3 3;opacity=75;" value="" vertex="1">
+          <mxGeometry height="16" width="40" x="295" y="1157.5" as="geometry" />
+        </mxCell>
+        <mxCell id="legend_grille_text" parent="1" style="text;html=1;whiteSpace=wrap;align=left;verticalAlign=middle;fontSize=11;fontColor=#30485A;fontFamily=Helvetica;" value="air grilles — overhead reference" vertex="1">
+          <mxGeometry height="30" width="280" x="345" y="1149.5" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

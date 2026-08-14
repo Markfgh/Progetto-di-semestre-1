@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="app.diagrams.net" modified="2026-08-13T00:00:00.000Z" agent="Codex" version="24.7.17" type="device" compressed="false">
+  <diagram id="room-radar-plan" name="Planimetria + radar">
+    <mxGraphModel dx="1654" dy="1169" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1654" pageHeight="1169" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <mxCell id="title" value="PLANIMETRIA INTERPRETATIVA — STANZA, TARGET METALLICI ED ECO RADAR" style="text;html=1;align=left;verticalAlign=middle;fontSize=24;fontStyle=1;fontColor=#17324D;" vertex="1" parent="1">
+          <mxGeometry x="60" y="30" width="1180" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="subtitle" value="Vista dall'alto ricostruita dalla fotografia e dalla mappa SAR • coordinate radar in metri • geometria fisica indicativa" style="text;html=1;align=left;verticalAlign=middle;fontSize=13;fontColor=#52606D;" vertex="1" parent="1">
+          <mxGeometry x="60" y="70" width="1180" height="26" as="geometry"/>
+        </mxCell>
+
+        <!-- Room envelope: X = -7.5...+7.5 m, Y = 0...15 m -->
+        <mxCell id="room" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FAFAF7;strokeColor=#263238;strokeWidth=4;" vertex="1" parent="1">
+          <mxGeometry x="180" y="130" width="900" height="900" as="geometry"/>
+        </mxCell>
+
+        <!-- Radar coordinate grid, 2.5 m spacing -->
+        <mxCell id="vx1" value="" style="shape=line;strokeColor=#CFD8DC;strokeWidth=1;dashed=1;dashPattern=4 4;" vertex="1" parent="1"><mxGeometry x="330" y="130" width="1" height="900" as="geometry"/></mxCell>
+        <mxCell id="vx2" value="" style="shape=line;strokeColor=#CFD8DC;strokeWidth=1;dashed=1;dashPattern=4 4;" vertex="1" parent="1"><mxGeometry x="480" y="130" width="1" height="900" as="geometry"/></mxCell>
+        <mxCell id="vx3" value="" style="shape=line;strokeColor=#B0BEC5;strokeWidth=2;dashed=1;dashPattern=4 4;" vertex="1" parent="1"><mxGeometry x="630" y="130" width="1" height="900" as="geometry"/></mxCell>
+        <mxCell id="vx4" value="" style="shape=line;strokeColor=#CFD8DC;strokeWidth=1;dashed=1;dashPattern=4 4;" vertex="1" parent="1"><mxGeometry x="780" y="130" width="1" height="900" as="geometry"/></mxCell>
+        <mxCell id="vx5" value="" style="shape=line;strokeColor=#CFD8DC;strokeWidth=1;dashed=1;dashPattern=4 4;" vertex="1" parent="1"><mxGeometry x="930" y="130" width="1" height="900" as="geometry"/></mxCell>
+        <mxCell id="hy1" value="" style="shape=line;strokeColor=#CFD8DC;strokeWidth=1;dashed=1;dashPattern=4 4;" vertex="1" parent="1"><mxGeometry x="180" y="880" width="900" height="1" as="geometry"/></mxCell>
+        <mxCell id="hy2" value="" style="shape=line;strokeColor=#CFD8DC;strokeWidth=1;dashed=1;dashPattern=4 4;" vertex="1" parent="1"><mxGeometry x="180" y="730" width="900" height="1" as="geometry"/></mxCell>
+        <mxCell id="hy3" value="" style="shape=line;strokeColor=#CFD8DC;strokeWidth=1;dashed=1;dashPattern=4 4;" vertex="1" parent="1"><mxGeometry x="180" y="580" width="900" height="1" as="geometry"/></mxCell>
+        <mxCell id="hy4" value="" style="shape=line;strokeColor=#CFD8DC;strokeWidth=1;dashed=1;dashPattern=4 4;" vertex="1" parent="1"><mxGeometry x="180" y="430" width="900" height="1" as="geometry"/></mxCell>
+        <mxCell id="hy5" value="" style="shape=line;strokeColor=#CFD8DC;strokeWidth=1;dashed=1;dashPattern=4 4;" vertex="1" parent="1"><mxGeometry x="180" y="280" width="900" height="1" as="geometry"/></mxCell>
+
+        <!-- Axis labels -->
+        <mxCell id="xlabel" value="X (m)" style="text;html=1;align=center;fontSize=14;fontStyle=1;fontColor=#37474F;" vertex="1" parent="1"><mxGeometry x="590" y="1080" width="80" height="24" as="geometry"/></mxCell>
+        <mxCell id="ylabel" value="Y (m)" style="text;html=1;align=center;rotation=-90;fontSize=14;fontStyle=1;fontColor=#37474F;" vertex="1" parent="1"><mxGeometry x="112" y="550" width="50" height="60" as="geometry"/></mxCell>
+        <mxCell id="x0" value="−7,5" style="text;html=1;align=center;fontSize=11;fontColor=#546E7A;" vertex="1" parent="1"><mxGeometry x="160" y="1038" width="50" height="20" as="geometry"/></mxCell>
+        <mxCell id="x1" value="−5" style="text;html=1;align=center;fontSize=11;fontColor=#546E7A;" vertex="1" parent="1"><mxGeometry x="310" y="1038" width="40" height="20" as="geometry"/></mxCell>
+        <mxCell id="x2" value="−2,5" style="text;html=1;align=center;fontSize=11;fontColor=#546E7A;" vertex="1" parent="1"><mxGeometry x="455" y="1038" width="50" height="20" as="geometry"/></mxCell>
+        <mxCell id="x3" value="0" style="text;html=1;align=center;fontSize=11;fontColor=#546E7A;" vertex="1" parent="1"><mxGeometry x="615" y="1038" width="30" height="20" as="geometry"/></mxCell>
+        <mxCell id="x4" value="+2,5" style="text;html=1;align=center;fontSize=11;fontColor=#546E7A;" vertex="1" parent="1"><mxGeometry x="755" y="1038" width="50" height="20" as="geometry"/></mxCell>
+        <mxCell id="x5" value="+5" style="text;html=1;align=center;fontSize=11;fontColor=#546E7A;" vertex="1" parent="1"><mxGeometry x="910" y="1038" width="40" height="20" as="geometry"/></mxCell>
+        <mxCell id="x6" value="+7,5" style="text;html=1;align=center;fontSize=11;fontColor=#546E7A;" vertex="1" parent="1"><mxGeometry x="1050" y="1038" width="50" height="20" as="geometry"/></mxCell>
+        <mxCell id="y0" value="0" style="text;html=1;align=right;fontSize=11;fontColor=#546E7A;" vertex="1" parent="1"><mxGeometry x="145" y="1018" width="28" height="20" as="geometry"/></mxCell>
+        <mxCell id="y1" value="2,5" style="text;html=1;align=right;fontSize=11;fontColor=#546E7A;" vertex="1" parent="1"><mxGeometry x="135" y="868" width="38" height="20" as="geometry"/></mxCell>
+        <mxCell id="y2" value="5" style="text;html=1;align=right;fontSize=11;fontColor=#546E7A;" vertex="1" parent="1"><mxGeometry x="145" y="718" width="28" height="20" as="geometry"/></mxCell>
+        <mxCell id="y3" value="7,5" style="text;html=1;align=right;fontSize=11;fontColor=#546E7A;" vertex="1" parent="1"><mxGeometry x="135" y="568" width="38" height="20" as="geometry"/></mxCell>
+        <mxCell id="y4" value="10" style="text;html=1;align=right;fontSize=11;fontColor=#546E7A;" vertex="1" parent="1"><mxGeometry x="140" y="418" width="33" height="20" as="geometry"/></mxCell>
+        <mxCell id="y5" value="12,5" style="text;html=1;align=right;fontSize=11;fontColor=#546E7A;" vertex="1" parent="1"><mxGeometry x="130" y="268" width="43" height="20" as="geometry"/></mxCell>
+        <mxCell id="y6" value="15" style="text;html=1;align=right;fontSize=11;fontColor=#546E7A;" vertex="1" parent="1"><mxGeometry x="140" y="120" width="33" height="20" as="geometry"/></mxCell>
+
+        <!-- Echo radar overlays: deliberately behind the physical objects -->
+        <mxCell id="echo_far" value="R4" style="ellipse;whiteSpace=wrap;html=1;fillColor=#FF3D00;strokeColor=none;opacity=24;fontSize=12;fontStyle=1;fontColor=#B71C1C;" vertex="1" parent="1"><mxGeometry x="500" y="164" width="250" height="44" as="geometry"/></mxCell>
+        <mxCell id="echo_far_band" value="" style="ellipse;whiteSpace=wrap;html=1;fillColor=#FFD600;strokeColor=none;opacity=25;" vertex="1" parent="1"><mxGeometry x="548" y="226" width="170" height="36" as="geometry"/></mxCell>
+        <mxCell id="echo_main_outer" value="" style="ellipse;whiteSpace=wrap;html=1;fillColor=#FFEA00;strokeColor=none;opacity=26;" vertex="1" parent="1"><mxGeometry x="490" y="606" width="285" height="95" as="geometry"/></mxCell>
+        <mxCell id="echo_main_mid" value="R1" style="ellipse;whiteSpace=wrap;html=1;fillColor=#FF6D00;strokeColor=none;opacity=34;fontSize=14;fontStyle=1;fontColor=#B71C1C;" vertex="1" parent="1"><mxGeometry x="566" y="625" width="135" height="58" as="geometry"/></mxCell>
+        <mxCell id="echo_main_core" value="" style="ellipse;whiteSpace=wrap;html=1;fillColor=#D50000;strokeColor=none;opacity=42;" vertex="1" parent="1"><mxGeometry x="607" y="638" width="54" height="32" as="geometry"/></mxCell>
+        <mxCell id="echo_left" value="R2" style="ellipse;whiteSpace=wrap;html=1;fillColor=#FFB300;strokeColor=none;opacity=28;fontSize=13;fontStyle=1;fontColor=#8D4B00;" vertex="1" parent="1"><mxGeometry x="240" y="585" width="260" height="165" as="geometry"/></mxCell>
+        <mxCell id="echo_right" value="R3" style="ellipse;whiteSpace=wrap;html=1;fillColor=#FFB300;strokeColor=none;opacity=27;fontSize=13;fontStyle=1;fontColor=#8D4B00;" vertex="1" parent="1"><mxGeometry x="770" y="570" width="280" height="180" as="geometry"/></mxCell>
+        <mxCell id="echo_near_left" value="R5" style="ellipse;whiteSpace=wrap;html=1;fillColor=#00B8D4;strokeColor=none;opacity=20;fontSize=12;fontStyle=1;fontColor=#006064;" vertex="1" parent="1"><mxGeometry x="210" y="845" width="255" height="150" as="geometry"/></mxCell>
+        <mxCell id="echo_near_right" value="" style="ellipse;whiteSpace=wrap;html=1;fillColor=#00B8D4;strokeColor=none;opacity=18;" vertex="1" parent="1"><mxGeometry x="830" y="850" width="210" height="135" as="geometry"/></mxCell>
+
+        <!-- Back wall, glazing and door -->
+        <mxCell id="back_glass_left" value="vetrata / banco posteriore" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#E1F5FE;strokeColor=#607D8B;strokeWidth=2;fontSize=11;fontColor=#37474F;" vertex="1" parent="1"><mxGeometry x="210" y="145" width="285" height="44" as="geometry"/></mxCell>
+        <mxCell id="door" value="PORTA" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ECEFF1;strokeColor=#455A64;strokeWidth=2;fontSize=11;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="505" y="132" width="120" height="90" as="geometry"/></mxCell>
+        <mxCell id="back_glass_right" value="vetrata / banco posteriore" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#E1F5FE;strokeColor=#607D8B;strokeWidth=2;fontSize=11;fontColor=#37474F;" vertex="1" parent="1"><mxGeometry x="635" y="145" width="415" height="44" as="geometry"/></mxCell>
+
+        <!-- Rear furniture -->
+        <mxCell id="f_back_left" value="M3a • banco con monitor e struttura metallica" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#DCE6EF;strokeColor=#274C77;strokeWidth=2;fontSize=11;fontColor=#17324D;" vertex="1" parent="1"><mxGeometry x="245" y="245" width="235" height="76" as="geometry"/></mxCell>
+        <mxCell id="f_back_mid" value="M3b • banco / armadio centrale" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#E6EDF3;strokeColor=#274C77;strokeWidth=2;fontSize=11;fontColor=#17324D;" vertex="1" parent="1"><mxGeometry x="650" y="245" width="185" height="70" as="geometry"/></mxCell>
+        <mxCell id="f_back_right" value="M3c • banchi, strumenti e contenitori" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#DCE6EF;strokeColor=#274C77;strokeWidth=2;fontSize=11;fontColor=#17324D;" vertex="1" parent="1"><mxGeometry x="855" y="240" width="190" height="86" as="geometry"/></mxCell>
+
+        <!-- Left metal structures -->
+        <mxCell id="m_left_front" value="M1a • telaio / rotaie in alluminio" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#CFD8DC;strokeColor=#455A64;strokeWidth=3;fontSize=11;fontStyle=1;fontColor=#263238;" vertex="1" parent="1"><mxGeometry x="205" y="745" width="245" height="125" as="geometry"/></mxCell>
+        <mxCell id="m_left_cart" value="M1b • carrello metallico con ripiani" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#D8E3EA;strokeColor=#455A64;strokeWidth=3;fontSize=11;fontStyle=1;fontColor=#263238;" vertex="1" parent="1"><mxGeometry x="305" y="565" width="180" height="150" as="geometry"/></mxCell>
+        <mxCell id="m_left_monitor" value="monitor" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#263238;strokeColor=#111111;strokeWidth=2;fontSize=10;fontColor=#FFFFFF;" vertex="1" parent="1"><mxGeometry x="335" y="585" width="82" height="45" as="geometry"/></mxCell>
+
+        <!-- Right cabinet run -->
+        <mxCell id="m_right_cabinet" value="M2 • armadi e banco destro con parti metalliche" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#E3EAF0;strokeColor=#123D75;strokeWidth=4;fontSize=12;fontStyle=1;fontColor=#17324D;" vertex="1" parent="1"><mxGeometry x="790" y="540" width="255" height="245" as="geometry"/></mxCell>
+        <mxCell id="m_right_top" value="piano di lavoro" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#B0BEC5;strokeColor=#123D75;strokeWidth=3;fontSize=10;fontColor=#263238;" vertex="1" parent="1"><mxGeometry x="772" y="525" width="290" height="42" as="geometry"/></mxCell>
+
+        <!-- Central wrapped target -->
+        <mxCell id="target_green" value="T1 • supporto avvolto" style="rounded=1;arcSize=18;whiteSpace=wrap;html=1;fillColor=#76B852;gradientColor=#A5D66A;strokeColor=#2E7D32;strokeWidth=3;fontSize=12;fontStyle=1;fontColor=#163A18;" vertex="1" parent="1"><mxGeometry x="548" y="660" width="168" height="92" as="geometry"/></mxCell>
+        <mxCell id="target_green_strap1" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#C6A66B;strokeColor=#8D6E3F;strokeWidth=1;" vertex="1" parent="1"><mxGeometry x="582" y="660" width="18" height="92" as="geometry"/></mxCell>
+        <mxCell id="target_green_strap2" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#C6A66B;strokeColor=#8D6E3F;strokeWidth=1;" vertex="1" parent="1"><mxGeometry x="668" y="660" width="18" height="92" as="geometry"/></mxCell>
+        <mxCell id="target_main" value="T1&#xa;cilindro metallico" style="ellipse;whiteSpace=wrap;html=1;fillColor=#CFD8DC;gradientColor=#78909C;strokeColor=#455A64;strokeWidth=3;fontSize=11;fontStyle=1;fontColor=#263238;" vertex="1" parent="1"><mxGeometry x="606" y="622" width="54" height="74" as="geometry"/></mxCell>
+        <mxCell id="target_stand" value="supporto" style="ellipse;whiteSpace=wrap;html=1;fillColor=#ECEFF1;strokeColor=#607D8B;strokeWidth=2;fontSize=9;fontColor=#455A64;" vertex="1" parent="1"><mxGeometry x="603" y="754" width="60" height="42" as="geometry"/></mxCell>
+
+        <!-- Copper/metal targets on left -->
+        <mxCell id="t2" value="T2" style="ellipse;whiteSpace=wrap;html=1;fillColor=#C87941;gradientColor=#F0B07A;strokeColor=#7B3F1D;strokeWidth=2;fontSize=10;fontStyle=1;fontColor=#FFFFFF;" vertex="1" parent="1"><mxGeometry x="270" y="600" width="28" height="62" as="geometry"/></mxCell>
+        <mxCell id="t3" value="T3" style="ellipse;whiteSpace=wrap;html=1;fillColor=#C87941;gradientColor=#F0B07A;strokeColor=#7B3F1D;strokeWidth=2;fontSize=10;fontStyle=1;fontColor=#FFFFFF;" vertex="1" parent="1"><mxGeometry x="320" y="640" width="28" height="62" as="geometry"/></mxCell>
+        <mxCell id="t4" value="T4" style="ellipse;whiteSpace=wrap;html=1;fillColor=#C87941;gradientColor=#F0B07A;strokeColor=#7B3F1D;strokeWidth=2;fontSize=10;fontStyle=1;fontColor=#FFFFFF;" vertex="1" parent="1"><mxGeometry x="442" y="515" width="26" height="58" as="geometry"/></mxCell>
+
+        <!-- Copper/metal targets on right -->
+        <mxCell id="t5" value="T5" style="ellipse;whiteSpace=wrap;html=1;fillColor=#C87941;gradientColor=#F0B07A;strokeColor=#7B3F1D;strokeWidth=2;fontSize=10;fontStyle=1;fontColor=#FFFFFF;" vertex="1" parent="1"><mxGeometry x="800" y="500" width="26" height="60" as="geometry"/></mxCell>
+        <mxCell id="t6" value="T6" style="ellipse;whiteSpace=wrap;html=1;fillColor=#C87941;gradientColor=#F0B07A;strokeColor=#7B3F1D;strokeWidth=2;fontSize=10;fontStyle=1;fontColor=#FFFFFF;" vertex="1" parent="1"><mxGeometry x="885" y="492" width="26" height="62" as="geometry"/></mxCell>
+        <mxCell id="t7" value="T7" style="ellipse;whiteSpace=wrap;html=1;fillColor=#C87941;gradientColor=#F0B07A;strokeColor=#7B3F1D;strokeWidth=2;fontSize=10;fontStyle=1;fontColor=#FFFFFF;" vertex="1" parent="1"><mxGeometry x="978" y="510" width="26" height="60" as="geometry"/></mxCell>
+
+        <!-- SAR rail and viewing direction -->
+        <mxCell id="sar_rail" value="LINEAR SAR • traiettoria di acquisizione" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#455A64;strokeColor=#263238;strokeWidth=3;fontSize=11;fontStyle=1;fontColor=#FFFFFF;" vertex="1" parent="1"><mxGeometry x="245" y="984" width="770" height="28" as="geometry"/></mxCell>
+        <mxCell id="radar" value="RADAR" style="shape=hexagon;perimeter=hexagonPerimeter2;whiteSpace=wrap;html=1;fixedSize=1;fillColor=#E53935;strokeColor=#8E0000;strokeWidth=3;fontSize=12;fontStyle=1;fontColor=#FFFFFF;" vertex="1" parent="1"><mxGeometry x="594" y="954" width="74" height="58" as="geometry"/></mxCell>
+        <mxCell id="fov" value="direzione di osservazione" style="endArrow=block;html=1;rounded=0;strokeColor=#E53935;strokeWidth=3;fontSize=11;fontStyle=1;fontColor=#B71C1C;" edge="1" parent="1">
+          <mxGeometry width="50" height="50" relative="1" as="geometry"><mxPoint x="631" y="952" as="sourcePoint"/><mxPoint x="631" y="835" as="targetPoint"/></mxGeometry>
+        </mxCell>
+
+        <!-- Orientation -->
+        <mxCell id="back_label" value="FONDO DELLA STANZA" style="text;html=1;align=center;fontSize=12;fontStyle=1;fontColor=#455A64;" vertex="1" parent="1"><mxGeometry x="760" y="105" width="230" height="24" as="geometry"/></mxCell>
+        <mxCell id="front_label" value="LATO SAR / FOTOCAMERA" style="text;html=1;align=center;fontSize=12;fontStyle=1;fontColor=#455A64;" vertex="1" parent="1"><mxGeometry x="760" y="1005" width="230" height="24" as="geometry"/></mxCell>
+
+        <!-- Legend and interpretation panel -->
+        <mxCell id="legend_panel" value="" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#F4F7FA;strokeColor=#90A4AE;strokeWidth=2;" vertex="1" parent="1"><mxGeometry x="1130" y="130" width="460" height="900" as="geometry"/></mxCell>
+        <mxCell id="legend_title" value="LEGENDA E CORRISPONDENZE" style="text;html=1;align=left;fontSize=18;fontStyle=1;fontColor=#17324D;" vertex="1" parent="1"><mxGeometry x="1160" y="155" width="390" height="30" as="geometry"/></mxCell>
+
+        <mxCell id="leg_metal" value="Target metallico identificabile nella fotografia" style="text;html=1;align=left;fontSize=12;fontColor=#263238;" vertex="1" parent="1"><mxGeometry x="1210" y="205" width="330" height="32" as="geometry"/></mxCell>
+        <mxCell id="leg_metal_icon" value="T" style="ellipse;whiteSpace=wrap;html=1;fillColor=#C87941;gradientColor=#F0B07A;strokeColor=#7B3F1D;strokeWidth=2;fontSize=11;fontStyle=1;fontColor=#FFFFFF;" vertex="1" parent="1"><mxGeometry x="1165" y="204" width="30" height="34" as="geometry"/></mxCell>
+        <mxCell id="leg_furniture" value="Mobile o struttura fisica della stanza" style="text;html=1;align=left;fontSize=12;fontColor=#263238;" vertex="1" parent="1"><mxGeometry x="1210" y="250" width="330" height="32" as="geometry"/></mxCell>
+        <mxCell id="leg_furniture_icon" value="M" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#DCE6EF;strokeColor=#274C77;strokeWidth=2;fontSize=11;fontStyle=1;fontColor=#17324D;" vertex="1" parent="1"><mxGeometry x="1165" y="250" width="30" height="30" as="geometry"/></mxCell>
+        <mxCell id="leg_echo" value="Area di risposta radar intensa (rosso = picco)" style="text;html=1;align=left;fontSize=12;fontColor=#263238;" vertex="1" parent="1"><mxGeometry x="1210" y="295" width="330" height="32" as="geometry"/></mxCell>
+        <mxCell id="leg_echo_icon" value="R" style="ellipse;whiteSpace=wrap;html=1;fillColor=#FF6D00;strokeColor=none;opacity=55;fontSize=11;fontStyle=1;fontColor=#B71C1C;" vertex="1" parent="1"><mxGeometry x="1162" y="293" width="38" height="34" as="geometry"/></mxCell>
+
+        <mxCell id="corr_title" value="Lettura proposta" style="text;html=1;align=left;fontSize=15;fontStyle=1;fontColor=#17324D;" vertex="1" parent="1"><mxGeometry x="1160" y="350" width="390" height="28" as="geometry"/></mxCell>
+        <mxCell id="corr1" value="R1 ↔ T1 — cilindro sul bersaglio verde&#xa;Picco principale a X≈0, Y≈6,5 m&#xa;CONFIDENZA: ALTA" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;align=left;verticalAlign=middle;spacingLeft=12;fillColor=#E8F5E9;strokeColor=#43A047;strokeWidth=2;fontSize=12;fontColor=#1B5E20;" vertex="1" parent="1"><mxGeometry x="1160" y="385" width="400" height="88" as="geometry"/></mxCell>
+        <mxCell id="corr2" value="R2 ↔ M1 + T2/T3/T4 — strutture a sinistra&#xa;Eco diffuse e multipath tra X≈−6 e −2 m&#xa;CONFIDENZA: MEDIA" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;align=left;verticalAlign=middle;spacingLeft=12;fillColor=#FFF8E1;strokeColor=#F9A825;strokeWidth=2;fontSize=12;fontColor=#6D4C00;" vertex="1" parent="1"><mxGeometry x="1160" y="485" width="400" height="88" as="geometry"/></mxCell>
+        <mxCell id="corr3" value="R3 ↔ M2 + T5/T6/T7 — banco e armadi a destra&#xa;Ritorni distribuiti tra X≈+2,5 e +7 m&#xa;CONFIDENZA: MEDIA" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;align=left;verticalAlign=middle;spacingLeft=12;fillColor=#FFF8E1;strokeColor=#F9A825;strokeWidth=2;fontSize=12;fontColor=#6D4C00;" vertex="1" parent="1"><mxGeometry x="1160" y="585" width="400" height="88" as="geometry"/></mxCell>
+        <mxCell id="corr4" value="R4 ↔ M3 / fondo stanza — banchi, vetrate e metallo&#xa;Fasce intense tra Y≈12,5 e 14,5 m&#xa;CONFIDENZA OGGETTO SINGOLO: BASSA" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;align=left;verticalAlign=middle;spacingLeft=12;fillColor=#FFEBEE;strokeColor=#E57373;strokeWidth=2;fontSize=12;fontColor=#8E2424;" vertex="1" parent="1"><mxGeometry x="1160" y="685" width="400" height="96" as="geometry"/></mxCell>
+        <mxCell id="corr5" value="R5 — zona vicina al SAR&#xa;Telaio, supporti e risposta di near-field; associazione puntuale non affidabile." style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;align=left;verticalAlign=middle;spacingLeft=12;fillColor=#E0F7FA;strokeColor=#26A69A;strokeWidth=2;fontSize=12;fontColor=#00695C;" vertex="1" parent="1"><mxGeometry x="1160" y="793" width="400" height="82" as="geometry"/></mxCell>
+
+        <mxCell id="notes" value="NOTA METODOLOGICA&#xa;La fotografia prospettica non consente di ricavare misure esatte. Le coordinate seguono la scala della mappa radar; sagome, dimensioni e associazioni laterali sono interpretative. Gli elementi sono separati e modificabili in Draw.io." style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;align=left;verticalAlign=top;spacing=12;fillColor=#ECEFF1;strokeColor=#78909C;strokeWidth=1;fontSize=11;fontColor=#37474F;" vertex="1" parent="1"><mxGeometry x="1160" y="900" width="400" height="105" as="geometry"/></mxCell>
+
+        <!-- Callout from central target to correspondence panel -->
+        <mxCell id="callout_t1" value="corrispondenza dominante" style="endArrow=block;html=1;rounded=0;dashed=1;dashPattern=6 4;strokeColor=#43A047;strokeWidth=2;fontSize=10;fontColor=#2E7D32;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry width="50" height="50" relative="1" as="geometry"><mxPoint x="680" y="640" as="sourcePoint"/><mxPoint x="1155" y="430" as="targetPoint"/></mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

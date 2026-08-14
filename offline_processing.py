@@ -3297,9 +3297,14 @@ def _offline_dsp_worker(
                 **_viewport_status_fields(applied_viewport, fallback_used=False),
             },
         )
+        algorithm_init_detail = (
+            f"angle_mode={range_angle_cfg.angle_processing.mode} nfft_angle={range_angle_cfg.nfft_angle} "
+            if str(algorithm) == "synthetic_range_angle"
+            else f"output_grid={gui_w}x{gui_h} aperture_samples={int(positions.size) * int(n_ant_used)} "
+        )
         print(
             f"[OFFLINE INFO] algorithm={algorithm} "
-            f"default_positions={x_start}:{x_end} angle_mode={range_angle_cfg.angle_processing.mode} "
+            f"default_positions={x_start}:{x_end} {algorithm_init_detail}"
             f"range={range_input_samples}->{nfft_range} used={range_samples_used} "
             f"bp_range_offset_m={range_offset_m:.6g} "
             f"bp_frame_position_error={'on' if frame_position_error_enabled else 'off'} "
@@ -3565,16 +3570,25 @@ def _offline_dsp_worker(
                     if int(sel_idx.size) > 0
                     else "none"
                 )
+                if str(algorithm) == "synthetic_range_angle":
+                    algorithm_frame_detail = (
+                        f"synthetic_ant={frame_meta.get('synthetic_antennas', n_ant_used)} "
+                        f"angle_used={frame_meta.get('angle_elements_used', 'n/a')} "
+                        f"angle_mode={frame_meta.get('angle_mode', range_angle_cfg.angle_processing.mode)} "
+                        f"nfft_angle={frame_meta.get('nfft_angle_effective', range_angle_cfg.nfft_angle)} "
+                        f"fft_uniform={frame_meta.get('fft_uniform_geometry', 'n/a')} "
+                    )
+                else:
+                    algorithm_frame_detail = (
+                        f"aperture_samples={int(sel_idx.size) * int(n_ant_used)} "
+                        f"output_grid={gui_w}x{gui_h} "
+                    )
                 print(
                     f"[OFFLINE INFO] frame algorithm={algorithm} positions={positions_text} "
-                    f"synthetic_ant={frame_meta.get('synthetic_antennas', n_ant_used)} "
-                    f"angle_used={frame_meta.get('angle_elements_used', 'n/a')} "
-                    f"angle_mode={frame_meta.get('angle_mode', range_angle_cfg.angle_processing.mode)} "
+                    f"{algorithm_frame_detail}"
                     f"nfft_range={nfft_range} "
                     f"mirror_x={bool(mirror_x)} "
-                    f"nfft_angle={frame_meta.get('nfft_angle_effective', range_angle_cfg.nfft_angle)} "
-                    f"filters={frame_meta.get('enabled_filters', _offline_sar_range_angle_filters_enabled(range_angle_cfg, algorithm=str(algorithm)))} "
-                    f"fft_uniform={frame_meta.get('fft_uniform_geometry', 'n/a')}"
+                    f"filters={frame_meta.get('enabled_filters', _offline_sar_range_angle_filters_enabled(range_angle_cfg, algorithm=str(algorithm)))}"
                 )
                 _queue_put_latest(
                     status_q,

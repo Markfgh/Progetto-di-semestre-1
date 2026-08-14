@@ -1,0 +1,103 @@
+data:
+  # Puoi mettere direttamente una run: logs/run_YYYYMMDD_HHMMSS
+  # Se lasci "logs", SARReader prende automaticamente l'ultima run con capture_pos*.bin.
+  input_dir: "logs\\pc_ok"
+  # Maximum time allowed to prepare all offline data before reporting a timeout.
+  startup_timeout_s: 3600
+  # Optional hard cap for the preflight memory estimate; null uses only the
+  # automatic guard against currently available system RAM.
+  max_memory_gib: null
+
+capture:
+  # Usa i primi N frame di ciascuna posizione (1..frame disponibili nella run).
+  frames_per_position: 1
+
+scan:
+  x_start: 1
+  x_end: 150
+  x_step: 1
+  # Nominal scan pitch kept for acquisition/planning compatibility. Both
+  # offline reconstructions use measured stage.position_mm from each header.
+  x_pitch_m: 0.007679999805986881 # 7.68 mm pitch
+
+
+
+reconstruction:
+  algorithm: "backprojection" # Options: backprojection, synthetic_range_angle.
+  # Display-only convention: reflects the final map horizontally without
+  # changing raw captures, stage coordinates, or reconstruction geometry.
+  mirror_x: true
+  # Full physical rectangle reconstructed by "Full map".  ROI controls are
+  # constrained to this domain and reconstruct their selected sector on the
+  # fixed offline image grid.
+  map_bounds:
+    x_min_m: -1.0
+    x_max_m: 1.0
+    y_min_m: 0.5
+    y_max_m: 2.5
+
+bp:
+  phase_sign: -1
+  # Calibrazione di range solo per backprojection, in metri di range
+  # equivalente one-way.  Se un bersaglio noto a R_true appare a R_meas,
+  # imposta R_meas - R_true (es.: +0.012 per 12 mm troppo lontano).
+  range_offset_m: 0.00
+  # FMCW residual-video-phase correction during backprojection.  Leave "off"
+  # unless a point-target test confirms a benefit; the sign depends on the
+  # dechirp/IQ convention. Options: "off", "+", "-".
+  residual_video_phase: "off"
+  # Simula un errore sulla coordinata X usata dalla backprojection.
+  # random_uniform: errore indipendente per ogni frame in [-max_abs_mm, +max_abs_mm].
+  # static_step: errore costante aggiunto a ogni passo: 8 mm + 2 mm = 10 mm.
+  # Non modifica IQ o header ed e' ignorato da synthetic_range_angle.
+  frame_position_error:
+    enabled: false
+    mode: "static_step" # random_uniform | static_step
+    max_abs_mm: 2.0
+    static_step_error_mm: 2.0
+    seed: 1234 # null genera una nuova estrazione a ogni elaborazione
+  tx_offsets_lambda:  null
+  rx_offsets_lambda:  null
+  tx_offsets_m: null
+  rx_offsets_m: null
+
+# Optional empty-scene reference for either reconstruction algorithm. Capture
+# this run with the same radar/setup and scan positions, then set this folder
+# and turn it on for a target run. All reference frames are complex-averaged
+# per position/antenna/range bin and subtracted before reconstruction (not
+# from the dB image).
+# The reference may contain a different number of frames than the target.
+offline_background:
+  enabled: false
+  reference_dir: "logs\\scena vuota"
+  scale: 1.0
+
+offline_sar_range_angle:
+  # range=fast-time e doppler=loop prima del bin zero. window_angle viene
+  # applicata sull'asse angolare da synthetic_range_angle e come finestra
+  # dell'apertura continua posizione×antenna dalla BP MIMO-SAR lineare.
+  use_realtime_filters: true
+  # Dimensioni FFT offline, indipendenti dal realtime.
+  # Backprojection: nfft_range deve essere almeno 6x i campioni ADC usati,
+  # per rendere affidabile l'interpolazione complessa phase-aware.
+  # synthetic_range_angle può invece usare nfft_range < input (troncamento).
+  # Valore > input: conserva tutto l'ingresso e aggiunge zero-padding.
+  # nfft_angle si applica come FFT/padding solo con angle_processing.mode=fft;
+  # in Bartlett/MVDR indica invece il numero di punti della griglia angolare.
+  nfft_range: 524288
+  nfft_angle: 524288
+  window_range: "blackman"
+  window_doppler: "hanning"
+  window_angle: "hanning"
+  zero_after_range_fft_bins: 0
+
+  mean_after_range_fft:
+    enabled: true
+    axes: [range_bin]
+
+  angle_processing:
+    mode: "fft" # Options: fft,bartlett, mvdr
+    mvdr_diagonal_loading: 0.05000000074505806
+    aggregation: "none"
+    frame_index: 0
+    loop_index: 0

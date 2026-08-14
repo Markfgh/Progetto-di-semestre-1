@@ -1,0 +1,274 @@
+radar:
+  c: 3e8                 # Speed of light [m/s].
+  fs: 10e6               # ADC sampling rate [Hz] = 10,000 ksps in mmWave Studio.
+  # 39.010 MHz/us with 10 Msps gives a positive-FFT range limit of 19.23 m.
+  # The realtime DSP uses the positive FFT half: its physical range limit is
+  # c*fs/(4*slope) = 19.23 m, enough for the 16.77 m far corner.
+  slope: 39.01e12        # FMCW slope [Hz/s]; must match the applied mmWave Studio value.
+  # Sweep frequency at the centre of the acquired ADC window:
+  # 77 GHz + 39.010 MHz/us × (6 us ADC start + 25.6 us) = 78.232716 GHz.
+  fc: 78.232716e9        # Effective carrier [Hz] used by angle/Doppler processing.
+  chirp_period_s: 160e-6 # PRI [s] = idle 100 us + ramp end 60 us; must match mmWave Studio.
+
+capture:
+  samples: 512   # ADC samples/chirp; 25.6 us at 10 Msps; must match mmWave Studio.
+  chirps: 256    # Chirps/frame.
+  rx: 4          # Current IQ conversion assumes RX=4.
+  tx: 2          # Uniform TDM-MIMO TX count; Doppler axis/compensation assume equal chirp spacing across TX.
+  x_frames: 1    # Frames processed per DSP batch.
+
+fft:
+  nfft_range: 512 # FFT length matches the 512 acquired ADC samples.
+  nfft_angle: 256 # Typical: 128/256/512. Higher = finer angular grid, more CPU.
+  workers: 4      # Bounded with Numba below: keeps realtime responsive without saturating all CPU cores.
+
+display:
+  vmax: 170.0          # Color scale max in RAW mode.
+  vmin: 160.0           # Color scale min in RAW mode.
+  vmin_norm: -20     # Normalized mode: typical clean range -25..-15 dB.
+  vmax_norm: 0       # Normalized mode peak.
+  velocity_vmin_mps: -0.70 # Default mode-1 signed-velocity scale min [m/s].
+  velocity_vmax_mps:  0.70 # Default mode-1 signed-velocity scale max [m/s].
+  projection_mode:   cartesian # Options: polar_stretched, cartesian.
+  projection_interp: nearest  # Used only in cartesian mode: nearest, bilinear.
+  range_max: 15.0       # Hard limit shown on Y axis [m].
+  crossrange_max: 7.5   # X extent is -7.5..+7.5 m, for a total width of 15 m.
+  rangefft_db_min: 0
+  rangefft_db_max: 95
+  rangefft_lin_min: 0
+  rangefft_lin_max: 15e7
+  normalize_skip_range_bins: 0 # Normalized display: ignore the first N range bins when choosing the frame peak.
+  # Fixed output rasters.  They are independent from Range/Angle FFT sizes and
+  # are allocated when the application starts.
+  image_resolution:
+    realtime: { width: 256, height: 256 }
+    offline:  { width: 4096, height: 4096 }
+
+display_zoom:
+  # Keep direct plot pan/zoom display-only.  Reconstructing an enlarged FFT
+  # grid here can make the realtime view show an old frame for seconds.
+  enabled: false
+  max_zoom_nfft_range: 256
+  max_zoom_nfft_angle: 256
+  max_update_hz: 22.0
+  dsp_budget_ms: 8.0 
+  fallback_mode: baseline_projection #
+
+processing:
+  range_max_m: 18.0 # Covers the 16.77 m far corner with margin below the 19.23 m nominal limit.
+
+dsp:
+  window_range: hanning # Options: none, rectangular, hanning, hamming, blackman.
+  window_doppler: hanning # Applied on slow-time chirps before Doppler FFT.
+  window_angle: hanning  # Options: none, rectangular, hanning, hamming, blackman.
+  zero_after_range_fft_bins: 0 # If > 0, zeroes the first N range bins globally right after range FFT.
+
+  range_angle_moving:
+    relative_power_floor_db: -22.0 # More permissive for weak/slow movers like a person or a hand-moved thermos.
+    min_power_db: 0.0 # Absolute moving-power floor before a cell is visible.
+    min_dominance_ratio: 0.45 # Required dominant-Doppler power / total Doppler power for the cell.
+    velocity_dead_zone: 0.08 # Visual-only fraction of the mode-1 velocity scale kept black around zero.
+    min_opacity: 0.0 # Minimum mode-1 opacity for valid cells; power still fades from this value to 1.0.
+
+  cfar_numba:
+    enabled: true # Optional JIT for CA-CFAR only; OS-CFAR remains on the Python path.
+    warmup_on_start: true # Compile/cache before the realtime loop to avoid a first-frame spike.
+    self_check_on_start: true # Disable JIT automatically if Python/JIT equivalence fails.
+
+  # The per-frame angle-power reduction uses Numba parallelism.  Limit this
+  # separately from FFTW so the DSP does not claim every logical core.
+  angle_power_numba:
+    enabled: true
+    threads: 4
+
+  diagnostics:
+    log_cpu_runtime: false # Logs actual CPU affinity/SIMD/FFT/JIT runtime exposure for this DSP process.
+  
+  mean_before_range_fft:
+    enabled: true # Keep enabled for a stable DC removal, especially in the presence of strong static targets.  
+    axes: [sample] # Options: frame, loop, tx, sample, range_bin, rx.
+                   # Suggested for realtime: [sample] (stable DC removal).
+
+  display_filters:
+    slow_time:
+      enabled: false
+      mode: mean_subtraction # Options: none, mean_subtraction, highpass, doppler_fft.
+      highpass_beta: 0.9 # Used only in highpass mode. Typical: 0.85..0.98.
+      doppler_fft_shift: true
+      doppler_zero_notch: false # In doppler_fft mode, can suppress static center line.
+
+    mean_after_range_fft:
+      enabled: false
+      axes: [range_bin] # Display-only flattening after range FFT.
+
+    background_subtraction:
+      enabled: true # Display heatmap background removal.
+      mode: frozen # Options: ema, running_mean, window_mean, frozen.
+      alpha: 0.02
+      init_frames: 40
+      window_frames: 40
+      clamp_positive_only: true
+
+    loop_average_after_background:
+      enabled: false
+
+  detection_static_filters:
+    mean_after_range_fft:
+      enabled: false
+      axes: [range_bin] # Static-detection branch only. Useful if you want parity with display filtering.
+
+    slow_time:
+      enabled: false # Static-detection branch only.
+      mode: none # Options: none, mean_subtraction, highpass, doppler_fft.
+      highpass_beta: 0.9
+      doppler_fft_shift: true
+      doppler_zero_notch: false
+
+    background_subtraction:
+      enabled: true # Static-detection branch only, with its own background state.
+      mode: frozen
+      alpha: 0.02
+      init_frames: 40
+      window_frames: 40
+      clamp_positive_only: false
+
+    loop_average_after_background:
+      enabled: false # Static-detection branch only; skipped if slow_time.mode=doppler_fft.
+
+  detection_moving_pre_doppler_filters:
+    mean_after_range_fft:
+      enabled: false
+      axes: [range_bin] # Applied before the moving branch Doppler FFT.
+
+    slow_time:
+      enabled: true # Supported here only with mode: none, mean_subtraction, highpass.
+      mode: mean_subtraction # Options: none, mean_subtraction, highpass. Doppler FFT is not supported here.
+      highpass_beta: 0.90
+
+    background_subtraction:
+      enabled: false # Applied before the moving branch Doppler FFT, with its own background state.
+      mode: frozen # Options: ema, running_mean, window_mean, frozen.
+      alpha: 0.02
+      init_frames: 40
+      window_frames: 40
+      clamp_positive_only: false
+
+  angle_processing:
+    mode: fft # Options: fft, bartlett, mvdr. fft and bartlett honor aggregation/frame_index/loop_index; mvdr always uses all available frame x loop snapshots.
+    mvdr_diagonal_loading: 0.02 # Stabilizza la covarianza per scene statiche (range tipico 0.01 - 0.05)
+    aggregation: frame_loop # fft/bartlett only: frame_loop=all frames+loops, frame=all frames at loop_index, loop=all loops at frame_index, none=single [frame_index, loop_index].
+    frame_index: 0 # Used only by fft/bartlett when aggregation is loop or none.
+    loop_index: 0 # Used only by fft/bartlett when aggregation is frame or none.
+
+  heatmap_ema:
+    enabled: false
+    alpha: 0.10 # Typical: 0.08..0.20. Lower=less jitter, more latency.
+
+  heatmap_spatial_filter:
+    enabled: false
+    mode: none # Display-only smoothing in polar space. Options: none, gaussian_3x3.
+
+antenna:
+  virtual_array_order:   [0, 1, 2, 3, 4, 5, 6, 7]
+  angle_axis_sign: 1 # Set to -1 only for a real mounting/cabling mirror, not to compensate DSP sign.
+
+tracking:
+  enabled: true # Enables/disables the multi-object tracker.
+  dt_s: 0.050 # Nominal frame period fallback [s], matching the requested 50 ms mmWave Studio frame periodicity.
+  model: kalman_cv_2d # Dynamic model in use: constant-velocity 2D Kalman filter (x, y, vx, vy).
+  max_tracks: 8 # Maximum number of live tracks kept at the same time.
+  min_hits_to_confirm: 3 # Required matches before a track changes from tentative to confirmed.
+  max_missed_tentative: 3 # How many unmatched frames are allowed for a tentative track.
+  max_missed_confirmed: 18 # How many unmatched frames are allowed for a confirmed track.
+  max_track_age: 0 # Maximum age in frames; 0 disables age-based deletion.
+  gating_xy_m: 1.0 # Maximum XY distance [m] allowed to associate a detection with a track.
+  gating_doppler_mps: 0.50 # Maximum doppler difference [m/s] allowed during association.
+  process_noise_pos: 0.3 # Process noise on position: higher = more flexible but less stable tracks.
+  process_noise_vel: 0.25 # Process noise on velocity: higher = Kalman accepts faster velocity changes.
+  measurement_noise_xy: 0.10 # Measurement noise on x/y [m]: higher = less trust in each instant detection.
+  moving_speed_threshold_mps: 0.22 # Estimated speed threshold above which a target tends to be classified as moving.
+  stopped_speed_threshold_mps: 0.10 # Estimated speed threshold below which a target tends to be classified as stopped.
+  doppler_moving_threshold_mps: 0.15 # Alternative absolute doppler threshold used to classify a target as moving.
+  motion_confirm_frames_moving: 2 # Number of consistent frames needed to confirm the moving state.
+  motion_confirm_frames_stopped: 3 # Number of consistent frames needed to confirm the stopped state.
+  stopped_memory_s: 5.0 # Keeps a stopped confirmed track alive longer when the moving branch drops it.
+  stopped_resume_gate_m: 0.8 # If the target restarts near the stop point, reacquire the same track.
+  stop_position_alpha: 0.35 # 0..1 smoothing applied to the stored stop position; higher = faster updates.
+  birth_min_separation_m: 0.35 # Minimum distance from existing tracks to avoid duplicate new-track allocation.
+  use_doppler_in_cost: true # Use doppler in the association cost, not only XY distance.
+  history_len: 12 # Number of past positions stored for each track.
+  debug_log: false # If true, prints tracker stats and details to the console.
+detection_static:
+  enabled: true
+  threshold_mode: relative # Options: relative, absolute, ca_cfar, os_cfar.
+  threshold_db: -10 # Relative mode: threshold = max_db + threshold_db.
+  localmax_range_bins: 1 # NMS neighborhood in range bins.
+  localmax_angle_bins: 1 # NMS neighborhood in angle bins.
+  min_power_db: 6 # Absolute safety floor (also in relative mode).
+  max_detections: 12 # Cap per frame.
+  cfar_train_range_bins: 8 # CFAR training cells before/after the CUT on range.
+  cfar_guard_range_bins: 2 # CFAR guard cells before/after the CUT on range.
+  cfar_train_col_bins: 8 # CFAR training cells before/after the CUT on angle.
+  cfar_guard_col_bins: 2 # CFAR guard cells before/after the CUT on angle.
+  cfar_threshold_db: 10 # CFAR offset above local noise estimate.
+  os_cfar_rank: 0 # 0 = automatic 75% rank; otherwise 1-based rank in sorted training cells.
+
+detection_moving:
+  enabled: true # Moving target detection is more computationally expensive due to the Doppler FFT, so disabled by default.
+  threshold_mode: ca_cfar # Options: relative, absolute, ca_cfar, os_cfar.
+  threshold_db: -7
+  localmax_range_bins: 2
+  localmax_doppler_bins: 2
+  zero_doppler_exclusion_bins: 0 # Keep near-zero Doppler; slow-time mean subtraction already removes exact DC clutter.
+  min_power_db: 6
+  max_detections: 12
+  cfar_train_range_bins: 8 # CFAR training cells before/after the CUT on range.
+  cfar_guard_range_bins: 2 # CFAR guard cells before/after the CUT on range.
+  cfar_train_col_bins: 4 # CFAR training cells before/after the CUT on Doppler.
+  cfar_guard_col_bins: 1 # CFAR guard cells before/after the CUT on Doppler.
+  cfar_threshold_db: 10 # CFAR offset above local noise estimate.
+  os_cfar_rank: 0 # 0 = automatic 75% rank; otherwise 1-based rank in sorted training cells.
+
+fusion:
+  enabled: true
+  merge_xy_m: 0.50
+  merge_range_m: 0.40
+  merge_angle_deg: 8.0
+  prefer_moving_when_doppler_valid: false # True: moving geometry. False: static geometry plus valid moving-branch Doppler.
+
+rx:
+  # Favor fresh frames over a multi-second UDP backlog.  At 20 Hz, 16 MiB is
+  # roughly eight raw frames / 0.4 s; use 8 MiB only if the link is stable.
+  socket_rcvbuf_bytes: 16777216
+  stall_timeout_s: 2.0
+  seq_reorder_max_back: 32
+
+process:
+  priority:
+    enabled: false # Enable only after validating system stability.
+    main: above_normal
+    rx: high
+    logger: below_normal
+    dsp: high
+  affinity:
+    enabled: false # Pinning can help jitter, but depends on CPU topology.
+    main: "24-31"
+    rx: "24"
+    logger: "25"
+    dsp: "0-23"
+
+debug:
+  debug_stats: true # Enable DSP timing and range stats.
+  print_top_peaks: false # Print the top peaks for range-angle and XY display in the DSP shell.
+  print_top_peaks_count: 4
+  print_top_peaks_range_min_m: 0.0 # Optional lower bound for debug peak search.
+  print_top_peaks_range_max_m: 1.4 # Optional upper bound for debug peak search.
+  print_top_peaks_angle_min_deg: -90.0 # Optional lower bound for debug angle search.
+  print_top_peaks_angle_max_deg: 90.0 # Optional upper bound for debug angle search.
+
+sar:
+  frames_per_position: 2
+  settling_delay_s: 1
+  # Timeout usati dal coordinatore della scansione SAR automatica in main.
+  scan_motion_timeout_s: 120.0
+  scan_capture_timeout_s: 120.0

@@ -93,6 +93,29 @@ def test_static_detection_finds_synthetic_target_with_physical_xy() -> None:
     np.testing.assert_allclose(det.y_m, expected_range * np.cos(np.deg2rad(angle_deg)), atol=0.03)
 
 
+def test_background_calibration_suppresses_detection_publication() -> None:
+    detection = realtime_dsp.Detection(
+        range_bin=10,
+        angle_bin=128,
+        doppler_bin=None,
+        range_m=1.0,
+        angle_deg=0.0,
+        doppler_mps=None,
+        x_m=0.0,
+        y_m=1.0,
+        power_lin=100.0,
+        power_db=20.0,
+        source="static",
+    )
+
+    assert realtime_dsp.suppress_detections_during_background_calibration(
+        [detection], calibration_was_active=True
+    ) == []
+    assert realtime_dsp.suppress_detections_during_background_calibration(
+        [detection], calibration_was_active=False
+    ) == [detection]
+
+
 def test_static_nms_keeps_stronger_of_nearby_angle_peaks() -> None:
     power_db = np.zeros((8, 12), dtype=np.float32)
     power_db[4, 5] = 20.0

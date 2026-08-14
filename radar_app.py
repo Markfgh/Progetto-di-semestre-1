@@ -194,6 +194,42 @@ def format_power_cursor_readout(
     norm_text = "n/a" if normalized_power_db is None else f"{float(normalized_power_db):+.2f} dB"
     return f"{position}\nPower raw: {raw_text}\nPower norm: {norm_text}"
 
+
+def format_memory_bytes(byte_count: int | float) -> str:
+    """Format a memory quantity without hiding small values as 0.00 GiB."""
+    value = max(0.0, float(byte_count))
+    gib = float(1024 ** 3)
+    mib = float(1024 ** 2)
+    kib = float(1024)
+    if value >= gib:
+        return f"{value / gib:.2f} GiB"
+    if value >= mib:
+        return f"{value / mib:.1f} MiB"
+    if value >= kib:
+        return f"{value / kib:.1f} KiB"
+    return f"{value:.0f} B"
+
+
+def format_realtime_pipeline_error(failures: list[tuple[str, str]]) -> str:
+    """Build one readable realtime failure block, with one entry per worker."""
+    lines = ["REALTIME PIPELINE ERROR"]
+    for worker_name, detail in failures:
+        worker = str(worker_name).strip() or "UNKNOWN"
+        message = str(detail).strip() or "unexpected worker exit"
+        lines.append(f"{worker}: {message}")
+    return "\n".join(lines)
+
+
+def format_offline_algorithm_summary(algorithm: object, angle_mode: object) -> str:
+    """Describe the active offline reconstruction without implying BP uses an angle FFT."""
+    algorithm_name = str(algorithm).strip().lower()
+    if algorithm_name == "backprojection":
+        return "Algorithm: BACKPROJECTION"
+    if algorithm_name == "synthetic_range_angle":
+        angle_name = str(angle_mode).strip().upper() or "N/A"
+        return f"Algorithm: SYNTHETIC RANGE-ANGLE | Angle: {angle_name}"
+    return f"Algorithm: {algorithm_name.upper() or 'UNKNOWN'}"
+
 from sar_capture import (
     CaptureError,
     CaptureMetadataStore,
@@ -597,7 +633,148 @@ from realtime_dsp import (
 # --- CONFIGURAZIONE ---
 CFG_PATH = Path(__file__).with_name("realtime_config.yaml")  # <-- nome esatto del tuo file
 with CFG_PATH.open("r", encoding="utf-8") as f:
-    cfg = yaml.safe_load(f)
+    cfg = yaml.safe_load(f) or {}
+
+
+def validate_realtime_configuration(config: dict) -> dict[str, float | int]:
+    """Reject settings that cannot represent the configured FMCW/TDM stream."""
+    if not isinstance(config, dict):
+        raise ValueError("realtime_config.yaml must contain a YAML mapping")
+    radar = config.get("radar", {}) or {}
+    capture = config.get("capture", {}) or {}
+    fft = config.get("fft", {}) or {}
+    display = config.get("display", {}) or {}
+    tracking = config.get("tracking", {}) or {}
+
+    def _finite_positive(mapping: dict, key: str, section: str) -> float:
+        try:
+            value = float(mapping[key])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{section}.{key} must be a positive finite number") from exc
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError(f"{section}.{key} must be a positive finite number")
+        return value
+
+    def _positive_int(mapping: dict, key: str, section: str) -> int:
+        try:
+            value = int(mapping[key])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{section}.{key} must be a positive integer") from exc
+        if value <= 0:
+            raise ValueError(f"{section}.{key} must be a positive integer")
+        return value
+
+    c_m_s = _finite_positive(radar, "c", "radar")
+    fs_hz = _finite_positive(radar, "fs", "radar")
+    slope_hz_s = _finite_positive(radar, "slope", "radar")
+    fc_hz = _finite_positive(radar, "fc", "radar")
+    chirp_period_s = _finite_positive(radar, "chirp_period_s", "radar")
+    samples = _positive_int(capture, "samples", "capture")
+    chirps = _positive_int(capture, "chirps", "capture")
+    rx = _positive_int(capture, "rx", "capture")
+    tx = _positive_int(capture, "tx", "capture")
+    _positive_int(capture, "x_frames", "capture")
+    nfft_range = _positive_int(fft, "nfft_range", "fft")
+    nfft_angle = _positive_int(fft, "nfft_angle", "fft")
+    _positive_int(fft, "workers", "fft")
+
+    if rx != 4:
+        raise ValueError("capture.rx must remain 4: the current DCA IQ unpacker is fixed to four RX channels")
+    if chirps % tx != 0:
+        raise ValueError("capture.chirps must be divisible by capture.tx for uniform TDM-MIMO")
+    if nfft_range < samples:
+        raise ValueError("fft.nfft_range must be >= capture.samples")
+    if nfft_angle < tx * rx:
+        raise ValueError("fft.nfft_angle must be >= capture.tx * capture.rx")
+
+    adc_duration_s = float(samples) / fs_hz
+    if adc_duration_s > chirp_period_s:
+        raise ValueError(
+            "capture.samples / radar.fs exceeds radar.chirp_period_s; the ADC acquisition cannot fit in one chirp"
+        )
+    acquisition_span_s = float(chirps) * chirp_period_s
+    try:
+        tracking_dt_s = float(tracking.get("dt_s", acquisition_span_s))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("tracking.dt_s must be a positive finite number") from exc
+    if not np.isfinite(tracking_dt_s) or tracking_dt_s <= 0.0:
+        raise ValueError("tracking.dt_s must be a positive finite number")
+    if acquisition_span_s > tracking_dt_s + 1e-12:
+        raise ValueError(
+            "capture.chirps * radar.chirp_period_s exceeds tracking.dt_s; the configured frame cannot fit in the nominal period"
+        )
+
+    physical_range_max_m = c_m_s * fs_hz / (4.0 * slope_hz_s)
+    processing_range_max_m = float(resolve_processing_range_max_m(config))
+    display_range_max_m = _finite_positive(display, "range_max", "display")
+    if processing_range_max_m > physical_range_max_m + 1e-9:
+        raise ValueError(
+            f"processing.range_max_m={processing_range_max_m:.3f} m exceeds the positive-FFT FMCW limit "
+            f"{physical_range_max_m:.3f} m"
+        )
+    if display_range_max_m > processing_range_max_m + 1e-9:
+        raise ValueError("display.range_max must be <= processing.range_max_m")
+
+    wavelength_m = c_m_s / fc_hz
+    loops_per_tx = chirps // tx
+    doppler_velocity_max_mps = wavelength_m / (4.0 * tx * chirp_period_s)
+    doppler_bin_mps = wavelength_m / (2.0 * loops_per_tx * tx * chirp_period_s)
+    for key in ("velocity_vmin_mps", "velocity_vmax_mps"):
+        if key not in display:
+            continue
+        try:
+            velocity = float(display[key])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"display.{key} must be finite") from exc
+        if not np.isfinite(velocity) or abs(velocity) > doppler_velocity_max_mps + 1e-9:
+            raise ValueError(
+                f"display.{key}={velocity:.3f} m/s exceeds the TDM Doppler limit "
+                f"+/-{doppler_velocity_max_mps:.3f} m/s"
+            )
+
+    retained_range_bins = int(np.floor(processing_range_max_m / (
+        c_m_s * fs_hz / (2.0 * slope_hz_s * nfft_range)
+    ))) + 1
+    for section_name, col_size in (
+        ("detection_static", nfft_angle),
+        ("detection_moving", loops_per_tx),
+    ):
+        section = config.get(section_name, {}) or {}
+        mode = str(section.get("threshold_mode", "relative")).strip().lower()
+        if mode not in {"ca_cfar", "os_cfar"}:
+            continue
+        train_r = int(section.get("cfar_train_range_bins", 0))
+        guard_r = int(section.get("cfar_guard_range_bins", 0))
+        train_c = int(section.get("cfar_train_col_bins", 0))
+        guard_c = int(section.get("cfar_guard_col_bins", 0))
+        if min(train_r, guard_r, train_c, guard_c) < 0:
+            raise ValueError(f"{section_name} CFAR train/guard sizes cannot be negative")
+        if train_r == 0 and train_c == 0:
+            raise ValueError(f"{section_name} {mode} needs at least one training axis")
+        if train_r > 0 and (2 * (train_r + guard_r) + 1) > retained_range_bins:
+            raise ValueError(f"{section_name} range CFAR window exceeds the retained range grid")
+        if train_c > 0 and (2 * (train_c + guard_c) + 1) > col_size:
+            raise ValueError(f"{section_name} column CFAR window exceeds its angle/Doppler grid")
+
+    range_resolution_m = c_m_s * fs_hz / (2.0 * slope_hz_s * samples)
+    range_bin_m = c_m_s * fs_hz / (2.0 * slope_hz_s * nfft_range)
+    return {
+        "physical_range_max_m": physical_range_max_m,
+        "processing_range_max_m": processing_range_max_m,
+        "display_range_max_m": display_range_max_m,
+        "range_resolution_m": range_resolution_m,
+        "range_bin_m": range_bin_m,
+        "doppler_velocity_max_mps": doppler_velocity_max_mps,
+        "doppler_bin_mps": doppler_bin_mps,
+        "adc_duration_ms": adc_duration_s * 1000.0,
+        "acquisition_span_ms": acquisition_span_s * 1000.0,
+        "nominal_frame_ms": tracking_dt_s * 1000.0,
+        "loops_per_tx": loops_per_tx,
+        "retained_range_bins": retained_range_bins,
+    }
+
+
+REALTIME_PHYSICAL_SUMMARY = validate_realtime_configuration(cfg)
 
 
 # --- CONFIGURAZIONE FISICA ---
@@ -1135,6 +1312,8 @@ def configure_offline_scan_for_run(
 # ----------------------------
 def radar_rx(
     cmd_queue: Queue,
+    rx_socket_state: Synchronized,
+    rx_socket_status,
     free_slots: Queue,
     dsp_ready_queue: Queue,
     shm_frames,
@@ -1209,23 +1388,14 @@ def radar_rx(
     U32_MOD = 1 << 32
     U32_HALF = 1 << 31
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF_BYTES)
-        effective_rcvbuf_bytes = int(sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF))
-        print(
-            "[RX] UDP receive buffer "
-            f"requested={RCVBUF_BYTES / (1024.0 * 1024.0):.1f} MiB, "
-            f"effective={effective_rcvbuf_bytes / (1024.0 * 1024.0):.1f} MiB."
-        )
-        sock.bind((PC_IP, PORT))
-        sock.settimeout(0.2)
-    except Exception:
-        try:
-            sock.close()
-        except Exception:
-            pass
-        raise
+    # The worker starts immediately but owns no UDP endpoint until the user
+    # completes mmWave Connect.  This keeps application startup independent
+    # from the current network-adapter state and makes Connect the single
+    # operation that configures both DCA1000 and the local receive endpoint.
+    sock = None
+    with rx_socket_state.get_lock():
+        rx_socket_state.value = 0
+    _write_shared_text(rx_socket_status, f"UDP idle; connect to bind {PC_IP}:{PORT}")
     if ready_evt is not None:
         ready_evt.set()
 
@@ -1319,6 +1489,12 @@ def radar_rx(
             if not cmd:
                 continue
             cmd_type = str(cmd[0]).strip().upper()
+            if cmd_type == "RX_BIND":
+                _bind_rx_socket()
+                continue
+            if cmd_type == "RX_UNBIND":
+                _close_rx_socket(status=f"UDP idle; connect to bind {PC_IP}:{PORT}")
+                continue
             if cmd_type == "CAPTURE_STOP":
                 pending = False
                 # La transizione e il tagging dei frame condividono lo stesso
@@ -1412,6 +1588,74 @@ def radar_rx(
         last_seq = None
         last_byte_count = None
         _bump_counter(stream_resets)
+
+    def _set_rx_socket_status(state: int, message: str) -> None:
+        with rx_socket_state.get_lock():
+            rx_socket_state.value = int(state)
+        _write_shared_text(rx_socket_status, message)
+
+    def _close_rx_socket(*, status: str, error: bool = False) -> None:
+        nonlocal sock, rx_state
+        current = sock
+        sock = None
+        if current is not None:
+            try:
+                current.close()
+            except Exception:
+                pass
+        _soft_reset_stream()
+        rx_state = RX_RUNNING
+        _set_rx_socket_status(3 if error else 0, status)
+
+    def _bind_rx_socket() -> bool:
+        nonlocal sock, last_packet_perf, t_flush, pkts_local, rx_state
+        if sock is not None:
+            _set_rx_socket_status(2, f"UDP bound to {PC_IP}:{PORT}")
+            return True
+        _set_rx_socket_status(1, f"Binding UDP {PC_IP}:{PORT}...")
+        candidate = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            candidate.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF_BYTES)
+            effective_rcvbuf_bytes = int(candidate.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF))
+            candidate.bind((PC_IP, PORT))
+            candidate.settimeout(0.2)
+        except OSError as exc:
+            try:
+                candidate.close()
+            except Exception:
+                pass
+            message = f"UDP bind {PC_IP}:{PORT} failed: {exc}"
+            _set_rx_socket_status(3, message)
+            print(f"[RX WARN] {message}", flush=True)
+            return False
+        except Exception:
+            try:
+                candidate.close()
+            except Exception:
+                pass
+            raise
+
+        sock = candidate
+        _soft_reset_stream()
+        rx_state = RX_RUNNING
+        pkts_local = 0
+        last_packet_perf = time.perf_counter()
+        t_flush = last_packet_perf
+        _set_rx_socket_status(
+            2,
+            (
+                f"UDP bound to {PC_IP}:{PORT} | receive buffer "
+                f"{effective_rcvbuf_bytes / (1024.0 * 1024.0):.1f} MiB"
+            ),
+        )
+        print(
+            "[RX] UDP receive buffer "
+            f"requested={RCVBUF_BYTES / (1024.0 * 1024.0):.1f} MiB, "
+            f"effective={effective_rcvbuf_bytes / (1024.0 * 1024.0):.1f} MiB; "
+            f"bound={PC_IP}:{PORT}.",
+            flush=True,
+        )
+        return True
 
     def _hard_resync_from_byte_count(byte_count: int, *, count_reset: bool = True) -> None:
         """
@@ -1516,6 +1760,10 @@ def radar_rx(
                 _poll_commands(now_perf)
                 _maybe_enable_capture(now_perf)
                 last_control_poll_s = now_perf
+
+            if sock is None:
+                stop_evt.wait(0.02)
+                continue
     
             try:
                 n_bytes, _ = sock.recvfrom_into(packet_mv)
@@ -1539,8 +1787,9 @@ def radar_rx(
             except OSError as exc:
                 if stop_evt.is_set():
                     break
-                print(f"[RX ERR] UDP receive failed: {exc}")
-                _soft_reset_stream()
+                message = f"UDP receive on {PC_IP}:{PORT} failed: {exc}"
+                print(f"[RX ERR] {message}", flush=True)
+                _close_rx_socket(status=message, error=True)
                 continue
     
             if n_bytes <= HEADER_LEN:
@@ -1645,7 +1894,8 @@ def radar_rx(
         last_seq = None
         last_byte_count = None
         try:
-            sock.close()
+            if sock is not None:
+                sock.close()
         except Exception:
             pass
 
@@ -2247,6 +2497,10 @@ def main():
     rx_ready_evt = _track_mp_ref(mp.Event())
     logger_ready_evt = _track_mp_ref(mp.Event())
     dsp_ready_evt = _track_mp_ref(mp.Event())
+    # 0=idle/unbound, 1=binding, 2=bound, 3=bind/receive error.
+    rx_socket_state = _track_mp_ref(Value("i", 0))
+    rx_socket_status = _track_mp_ref(mp.Array("u", 512, lock=True))
+    _write_shared_text(rx_socket_status, "UDP worker starting...")
     shutdown_resources["stop_evt"] = stop_evt
     sar_pos_counter = _track_mp_ref(Value("L", 0))  # GUI-only counter (pos id generator)
     capture_sessions = CaptureSessionManager(
@@ -2293,6 +2547,9 @@ def main():
     dsp_skip = _track_mp_ref(Value("L", 0))
     dsp_ms_avg = _track_mp_ref(Value("d", 0.0))
     dsp_ms_p95 = _track_mp_ref(Value("d", 0.0))
+    calibration_frames_done = _track_mp_ref(Value("i", 0))
+    calibration_frames_target = _track_mp_ref(Value("i", 0))
+    calibration_active = _track_mp_ref(Value("b", 0))
     log_bytes = _track_mp_ref(Value("L", 0))
     norm_to_peak = _track_mp_ref(Value("b", 1))
     heatmap_view_mode = _track_mp_ref(Value("i", 0))  # 0=power XY, 1=projected XY moving velocity
@@ -2334,6 +2591,8 @@ def main():
         args=(
             worker_status_q,
             cmd_q,
+            rx_socket_state,
+            rx_socket_status,
             free_slots,
             dsp_ready_queue,
             shm_frames,
@@ -2456,6 +2715,9 @@ def main():
             "display_power_normalized": display_power_normalized,
             "slot_frame_time_s": slot_frame_time_s,
             "ready_evt": dsp_ready_evt,
+            "calibration_frames_done": calibration_frames_done,
+            "calibration_frames_target": calibration_frames_target,
+            "calibration_active": calibration_active,
         },
     )
     _track_process(p_dsp)
@@ -2466,17 +2728,12 @@ def main():
     p_rx.start()
     p_log.start()
     p_dsp.start()
-    if not rx_ready_evt.wait(timeout=5.0):
-        print("[RX WARN] processo RX non pronto entro 5 s.")
-    if not logger_ready_evt.wait(timeout=5.0):
-        print("[LOGGER WARN] processo logger non pronto entro 5 s; catture temporaneamente non affidabili.")
-    if not dsp_ready_evt.wait(timeout=10.0):
-        print("[DSP WARN] processo DSP non pronto entro 10 s.")
 
     worker_processes = {"RX": p_rx, "LOGGER": p_log, "DSP": p_dsp}
 
     def _poll_worker_health() -> None:
-        fatal_messages: list[str] = []
+        nonlocal realtime_frame_valid
+        fatal_by_worker: dict[str, str] = {}
         while True:
             try:
                 event, worker_name, _pid, detail = worker_status_q.get_nowait()
@@ -2489,20 +2746,26 @@ def main():
                     (line.strip() for line in reversed(str(detail).splitlines()) if line.strip()),
                     "unknown worker error",
                 )
-                fatal_messages.append(f"{worker_name}: {last_line}")
+                fatal_by_worker[str(worker_name)] = last_line
         if not stop_evt.is_set():
             for worker_name, proc in worker_processes.items():
                 if not proc.is_alive():
                     key = (worker_name, proc.exitcode)
                     if key not in pipeline_health["reported"]:
                         pipeline_health["reported"].add(key)
-                        fatal_messages.append(f"{worker_name} exited (code {proc.exitcode})")
-        if not fatal_messages or bool(pipeline_health["fatal"]):
+                        fatal_by_worker.setdefault(
+                            str(worker_name),
+                            f"exited unexpectedly (code {proc.exitcode})",
+                        )
+        if not fatal_by_worker or bool(pipeline_health["fatal"]):
             return
 
         pipeline_health["fatal"] = True
-        pipeline_health["message"] = "Realtime pipeline stopped: " + " | ".join(fatal_messages)
+        pipeline_health["message"] = format_realtime_pipeline_error(list(fatal_by_worker.items()))
         print(f"[PIPELINE FATAL] {pipeline_health['message']}")
+        realtime_frame_valid = False
+        with gui_latest_idx.get_lock():
+            gui_latest_idx.value = -1
         stop_evt.set()
         capture_sessions.cancel()
         try:
@@ -2511,7 +2774,10 @@ def main():
         except Exception:
             pass
         try:
-            mmwave_bridge.set_status(error=str(pipeline_health["message"]))
+            _set_gui_text_if_changed(TXT_PIPELINE_STATUS_TAG, pipeline_health["message"])
+            dpg.configure_item(TXT_PIPELINE_STATUS_TAG, color=(255, 130, 110))
+            tex_np.reshape(-1, 4)[:, :] = (0.015, 0.015, 0.018, 1.0)
+            dpg.set_value(TEX_TAG, tex_buf)
         except Exception:
             pass
 
@@ -2527,10 +2793,6 @@ def main():
             name="pipeline-fatal-hardware-stop",
             daemon=True,
         ).start()
-        try:
-            _set_scan_status(str(pipeline_health["message"]))
-        except Exception:
-            pass
         for tag in (BTN_CAPTURE_TAG, BTN_MMWAVE_CONNECT_TAG, BTN_MMWAVE_STREAM_TAG):
             try:
                 if dpg.does_item_exist(tag):
@@ -2774,6 +3036,7 @@ def main():
         "resyncs": "debug_stat_resyncs",
     }
     TXT_TUNING_STATUS_TAG = "txt_tuning_status"
+    TXT_CALIBRATION_STATUS_TAG = "txt_calibration_status"
     IN_VMIN, IN_VMAX = "in_vmin", "in_vmax"
     IN_RMAX, IN_XMAX = "in_rmax", "in_xmax"
     IN_FFT_XMIN, IN_FFT_XMAX = "in_fft_xmin", "in_fft_xmax"
@@ -2800,8 +3063,10 @@ def main():
     BTN_MMWAVE_STREAM_TAG = "btn_mmwave_stream"
     TXT_MMWAVE_STATUS_TAG = "txt_mmwave_status"
     TXT_MMWAVE_LINKS_TAG = "txt_mmwave_links"
+    TXT_PIPELINE_STATUS_TAG = "txt_realtime_pipeline_status"
 
     TEX_TAG = "heat_tex"
+    TEXTURE_REGISTRY_TAG = "texture_registry"
     HEAT_PLOT_TAG = "heat_plot"
     XAXIS_TAG, YAXIS_TAG = "xaxis", "yaxis"
     IMG_SERIES_TAG = "img_series"
@@ -2818,6 +3083,7 @@ def main():
     TRACK_ANN_PREFIX = "track_ann_"
     TRACK_VEL_SCALE = 0.25
     PROC_TEX_TAG = "proc_heat_tex"
+    PROC_PLACEHOLDER_TEX_TAG = "proc_heat_placeholder_tex"
     PROC_HEAT_PLOT_TAG = "proc_heat_plot"
     PROC_XAXIS_TAG, PROC_YAXIS_TAG = "proc_xaxis", "proc_yaxis"
     PROC_IMG_SERIES_TAG = "proc_img_series"
@@ -2839,12 +3105,28 @@ def main():
     PROC_TXT_CURSOR_TAG = "proc_txt_cursor_power"
     PROC_CMAP_NUM_FMT = "%+6.1f"
     TXT_OFFLINE_TUNING_STATUS_TAG = "txt_offline_tuning_status"
+
+    # Several status widgets are refreshed from the main loop.  Avoid sending
+    # the same string to Dear PyGui on every pass: it creates needless GUI work
+    # and makes status/error handling look like a stream of repeated events.
+    gui_text_cache: dict[str, str] = {}
+
+    def _set_gui_text_if_changed(tag: str, value: object) -> bool:
+        text = str(value)
+        if gui_text_cache.get(tag) == text:
+            return False
+        if not dpg.does_item_exist(tag):
+            return False
+        dpg.set_value(tag, text)
+        gui_text_cache[tag] = text
+        return True
     TXT_OFFLINE_TUNING_INFO_TAG = "txt_offline_tuning_info"
     BTN_OFFLINE_INSPECT_RUN = "btn_offline_inspect_run"
     TXT_OFFLINE_RUN_FORMAT = "txt_offline_run_format"
     OFFLINE_TUNING_GRP_LINEAR_SCAN = "offline_tuning_grp_linear_scan"
     OFFLINE_TUNING_GRP_RECONSTRUCTION = "offline_tuning_grp_reconstruction"
     OFFLINE_TUNING_GRP_MAP_BOUNDS = "offline_tuning_grp_map_bounds"
+    OFFLINE_TUNING_TAB_ANGLE = "offline_tuning_tab_angle"
     CMAP_SCALE_TAG = "cmap_scale"
     CMAP_NUM_FMT = "%+6.1f"
     CMAP_VELOCITY_NUM_FMT = "%+5.2f"
@@ -2957,8 +3239,14 @@ def main():
     doppler_diag_tex_buf = array("f", [0.0]) * (doppler_diag_tex_w * doppler_diag_tex_h * 4)
     doppler_diag_tex_np = np.frombuffer(doppler_diag_tex_buf, dtype=np.float32)
     proc_tex_w, proc_tex_h = int(offline_gui_w), int(offline_gui_h)
-    proc_tex_buf = array("f", [0.0]) * (proc_tex_w * proc_tex_h * 4)
-    proc_tex_np = np.frombuffer(proc_tex_buf, dtype=np.float32)
+    proc_tex_buf = None
+    proc_tex_np = None
+    proc_frame = None
+    proc_norm_frame = None
+    proc_lut_idx = None
+    proc_rgba_frame = None
+    proc_view_frame = None
+    offline_display_resources_ready = False
 
     off_pos_min = int(offline_info.get("pos_min", 0)) if offline_info else 0
     off_pos_max = int(offline_info.get("pos_max", 0)) if offline_info else 0
@@ -3112,6 +3400,7 @@ def main():
             "iq_bytes": int(iq_bytes),
             "fft_bytes": int(fft_bytes),
             "retained_range_bins": int(retained_range_bins),
+            "algorithm": str(algorithm),
             "effective_angle_mode": str(angle_mode),
             "max_position_frames": int(max_position_frames),
             "full_loop_range_fft": bool(full_loop_range_fft),
@@ -3122,26 +3411,32 @@ def main():
     def _format_offline_memory_estimate(cfg_source: dict | None = None) -> str:
         try:
             estimate = _estimate_offline_memory(cfg_source)
-            gib = float(1024 ** 3)
             padding_note = (
                 "zero-padding"
                 if int(estimate["nfft_range"]) > int(estimate["samples_input"])
                 else "no range zero-padding"
             )
+            algorithm_summary = format_offline_algorithm_summary(
+                estimate["algorithm"],
+                estimate["effective_angle_mode"],
+            )
+            algorithm_details = f"{algorithm_summary} | batch {estimate['max_position_frames']} frame(s)"
+            if str(estimate["algorithm"]) == "synthetic_range_angle":
+                algorithm_details += (
+                    f" | full-loop Range FFT: {'yes' if estimate['full_loop_range_fft'] else 'no'}"
+                )
             return (
-                f"Memory estimate (payload not loaded): {estimate['files']} files | "
-                f"Range {estimate['samples_input']} -> {estimate['nfft_range']} ({padding_note}), "
-                f"stored bins {estimate['retained_range_bins']}\n"
-                f"Angle memory mode {estimate['effective_angle_mode']} | "
-                f"largest target/reference batch {estimate['max_position_frames']} frames\n"
-                f"Loop-aware full Range FFT: {'yes' if estimate['full_loop_range_fft'] else 'no'}\n"
-                f"Per-position IQ {estimate['iq_bytes'] / gib:.2f} GiB | "
-                f"Range FFT workspace {estimate['fft_bytes'] / gib:.2f} GiB | "
-                f"Doppler-zero shared {estimate['prepared_bytes'] / gib:.2f} GiB | "
-                f"streaming peak about {estimate['peak_bytes'] / gib:.2f} GiB"
+                f"OFFLINE memory estimate (payload not loaded): {estimate['files']} files\n"
+                f"Range FFT {estimate['samples_input']:,} -> {estimate['nfft_range']:,} "
+                f"({padding_note}) | retained bins {estimate['retained_range_bins']:,}\n"
+                f"{algorithm_details}\n"
+                f"RAM: IQ {format_memory_bytes(estimate['iq_bytes'])} | "
+                f"Range FFT {format_memory_bytes(estimate['fft_bytes'])} | "
+                f"Doppler-zero {format_memory_bytes(estimate['prepared_bytes'])} | "
+                f"peak {format_memory_bytes(estimate['peak_bytes'])}"
             )
         except Exception as exc:
-            return f"Memory estimate unavailable: {exc}"
+            return f"OFFLINE MEMORY ESTIMATE\nUnavailable: {exc}"
 
     offline_memory_estimate_text = _format_offline_memory_estimate(offline_boot_cfg)
     offline_frame_valid = False
@@ -3330,14 +3625,13 @@ def main():
         if offline_last_calculation_ms is not None:
             lines.append(f"Last reconstruction: {offline_last_calculation_ms:.1f} ms")
         lines.append(offline_memory_estimate_text)
-        if dpg.does_item_exist(PROC_TXT_MEMORY_ESTIMATE):
-            dpg.set_value(PROC_TXT_MEMORY_ESTIMATE, "\n".join(lines))
+        _set_gui_text_if_changed(PROC_TXT_MEMORY_ESTIMATE, "\n".join(lines))
 
     def _on_main_tab_changed(sender=None, app_data=None):
         nonlocal off_texture_upload_requested
         off_texture_upload_requested = True
 
-    with dpg.texture_registry(show=False):
+    with dpg.texture_registry(show=False, tag=TEXTURE_REGISTRY_TAG):
         dpg.add_dynamic_texture(
             width=tex_w,
             height=tex_h,
@@ -3357,11 +3651,53 @@ def main():
             tag=DOPPLERFFT_TEX_TAG,
         )
         dpg.add_dynamic_texture(
-            width=proc_tex_w,
-            height=proc_tex_h,
-            default_value=[0.0, 0.0, 0.0, 1.0] * proc_tex_w * proc_tex_h,
-            tag=PROC_TEX_TAG,
+            width=1,
+            height=1,
+            default_value=[0.015, 0.015, 0.018, 1.0],
+            tag=PROC_PLACEHOLDER_TEX_TAG,
         )
+
+    def _ensure_offline_display_resources() -> None:
+        """Allocate the large offline CPU/GPU display buffers on first use."""
+        nonlocal proc_tex_buf, proc_tex_np, proc_frame
+        nonlocal proc_norm_frame, proc_lut_idx, proc_rgba_frame, proc_view_frame
+        nonlocal offline_display_resources_ready
+        if offline_display_resources_ready:
+            return
+
+        tex_buf_new = array("f", [0.0]) * (proc_tex_w * proc_tex_h * 4)
+        tex_np_new = np.frombuffer(tex_buf_new, dtype=np.float32)
+        rgba_new = np.empty((proc_tex_h, proc_tex_w, 4), dtype=np.float32)
+        rgba_new[:, :, :] = (0.015, 0.015, 0.018, 1.0)
+        tex_np_new[:] = rgba_new.reshape(-1)
+        frame_new = np.full((proc_tex_h, proc_tex_w), off_vmin, dtype=np.float32)
+        norm_new = np.empty((proc_tex_h, proc_tex_w), dtype=np.float32)
+        lut_idx_new = np.empty((proc_tex_h, proc_tex_w), dtype=np.int32)
+        view_new = np.empty((proc_tex_h, proc_tex_w), dtype=np.float32)
+
+        try:
+            dpg.add_dynamic_texture(
+                width=proc_tex_w,
+                height=proc_tex_h,
+                default_value=tex_buf_new,
+                tag=PROC_TEX_TAG,
+                parent=TEXTURE_REGISTRY_TAG,
+            )
+            if dpg.does_item_exist(PROC_IMG_SERIES_TAG):
+                dpg.configure_item(PROC_IMG_SERIES_TAG, texture_tag=PROC_TEX_TAG)
+        except Exception:
+            if dpg.does_item_exist(PROC_TEX_TAG):
+                dpg.delete_item(PROC_TEX_TAG)
+            raise
+
+        proc_tex_buf = tex_buf_new
+        proc_tex_np = tex_np_new
+        proc_frame = frame_new
+        proc_norm_frame = norm_new
+        proc_lut_idx = lut_idx_new
+        proc_rgba_frame = rgba_new
+        proc_view_frame = view_new
+        offline_display_resources_ready = True
 
     # 5) Callbacks
     dpg.set_exit_callback(_shutdown)
@@ -3581,8 +3917,7 @@ def main():
     }
 
     def _set_scan_status(text: str) -> None:
-        if dpg.does_item_exist(TXT_SCAN_STATUS_TAG):
-            dpg.set_value(TXT_SCAN_STATUS_TAG, str(text))
+        _set_gui_text_if_changed(TXT_SCAN_STATUS_TAG, text)
 
     def _any_scan_active() -> bool:
         return bool(sar_scan is not None and sar_scan.active)
@@ -3597,7 +3932,7 @@ def main():
             label = f"Pitch from offline_config: {float(pitch_mm):.6f} mm"
         else:
             label = f"offline_config error: {error or 'invalid pitch'}"
-        dpg.set_value(TXT_SCAN_PITCH_TAG, label)
+        _set_gui_text_if_changed(TXT_SCAN_PITCH_TAG, label)
 
     def _motor_metadata_for_capture() -> tuple[float | None, int | None]:
         if stepper_controller is None:
@@ -3617,10 +3952,10 @@ def main():
 
     def _on_capture():
         if bool(pipeline_health["fatal"]):
-            _set_scan_status(str(pipeline_health["message"]))
+            manual_capture_state["message"] = str(pipeline_health["message"])
             return
         if _any_scan_active():
-            _set_scan_status("Manual capture is disabled during a SAR scan.")
+            manual_capture_state["message"] = "Manual capture is disabled during a SAR scan."
             return
         try:
             radar_state = mmwave_bridge.get_gui_state()
@@ -3647,10 +3982,8 @@ def main():
             with sar_pos_counter.get_lock():
                 sar_pos_counter.value = int(next_pid)
             dpg.set_value(TXT_POS_TAG, f"Last position: {next_pid} | next ID: {next_pid + 1}")
-            _set_scan_status(f"Manual capture for position {next_pid} is running")
         except Exception as exc:
             manual_capture_state["message"] = f"Capture did not start: {exc}"
-            _set_scan_status(f"Capture did not start: {exc}")
 
     def _poll_manual_capture() -> None:
         ticket = manual_capture_state.get("ticket")
@@ -3668,7 +4001,6 @@ def main():
                         "cancel_requested": False,
                     }
                 )
-                _set_scan_status(str(manual_capture_state["message"]))
                 return
             if (
                 time.monotonic() >= float(manual_capture_state.get("deadline_s", 0.0))
@@ -3677,7 +4009,6 @@ def main():
                 capture_sessions.cancel()
                 manual_capture_state["cancel_requested"] = True
                 manual_capture_state["message"] = "Manual capture timed out; cancellation requested."
-                _set_scan_status(str(manual_capture_state["message"]))
         except CaptureError as exc:
             manual_capture_state.update(
                 {
@@ -3686,7 +4017,6 @@ def main():
                     "cancel_requested": False,
                 }
             )
-            _set_scan_status(str(manual_capture_state["message"]))
 
     def _on_new_sar_session() -> None:
         """Passa a una cartella di acquisizione vuota senza riavviare la GUI."""
@@ -3711,9 +4041,8 @@ def main():
             if dpg.does_item_exist(TXT_RUN_DIR_TAG):
                 dpg.set_value(TXT_RUN_DIR_TAG, f"Current run: {out_dir.name}")
             manual_capture_state["message"] = "Ready for a manual capture in the current run."
-            _set_scan_status(f"New session ready: {out_dir.name}")
         except Exception as exc:
-            _set_scan_status(f"New session was not created: {exc}")
+            manual_capture_state["message"] = f"New session was not created: {exc}"
 
     def _on_motor_connect() -> None:
         if stepper_controller is None:
@@ -3762,7 +4091,6 @@ def main():
             capture_sessions.cancel()
             manual_capture_state["cancel_requested"] = True
             manual_capture_state["message"] = "Capture cancellation requested..."
-            _set_scan_status("Capture cancellation requested...")
             return
         if stepper_controller is not None:
             try:
@@ -3853,6 +4181,14 @@ def main():
 
     motor_log_lines: list[str] = []
 
+    def _append_motor_log(message: object) -> None:
+        text = str(message).strip()
+        if not text or (motor_log_lines and motor_log_lines[-1] == text):
+            return
+        motor_log_lines.append(text)
+        if len(motor_log_lines) > 100:
+            del motor_log_lines[:-100]
+
     def _scan_event_label(event: ScanEvent) -> str:
         """Renderizza l'evento SAR strutturato nella lingua della GUI."""
         labels = {
@@ -3876,7 +4212,7 @@ def main():
             while True:
                 event, value = stepper_controller.gui_queue.get_nowait()
                 if event == "log":
-                    motor_log_lines.append(str(value))
+                    _append_motor_log(value)
                 elif event == "position":
                     try:
                         mm = stepper_controller.config.mechanics.mm_from_microsteps(float(value))
@@ -3887,7 +4223,7 @@ def main():
         except pyqueue.Empty:
             pass
         except Exception as exc:
-            motor_log_lines.append(f"[motor event error] {exc}")
+            _append_motor_log(f"[motor event error] {exc}")
 
         try:
             snapshot = stepper_controller.snapshot()
@@ -3895,13 +4231,14 @@ def main():
             connected = "connected" if bool(snapshot.get("connected")) else "disconnected"
             homed = "HOME complete" if bool(snapshot.get("homed")) else "HOME required"
             limits = f"MIN={'ACTIVE' if snapshot.get('min_active') else 'clear'} MAX={'ACTIVE' if snapshot.get('max_active') else 'clear'}"
-            if dpg.does_item_exist(TXT_MOTOR_STATUS_TAG):
-                dpg.set_value(TXT_MOTOR_STATUS_TAG, f"Carriage: {connected} | {state}\n{homed} | {limits}")
+            _set_gui_text_if_changed(
+                TXT_MOTOR_STATUS_TAG,
+                f"Carriage: {connected} | {state}\n{homed} | {limits}",
+            )
         except Exception:
             pass
 
-        if dpg.does_item_exist(TXT_MOTOR_LOG_TAG):
-            dpg.set_value(TXT_MOTOR_LOG_TAG, "\n".join(motor_log_lines[-4:]))
+        _set_gui_text_if_changed(TXT_MOTOR_LOG_TAG, "\n".join(motor_log_lines[-4:]))
 
     def _refresh_sar_scan_ui() -> ScanState:
         """Aggiorna i controlli dal thread GUI e restituisce lo stato scan."""
@@ -3924,8 +4261,7 @@ def main():
                     detail += f" | {int(status.completed)}/{int(status.total)}"
                 if status.error:
                     detail += f" | ERROR: {status.error}"
-                if dpg.does_item_exist(TXT_SCAN_STATUS_TAG):
-                    dpg.set_value(TXT_SCAN_STATUS_TAG, detail)
+                _set_gui_text_if_changed(TXT_SCAN_STATUS_TAG, detail)
             if state is ScanState.CAPTURING and status.position_id is not None:
                 with sar_pos_counter.get_lock():
                     sar_pos_counter.value = int(status.position_id)
@@ -3933,21 +4269,26 @@ def main():
                     dpg.set_value(TXT_POS_TAG, f"Scan: position ID {int(status.position_id)}")
 
         busy_capture = bool(capture_sessions.inflight)
-        if dpg.does_item_exist(TXT_CAPTURE_STATUS_TAG):
-            if active:
-                capture_detail = "Automatic capture is managed by the active scan."
-            elif busy_capture:
-                capture_detail = (
-                    f"Manual capture in progress | position {int(cap_pos_id.value)} | "
-                    f"{int(cap_saved.value)}/{int(FRAMES_PER_POSITION)} frame"
-                )
-            else:
-                capture_detail = str(manual_capture_state.get("message") or "Ready for a manual capture in the current run.")
-            dpg.set_value(TXT_CAPTURE_STATUS_TAG, capture_detail)
+        if active:
+            capture_detail = "Automatic capture is managed by the active scan."
+        elif busy_capture:
+            capture_detail = (
+                f"Manual capture in progress | position {int(cap_pos_id.value)} | "
+                f"{int(cap_saved.value)}/{int(FRAMES_PER_POSITION)} frame"
+            )
+        else:
+            capture_detail = str(manual_capture_state.get("message") or "Ready for a manual capture in the current run.")
+        _set_gui_text_if_changed(TXT_CAPTURE_STATUS_TAG, capture_detail)
         if dpg.does_item_exist(BTN_CAPTURE_TAG):
             dpg.configure_item(
                 BTN_CAPTURE_TAG,
-                enabled=not bool(pipeline_health["fatal"]) and not active and not busy_capture,
+                enabled=(
+                    not bool(pipeline_health["fatal"])
+                    and _realtime_workers_ready()
+                    and _rx_socket_state_value() == 2
+                    and not active
+                    and not busy_capture
+                ),
             )
         if dpg.does_item_exist(BTN_NEW_SESSION_TAG):
             dpg.configure_item(
@@ -3965,6 +4306,8 @@ def main():
                 enabled=(
                     sar_scan is not None
                     and not bool(pipeline_health["fatal"])
+                    and _realtime_workers_ready()
+                    and _rx_socket_state_value() == 2
                     and not active
                     and not busy_capture
                     and scan_pending_run["start_position_id"] is None
@@ -3989,6 +4332,44 @@ def main():
     MMWAVE_RX_IDLE_DCA_REARM_S = 1.00
     MMWAVE_RX_IDLE_HEAVY_REARM_S = 3.0
     mmwave_control_busy = threading.Event()
+
+    def _realtime_workers_ready() -> bool:
+        return bool(rx_ready_evt.is_set() and logger_ready_evt.is_set() and dsp_ready_evt.is_set())
+
+    def _rx_socket_state_value() -> int:
+        try:
+            with rx_socket_state.get_lock():
+                return int(rx_socket_state.value)
+        except Exception:
+            return 3
+
+    def _queue_rx_socket_command(command: str) -> None:
+        try:
+            cmd_q.put((str(command),), timeout=0.25)
+        except pyqueue.Full as exc:
+            raise MmwaveStudioError("RX command queue is busy") from exc
+
+    def _bind_rx_socket_with_retry(*, timeout_s: float = 5.0, retry_s: float = 0.5) -> None:
+        if not rx_ready_evt.wait(timeout=2.0):
+            raise MmwaveStudioError("RX worker is not ready")
+        deadline = time.perf_counter() + max(0.5, float(timeout_s))
+        next_attempt = 0.0
+        while time.perf_counter() < deadline:
+            if not p_rx.is_alive():
+                raise MmwaveStudioError("RX worker exited before UDP bind")
+            state_now = _rx_socket_state_value()
+            if state_now == 2:
+                return
+            now_bind = time.perf_counter()
+            if now_bind >= next_attempt:
+                _queue_rx_socket_command("RX_BIND")
+                next_attempt = now_bind + max(0.1, float(retry_s))
+            time.sleep(0.05)
+        detail = _read_shared_text(rx_socket_status).strip() or "unknown bind error"
+        raise MmwaveStudioError(f"UDP receiver not ready after {timeout_s:.1f} s: {detail}")
+
+    def _unbind_rx_socket() -> None:
+        _queue_rx_socket_command("RX_UNBIND")
 
     def _start_mmwave_control(operation_name: str, operation) -> bool:
         """Serializza le chiamate lente a RSTD/DCA fuori dal thread GUI."""
@@ -4030,11 +4411,17 @@ def main():
 
     def _refresh_mmwave_controls() -> None:
         state = mmwave_bridge.get_gui_state()
+        workers_ready = _realtime_workers_ready()
+        rx_state_now = _rx_socket_state_value()
         if dpg.does_item_exist(BTN_MMWAVE_CONNECT_TAG):
             dpg.configure_item(
                 BTN_MMWAVE_CONNECT_TAG,
                 label=_mmwave_connect_label(state.connected),
-                enabled=not bool(pipeline_health["fatal"]) and not mmwave_control_busy.is_set(),
+                enabled=(
+                    not bool(pipeline_health["fatal"])
+                    and not mmwave_control_busy.is_set()
+                    and bool(rx_ready_evt.is_set())
+                ),
             )
         if dpg.does_item_exist(BTN_MMWAVE_STREAM_TAG):
             dpg.configure_item(BTN_MMWAVE_STREAM_TAG, label=_mmwave_stream_label(state.streaming))
@@ -4050,35 +4437,43 @@ def main():
                     not bool(pipeline_health["fatal"])
                     and not mmwave_control_busy.is_set()
                     and bool(state.connected)
-                    and (state.streaming or connect_wait_remaining <= 0.0)
+                    and workers_ready
+                    and (
+                        state.streaming
+                        or (rx_state_now == 2 and connect_wait_remaining <= 0.0)
+                    )
                 ),
             )
-        if dpg.does_item_exist(TXT_MMWAVE_STATUS_TAG):
-            status_text = state.last_error if state.last_error else state.last_message
-            if not status_text:
-                status_text = "mmWave Studio bridge idle"
-            if state.connected and not state.streaming and mmwave_connected_since_perf is not None:
-                remaining = max(
-                    0.0,
-                    MMWAVE_CONNECT_SETTLE_S - (time.perf_counter() - mmwave_connected_since_perf),
-                )
-                if remaining > 0.0:
-                    status_text = f"Radar connected: wait {remaining:.1f} s before START"
-            dpg.set_value(TXT_MMWAVE_STATUS_TAG, status_text)
-        if dpg.does_item_exist(TXT_MMWAVE_LINKS_TAG):
-            udp_idle_s = max(0.0, _sync_mmwave_udp_activity())
-            udp_receiving = bool(state.streaming and udp_idle_s <= MMWAVE_RX_IDLE_DCA_REARM_S)
-            link_lines = [
-                "LINK STATUS",
-                f"{'RSTD':<18}{'ON' if state.rstd_connected else 'OFF'}",
-                f"{'Radar link':<18}{'ON' if state.radar_connected else 'OFF'}",
-                f"{'DCA ready':<18}{'ON' if state.dca_ready else 'OFF'}",
-                f"{'Streaming req':<18}{'ON' if state.streaming else 'OFF'}",
-                f"{'UDP receiving':<18}{'ON' if udp_receiving else 'OFF'}",
-                f"{'UDP idle s':<18}{udp_idle_s:>6.1f}",
-                f"{'Last rearm s':<18}{float(state.last_rearm_s):>6.1f}",
-            ]
-            dpg.set_value(TXT_MMWAVE_LINKS_TAG, "\n".join(link_lines))
+        status_text = state.last_error if state.last_error else state.last_message
+        if not status_text:
+            status_text = "mmWave Studio bridge idle"
+        if state.connected and not state.streaming and mmwave_connected_since_perf is not None:
+            remaining = max(
+                0.0,
+                MMWAVE_CONNECT_SETTLE_S - (time.perf_counter() - mmwave_connected_since_perf),
+            )
+            if remaining > 0.0:
+                status_text = f"Radar connected: wait {remaining:.1f} s before START"
+        _set_gui_text_if_changed(TXT_MMWAVE_STATUS_TAG, status_text)
+
+        udp_idle_s = max(0.0, _sync_mmwave_udp_activity())
+        udp_receiving = bool(state.streaming and udp_idle_s <= MMWAVE_RX_IDLE_DCA_REARM_S)
+        link_lines = [
+            "LINK STATUS",
+            f"{'Workers ready':<18}{'ON' if workers_ready else 'WAIT'}",
+            f"{'RSTD':<18}{'ON' if state.rstd_connected else 'OFF'}",
+            f"{'Radar link':<18}{'ON' if state.radar_connected else 'OFF'}",
+            f"{'DCA ready':<18}{'ON' if state.dca_ready else 'OFF'}",
+            f"{'UDP socket':<18}{('BOUND' if rx_state_now == 2 else 'ERROR' if rx_state_now == 3 else 'WAIT')}",
+            f"{'Streaming req':<18}{'ON' if state.streaming else 'OFF'}",
+            f"{'UDP receiving':<18}{'ON' if udp_receiving else 'OFF'}",
+            f"{'UDP idle s':<18}{udp_idle_s:>6.1f}",
+            f"{'Last rearm s':<18}{float(state.last_rearm_s):>6.1f}",
+        ]
+        rx_socket_detail = _read_shared_text(rx_socket_status).strip()
+        if rx_socket_detail:
+            link_lines.append(rx_socket_detail)
+        _set_gui_text_if_changed(TXT_MMWAVE_LINKS_TAG, "\n".join(link_lines))
 
     def _maybe_rearm_mmwave_stream(now_perf: float) -> None:
         nonlocal mmwave_last_rx_pkt_t, mmwave_outage_dca_done, mmwave_outage_heavy_done, mmwave_auto_rearm_armed
@@ -4124,15 +4519,28 @@ def main():
         nonlocal mmwave_auto_rearm_armed, mmwave_connected_since_perf
         if bool(pipeline_health["fatal"]) or mmwave_control_busy.is_set():
             return
-        if dpg.does_item_exist(TXT_MMWAVE_STATUS_TAG):
-            dpg.set_value(TXT_MMWAVE_STATUS_TAG, "mmWave connect/disconnect in progress...")
+        _set_gui_text_if_changed(TXT_MMWAVE_STATUS_TAG, "mmWave connect/disconnect in progress...")
         print("[gui] mmWave connect button pressed", flush=True)
 
         def _toggle_connection() -> None:
             nonlocal mmwave_last_rx_pkt_t, mmwave_outage_dca_done, mmwave_outage_heavy_done
             nonlocal mmwave_auto_rearm_armed, mmwave_connected_since_perf
             was_connected = bool(mmwave_bridge.get_gui_state().connected)
-            new_state = mmwave_bridge.toggle_connection(radar=mmwave_radar_cfg, dca=mmwave_dca_cfg)
+            if was_connected:
+                try:
+                    new_state = mmwave_bridge.disconnect_hardware(stop_delay_s=0.25)
+                finally:
+                    _unbind_rx_socket()
+            else:
+                new_state = mmwave_bridge.connect_hardware(radar=mmwave_radar_cfg, dca=mmwave_dca_cfg)
+                try:
+                    _bind_rx_socket_with_retry(timeout_s=5.0, retry_s=0.5)
+                except Exception:
+                    try:
+                        mmwave_bridge.disconnect_hardware(stop_delay_s=0.25)
+                    finally:
+                        _unbind_rx_socket()
+                    raise
             mmwave_last_rx_pkt_t = time.time()
             mmwave_outage_dca_done = False
             mmwave_outage_heavy_done = False
@@ -4148,8 +4556,7 @@ def main():
         nonlocal mmwave_last_rx_pkt_t, mmwave_outage_dca_done, mmwave_outage_heavy_done, mmwave_auto_rearm_armed
         if bool(pipeline_health["fatal"]) or mmwave_control_busy.is_set():
             return
-        if dpg.does_item_exist(TXT_MMWAVE_STATUS_TAG):
-            dpg.set_value(TXT_MMWAVE_STATUS_TAG, "Radar start/stop in progress...")
+        _set_gui_text_if_changed(TXT_MMWAVE_STATUS_TAG, "Radar start/stop in progress...")
         print("[gui] Radar start/stop button pressed", flush=True)
         state_before = mmwave_bridge.get_gui_state()
         if state_before.connected and not state_before.streaming and mmwave_connected_since_perf is not None:
@@ -4708,8 +5115,7 @@ def main():
         dpg.set_value(tag, min(current, available_i))
 
     def _set_offline_tuning_status(message: str) -> None:
-        if dpg.does_item_exist(TXT_OFFLINE_TUNING_STATUS_TAG):
-            dpg.set_value(TXT_OFFLINE_TUNING_STATUS_TAG, str(message))
+        _set_gui_text_if_changed(TXT_OFFLINE_TUNING_STATUS_TAG, message)
 
     def _offline_tuning_snapshot() -> dict:
         base = yaml.safe_load(yaml.safe_dump(offline_tuning_cfg, sort_keys=False)) or {}
@@ -4726,7 +5132,7 @@ def main():
             _offline_cfg_path_set(base, spec["path"], value)
         return base
 
-    def _apply_offline_geometry_controls() -> None:
+    def _apply_offline_geometry_controls(sender=None, app_data=None) -> None:
         """Apply the fixed controls used by linear V1 captures."""
         for tag in (
             OFFLINE_TUNING_GRP_LINEAR_SCAN,
@@ -4750,6 +5156,25 @@ def main():
                 dpg.configure_item(tag, label=label)
         if dpg.does_item_exist(TXT_OFFLINE_RUN_FORMAT):
             dpg.set_value(TXT_OFFLINE_RUN_FORMAT, "Format: rt_capture_v1 / linear")
+
+        algorithm_tag = _offline_tune_tag("reconstruction.algorithm")
+        algorithm = str(
+            dpg.get_value(algorithm_tag)
+            if dpg.does_item_exist(algorithm_tag)
+            else _offline_cfg_path_get(offline_tuning_cfg, "reconstruction.algorithm", "backprojection")
+        ).strip().lower()
+        uses_explicit_angle_stage = algorithm == "synthetic_range_angle"
+        angle_fft_tag = _offline_tune_tag("offline_sar_range_angle.nfft_angle")
+        if dpg.does_item_exist(angle_fft_tag):
+            dpg.configure_item(angle_fft_tag, show=uses_explicit_angle_stage)
+        if dpg.does_item_exist(OFFLINE_TUNING_TAB_ANGLE):
+            dpg.configure_item(OFFLINE_TUNING_TAB_ANGLE, show=uses_explicit_angle_stage)
+        aperture_window_tag = _offline_tune_tag("offline_sar_range_angle.window_angle")
+        if dpg.does_item_exist(aperture_window_tag):
+            dpg.configure_item(
+                aperture_window_tag,
+                label=("Angle window" if uses_explicit_angle_stage else "SAR aperture window"),
+            )
 
     def _inspect_offline_run(sender=None, app_data=None) -> bool:
         """Inspect the configured linear V1 run without loading its payload."""
@@ -4959,6 +5384,12 @@ def main():
             return False
         if save_config and _save_offline_tuning_config(allow_scan_finalize=allow_scan_finalize) is None:
             return False
+        try:
+            _ensure_offline_display_resources()
+        except Exception as exc:
+            _set_offline_tuning_status(f"Offline display allocation error: {exc}")
+            _render_offline_summary(state=f"Offline display allocation error: {exc}")
+            return False
 
         old_runtime = offline_runtime
         offline_runtime = None
@@ -5045,7 +5476,15 @@ def main():
             default_s = str(default)
             if default_s not in items:
                 default_s = str(spec.get("default", items[0]))
-            dpg.add_combo(items, label=spec["label"], tag=tag, default_value=default_s, width=width)
+            callback = _apply_offline_geometry_controls if spec["path"] == "reconstruction.algorithm" else None
+            dpg.add_combo(
+                items,
+                label=spec["label"],
+                tag=tag,
+                default_value=default_s,
+                width=width,
+                callback=callback,
+            )
         elif kind == "int":
             dpg.add_input_int(label=spec["label"], tag=tag, default_value=int(default), step=int(spec.get("step", 1)), width=width, min_value=int(spec.get("min", 0)), min_clamped=("min" in spec))
         else:
@@ -5386,7 +5825,18 @@ def main():
                             width=-1,
                             height=36,
                         )
-                        dpg.add_text("mmWave Studio bridge idle", tag=TXT_MMWAVE_STATUS_TAG, wrap=-1)
+                        dpg.add_text("REALTIME STATUS", color=(255, 200, 0))
+                        dpg.add_text(
+                            "Realtime pipeline: running",
+                            tag=TXT_PIPELINE_STATUS_TAG,
+                            wrap=CTRL_W,
+                            color=(150, 220, 170),
+                        )
+                        dpg.add_text(
+                            "mmWave Studio bridge idle",
+                            tag=TXT_MMWAVE_STATUS_TAG,
+                            wrap=CTRL_W,
+                        )
                         dpg.add_text("", tag=TXT_MMWAVE_LINKS_TAG, wrap=-1)
                         dpg.add_spacer(height=14)
                         dpg.add_text("SAR ACQUISITION", color=(255, 200, 0))
@@ -5479,7 +5929,16 @@ def main():
                             dpg.add_text(
                                 (
                                     f"Grid RT/OFF: {gui_w}x{gui_h} / {offline_gui_w}x{offline_gui_h}\n"
-                                    f"FFT range/angle: {NFFT_RANGE} / {NFFT_ANGLE}"
+                                    f"FFT range/angle: {NFFT_RANGE} / {NFFT_ANGLE}\n"
+                                    f"FMCW range: display {REALTIME_PHYSICAL_SUMMARY['display_range_max_m']:.2f} m | "
+                                    f"DSP {REALTIME_PHYSICAL_SUMMARY['processing_range_max_m']:.2f} m | "
+                                    f"physical {REALTIME_PHYSICAL_SUMMARY['physical_range_max_m']:.2f} m\n"
+                                    f"Range resolution/bin: {REALTIME_PHYSICAL_SUMMARY['range_resolution_m']:.3f} / "
+                                    f"{REALTIME_PHYSICAL_SUMMARY['range_bin_m']:.3f} m\n"
+                                    f"Doppler: +/-{REALTIME_PHYSICAL_SUMMARY['doppler_velocity_max_mps']:.2f} m/s | "
+                                    f"bin {REALTIME_PHYSICAL_SUMMARY['doppler_bin_mps']:.3f} m/s\n"
+                                    f"Acquisition/frame: {REALTIME_PHYSICAL_SUMMARY['acquisition_span_ms']:.2f} / "
+                                    f"{REALTIME_PHYSICAL_SUMMARY['nominal_frame_ms']:.2f} ms"
                                 ),
                                 tag=TXT_PIPELINE_CONFIG_TAG,
                                 wrap=-1,
@@ -6030,7 +6489,7 @@ def main():
                         dpg.add_plot_axis(dpg.mvXAxis, label="X (m)", tag=PROC_XAXIS_TAG)
                         dpg.add_plot_axis(dpg.mvYAxis, label="Y (m)", tag=PROC_YAXIS_TAG)
                         dpg.add_image_series(
-                            PROC_TEX_TAG,
+                            PROC_PLACEHOLDER_TEX_TAG,
                             bounds_min=(float(off_applied_meta_current.x_min_m), float(off_applied_meta_current.y_min_m)),
                             bounds_max=(float(off_applied_meta_current.x_max_m), float(off_applied_meta_current.y_max_m)),
                             tag=PROC_IMG_SERIES_TAG,
@@ -6069,6 +6528,12 @@ def main():
             dpg.add_text("RUNTIME TUNING", color=(255, 200, 0))
             dpg.add_separator()
             dpg.add_text("Ready", tag=TXT_TUNING_STATUS_TAG, wrap=-1)
+            dpg.add_text(
+                "Empty-room calibration: waiting for radar data",
+                tag=TXT_CALIBRATION_STATUS_TAG,
+                wrap=-1,
+                color=(255, 210, 90),
+            )
             dpg.add_spacer(height=6)
             with dpg.tab_bar(tag="tuning_subtabbar"):
                 with dpg.tab(label="DSP"):
@@ -6149,7 +6614,7 @@ def main():
                             wrap=-1,
                         )
                         _add_offline_tuning_section("Offline reference background")
-                with dpg.tab(label="Angle"):
+                with dpg.tab(label="Angle", tag=OFFLINE_TUNING_TAB_ANGLE):
                     with dpg.child_window(width=-1, height=-1, border=False):
                         _add_offline_tuning_section("Angle estimation")
 
@@ -6223,7 +6688,6 @@ def main():
     gui_tracks_state_view = np.frombuffer(gui_tracks_state_dbuf, dtype=np.int32, count=track_max_shared * 2)
     gui_tracks_stop_xy_view = np.frombuffer(gui_tracks_stop_xy_dbuf, dtype=np.float32, count=track_max_shared * 2)
     tracks_out: list[dict[str, float | int | bool]] = []
-    proc_frame = np.full((proc_tex_h, proc_tex_w), off_vmin, dtype=np.float32)
     x_range_cache = {}
     jet_lut = _build_jet_lut(2048)
     velocity_lut = _build_velocity_lut(2048, velocity_dead_zone_runtime)
@@ -6238,16 +6702,14 @@ def main():
     doppler_diag_norm_frame = np.empty((fft_plot_h, DOPPLERFFT_BINS), dtype=np.float32)
     doppler_diag_lut_idx = np.empty((fft_plot_h, DOPPLERFFT_BINS), dtype=np.int32)
     doppler_diag_rgba_frame = np.empty((fft_plot_h, DOPPLERFFT_BINS, 4), dtype=np.float32)
-    proc_norm_frame = np.empty((proc_tex_h, proc_tex_w), dtype=np.float32)
-    proc_lut_idx = np.empty((proc_tex_h, proc_tex_w), dtype=np.int32)
-    proc_rgba_frame = np.empty((proc_tex_h, proc_tex_w, 4), dtype=np.float32)
-    proc_view_frame = np.empty((proc_tex_h, proc_tex_w), dtype=np.float32)
     off_power_normalization_reference_db = float("nan")
     lut_last = float(jet_lut.shape[0] - 1)
 
     def _refresh_offline_texture_from_cached_matrix() -> None:
         """Reapply normalization/levels/LUT without invoking offline DSP."""
         nonlocal off_power_normalization_reference_db
+        if not offline_display_resources_ready:
+            return
         if not offline_frame_valid:
             off_power_normalization_reference_db = float("nan")
             proc_lut_idx.fill(0)
@@ -6377,7 +6839,7 @@ def main():
 
     def _refresh_offline_cursor_readout() -> None:
         cursor_xy = _hovered_plot_xy(PROC_HEAT_PLOT_TAG)
-        if cursor_xy is None or not offline_frame_valid:
+        if cursor_xy is None or not offline_frame_valid or proc_frame is None:
             _hide_cursor_readout(PROC_TXT_CURSOR_TAG, PROC_CURSOR_ANNOTATION_TAG)
             return
         x_m, y_m = cursor_xy
@@ -6431,6 +6893,26 @@ def main():
                 housekeeping_last_t = now
                 _poll_worker_health()
                 _refresh_mmwave_controls()
+                if dpg.does_item_exist(TXT_CALIBRATION_STATUS_TAG):
+                    try:
+                        with calibration_frames_done.get_lock():
+                            cal_done = int(calibration_frames_done.value)
+                        with calibration_frames_target.get_lock():
+                            cal_target = int(calibration_frames_target.value)
+                        with calibration_active.get_lock():
+                            cal_active = bool(calibration_active.value)
+                        if cal_target <= 0:
+                            cal_text = "Empty-room calibration: disabled"
+                        elif cal_active:
+                            cal_text = (
+                                f"Empty-room calibration: {cal_done}/{cal_target} frames — "
+                                "keep the room empty"
+                            )
+                        else:
+                            cal_text = f"Empty-room calibration: ready ({cal_target} frames)"
+                        _set_gui_text_if_changed(TXT_CALIBRATION_STATUS_TAG, cal_text)
+                    except Exception:
+                        pass
             refresh_offline_display = bool(off_texture_upload_requested)
             off_texture_upload_requested = False
             # The DSP result is copied before the texture upload.  Defer its
@@ -6596,8 +7078,17 @@ def main():
                     range_input = info_now.get("range_input_samples", "n/a")
                     range_used = info_now.get("range_samples_used", "n/a")
                     range_nfft = info_now.get("nfft_range", "n/a")
-                    if str(info_now.get("algorithm", "")) == "backprojection":
-                        angle_fft_text = "Angle FFT: n/a for backprojection"
+                    algorithm_now = str(info_now.get("algorithm", "backprojection"))
+                    angle_mode_now = info_now.get(
+                        "angle_mode",
+                        info_now.get("range_angle_angle_mode_requested", "n/a"),
+                    )
+                    algorithm_text = format_offline_algorithm_summary(
+                        algorithm_now,
+                        angle_mode_now,
+                    )
+                    if algorithm_now == "backprojection":
+                        angle_fft_text = "Angle processing: included in backprojection"
                     else:
                         angle_fft_text = (
                             f"Angle: input {info_now.get('angle_input_elements', 'n/a')} -> "
@@ -6616,9 +7107,7 @@ def main():
                     warning_text = f"\nWARNING: {runtime_warning}" if runtime_warning else ""
                     dpg.set_value(
                         TXT_OFFLINE_TUNING_INFO_TAG,
-                        f"Algorithm: {info_now.get('algorithm', 'n/a')} | "
-                        f"Angle: {info_now.get('angle_mode', info_now.get('range_angle_angle_mode_requested', 'n/a'))} | "
-                        f"Filters: {filters_text} | {background_text}\n"
+                        f"{algorithm_text} | Filters: {filters_text} | {background_text}\n"
                         f"Range: input {range_input} -> used {range_used} -> FFT {range_nfft} | {angle_fft_text}"
                         f"{warning_text}",
                     )
@@ -6831,6 +7320,8 @@ def main():
                 off_frame = offline_runtime.poll_frame(copy_frame=False)
                 if off_frame is not None:
                     frame_db, info = off_frame
+                    if not offline_display_resources_ready or proc_frame is None:
+                        raise RuntimeError("offline display resources are not initialized")
                     proc_frame[:, :] = frame_db
                     offline_frame_valid = True
                     refresh_offline_display = True
