@@ -8,6 +8,8 @@ GUI principale.
 from __future__ import annotations
 
 import argparse
+import socket
+import struct
 import sys
 import threading
 import time
@@ -19,10 +21,126 @@ DEFAULT_STUDIO_ROOT = Path(r"C:\ti\mmwave_studio_02_01_01_00\mmWaveStudio")
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 2777
 SUCCESS_CODES = {0, 30000}
+DCA1000_HEADER = 0xA55A
+DCA1000_FOOTER = 0xEEAA
+DCA1000_CMD_START_RECORD = 0x05
+DCA1000_CMD_STOP_RECORD = 0x06
+DCA1000_CMD_SYSTEM_ALIVENESS = 0x09
 
 
 class MmwaveStudioError(RuntimeError):
     """Raised when the bridge cannot talk to mmWave Studio."""
+
+
+def build_dca1000_command(command: int) -> bytes:
+    """Build the fixed eight-byte DCA1000 UDP command packet."""
+    return struct.pack(
+        "<HHHH",
+        DCA1000_HEADER,
+        int(command) & 0xFFFF,
+        0,
+        DCA1000_FOOTER,
+    )
+
+
+def parse_dca1000_response(packet: bytes) -> tuple[int, int]:
+    """Return ``(command, status)`` after validating a DCA1000 response."""
+    if len(packet) < 8:
+        raise MmwaveStudioError(f"DCA1000 response is too short: {len(packet)} byte(s)")
+    header, command, status, footer = struct.unpack_from("<HHHH", packet)
+    if header != DCA1000_HEADER or footer != DCA1000_FOOTER:
+        raise MmwaveStudioError(
+            f"Invalid DCA1000 response framing: header=0x{header:04X}, footer=0x{footer:04X}"
+        )
+    return int(command), int(status)
+
+
+class DCA1000UdpRecordControl:
+    """Own the DCA config port and control recording without TI's file recorder."""
+
+    def __init__(
+        self,
+        *,
+        pc_ip: str,
+        capture_card_ip: str,
+        config_port: int,
+        timeout_s: float = 3.0,
+    ) -> None:
+        self.pc_ip = str(pc_ip)
+        self.capture_card_ip = str(capture_card_ip)
+        self.config_port = int(config_port)
+        self.timeout_s = max(0.1, float(timeout_s))
+        self._socket: socket.socket | None = None
+        self._lock = threading.RLock()
+
+    @property
+    def is_open(self) -> bool:
+        return self._socket is not None
+
+    def open(self) -> None:
+        with self._lock:
+            if self._socket is not None:
+                return
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sock.bind((self.pc_ip, self.config_port))
+                sock.settimeout(self.timeout_s)
+                self._socket = sock
+                self.send_command(DCA1000_CMD_SYSTEM_ALIVENESS)
+            except Exception:
+                self._socket = None
+                sock.close()
+                raise
+
+    def close(self) -> None:
+        with self._lock:
+            sock = self._socket
+            self._socket = None
+            if sock is not None:
+                sock.close()
+
+    def send_command(self, command: int) -> int:
+        with self._lock:
+            sock = self._socket
+            if sock is None:
+                raise MmwaveStudioError("DCA1000 direct control socket is not open")
+            expected_command = int(command) & 0xFFFF
+            deadline = time.monotonic() + self.timeout_s
+            sock.sendto(
+                build_dca1000_command(expected_command),
+                (self.capture_card_ip, self.config_port),
+            )
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise MmwaveStudioError(
+                        f"DCA1000 command 0x{expected_command:02X} timed out"
+                    )
+                sock.settimeout(remaining)
+                try:
+                    response, sender = sock.recvfrom(2048)
+                except socket.timeout as exc:
+                    raise MmwaveStudioError(
+                        f"DCA1000 command 0x{expected_command:02X} timed out"
+                    ) from exc
+                if str(sender[0]) != self.capture_card_ip:
+                    continue
+                response_command, status = parse_dca1000_response(response)
+                # The config port can also carry asynchronous FPGA status
+                # packets. Ignore those until the response to our command.
+                if response_command != expected_command:
+                    continue
+                if status != 0:
+                    raise MmwaveStudioError(
+                        f"DCA1000 command 0x{expected_command:02X} failed with status 0x{status:04X}"
+                    )
+                return status
+
+    def start_record(self) -> int:
+        return self.send_command(DCA1000_CMD_START_RECORD)
+
+    def stop_record(self) -> int:
+        return self.send_command(DCA1000_CMD_STOP_RECORD)
 
 
 def list_available_com_ports() -> list[str]:
@@ -128,6 +246,8 @@ class DCA1000Config:
     mode_lvds_mode: int = 2
     mode_data_transfer: int = 3
     mode_data_capture: int = 30
+    direct_record_control: bool = True
+    control_timeout_s: float = 3.0
     adc_data_path: Path = DEFAULT_STUDIO_ROOT / "PostProc" / "adc_data.bin"
 
 
@@ -176,6 +296,8 @@ class MmwaveStudioBridge:
         self._lock = threading.RLock()
         self._last_error = ""
         self._last_message = "Idle"
+        self._dca_config: DCA1000Config | None = None
+        self._dca_record_control: DCA1000UdpRecordControl | None = None
 
     @property
     def netclient_dll(self) -> Path:
@@ -203,6 +325,7 @@ class MmwaveStudioBridge:
 
     def disconnect(self) -> None:
         with self._lock:
+            self._close_dca_record_control()
             if self._api is None or not self._connected:
                 return
             try:
@@ -214,6 +337,27 @@ class MmwaveStudioBridge:
                 self._radar_connected = False
                 self._dca_ready = False
                 self._last_message = "Disconnected from RSTD"
+
+    def _open_dca_record_control(self, config: DCA1000Config) -> None:
+        self._close_dca_record_control()
+        self._dca_config = config
+        if not bool(config.direct_record_control):
+            return
+        control = DCA1000UdpRecordControl(
+            pc_ip=config.pc_ip,
+            capture_card_ip=config.capture_card_ip,
+            config_port=config.config_port,
+            timeout_s=config.control_timeout_s,
+        )
+        control.open()
+        self._dca_record_control = control
+
+    def _close_dca_record_control(self) -> None:
+        control = self._dca_record_control
+        self._dca_record_control = None
+        self._dca_config = None
+        if control is not None:
+            control.close()
 
     def __enter__(self) -> "MmwaveStudioBridge":
         self.connect()
@@ -337,6 +481,7 @@ class MmwaveStudioBridge:
                 )
                 self._radar_connected = True
                 self.setup_dca1000(dca_cfg)
+                self._open_dca_record_control(dca_cfg)
                 self._hw_connected = True
                 self._streaming = False
                 self._last_error = ""
@@ -359,6 +504,7 @@ class MmwaveStudioBridge:
                 self._hw_connected = False
                 self._radar_connected = False
                 self._dca_ready = False
+                self._close_dca_record_control()
                 try:
                     self.disconnect()
                 except Exception:
@@ -414,9 +560,21 @@ class MmwaveStudioBridge:
         return self.connect_hardware(radar=radar, dca=dca)
 
     def start_record(self, adc_data_path: str | Path, capture_mode: int = 1) -> int:
+        if self._dca_record_control is not None:
+            status = self._dca_record_control.start_record()
+            self._last_message = "DCA1000 recording armed directly for Python RX"
+            print("[mmwave] DCA1000 direct START_RECORD -> status 0", flush=True)
+            return status
         adc_path = _lua_path(adc_data_path)
         lua = f'ar1.CaptureCardConfig_StartRecord("{adc_path}", {int(capture_mode)})'
         return self.send_lua(lua, label="CaptureCardConfig_StartRecord")
+
+    def stop_record(self) -> int:
+        if self._dca_record_control is None:
+            return 0
+        status = self._dca_record_control.stop_record()
+        print("[mmwave] DCA1000 direct STOP_RECORD -> status 0", flush=True)
+        return status
 
     def start_frame(self) -> int:
         return self.send_lua("ar1.StartFrame()", label="StartFrame")
@@ -454,7 +612,10 @@ class MmwaveStudioBridge:
             self.start_frame()
             self._streaming = True
             self._last_error = ""
-            self._last_message = f"Streaming started -> {Path(adc_data_path)}"
+            if self._dca_record_control is not None:
+                self._last_message = "Streaming started -> Python UDP receiver"
+            else:
+                self._last_message = f"Streaming started -> {Path(adc_data_path)}"
             print(f"[mmwave] {self._last_message}", flush=True)
             return self.get_gui_state()
 
@@ -465,9 +626,19 @@ class MmwaveStudioBridge:
                 return self.get_gui_state()
             # StopFrame precede l'attesa: il ritardo consente alla catena DCA1000 di
             # completare i pacchetti gia' in transito prima di dichiarare fermo lo stream.
-            self.stop_frame()
-            if stop_delay_s > 0:
-                time.sleep(float(stop_delay_s))
+            stop_frame_error: Exception | None = None
+            try:
+                self.stop_frame()
+            except Exception as exc:
+                stop_frame_error = exc
+            finally:
+                if stop_delay_s > 0:
+                    time.sleep(float(stop_delay_s))
+                # Do not leave the DCA armed if StopFrame fails: the direct
+                # control socket is independent from RSTD and can still stop it.
+                self.stop_record()
+            if stop_frame_error is not None:
+                raise stop_frame_error
             self._streaming = False
             self._last_error = ""
             self._last_message = "Streaming stopped"
@@ -495,6 +666,11 @@ class MmwaveStudioBridge:
                     time.sleep(float(stop_delay_s))
             except Exception:
                 pass
+            if self._dca_record_control is not None:
+                try:
+                    self.stop_record()
+                except Exception:
+                    pass
             self.start_record(adc_data_path, capture_mode=capture_mode)
             if arm_delay_s > 0:
                 time.sleep(float(arm_delay_s))
@@ -502,7 +678,10 @@ class MmwaveStudioBridge:
             self._streaming = True
             self._last_rearm_s = float(time.perf_counter())
             self._last_error = ""
-            self._last_message = f"Streaming re-armed -> {Path(adc_data_path)}"
+            if self._dca_record_control is not None:
+                self._last_message = "Streaming re-armed -> Python UDP receiver"
+            else:
+                self._last_message = f"Streaming re-armed -> {Path(adc_data_path)}"
             print(f"[mmwave] {self._last_message}", flush=True)
             return self.get_gui_state()
 
@@ -516,13 +695,21 @@ class MmwaveStudioBridge:
         with self._lock:
             if not self._hw_connected:
                 raise MmwaveStudioError("Cannot re-arm DCA1000: hardware is not connected.")
+            if self._dca_record_control is not None:
+                try:
+                    self.stop_record()
+                except Exception:
+                    pass
             self.start_record(adc_data_path, capture_mode=capture_mode)
             if arm_delay_s > 0:
                 time.sleep(float(arm_delay_s))
             self._streaming = True
             self._last_rearm_s = float(time.perf_counter())
             self._last_error = ""
-            self._last_message = f"DCA1000 re-armed -> {Path(adc_data_path)}"
+            if self._dca_record_control is not None:
+                self._last_message = "DCA1000 re-armed directly for Python UDP receiver"
+            else:
+                self._last_message = f"DCA1000 re-armed -> {Path(adc_data_path)}"
             print(f"[mmwave] {self._last_message}", flush=True)
             return self.get_gui_state()
 
@@ -570,6 +757,7 @@ class MmwaveStudioBridge:
         stop_frame_status = self.stop_frame()
         if stop_delay_s > 0:
             time.sleep(float(stop_delay_s))
+        self.stop_record()
 
         return SequenceResult(
             adc_data_path=adc_path,

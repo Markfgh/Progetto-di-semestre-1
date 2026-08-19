@@ -130,6 +130,8 @@ def _run_display_process(
     display_viewport: realtime_dsp.DisplayViewport | None = None,
     display_zoom_cfg: realtime_dsp.DisplayZoomConfig | None = None,
     display_zoom_runtime: realtime_dsp.DisplayZoomRuntime | None = None,
+    heatmap_ema_cfg: realtime_dsp.HeatmapEMAConfig | None = None,
+    heatmap_ema_in: np.ndarray | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray, np.ndarray, np.ndarray]:
     samples = 32
     loops = 8
@@ -197,7 +199,7 @@ def _run_display_process(
         False,
         False,
         angle_processing or realtime_dsp.AngleProcessingConfig(mode="mvdr"),
-        realtime_dsp.HeatmapEMAConfig(enabled=False),
+        heatmap_ema_cfg or realtime_dsp.HeatmapEMAConfig(enabled=False),
         realtime_dsp.HeatmapSpatialFilterConfig(enabled=False),
         display_projection_cfg or realtime_dsp.DisplayProjectionConfig(projection_mode="cartesian", projection_interp="nearest"),
         geometry,
@@ -214,7 +216,7 @@ def _run_display_process(
         realtime_dsp.BackgroundSubtractionState(),
         realtime_dsp.BackgroundSubtractionState(),
         realtime_dsp.BackgroundSubtractionState(),
-        None,
+        heatmap_ema_in,
         None,
         None,
         np.empty((n_frames, loops, dsp_cfg.tx, 20, dsp_cfg.rx), dtype=np.complex64),
@@ -799,6 +801,79 @@ def test_display_zoom_runtime_home_viewport_update_resets_stale_state() -> None:
     assert runtime.last_compute_ms == 0.0
     assert runtime.last_compute_t_s == 0.0
     assert runtime.last_mode == "power_xy"
+
+
+def test_power_heatmap_ema_restarts_when_display_range_changes() -> None:
+    dsp_cfg = _dsp_cfg(samples=32, loops=8)
+    dr_m = dsp_cfg.c * dsp_cfg.fs / (2.0 * dsp_cfg.slope * dsp_cfg.nfft_range)
+    old_home = realtime_dsp.build_display_viewport(
+        x_min_m=-1.5,
+        x_max_m=1.5,
+        y_min_m=0.0,
+        y_max_m=2.0,
+        dr_m=dr_m,
+        seq=1,
+    )
+    new_home = realtime_dsp.build_display_viewport(
+        x_min_m=-1.5,
+        x_max_m=1.5,
+        y_min_m=0.0,
+        y_max_m=1.7,
+        dr_m=dr_m,
+        seq=2,
+    )
+    runtime = realtime_dsp.DisplayZoomRuntime(home_viewport=old_home)
+    ema_cfg = realtime_dsp.HeatmapEMAConfig(enabled=True, alpha=0.25)
+    angle_cfg = realtime_dsp.AngleProcessingConfig(mode="fft")
+
+    old_ema, _, _, _ = _run_display_process(
+        angle_processing=angle_cfg,
+        display_viewport=old_home,
+        display_zoom_runtime=runtime,
+        heatmap_ema_cfg=ema_cfg,
+    )
+    assert old_ema is not None
+
+    assert realtime_dsp.update_display_zoom_runtime_home_viewport(runtime, new_home)
+    new_ema, new_view, _, _ = _run_display_process(
+        angle_processing=angle_cfg,
+        display_viewport=new_home,
+        display_zoom_runtime=runtime,
+        heatmap_ema_cfg=ema_cfg,
+        heatmap_ema_in=old_ema,
+    )
+    expected_current, _, _, _ = _run_display_process(
+        angle_processing=angle_cfg,
+        display_viewport=new_home,
+    )
+
+    assert new_ema is not None
+    assert expected_current is not None
+    assert old_ema.shape != new_ema.shape
+    assert new_ema.shape == (math.ceil(new_home.range_max_bin_f), dsp_cfg.nfft_angle)
+    np.testing.assert_array_equal(new_ema, expected_current)
+    assert np.isfinite(new_view).all()
+
+
+def test_enabling_frozen_display_background_requests_pipeline_recalibration() -> None:
+    disabled = realtime_dsp.PostRangeFftFilterConfig(
+        background_subtraction=realtime_dsp.BackgroundSubtractionConfig(
+            enabled=False,
+            mode="frozen",
+            init_frames=80,
+        )
+    )
+    enabled = realtime_dsp.PostRangeFftFilterConfig(
+        background_subtraction=realtime_dsp.BackgroundSubtractionConfig(
+            enabled=True,
+            mode="frozen",
+            init_frames=80,
+        )
+    )
+
+    assert realtime_dsp.frozen_background_activated(disabled, enabled)
+    assert not realtime_dsp.frozen_background_activated(enabled, enabled)
+    assert not realtime_dsp.frozen_background_activated(enabled, disabled)
 
 
 def test_requested_viewport_matching_updated_home_disables_zoom() -> None:

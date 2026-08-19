@@ -371,6 +371,20 @@ def background_calibration_progress(
     return done, target, True
 
 
+def frozen_background_activated(
+    previous_filters: "PostRangeFftFilterConfig",
+    next_filters: "PostRangeFftFilterConfig",
+) -> bool:
+    """Whether a runtime edit has just enabled frozen-background calibration."""
+    previous_bg = previous_filters.background_subtraction
+    next_bg = next_filters.background_subtraction
+    return bool(
+        next_bg.enabled
+        and str(next_bg.mode) == "frozen"
+        and (not previous_bg.enabled or str(previous_bg.mode) != "frozen")
+    )
+
+
 @dataclass(frozen=True)
 class LoopAverageConfig:
     enabled: bool = False
@@ -5625,8 +5639,11 @@ def process_buffer(
 
             if not heatmap_ema_cfg.enabled:
                 heatmap_ema = heatmap
-            elif heatmap_ema is None:
-                heatmap_ema = heatmap
+            elif heatmap_ema is None or heatmap_ema.shape != heatmap.shape:
+                # Display range/ROI changes can alter the number of heatmap
+                # rows at runtime.  An EMA learned on the previous geometry
+                # cannot be updated in place, so restart it from this frame.
+                heatmap_ema = np.array(heatmap, dtype=np.float32, copy=True)
             else:
                 heatmap_ema *= (1.0 - heatmap_ema_cfg.alpha)
                 heatmap_ema += (heatmap_ema_cfg.alpha * heatmap)
@@ -6511,6 +6528,10 @@ def dsp_worker(
         next_detection_moving_cfg = detection_moving_from_yaml_dict(next_cfg_dict)
         next_fusion_cfg = fusion_from_yaml_dict(next_cfg_dict)
         next_tracking_cfg = tracking_from_yaml_dict(next_cfg_dict)
+        restart_pipeline_frozen_background = frozen_background_activated(
+            display_post_range_fft_filters,
+            next_display_filters,
+        )
         if int(next_tracking_cfg.max_tracks) > tracks_capacity:
             print(
                 f"[TRACK WARN] max_tracks={int(next_tracking_cfg.max_tracks)} exceeds shared GUI capacity "
@@ -6534,7 +6555,13 @@ def dsp_worker(
 
         # EMA e modelli di clutter dipendono dai parametri che li hanno
         # generati; azzerarli evita di mescolare due regimi di filtraggio.
-        if next_detection_static_filters != detection_static_post_range_fft_filters:
+        if (
+            next_detection_static_filters != detection_static_post_range_fft_filters
+            or restart_pipeline_frozen_background
+        ):
+            # The GUI intentionally uses Display BG OFF -> ON as the manual
+            # empty-room reset. Restart the static model too, so the single
+            # pipeline calibration status and the detector remain coherent.
             detection_static_bg_state = BackgroundSubtractionState()
             warned_detection_loop_average_after_doppler = False
         if next_detection_moving_filters != detection_moving_pre_doppler_filters:
@@ -6544,9 +6571,11 @@ def dsp_worker(
                 display_zoom_runtime.moving_bg_state_cache.clear()
         if next_display_filters != display_post_range_fft_filters:
             display_bg_state = BackgroundSubtractionState()
+            heatmap_ema = None
             if display_zoom_runtime is not None:
                 display_zoom_runtime.display_bg_state = BackgroundSubtractionState()
                 display_zoom_runtime.display_bg_state_cache.clear()
+                display_zoom_runtime.heatmap_ema = None
             warned_display_loop_average_after_doppler = False
         if next_heatmap_ema_cfg != heatmap_ema_cfg:
             heatmap_ema = None

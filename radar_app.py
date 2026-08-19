@@ -2533,6 +2533,7 @@ def main():
         capture_card_ip="192.168.33.180",
         capture_card_mac="12:34:56:78:90:12",
         mode_device_type=1,
+        direct_record_control=True,
         adc_data_path=Path(r"C:\ti\mmwave_studio_02_01_01_00\mmWaveStudio\PostProc\adc_data.bin"),
     )
 
@@ -5670,7 +5671,27 @@ def main():
             except Exception:
                 continue
         try:
-            dsp_cmd_q.put_nowait({"type": "update_runtime_config", "cfg_patch": patch, "reset_runtime_state": True})
+            changed_path = next(
+                (
+                    str(spec["path"])
+                    for spec in TUNING_FIELD_SPECS
+                    if sender == _tune_tag(str(spec["path"]))
+                ),
+                "",
+            )
+            display_background_only = changed_path.startswith(
+                "dsp.display_filters.background_subtraction."
+            )
+            dsp_cmd_q.put_nowait(
+                {
+                    "type": "update_runtime_config",
+                    "cfg_patch": patch,
+                    # Display-background changes have their own state invalidation
+                    # in the DSP worker.  A global reset here would also restart
+                    # the independent static-detection frozen background.
+                    "reset_runtime_state": not display_background_only,
+                }
+            )
             moving_patch = ((patch.get("dsp", {}) or {}).get("range_angle_moving", {}) or {})
             velocity_dead_zone_runtime = float(
                 moving_patch.get("velocity_dead_zone", velocity_dead_zone_runtime)
@@ -5681,7 +5702,12 @@ def main():
             )
             velocity_lut = _build_velocity_lut(2048, velocity_dead_zone_runtime)
             if dpg.does_item_exist(TXT_TUNING_STATUS_TAG):
-                dpg.set_value(TXT_TUNING_STATUS_TAG, "Runtime update and DSP soft reset sent")
+                status_text = (
+                    "Runtime display-background update sent"
+                    if display_background_only
+                    else "Runtime update and DSP soft reset sent"
+                )
+                dpg.set_value(TXT_TUNING_STATUS_TAG, status_text)
         except Exception as e:
             if dpg.does_item_exist(TXT_TUNING_STATUS_TAG):
                 dpg.set_value(TXT_TUNING_STATUS_TAG, f"ERR tuning: {e}")
@@ -6529,7 +6555,7 @@ def main():
             dpg.add_separator()
             dpg.add_text("Ready", tag=TXT_TUNING_STATUS_TAG, wrap=-1)
             dpg.add_text(
-                "Empty-room calibration: waiting for radar data",
+                "Pipeline frozen background: waiting for radar data",
                 tag=TXT_CALIBRATION_STATUS_TAG,
                 wrap=-1,
                 color=(255, 210, 90),
@@ -6902,14 +6928,14 @@ def main():
                         with calibration_active.get_lock():
                             cal_active = bool(calibration_active.value)
                         if cal_target <= 0:
-                            cal_text = "Empty-room calibration: disabled"
+                            cal_text = "Pipeline frozen background: disabled"
                         elif cal_active:
                             cal_text = (
-                                f"Empty-room calibration: {cal_done}/{cal_target} frames — "
+                                f"Pipeline frozen background: {cal_done}/{cal_target} frames - "
                                 "keep the room empty"
                             )
                         else:
-                            cal_text = f"Empty-room calibration: ready ({cal_target} frames)"
+                            cal_text = f"Pipeline frozen background: ready ({cal_target} frames)"
                         _set_gui_text_if_changed(TXT_CALIBRATION_STATUS_TAG, cal_text)
                     except Exception:
                         pass
