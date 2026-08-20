@@ -23,6 +23,18 @@ class _ScanCancelled(ScanError):
     """Segnale interno di annullamento, distinto dagli errori operativi."""
 
 
+def _strict_integer(value: Any, *, field_name: str) -> int:
+    if isinstance(value, bool):
+        raise ScanError(f"{field_name} deve essere un intero.")
+    try:
+        value_f = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ScanError(f"{field_name} deve essere un intero.") from exc
+    if not math.isfinite(value_f) or not value_f.is_integer():
+        raise ScanError(f"{field_name} deve essere un intero.")
+    return int(value_f)
+
+
 class ScanState(str, Enum):
     """Stato macchina della scansione, indipendente dalla lingua della GUI."""
 
@@ -68,11 +80,11 @@ class ScanPlan:
     capture_timeout_seconds: float = 120.0
 
     def validate(self) -> None:
-        if int(self.positions) <= 0:
+        if _strict_integer(self.positions, field_name="Il numero di posizioni") <= 0:
             raise ScanError("Il numero di posizioni deve essere maggiore di zero.")
         if not math.isfinite(float(self.pitch_mm)) or float(self.pitch_mm) <= 0.0:
             raise ScanError("Il pitch della scansione deve essere maggiore di zero.")
-        if int(self.start_position_id) <= 0:
+        if _strict_integer(self.start_position_id, field_name="L'ID iniziale") <= 0:
             raise ScanError("L'ID iniziale della scansione deve essere positivo.")
         timing = (
             float(self.settling_seconds),
@@ -111,7 +123,8 @@ def absolute_scan_targets_microsteps(
     sommando a ogni ciclo un passo già arrotondato.
     """
 
-    if int(positions) <= 0:
+    positions_i = _strict_integer(positions, field_name="Il numero di posizioni")
+    if positions_i <= 0:
         raise ScanError("Il numero di posizioni deve essere maggiore di zero.")
     if (
         not math.isfinite(float(pitch_mm))
@@ -121,8 +134,8 @@ def absolute_scan_targets_microsteps(
     ):
         raise ScanError("Pitch e risoluzione meccanica devono essere maggiori di zero.")
     pitch_microsteps = float(pitch_mm) / float(mm_per_microstep)
-    start = int(start_microsteps)
-    return tuple(start + int(round(index * pitch_microsteps)) for index in range(int(positions)))
+    start = _strict_integer(start_microsteps, field_name="La posizione iniziale")
+    return tuple(start + int(round(index * pitch_microsteps)) for index in range(positions_i))
 
 
 class SarScanCoordinator:
@@ -205,6 +218,7 @@ class SarScanCoordinator:
                 state=ScanState.CANCELLING,
                 event=ScanEvent.CANCELLATION_REQUESTED,
             )
+            cancel_event = self._cancel_event
         # Prima rendi sicuro il carrello e imposta i suoi flag STOP; soltanto
         # dopo sveglia il worker tramite cancel_event. In caso contrario il
         # worker potrebbe eseguire finish_motion(False) un istante prima di
@@ -214,7 +228,7 @@ class SarScanCoordinator:
         except Exception:
             pass
         finally:
-            self._cancel_event.set()
+            cancel_event.set()
         try:
             self._cancel_capture()
         except Exception:

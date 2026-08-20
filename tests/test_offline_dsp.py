@@ -14,6 +14,7 @@ from offline_dsp import (
     build_mimo_geometry,
     prepare_synthetic_aperture_data,
     prepare_mimo_snapshots,
+    phase_sign_normalize,
     residual_video_phase_sign_normalize,
 )
 def _target_profile(n_bins: int, bin_float: float, phase: complex) -> np.ndarray:
@@ -502,6 +503,14 @@ def test_geometry_bp_numba_matches_numpy_reference_with_frames_weights_and_rvp()
 )
 def test_residual_video_phase_sign_normalize(value: object, expected: int) -> None:
     assert residual_video_phase_sign_normalize(value) == expected
+
+
+@pytest.mark.parametrize("value", [True, False, 1.5, -1.5, 0.5])
+def test_phase_sign_parsers_reject_boolean_and_fractional_values(value: object) -> None:
+    with pytest.raises(ValueError):
+        phase_sign_normalize(value)
+    with pytest.raises(ValueError):
+        residual_video_phase_sign_normalize(value)
 
 
 def test_residual_video_phase_refocuses_matching_fmcw_snapshots() -> None:

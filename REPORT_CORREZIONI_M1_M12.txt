@@ -1,0 +1,161 @@
+REPORT CORREZIONI CODICE M1-M12
+Data verifica: 20/08/2026
+
+SCOPO
+Sono state applicate esclusivamente le correzioni concordate nei moduli M1-M12,
+con modifiche localizzate. I documenti Word non sono stati modificati durante
+questa fase.
+
+M1 - Controllo transazionale radar/DCA1000
+Problema: un errore di StartFrame dopo START_RECORD lasciava la DCA armata; due
+errori durante lo stop potevano mascherare la prima causa e lasciare uno stato
+locale non recuperabile.
+Soluzione: aggiunto rollback STOP_RECORD su start fallito; StopFrame e
+STOP_RECORD vengono entrambi tentati, preservando l'errore primario e annotando
+quello secondario. In caso di stop incerto il flag resta attivo per consentire
+un nuovo tentativo. La stessa logica è applicata a start, rearm e capture_once.
+Perché: lo stato software deve rimanere conservativo finché l'arresto hardware
+non è confermato.
+
+M2 - Recupero stato controller Phidget
+Problema: un errore durante l'invio del target o un detach durante il moto
+potevano lasciare command_direction diverso da zero, bloccando i comandi e HOME.
+Soluzione: rollback dello stato logico su errore; detach e nuova connessione
+azzerano direzione/eventi e invalidano correttamente HOME.
+Perché: il controller open-loop non deve conservare una falsa condizione di moto.
+
+M3 - Catture manuali senza stage
+Problema: la GUI consentiva una cattura senza stage, ma il file appariva come
+SAR e veniva poi rifiutato senza una classificazione esplicita.
+Soluzione: introdotti i tipi "sar" e "manual_no_stage". La GUI mantiene la
+cattura manuale richiesta, ma mostra un avviso; l'inspector la riconosce e
+l'offline la rifiuta con un messaggio specifico.
+Perché: non perdere una cattura manuale, evitando però di confonderla con dati
+geometricamente validi per una ricostruzione SAR.
+
+M4 - Identità file/header e integrità payload
+Problema: capture_id e position potevano generare nome file e header
+incompatibili; l'inspector accettava un numero di frame diverso da quello
+dichiarato purché il payload fosse divisibile per un frame.
+Soluzione: il nome capture_posN usa la position pubblica scritta nell'header;
+capture_id e acquisition_index sono conservati come metadati separati. Inspector
+e reader verificano allineamento, presenza di frame e uguaglianza con
+frames_per_position.
+Perché: un file dichiarato valido deve essere coerente sia strutturalmente sia
+semanticamente.
+
+M5 - Numero di bin range realtime
+Problema: il limite di 18 m conservava 239 bin invece dei 240 necessari a
+includere tutti i centri bin <= 18 m.
+Soluzione: una sola funzione condivisa calcola floor(range/dr)+1 e limita il
+risultato alla metà positiva della FFT. Config attuale verificata: 240 bin.
+Perché: eliminare l'errore off-by-one e mantenere uguali validazione e worker DSP.
+
+M6 - Limite fisico della Range FFT offline
+Problema: mappe oltre la metà positiva potevano leggere bin FFT negativi/wrapped;
+inoltre il path del test YAML puntava a una cartella inesistente.
+Soluzione: il preflight rifiuta la ROI che richiede bin oltre nfft_range/2; il
+path test_configuration è stato corretto in ..\logs\pc_ok.
+Perché: fallire prima dell'allocazione è preferibile a produrre una mappa
+fisicamente errata.
+
+M7 - Cache e normalizzazione dello zoom
+Problema: il fallback cached_frame poteva sottrarre nuovamente il riferimento dB
+e la normalizzazione dello zoom poteva usare la mappa baseline anziché quella
+ricalcolata per la ROI.
+Soluzione: la cache conserva il raster pre-normalizzazione e il suo riferimento;
+lo zoom usa la propria heatmap per calcolare il riferimento.
+Perché: evitare deriva dei livelli e dipendenza errata dalla viewport precedente.
+
+M8 - EMA, filtro spaziale e retry zoom
+Problema: il blur rientrava nello stato EMA, accumulando sfocatura; un errore zoom
+non aggiornava il timestamp e poteva essere ritentato a ogni frame.
+Soluzione: lo stato EMA resta non filtrato, mentre il filtro spaziale è solo una
+trasformazione di visualizzazione. Anche i fallback aggiornano durata e timestamp.
+Perché: mantenere stabile la risposta temporale e limitare retry costosi.
+
+M9 - Validazioni strette
+Problema: booleani e float frazionari venivano troncati a interi; alcune stringhe
+"false" diventavano vere; NaN/Inf potevano contaminare EMA, high-pass,
+background, MVDR e configurazione motore.
+Soluzione: parser stretti per interi, booleani, segni e coefficienti finiti in
+realtime, offline, catture, piani SAR e Phidget.
+Perché: una configurazione invalida deve essere rifiutata all'avvio, non alterare
+silenziosamente l'elaborazione.
+
+M10 - Coerenza configurazione offline
+Problema: override antenna in metri e lambda insieme davano precedenza silenziosa
+ai metri; opzioni inerti in backprojection e fallback FFT->Bartlett non erano
+segnalati chiaramente; la proiezione offline sintetica è sempre cartesiana.
+Soluzione: conflitto m/lambda rifiutato; warning espliciti per parametri ignorati,
+proiezione cartesiana effettiva e fallback Bartlett prima della stima memoria.
+Perché: la configurazione mostrata deve corrispondere a quella realmente eseguita.
+
+M11 - Cleanup processi e code
+Problema: "joined" contava chiamate join, non processi conclusi; mancavano numero
+di superstiti e timeout per join_thread delle code.
+Soluzione: diagnostica con joined reali, join_attempts, terminated e survivors;
+join del feeder eseguito con timeout e cancel_join_thread di fallback.
+Perché: lo shutdown non deve bloccarsi indefinitamente e i contatori devono essere
+interpretabili.
+
+M12 - Race SAR e robustezza tracker
+Problema: una cancellazione tardiva poteva colpire l'Event di una scansione nuova;
+max_track_age valeva solo per track unmatched; un campo detection malformato
+poteva interrompere l'intero step.
+Soluzione: cancel usa l'Event della generazione osservata; max_track_age è applicato
+a tutti i track; tutte le conversioni detection sono protette e le misure invalide
+sono scartate e conteggiate.
+Perché: isolamento corretto tra scansioni e degradazione controllata su input errato.
+
+VERIFICHE SOFTWARE
+- Baseline prima delle modifiche: 280 test passati.
+- Suite finale: 324 test passati in 12,45 s con warning trattati come errori.
+- Test mirati finali M1: 9 passati.
+- git diff --check: nessun errore di whitespace/patch.
+- pip check: nessuna dipendenza incompatibile.
+- Smoke test configurazioni reali:
+  * realtime_config.yaml valido, retained_range_bins=240;
+  * offline_config.yaml valido, 150 posizioni, 1 frame selezionato;
+  * test_configuration/offline_config.yaml valido, 150 posizioni, 1 frame selezionato.
+
+VERIFICHE HARDWARE
+- Phidget 1063: PASS. Connessione, HOME, rilascio a 9,9969 mm, movimento +20 mm
+  fino a 29,9907 mm e ritorno a 9,9969 mm; nessun finecorsa o flag moto residuo.
+- Phidget dalla GUI: PASS. Verificati due cicli Connect -> HOME -> Disconnect/
+  Connect -> HOME senza stato logico bloccato.
+- DCA1000: comando di sicurezza STOP_RECORD verificato con ACK=0.
+- RSTD: connessione Python al server verificata dopo riavvio di mmWave Studio.
+- Un primo Test GUI Connect ha restituito status 10054 (connessione resettata dal
+  peer) durante SelectCaptureDevice; la gestione errore ha disconnesso il bridge.
+- Dopo riavvio/configurazione mmWave Studio e stabilizzazione dei cavi: PASS.
+  Verificati SelectCaptureDevice, Radar Connect COM3, configurazione Ethernet/mode/
+  packet delay DCA, bind UDP 192.168.33.30:4098, START_RECORD, StartFrame, ricezione
+  UDP e calibrazione DSP. Verificato anche Stop, Disconnect e successiva reconnessione.
+- Cattura reale: PASS. File logs/run_20260820_102050/capture_pos1.bin, header 417 byte,
+  payload 4.194.304 byte, 2 frame esatti da 2.097.152 byte, kind=sar, identità
+  capture_id/acquisition_index/position=1 e stage.position_mm=9,996896.
+- Reader offline sulla cattura reale: PASS. Decodifica complex64 con forma
+  (2 frame, 128 loop, 8 antenne virtuali, 512 campioni), tutti i valori finiti.
+- Scansione SAR automatica multi-posizione: PASS. Run run_20260820_102548 con
+  3 posizioni e 2 frame completi per posizione. Coordinate stage 9,9969 mm,
+  17,6847 mm e 25,3442 mm; passi misurati 7,6878 mm e 7,6596 mm, coerenti con
+  il pitch nominale 7,68 mm e la quantizzazione al microstep. Tutti e tre i
+  payload sono stati validati e decodificati dal reader offline come array
+  complex64 (2, 128, 8, 512) con valori finiti.
+
+OSSERVAZIONE SUL COLLAUDO HARDWARE
+I cavi USB di radar/DCA sono stati indicati come meccanicamente instabili e possono
+disconnettersi quando si muove il carrello. Il comportamento RSTD 10054 osservato
+nel primo tentativo è coerente con questa instabilità; il codice ha propagato
+l'errore e ha eseguito la disconnessione. Il successivo percorso Connect -> Start
+-> ricezione UDP -> Capture -> Stop -> Disconnect è stato completato con successo
+e, dopo aver stabilizzato i collegamenti, anche la scansione automatica fisica
+multi-posizione è stata completata correttamente.
+
+ESITO
+Le correzioni M1-M12 sono implementate e superano l'intera suite software. Il
+carrello, il radar/DCA, lo streaming UDP, la cattura su file e la lettura offline
+sono stati verificati fisicamente/end-to-end, inclusa la scansione automatica
+multi-posizione. La stabilità meccanica dei cavi USB resta una precauzione
+operativa dell'allestimento, non una correzione software.

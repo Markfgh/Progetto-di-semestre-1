@@ -6,7 +6,9 @@ import ast
 from pathlib import Path
 
 import numpy as np
+import pytest
 
+import radar_app
 import realtime_dsp
 
 
@@ -29,6 +31,43 @@ def _dsp_cfg() -> realtime_dsp.RealtimeDSPConfig:
         fft_workers=1,
         debug_stats=False,
     )
+
+
+def test_retained_positive_range_bins_includes_last_bin_centre_and_caps_half_fft() -> None:
+    current_dr = 3.0e8 * 10.0e6 / (2.0 * 39.01e12 * 512)
+    assert realtime_dsp.retained_positive_range_bins(18.0, current_dr, 512) == 240
+    assert realtime_dsp.retained_positive_range_bins(0.0, 0.1, 512) == 1
+    assert realtime_dsp.retained_positive_range_bins(100.0, 0.1, 512) == 256
+
+
+@pytest.mark.parametrize("invalid", [True, 512.5])
+def test_realtime_configuration_rejects_non_integer_capture_sizes(invalid: object) -> None:
+    config = radar_app.yaml.safe_load(radar_app.CFG_PATH.read_text(encoding="utf-8"))
+    config["capture"]["samples"] = invalid
+    with pytest.raises(ValueError, match="capture.samples must be a positive integer"):
+        radar_app.validate_realtime_configuration(config)
+
+
+def test_nested_filter_booleans_and_nonfinite_coefficients_are_strict() -> None:
+    filters = realtime_dsp.display_post_range_fft_filters_from_yaml_dict(
+        {"dsp": {"display_filters": {"mean_after_range_fft": {"enabled": "false"}}}}
+    )
+    assert not filters.mean_after_range_fft.enabled
+
+    with pytest.raises(ValueError, match="heatmap_ema.alpha"):
+        realtime_dsp.heatmap_ema_from_yaml_dict({"dsp": {"heatmap_ema": {"alpha": "nan"}}})
+    with pytest.raises(ValueError, match="slow_time.highpass_beta"):
+        realtime_dsp.display_post_range_fft_filters_from_yaml_dict(
+            {"dsp": {"display_filters": {"slow_time": {"highpass_beta": "nan"}}}}
+        )
+    with pytest.raises(ValueError, match="background_subtraction.alpha"):
+        realtime_dsp.display_post_range_fft_filters_from_yaml_dict(
+            {"dsp": {"display_filters": {"background_subtraction": {"alpha": "inf"}}}}
+        )
+    with pytest.raises(ValueError, match="mvdr_diagonal_loading"):
+        realtime_dsp.angle_processing_from_yaml_dict(
+            {"dsp": {"angle_processing": {"mvdr_diagonal_loading": "inf"}}}
+        )
 
 
 EXPECTED_TUNING_PATHS = {

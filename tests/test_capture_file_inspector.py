@@ -206,3 +206,41 @@ def test_zero_layout_exits_before_payload_modulo(
     assert main([str(path)]) == 2
     output = capsys.readouterr().out
     assert "capture.samples deve essere > 0" in output
+
+
+def test_manual_no_stage_capture_is_valid_with_explicit_warning(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    metadata = _valid_metadata()
+    metadata["capture"]["kind"] = "manual_no_stage"
+    del metadata["stage"]
+    bytes_per_frame = 4 * 8 * 4 * 4
+    path = tmp_path / "capture_pos7.bin"
+    _write_capture(path, metadata, payload=bytes(bytes_per_frame))
+
+    parsed, _offset = read_capture_header(path)
+    assert parsed["capture"]["kind"] == "manual_no_stage"
+    assert main([str(path)]) == 0
+    assert "[WARN] Cattura manuale senza stage" in capsys.readouterr().out
+
+
+def test_declared_frame_count_must_match_complete_payload(tmp_path: Path) -> None:
+    metadata = _valid_metadata()
+    metadata["capture"]["frames_per_position"] = 2
+    bytes_per_frame = 4 * 8 * 4 * 4
+    path = tmp_path / "capture_pos7.bin"
+    _write_capture(path, metadata, payload=bytes(bytes_per_frame))
+
+    with pytest.raises(ValueError, match=r"header\.frames_per_position=2, payload=1"):
+        read_capture_header(path)
+
+
+def test_partial_payload_is_rejected(tmp_path: Path) -> None:
+    metadata = _valid_metadata()
+    bytes_per_frame = 4 * 8 * 4 * 4
+    path = tmp_path / "capture_pos7.bin"
+    _write_capture(path, metadata, payload=bytes(bytes_per_frame - 1))
+
+    with pytest.raises(ValueError, match="payload non multiplo"):
+        read_capture_header(path)

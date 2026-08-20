@@ -489,8 +489,11 @@ class DisplayZoomRuntime:
     display_bg_state_cache: dict[tuple[int, ...], BackgroundSubtractionState] = field(default_factory=dict)
     moving_bg_state_cache: dict[tuple[int, ...], BackgroundSubtractionState] = field(default_factory=dict)
     heatmap_ema: np.ndarray | None = None
+    # Cached power rasters are always pre-normalization.  This prevents a
+    # cached fallback from subtracting the same dB reference repeatedly.
     last_view_db: np.ndarray | None = None
     last_view_alpha: np.ndarray | None = None
+    last_normalization_reference_db: float = float("nan")
     last_fill_value: float = -120.0
     last_applied_meta: AppliedViewportMeta | None = None
     last_viewport_signature: tuple[Any, ...] | None = None
@@ -724,11 +727,55 @@ def selection_from_yaml_dict(cfg: dict[str, Any]) -> DspSelection:
     )
 
 
+def _strict_config_bool(value: Any, *, field_name: str, default: bool) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "disabled"}:
+            return False
+    if isinstance(value, (int, np.integer)) and int(value) in (0, 1):
+        return bool(value)
+    raise ValueError(f"{field_name} must be a boolean")
+
+
+def _finite_config_float(value: Any, *, field_name: str, default: float) -> float:
+    if value is None:
+        return float(default)
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a finite number") from exc
+    if not np.isfinite(parsed):
+        raise ValueError(f"{field_name} must be a finite number")
+    return parsed
+
+
+def _strict_config_int(value: Any, *, field_name: str, default: int) -> int:
+    if value is None:
+        return int(default)
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{field_name} must be an integer")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be an integer") from exc
+    if not np.isfinite(parsed) or not parsed.is_integer():
+        raise ValueError(f"{field_name} must be an integer")
+    return int(parsed)
+
+
 def _mean_selection_from_yaml_dict(dsp: dict[str, Any], key: str, default_axes: tuple[MeanAxis, ...]) -> MeanSelection:
     block = dsp.get(key, {}) or {}
     return MeanSelection(
         axes=mean_axes_normalize(block.get("axes"), default_axes),
-        enabled=bool(block.get("enabled", False)),
+        enabled=_strict_config_bool(
+            block.get("enabled"), field_name=f"dsp.{key}.enabled", default=False
+        ),
     )
 
 
@@ -747,21 +794,20 @@ def angle_processing_from_yaml_dict(cfg: dict[str, Any]) -> AngleProcessingConfi
             mode = "bartlett"
         elif mode_raw == "mvdr":
             mode = "mvdr"
-    try:
-        mvdr_diagonal_loading = float(block.get("mvdr_diagonal_loading", 0.01))
-    except (TypeError, ValueError):
-        mvdr_diagonal_loading = 0.01
+    mvdr_diagonal_loading = _finite_config_float(
+        block.get("mvdr_diagonal_loading"),
+        field_name="dsp.angle_processing.mvdr_diagonal_loading",
+        default=0.01,
+    )
     aggregation_raw = str(block.get("aggregation", "frame_loop")).strip().lower()
     if aggregation_raw not in {"frame_loop", "frame", "loop", "none"}:
         aggregation_raw = "frame_loop"
-    try:
-        frame_index = int(block.get("frame_index", 0))
-    except (TypeError, ValueError):
-        frame_index = 0
-    try:
-        loop_index = int(block.get("loop_index", 0))
-    except (TypeError, ValueError):
-        loop_index = 0
+    frame_index = _strict_config_int(
+        block.get("frame_index"), field_name="dsp.angle_processing.frame_index", default=0
+    )
+    loop_index = _strict_config_int(
+        block.get("loop_index"), field_name="dsp.angle_processing.loop_index", default=0
+    )
     return AngleProcessingConfig(
         mode=mode,
         mvdr_diagonal_loading=max(0.0, mvdr_diagonal_loading),
@@ -774,12 +820,13 @@ def angle_processing_from_yaml_dict(cfg: dict[str, Any]) -> AngleProcessingConfi
 def heatmap_ema_from_yaml_dict(cfg: dict[str, Any]) -> HeatmapEMAConfig:
     dsp = cfg.get("dsp", {}) or {}
     block = dsp.get("heatmap_ema", {}) or {}
-    try:
-        alpha = float(block.get("alpha", 0.2))
-    except (TypeError, ValueError):
-        alpha = 0.2
+    alpha = _finite_config_float(
+        block.get("alpha"), field_name="dsp.heatmap_ema.alpha", default=0.2
+    )
     return HeatmapEMAConfig(
-        enabled=bool(block.get("enabled", True)),
+        enabled=_strict_config_bool(
+            block.get("enabled"), field_name="dsp.heatmap_ema.enabled", default=True
+        ),
         alpha=min(max(alpha, 0.0), 1.0),
     )
 
@@ -792,7 +839,9 @@ def heatmap_spatial_filter_from_yaml_dict(cfg: dict[str, Any]) -> HeatmapSpatial
     if mode_raw in _VALID_HEATMAP_SPATIAL_FILTER_MODES and mode_raw == "none":
         mode = "none"
     return HeatmapSpatialFilterConfig(
-        enabled=bool(block.get("enabled", False)),
+        enabled=_strict_config_bool(
+            block.get("enabled"), field_name="dsp.heatmap_spatial_filter.enabled", default=False
+        ),
         mode=mode,
     )
 
@@ -888,16 +937,21 @@ def _slow_time_from_block(block: dict[str, Any]) -> SlowTimeConfig:
             mode = "highpass"
         elif mode_raw == "doppler_fft":
             mode = "doppler_fft"
-    try:
-        highpass_beta = float(block.get("highpass_beta", 0.9))
-    except (TypeError, ValueError):
-        highpass_beta = 0.9
+    highpass_beta = _finite_config_float(
+        block.get("highpass_beta"), field_name="slow_time.highpass_beta", default=0.9
+    )
     return SlowTimeConfig(
-        enabled=bool(block.get("enabled", False)),
+        enabled=_strict_config_bool(
+            block.get("enabled"), field_name="slow_time.enabled", default=False
+        ),
         mode=mode,
         highpass_beta=min(max(highpass_beta, 0.0), 1.0),
-        doppler_fft_shift=bool(block.get("doppler_fft_shift", True)),
-        doppler_zero_notch=bool(block.get("doppler_zero_notch", False)),
+        doppler_fft_shift=_strict_config_bool(
+            block.get("doppler_fft_shift"), field_name="slow_time.doppler_fft_shift", default=True
+        ),
+        doppler_zero_notch=_strict_config_bool(
+            block.get("doppler_zero_notch"), field_name="slow_time.doppler_zero_notch", default=False
+        ),
     )
 
 
@@ -905,31 +959,38 @@ def _background_subtraction_from_block(block: dict[str, Any]) -> BackgroundSubtr
     mode = str(block.get("mode", "ema")).strip().lower()
     if mode not in _VALID_BACKGROUND_MODES:
         mode = "ema"
-    try:
-        alpha = float(block.get("alpha", 0.02))
-    except (TypeError, ValueError):
-        alpha = 0.02
+    alpha = _finite_config_float(
+        block.get("alpha"), field_name="background_subtraction.alpha", default=0.02
+    )
     alpha = min(max(alpha, 0.0), 1.0)
-    try:
-        init_frames = int(block.get("init_frames", 20))
-    except (TypeError, ValueError):
-        init_frames = 20
-    try:
-        window_frames = int(block.get("window_frames", 20))
-    except (TypeError, ValueError):
-        window_frames = 20
+    init_frames = _strict_config_int(
+        block.get("init_frames"), field_name="background_subtraction.init_frames", default=20
+    )
+    window_frames = _strict_config_int(
+        block.get("window_frames"), field_name="background_subtraction.window_frames", default=20
+    )
     return BackgroundSubtractionConfig(
-        enabled=bool(block.get("enabled", False)),
+        enabled=_strict_config_bool(
+            block.get("enabled"), field_name="background_subtraction.enabled", default=False
+        ),
         mode=mode,  # type: ignore[arg-type]
         alpha=alpha,
         init_frames=max(1, init_frames),
         window_frames=max(1, window_frames),
-        clamp_positive_only=bool(block.get("clamp_positive_only", False)),
+        clamp_positive_only=_strict_config_bool(
+            block.get("clamp_positive_only"),
+            field_name="background_subtraction.clamp_positive_only",
+            default=False,
+        ),
     )
 
 
 def _loop_average_after_background_from_block(block: dict[str, Any]) -> LoopAverageConfig:
-    return LoopAverageConfig(enabled=bool(block.get("enabled", False)))
+    return LoopAverageConfig(
+        enabled=_strict_config_bool(
+            block.get("enabled"), field_name="loop_average_after_background.enabled", default=False
+        )
+    )
 
 
 def display_post_range_fft_filters_from_yaml_dict(cfg: dict[str, Any]) -> PostRangeFftFilterConfig:
@@ -1270,6 +1331,21 @@ def resolve_processing_range_max_m(cfg: dict[str, Any]) -> float:
     if display_fallback is not None and display_fallback > 0.0:
         return float(display_fallback)
     return 0.0
+
+
+def retained_positive_range_bins(max_range_m: float, dr_m: float, nfft_range: int) -> int:
+    """Return an exclusive slice length containing every bin centre <= max range."""
+    max_range_f = float(max_range_m)
+    dr_f = float(dr_m)
+    nfft_i = int(nfft_range)
+    if not np.isfinite(max_range_f) or max_range_f < 0.0:
+        raise ValueError("max_range_m must be finite and >= 0")
+    if not np.isfinite(dr_f) or dr_f <= 0.0:
+        raise ValueError("dr_m must be finite and > 0")
+    if nfft_i < 2:
+        raise ValueError("nfft_range must be >= 2")
+    requested = int(math.floor(max_range_f / dr_f)) + 1
+    return max(1, min(requested, nfft_i // 2))
 
 
 def _default_virtual_array_order_flat(virtual_ant: int) -> np.ndarray:
@@ -1690,6 +1766,7 @@ def update_display_zoom_runtime_home_viewport(
         return False
     runtime.last_view_db = None
     runtime.last_view_alpha = None
+    runtime.last_normalization_reference_db = float("nan")
     runtime.last_applied_meta = None
     runtime.last_viewport_signature = None
     runtime.last_compute_ms = 0.0
@@ -5286,6 +5363,9 @@ def process_buffer(
         fallback_used = False
         view_alpha: np.ndarray | None = None
         normalization_reference_db = float("nan")
+        cached_normalization_reference_db: float | None = None
+        normalization_heatmap: np.ndarray | None = None
+        cached_view_db_raw: np.ndarray | None = None
         power_display_normalized = False
         viewport_range_max_m = max(0.0, float(active_viewport.range_max_bin_f) * float(range_bin_m))
 
@@ -5565,6 +5645,10 @@ def process_buffer(
                     display_zoom_runtime.last_compute_t_s = time.perf_counter()
                 except Exception as exc:
                     fallback_used = True
+                    display_zoom_runtime.last_compute_ms = float(
+                        (time.perf_counter() - zoom_t0) * 1000.0
+                    )
+                    display_zoom_runtime.last_compute_t_s = time.perf_counter()
                     error_signature = (type(exc).__name__, str(exc))
                     if display_zoom_runtime.last_error_signature != error_signature:
                         print(f"[DSP WARN] moving display zoom fallback: {type(exc).__name__}: {exc}")
@@ -5647,11 +5731,14 @@ def process_buffer(
             else:
                 heatmap_ema *= (1.0 - heatmap_ema_cfg.alpha)
                 heatmap_ema += (heatmap_ema_cfg.alpha * heatmap)
-            heatmap_ema = apply_heatmap_spatial_filter(heatmap_ema, heatmap_spatial_filter_cfg)
-            debug_heatmap = heatmap_ema
+            # Keep the temporal state unblurred.  The optional spatial filter
+            # is a display transform, not the next EMA input.
+            heatmap_display = apply_heatmap_spatial_filter(heatmap_ema, heatmap_spatial_filter_cfg)
+            debug_heatmap = heatmap_display
+            normalization_heatmap = heatmap_display
 
             view_display = _project_view(
-                heatmap_ema,
+                heatmap_display,
                 angle_axis_local=angle_axis_deg,
                 dr_local=range_bin_m,
                 projection_mode_local=display_projection_cfg.projection_mode,
@@ -5673,6 +5760,9 @@ def process_buffer(
                     and display_zoom_runtime.last_view_db.shape == view_display.shape
                 ):
                     np.copyto(view_display, display_zoom_runtime.last_view_db, casting="unsafe")
+                    cached_ref = float(display_zoom_runtime.last_normalization_reference_db)
+                    if np.isfinite(cached_ref):
+                        cached_normalization_reference_db = cached_ref
             elif zoom_should_recompute and display_zoom_runtime is not None:
                 zoom_t0 = time.perf_counter()
                 try:
@@ -5770,11 +5860,15 @@ def process_buffer(
                     else:
                         zoom_heatmap_ema *= (1.0 - heatmap_ema_cfg.alpha)
                         zoom_heatmap_ema += (heatmap_ema_cfg.alpha * zoom_heatmap)
-                    zoom_heatmap_ema = apply_heatmap_spatial_filter(zoom_heatmap_ema, heatmap_spatial_filter_cfg)
                     display_zoom_runtime.heatmap_ema = zoom_heatmap_ema
-                    debug_heatmap = zoom_heatmap_ema
-                    view_display = _project_view(
+                    zoom_heatmap_display = apply_heatmap_spatial_filter(
                         zoom_heatmap_ema,
+                        heatmap_spatial_filter_cfg,
+                    )
+                    debug_heatmap = zoom_heatmap_display
+                    normalization_heatmap = zoom_heatmap_display
+                    view_display = _project_view(
+                        zoom_heatmap_display,
                         angle_axis_local=zoom_angle_axis,
                         dr_local=zoom_range_bin_m,
                         projection_mode_local=display_projection_cfg.projection_mode,
@@ -5788,6 +5882,10 @@ def process_buffer(
                     display_zoom_runtime.last_compute_t_s = time.perf_counter()
                 except Exception as exc:
                     fallback_used = True
+                    display_zoom_runtime.last_compute_ms = float(
+                        (time.perf_counter() - zoom_t0) * 1000.0
+                    )
+                    display_zoom_runtime.last_compute_t_s = time.perf_counter()
                     error_signature = (type(exc).__name__, str(exc))
                     if display_zoom_runtime.last_error_signature != error_signature:
                         print(f"[DSP WARN] power display zoom fallback: {type(exc).__name__}: {exc}")
@@ -5820,9 +5918,13 @@ def process_buffer(
                 )
 
             if view_display.size > 0:
-                norm_ref_db = _normalization_reference_db(
-                    heatmap_ema,
-                    skip_range_bins=int(getattr(dsp_cfg, "normalize_skip_range_bins", 0)),
+                norm_ref_db = (
+                    cached_normalization_reference_db
+                    if cached_normalization_reference_db is not None
+                    else _normalization_reference_db(
+                        heatmap_display if normalization_heatmap is None else normalization_heatmap,
+                        skip_range_bins=int(getattr(dsp_cfg, "normalize_skip_range_bins", 0)),
+                    )
                 )
                 raw_max = float(np.max(view_display))
                 normalization_reference_db = (
@@ -5844,6 +5946,7 @@ def process_buffer(
                             stat_norm_max_db.value = norm_max
                     except Exception:
                         pass
+                cached_view_db_raw = np.array(view_display, dtype=np.float32, copy=True)
                 if normalize_to_peak:
                     view_display -= normalization_reference_db
                     power_display_normalized = True
@@ -5958,7 +6061,9 @@ def process_buffer(
                 fallback_used=bool(fallback_used),
                 frame_seq=int(frame_seq),
             )
-            display_zoom_runtime.last_view_db = np.array(view_display, dtype=np.float32, copy=True)
+            view_for_cache = view_display if cached_view_db_raw is None else cached_view_db_raw
+            display_zoom_runtime.last_view_db = np.array(view_for_cache, dtype=np.float32, copy=True)
+            display_zoom_runtime.last_normalization_reference_db = float(normalization_reference_db)
             if view_alpha is None:
                 display_zoom_runtime.last_view_alpha = None
             else:
@@ -6253,8 +6358,11 @@ def dsp_worker(
     processing_range_max_m = float(
         dsp_cfg.range_max_processing_m if dsp_cfg.range_max_processing_m > 0.0 else dsp_cfg.range_max_display
     )
-    processing_max_bin = int(np.floor(processing_range_max_m / dr))
-    processing_max_bin = max(1, min(processing_max_bin, dsp_cfg.nfft_range // 2))
+    processing_max_bin = retained_positive_range_bins(
+        processing_range_max_m,
+        dr,
+        dsp_cfg.nfft_range,
+    )
     display_max_bin = int(math.ceil(float(home_viewport.range_max_bin_f)))
     display_max_bin = max(1, min(display_max_bin, dsp_cfg.nfft_range // 2))
     max_virtual_array_bin = max(processing_max_bin, display_max_bin)
@@ -6481,6 +6589,7 @@ def dsp_worker(
             display_zoom_runtime.heatmap_ema = None
             display_zoom_runtime.last_view_db = None
             display_zoom_runtime.last_view_alpha = None
+            display_zoom_runtime.last_normalization_reference_db = float("nan")
             display_zoom_runtime.last_viewport_signature = None
             display_zoom_runtime.last_applied_meta = None
             display_zoom_runtime.last_mode = "power_xy"
@@ -6622,6 +6731,7 @@ def dsp_worker(
         if display_zoom_runtime is not None:
             display_zoom_runtime.last_view_db = None
             display_zoom_runtime.last_view_alpha = None
+            display_zoom_runtime.last_normalization_reference_db = float("nan")
             display_zoom_runtime.last_viewport_signature = None
         if reset_runtime_state:
             _reset_runtime_processing_state(reset_tracker=True)

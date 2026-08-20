@@ -23,6 +23,7 @@ import json
 import re
 import struct
 import traceback
+from numbers import Real
 from datetime import datetime
 
 
@@ -231,6 +232,8 @@ def format_offline_algorithm_summary(algorithm: object, angle_mode: object) -> s
     return f"Algorithm: {algorithm_name.upper() or 'UNKNOWN'}"
 
 from sar_capture import (
+    CAPTURE_KIND_MANUAL_NO_STAGE,
+    CAPTURE_KIND_SAR,
     CaptureError,
     CaptureMetadataStore,
     CaptureSessionManager,
@@ -624,6 +627,7 @@ from realtime_dsp import (
     display_zoom_from_yaml_dict,
     dsp_worker,
     range_angle_moving_from_yaml_dict,
+    retained_positive_range_bins,
     resolve_processing_range_max_m,
     resolve_display_crossrange_max_m,
 )
@@ -657,9 +661,12 @@ def validate_realtime_configuration(config: dict) -> dict[str, float | int]:
 
     def _positive_int(mapping: dict, key: str, section: str) -> int:
         try:
-            value = int(mapping[key])
-        except (KeyError, TypeError, ValueError) as exc:
+            raw = mapping[key]
+        except KeyError as exc:
             raise ValueError(f"{section}.{key} must be a positive integer") from exc
+        if isinstance(raw, bool) or not isinstance(raw, Real) or not np.isfinite(raw) or float(raw) != int(raw):
+            raise ValueError(f"{section}.{key} must be a positive integer")
+        value = int(raw)
         if value <= 0:
             raise ValueError(f"{section}.{key} must be a positive integer")
         return value
@@ -732,9 +739,11 @@ def validate_realtime_configuration(config: dict) -> dict[str, float | int]:
                 f"+/-{doppler_velocity_max_mps:.3f} m/s"
             )
 
-    retained_range_bins = int(np.floor(processing_range_max_m / (
-        c_m_s * fs_hz / (2.0 * slope_hz_s * nfft_range)
-    ))) + 1
+    retained_range_bins = retained_positive_range_bins(
+        processing_range_max_m,
+        c_m_s * fs_hz / (2.0 * slope_hz_s * nfft_range),
+        nfft_range,
+    )
     for section_name, col_size in (
         ("detection_static", nfft_angle),
         ("detection_moving", loops_per_tx),
@@ -998,8 +1007,24 @@ def _build_capture_file_header(
     *,
     carriage_position_mm: float | None = None,
     carriage_microsteps: int | None = None,
+    capture_id: int | None = None,
+    acquisition_index: int | None = None,
+    capture_kind: str | None = None,
 ) -> bytes:
     """Serializza l'header RTPBIN v1 che precede i frame raw nel file catturato."""
+    effective_capture_id = int(pos_id if capture_id is None else capture_id)
+    effective_acquisition_index = int(
+        effective_capture_id if acquisition_index is None else acquisition_index
+    )
+    effective_capture_kind = str(
+        capture_kind
+        if capture_kind is not None
+        else (
+            CAPTURE_KIND_SAR
+            if carriage_position_mm is not None
+            else CAPTURE_KIND_MANUAL_NO_STAGE
+        )
+    ).strip().lower()
     header = {
         "format": "rt_capture_v1",
         "position": int(pos_id),
@@ -1017,6 +1042,9 @@ def _build_capture_file_header(
             "tx": int(TX),
             "x_frames": int(X_FRAMES),  # Realtime batch size.
             "frames_per_position": int(FRAMES_PER_POSITION),
+            "kind": effective_capture_kind,
+            "capture_id": effective_capture_id,
+            "acquisition_index": effective_acquisition_index,
         },
     }
     if carriage_position_mm is not None or carriage_microsteps is not None:
@@ -2054,8 +2082,14 @@ def logger_worker(
             int(metadata["position"]),
             carriage_position_mm=metadata.get("carriage_position_mm"),
             carriage_microsteps=metadata.get("carriage_microsteps"),
+            capture_id=metadata.get("capture_id"),
+            acquisition_index=metadata.get("acquisition_index"),
+            capture_kind=metadata.get("capture_kind"),
         )
-        p = _current_output_dir() / f"capture_pos{int(capture_file_id)}.bin"
+        # The linear position is the public filename/header identity.  The
+        # capture/session identifiers remain independent metadata.
+        position_id = int(metadata["position"])
+        p = _current_output_dir() / f"capture_pos{position_id}.bin"
         if p.exists():
             raise RuntimeError(f"capture file already exists: {p}")
         part_path = p.with_name(p.name + ".part")
@@ -3969,14 +4003,29 @@ def main():
             if received_packets <= 0 or udp_idle_s > 2.0:
                 raise CaptureError("UDP radar data is not active; wait for fresh packets.")
             position_mm, position_steps = _motor_metadata_for_capture()
+            capture_kind = (
+                CAPTURE_KIND_SAR
+                if position_mm is not None
+                else CAPTURE_KIND_MANUAL_NO_STAGE
+            )
             with sar_pos_counter.get_lock():
                 next_pid = int(sar_pos_counter.value) + 1
-            ticket = capture_sessions.request(next_pid, position_mm, position_steps)
+            ticket = capture_sessions.request(
+                next_pid,
+                position_mm,
+                position_steps,
+                capture_kind=capture_kind,
+            )
+            warning = (
+                " WARNING: stage unavailable; this capture is not usable for SAR."
+                if capture_kind == CAPTURE_KIND_MANUAL_NO_STAGE
+                else ""
+            )
             manual_capture_state.update(
                 {
                     "ticket": ticket,
                     "deadline_s": time.monotonic() + float(manual_capture_timeout_s),
-                    "message": f"Manual capture {next_pid} in progress...",
+                    "message": f"Manual capture {next_pid} in progress...{warning}",
                     "cancel_requested": False,
                 }
             )
@@ -3992,12 +4041,17 @@ def main():
             return
         try:
             if capture_sessions.poll_completion(ticket):
-                path = out_dir / f"capture_pos{int(ticket.capture_id)}.bin"
+                path = out_dir / f"capture_pos{int(ticket.position_id)}.bin"
+                warning = (
+                    " | WARNING: no stage metadata; not usable for offline SAR"
+                    if ticket.capture_kind == CAPTURE_KIND_MANUAL_NO_STAGE
+                    else ""
+                )
                 manual_capture_state.update(
                     {
                         "ticket": None,
                         "message": (
-                            f"Capture completed: {int(FRAMES_PER_POSITION)} frames | {path}"
+                            f"Capture completed: {int(FRAMES_PER_POSITION)} frames | {path}{warning}"
                         ),
                         "cancel_requested": False,
                     }

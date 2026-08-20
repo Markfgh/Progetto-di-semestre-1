@@ -316,10 +316,10 @@ class MultiObjectTracker:
 
         # La predizione porta tutti i track allo stesso istante della misura.
         self._predict_stage(dt_s, now_s)
+        deleted_tracks = self._drop_tracks_over_max_age()
         matches, unmatched_tracks, unmatched_measurements, assoc_debug = self._associate_stage(measurements, now_s)
         self._update_stage(matches, measurements, now_s)
 
-        deleted_tracks = 0
         for track_idx in unmatched_tracks:
             if self._mark_unmatched(self.tracks[track_idx], now_s):
                 deleted_tracks += 1
@@ -395,38 +395,22 @@ class MultiObjectTracker:
         try:
             x_m = float(getattr(det, "x_m"))
             y_m = float(getattr(det, "y_m"))
+            range_m = float(getattr(det, "range_m", math.hypot(x_m, y_m)))
+            angle_deg = float(
+                getattr(det, "angle_deg", math.degrees(math.atan2(x_m, max(y_m, _EPS))))
+            )
+            doppler_raw = getattr(det, "doppler_mps", None)
+            doppler_mps = None if doppler_raw is None else float(doppler_raw)
+            power_lin = float(getattr(det, "power_lin", 0.0))
+            power_db = float(getattr(det, "power_db", 0.0))
+            source = str(getattr(det, "source", "unknown") or "unknown").strip().lower()
         except Exception:
             return None
-        if not (math.isfinite(x_m) and math.isfinite(y_m)):
+        finite_values = (x_m, y_m, range_m, angle_deg, power_lin, power_db)
+        if not all(math.isfinite(value) for value in finite_values) or range_m < 0.0:
             return None
-
-        range_m = float(getattr(det, "range_m", math.hypot(x_m, y_m)))
-        if not math.isfinite(range_m) or range_m < 0.0:
-            range_m = float(math.hypot(x_m, y_m))
-
-        angle_deg = float(getattr(det, "angle_deg", math.degrees(math.atan2(x_m, max(y_m, _EPS)))))
-        if not math.isfinite(angle_deg):
-            angle_deg = float(math.degrees(math.atan2(x_m, max(y_m, _EPS))))
-
-        doppler_raw = getattr(det, "doppler_mps", None)
-        doppler_mps: float | None
-        if doppler_raw is None:
-            doppler_mps = None
-        else:
-            try:
-                doppler_val = float(doppler_raw)
-            except Exception:
-                doppler_val = float("nan")
-            doppler_mps = float(doppler_val) if math.isfinite(doppler_val) else None
-
-        power_lin = float(getattr(det, "power_lin", 0.0))
-        if not math.isfinite(power_lin):
-            power_lin = 0.0
-        power_db = float(getattr(det, "power_db", 0.0))
-        if not math.isfinite(power_db):
-            power_db = 0.0
-
-        source = str(getattr(det, "source", "unknown") or "unknown").strip().lower()
+        if doppler_mps is not None and not math.isfinite(doppler_mps):
+            return None
         abs_doppler = None if doppler_mps is None else abs(float(doppler_mps))
         moving_hint = bool(
             source == "moving"
@@ -705,11 +689,6 @@ class MultiObjectTracker:
 
     def _mark_unmatched(self, track: Track, now_s: float) -> bool:
         """Applica la politica di sopravvivenza a un track senza misura associata."""
-        max_age = int(max(0, self.tracking_cfg.max_track_age))
-        if max_age > 0 and track.age > max_age:
-            track.state = "deleted"
-            return True
-
         if track.state == "tentative":
             if track.missed > int(self.tracking_cfg.max_missed_tentative):
                 track.state = "deleted"
@@ -729,6 +708,22 @@ class MultiObjectTracker:
             track.state = "deleted"
             return True
         return False
+
+    def _drop_tracks_over_max_age(self) -> int:
+        """Apply max_track_age to every track, including continuously matched ones."""
+        max_age = int(max(0, self.tracking_cfg.max_track_age))
+        if max_age <= 0:
+            return 0
+        live_tracks: list[Track] = []
+        deleted = 0
+        for track in self.tracks:
+            if track.age > max_age:
+                track.state = "deleted"
+                deleted += 1
+            else:
+                live_tracks.append(track)
+        self.tracks = live_tracks
+        return int(deleted)
 
     def _decay_unmatched_track_motion(self, track: Track, now_s: float) -> None:
         if track.motion_state == "stopped":

@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+
 from sar_scan import (
     ScanEvent,
+    ScanError,
     ScanPlan,
     ScanState,
     SarScanCoordinator,
@@ -25,6 +28,55 @@ def test_absolute_targets_do_not_accumulate_per_step_rounding() -> None:
     assert targets == (10_000, 10_277, 10_553, 10_830)
     # Sommare sempre 277 avrebbe prodotto 10_554 e 10_831: deriva evitata.
     assert targets[-1] != 10_831
+
+
+@pytest.mark.parametrize("positions", [True, 1.9])
+def test_scan_plan_rejects_non_integer_position_count(positions: object) -> None:
+    with pytest.raises(ScanError, match="intero"):
+        ScanPlan(positions=positions, pitch_mm=1.0).validate()
+
+
+def test_cancel_is_bound_to_the_scan_generation_that_was_observed() -> None:
+    old_can_finish = threading.Event()
+    new_can_finish = threading.Event()
+    stop_entered = threading.Event()
+    release_stop = threading.Event()
+
+    def wait_capture(ticket: int, _timeout: float, _cancel: threading.Event) -> None:
+        (old_can_finish if ticket == 1 else new_can_finish).wait(timeout=1.0)
+
+    def stop_motion() -> None:
+        stop_entered.set()
+        release_stop.wait(timeout=1.0)
+
+    coordinator = SarScanCoordinator(
+        begin_motion=lambda: None,
+        finish_motion=lambda _success: None,
+        get_position_microsteps=lambda: 0,
+        mm_from_microsteps=lambda steps: float(steps),
+        mm_per_microstep=lambda: 1.0,
+        move_to_microsteps=lambda *_args: None,
+        request_capture=lambda pos_id, _mm, _steps: pos_id,
+        wait_capture=wait_capture,
+        cancel_capture=lambda: None,
+        stop_motion=stop_motion,
+    )
+
+    coordinator.start(ScanPlan(positions=1, pitch_mm=1.0, start_position_id=1))
+    cancel_thread = threading.Thread(target=coordinator.cancel)
+    cancel_thread.start()
+    assert stop_entered.wait(timeout=1.0)
+    old_can_finish.set()
+    coordinator.join(timeout=1.0)
+
+    coordinator.start(ScanPlan(positions=1, pitch_mm=1.0, start_position_id=2))
+    release_stop.set()
+    cancel_thread.join(timeout=1.0)
+    assert coordinator.active
+
+    new_can_finish.set()
+    coordinator.join(timeout=1.0)
+    assert coordinator.status().state is ScanState.COMPLETED
 
 
 def test_coordinator_captures_before_each_move_and_skips_final_move() -> None:

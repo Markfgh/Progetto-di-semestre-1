@@ -105,6 +105,7 @@ def _write_capture(
     raw_i16_value: int | None = None,
     stage_position_mm: float | None = None,
     include_stage: bool = True,
+    capture_kind: str | None = None,
     format_name: str = "rt_capture_v1",
     radar: dict[str, float] | None = None,
 ) -> None:
@@ -115,6 +116,8 @@ def _write_capture(
         "tx": tx,
         "frames_per_position": frames,
     }
+    if capture_kind is not None:
+        capture["kind"] = str(capture_kind)
     header_payload = {
         "format": format_name,
         "position": position,
@@ -531,6 +534,29 @@ def test_read_bp_runtime_cfg_rejects_invalid_frame_position_error_amplitude(
     _write_yaml(fallback_cfg, _fallback_capture_cfg())
 
     with pytest.raises(ValueError, match="frame_position_error.max_abs_mm"):
+        _read_bp_runtime_cfg(offline_cfg, fallback_cfg)
+
+
+@pytest.mark.parametrize("algorithm", [False, 0])
+def test_read_bp_runtime_cfg_rejects_falsy_invalid_algorithm(
+    tmp_path: Path, algorithm: object
+) -> None:
+    offline_cfg = tmp_path / "offline_config.yaml"
+    fallback_cfg = tmp_path / "realtime_config.yaml"
+    _write_yaml(offline_cfg, _offline_reconstruction_cfg(algorithm=algorithm))
+    _write_yaml(fallback_cfg, _fallback_capture_cfg())
+    with pytest.raises(ValueError, match="reconstruction.algorithm non valido"):
+        _read_bp_runtime_cfg(offline_cfg, fallback_cfg)
+
+
+def test_read_bp_runtime_cfg_rejects_meter_and_lambda_geometry_together(tmp_path: Path) -> None:
+    offline_cfg = tmp_path / "offline_config.yaml"
+    fallback_cfg = tmp_path / "realtime_config.yaml"
+    payload = _offline_reconstruction_cfg()
+    payload["bp"] = {"tx_offsets_m": [0.0, 0.01], "tx_offsets_lambda": [0.0, 2.0]}
+    _write_yaml(offline_cfg, payload)
+    _write_yaml(fallback_cfg, _fallback_capture_cfg())
+    with pytest.raises(ValueError, match="non entrambi"):
         _read_bp_runtime_cfg(offline_cfg, fallback_cfg)
 
 
@@ -958,6 +984,71 @@ def test_stream_reader_rejects_linear_capture_without_measured_stage_position(tm
         SARReader(offline_cfg).describe_stream()
 
 
+def test_stream_reader_rejects_explicit_manual_no_stage_capture(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_manual_no_stage"
+    run_dir.mkdir()
+    _write_capture(
+        run_dir / "capture_pos1.bin",
+        position=1,
+        include_stage=False,
+        capture_kind="manual_no_stage",
+    )
+    offline_cfg = tmp_path / "offline_config.yaml"
+    _write_yaml(
+        offline_cfg,
+        {
+            "data": {"input_dir": str(run_dir)},
+            "scan": {"x_start": 1, "x_end": 1, "x_step": 1, "x_pitch_m": 0.01},
+        },
+    )
+
+    with pytest.raises(ValueError, match="manual_no_stage"):
+        SARReader(offline_cfg).describe_stream()
+
+
+def test_stream_reader_rejects_whole_frame_truncation_against_header(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_whole_frame_truncated"
+    run_dir.mkdir()
+    path = run_dir / "capture_pos1.bin"
+    _write_capture(path, position=1, frames=2)
+    bytes_per_frame = 4 * 8 * 4 * 4
+    path.write_bytes(path.read_bytes()[:-bytes_per_frame])
+    offline_cfg = tmp_path / "offline_config.yaml"
+    _write_yaml(
+        offline_cfg,
+        {
+            "data": {"input_dir": str(run_dir)},
+            "capture": {"frames_per_position": 1},
+            "scan": {"x_start": 1, "x_end": 1, "x_step": 1, "x_pitch_m": 0.01},
+        },
+    )
+
+    with pytest.raises(ValueError, match=r"numero frame incoerente \(header=2, payload=1\)"):
+        SARReader(offline_cfg).describe_stream()
+
+
+def test_backprojection_range_bound_rejects_bins_beyond_positive_fft_half() -> None:
+    viewport = build_display_viewport(
+        x_min_m=-1.0,
+        x_max_m=1.0,
+        y_min_m=25.0,
+        y_max_m=30.0,
+        dr_m=0.075,
+        seq=0,
+    )
+
+    with pytest.raises(ValueError, match="metà FFT positiva"):
+        _backprojection_viewport_max_bin(
+            viewport,
+            x_pos_m=np.asarray([0.0], dtype=np.float32),
+            x_tx_ant_m=np.asarray([0.0], dtype=np.float32),
+            x_rx_ant_m=np.asarray([0.0], dtype=np.float32),
+            dr_m=0.075,
+            available_bins=256,
+            strict_available=True,
+        )
+
+
 def test_stream_reader_uses_requested_prefix_of_available_frames(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -1317,7 +1408,15 @@ def test_offline_reader_subtracts_empty_scene_reference_with_different_frame_cou
             "data": {"input_dir": str(target_dir)},
             "capture": {"frames_per_position": 2},
             "scan": {"x_start": 1, "x_end": 2, "x_step": 1, "x_pitch_m": 0.01},
-            "reconstruction": {"algorithm": "backprojection"},
+            "reconstruction": {
+                "algorithm": "backprojection",
+                "map_bounds": {
+                    "x_min_m": -1.0,
+                    "x_max_m": 1.0,
+                    "y_min_m": 0.0,
+                    "y_max_m": 5.0,
+                },
+            },
             "bp": {},
             "offline_background": {
                 "enabled": True,

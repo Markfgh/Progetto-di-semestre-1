@@ -131,6 +131,7 @@ def _run_display_process(
     display_zoom_cfg: realtime_dsp.DisplayZoomConfig | None = None,
     display_zoom_runtime: realtime_dsp.DisplayZoomRuntime | None = None,
     heatmap_ema_cfg: realtime_dsp.HeatmapEMAConfig | None = None,
+    heatmap_spatial_filter_cfg: realtime_dsp.HeatmapSpatialFilterConfig | None = None,
     heatmap_ema_in: np.ndarray | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray, np.ndarray, np.ndarray]:
     samples = 32
@@ -200,7 +201,7 @@ def _run_display_process(
         False,
         angle_processing or realtime_dsp.AngleProcessingConfig(mode="mvdr"),
         heatmap_ema_cfg or realtime_dsp.HeatmapEMAConfig(enabled=False),
-        realtime_dsp.HeatmapSpatialFilterConfig(enabled=False),
+        heatmap_spatial_filter_cfg or realtime_dsp.HeatmapSpatialFilterConfig(enabled=False),
         display_projection_cfg or realtime_dsp.DisplayProjectionConfig(projection_mode="cartesian", projection_interp="nearest"),
         geometry,
         steering,
@@ -724,6 +725,69 @@ def test_power_xy_zoom_keeps_fixed_texture_size_and_tracks_applied_viewport() ->
     assert not np.allclose(full_view, zoom_view)
 
 
+def test_cached_power_zoom_does_not_accumulate_peak_normalization() -> None:
+    gui_h = 48
+    gui_w = 96
+    dsp_cfg = _dsp_cfg()
+    home_viewport, zoom_viewport = _build_home_and_zoom_viewports(
+        dsp_cfg=dsp_cfg,
+        gui_h=gui_h,
+        gui_w=gui_w,
+    )
+    zoom_cfg = realtime_dsp.DisplayZoomConfig(
+        enabled=True,
+        max_zoom_nfft_range=dsp_cfg.nfft_range * 2,
+        max_zoom_nfft_angle=dsp_cfg.nfft_angle * 2,
+        max_update_hz=0.001,
+        dsp_budget_ms=1000.0,
+        fallback_mode="cached_frame",
+    )
+    runtime = realtime_dsp.DisplayZoomRuntime(home_viewport=home_viewport)
+
+    _state_first, first_view, _, _ = _run_display_process(
+        gui_h=gui_h,
+        gui_w=gui_w,
+        display_viewport=zoom_viewport,
+        display_zoom_cfg=zoom_cfg,
+        display_zoom_runtime=runtime,
+        normalize_to_peak=True,
+    )
+    assert runtime.last_view_db is not None
+    assert np.isfinite(runtime.last_normalization_reference_db)
+
+    _state_second, second_view, _, _ = _run_display_process(
+        gui_h=gui_h,
+        gui_w=gui_w,
+        display_viewport=zoom_viewport,
+        display_zoom_cfg=zoom_cfg,
+        display_zoom_runtime=runtime,
+        normalize_to_peak=True,
+    )
+
+    np.testing.assert_allclose(second_view, first_view, rtol=0.0, atol=1e-5)
+    assert runtime.last_applied_meta is not None
+    assert runtime.last_applied_meta.fallback_used
+
+
+def test_spatial_filter_does_not_feed_back_into_heatmap_ema_state() -> None:
+    ema_cfg = realtime_dsp.HeatmapEMAConfig(enabled=True, alpha=0.25)
+    plain_state, _plain_view, _, _ = _run_display_process(
+        heatmap_ema_cfg=ema_cfg,
+        heatmap_spatial_filter_cfg=realtime_dsp.HeatmapSpatialFilterConfig(enabled=False),
+    )
+    filtered_state, _filtered_view, _, _ = _run_display_process(
+        heatmap_ema_cfg=ema_cfg,
+        heatmap_spatial_filter_cfg=realtime_dsp.HeatmapSpatialFilterConfig(
+            enabled=True,
+            mode="gaussian_3x3",
+        ),
+    )
+
+    assert plain_state is not None
+    assert filtered_state is not None
+    np.testing.assert_array_equal(filtered_state, plain_state)
+
+
 def test_display_zoom_over_budget_retries_periodically() -> None:
     gui_h = 48
     gui_w = 96
@@ -763,6 +827,52 @@ def test_display_zoom_over_budget_retries_periodically() -> None:
     )
 
 
+def test_display_zoom_failure_advances_retry_timestamp(monkeypatch) -> None:
+    gui_h = 48
+    gui_w = 96
+    dsp_cfg = _dsp_cfg()
+    home_viewport, zoom_viewport = _build_home_and_zoom_viewports(
+        dsp_cfg=dsp_cfg,
+        gui_h=gui_h,
+        gui_w=gui_w,
+    )
+    zoom_cfg = realtime_dsp.DisplayZoomConfig(
+        enabled=True,
+        max_zoom_nfft_range=dsp_cfg.nfft_range * 2,
+        max_zoom_nfft_angle=dsp_cfg.nfft_angle * 2,
+        max_update_hz=1.0,
+        dsp_budget_ms=1000.0,
+        fallback_mode="baseline_projection",
+    )
+    runtime = realtime_dsp.DisplayZoomRuntime(home_viewport=home_viewport)
+    original = realtime_dsp.compute_angle_heatmap
+
+    def fail_only_zoom(*args, **kwargs):
+        cfg = kwargs["dsp_cfg"]
+        if int(cfg.nfft_range) > int(dsp_cfg.nfft_range):
+            raise RuntimeError("controlled zoom failure")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(realtime_dsp, "compute_angle_heatmap", fail_only_zoom)
+
+    _run_display_process(
+        gui_h=gui_h,
+        gui_w=gui_w,
+        display_viewport=zoom_viewport,
+        display_zoom_cfg=zoom_cfg,
+        display_zoom_runtime=runtime,
+    )
+
+    assert runtime.last_compute_t_s > 0.0
+    assert not realtime_dsp.should_recompute_display_zoom(
+        runtime,
+        active_viewport_sig=realtime_dsp.display_viewport_signature(zoom_viewport),
+        display_mode="power_xy",
+        display_zoom_cfg=zoom_cfg,
+        now_s=runtime.last_compute_t_s + 0.1,
+    )
+
+
 def test_display_zoom_runtime_home_viewport_update_resets_stale_state() -> None:
     dsp_cfg = _dsp_cfg()
     gui_h = 48
@@ -789,6 +899,7 @@ def test_display_zoom_runtime_home_viewport_update_resets_stale_state() -> None:
     runtime.last_compute_ms = 11.0
     runtime.last_compute_t_s = 42.0
     runtime.last_mode = "range_angle_moving"
+    runtime.last_normalization_reference_db = 17.5
 
     changed = realtime_dsp.update_display_zoom_runtime_home_viewport(runtime, new_home)
 
@@ -801,6 +912,7 @@ def test_display_zoom_runtime_home_viewport_update_resets_stale_state() -> None:
     assert runtime.last_compute_ms == 0.0
     assert runtime.last_compute_t_s == 0.0
     assert runtime.last_mode == "power_xy"
+    assert math.isnan(runtime.last_normalization_reference_db)
 
 
 def test_power_heatmap_ema_restarts_when_display_range_changes() -> None:

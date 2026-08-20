@@ -582,6 +582,38 @@ class MmwaveStudioBridge:
     def stop_frame(self) -> int:
         return self.send_lua("ar1.StopFrame()", label="StopFrame")
 
+    @staticmethod
+    def _attach_secondary_error(primary: Exception, *, action: str, secondary: Exception) -> None:
+        """Preserve the first failure while retaining cleanup diagnostics."""
+        note = f"{action} also failed: {type(secondary).__name__}: {secondary}"
+        add_note = getattr(primary, "add_note", None)
+        if callable(add_note):
+            add_note(note)
+
+    def _rollback_record_after_start_failure(self, primary: Exception) -> None:
+        """Disarm the capture card after a failed radar start.
+
+        ``_streaming`` stays true only when the rollback itself fails.  That
+        conservative state lets the caller retry the normal stop sequence.
+        """
+        try:
+            self.stop_record()
+        except Exception as rollback_error:
+            self._streaming = True
+            self._attach_secondary_error(
+                primary,
+                action="STOP_RECORD rollback",
+                secondary=rollback_error,
+            )
+            self._last_error = (
+                f"Start failed ({primary}); STOP_RECORD rollback failed ({rollback_error})"
+            )
+            self._last_message = "Streaming state uncertain after failed start"
+        else:
+            self._streaming = False
+            self._last_error = f"Start failed and DCA1000 was disarmed: {primary}"
+            self._last_message = "Streaming start rolled back"
+
     def send_commands(self, commands: list[str]) -> list[int]:
         statuses: list[int] = []
         for command in commands:
@@ -606,10 +638,14 @@ class MmwaveStudioBridge:
             # La DCA1000 va armata prima del radar: StartFrame fa partire subito i chirp
             # e un record non ancora armato perderebbe l'inizio della cattura.
             self.start_record(adc_data_path, capture_mode=capture_mode)
-            if arm_delay_s > 0:
-                # Lasciamo al firmware il tempo di applicare il comando di armamento.
-                time.sleep(float(arm_delay_s))
-            self.start_frame()
+            try:
+                if arm_delay_s > 0:
+                    # Lasciamo al firmware il tempo di applicare il comando di armamento.
+                    time.sleep(float(arm_delay_s))
+                self.start_frame()
+            except Exception as exc:
+                self._rollback_record_after_start_failure(exc)
+                raise
             self._streaming = True
             self._last_error = ""
             if self._dca_record_control is not None:
@@ -626,19 +662,33 @@ class MmwaveStudioBridge:
                 return self.get_gui_state()
             # StopFrame precede l'attesa: il ritardo consente alla catena DCA1000 di
             # completare i pacchetti gia' in transito prima di dichiarare fermo lo stream.
-            stop_frame_error: Exception | None = None
+            primary_error: Exception | None = None
             try:
                 self.stop_frame()
             except Exception as exc:
-                stop_frame_error = exc
-            finally:
-                if stop_delay_s > 0:
-                    time.sleep(float(stop_delay_s))
-                # Do not leave the DCA armed if StopFrame fails: the direct
-                # control socket is independent from RSTD and can still stop it.
+                primary_error = exc
+            if stop_delay_s > 0:
+                time.sleep(float(stop_delay_s))
+            # Do not leave the DCA armed if StopFrame fails: the direct
+            # control socket is independent from RSTD and can still stop it.
+            try:
                 self.stop_record()
-            if stop_frame_error is not None:
-                raise stop_frame_error
+            except Exception as exc:
+                if primary_error is None:
+                    primary_error = exc
+                else:
+                    self._attach_secondary_error(
+                        primary_error,
+                        action="STOP_RECORD",
+                        secondary=exc,
+                    )
+            if primary_error is not None:
+                # A failed stop leaves the hardware state uncertain.  Keep the
+                # conservative flag set so a subsequent Stop can retry both paths.
+                self._streaming = True
+                self._last_error = f"Streaming stop failed: {primary_error}"
+                self._last_message = "Streaming stop incomplete; retry required"
+                raise primary_error
             self._streaming = False
             self._last_error = ""
             self._last_message = "Streaming stopped"
@@ -672,9 +722,13 @@ class MmwaveStudioBridge:
                 except Exception:
                     pass
             self.start_record(adc_data_path, capture_mode=capture_mode)
-            if arm_delay_s > 0:
-                time.sleep(float(arm_delay_s))
-            self.start_frame()
+            try:
+                if arm_delay_s > 0:
+                    time.sleep(float(arm_delay_s))
+                self.start_frame()
+            except Exception as exc:
+                self._rollback_record_after_start_failure(exc)
+                raise
             self._streaming = True
             self._last_rearm_s = float(time.perf_counter())
             self._last_error = ""
@@ -750,14 +804,41 @@ class MmwaveStudioBridge:
         if arm_delay_s > 0:
             time.sleep(float(arm_delay_s))
 
-        start_frame_status = self.start_frame()
+        try:
+            start_frame_status = self.start_frame()
+        except Exception as exc:
+            self._rollback_record_after_start_failure(exc)
+            raise
+        self._streaming = True
+
+        primary_error: Exception | None = None
+        stop_frame_status = 0
         if frame_run_s > 0:
             time.sleep(float(frame_run_s))
-
-        stop_frame_status = self.stop_frame()
+        try:
+            stop_frame_status = self.stop_frame()
+        except Exception as exc:
+            primary_error = exc
         if stop_delay_s > 0:
             time.sleep(float(stop_delay_s))
-        self.stop_record()
+        try:
+            self.stop_record()
+        except Exception as exc:
+            if primary_error is None:
+                primary_error = exc
+            else:
+                self._attach_secondary_error(
+                    primary_error,
+                    action="STOP_RECORD",
+                    secondary=exc,
+                )
+        if primary_error is not None:
+            self._last_error = f"Capture stop failed: {primary_error}"
+            self._last_message = "Capture stop incomplete; retry required"
+            raise primary_error
+        self._streaming = False
+        self._last_error = ""
+        self._last_message = "Capture completed and streaming stopped"
 
         return SequenceResult(
             adc_data_path=adc_path,

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import math
+from numbers import Real
 import queue
 import threading
 import time
@@ -13,6 +14,21 @@ from typing import Any, Mapping
 
 class CaptureError(RuntimeError):
     """Una cattura non è stata accettata, completata o è stata annullata."""
+
+
+CAPTURE_KIND_SAR = "sar"
+CAPTURE_KIND_MANUAL_NO_STAGE = "manual_no_stage"
+CAPTURE_KINDS = frozenset({CAPTURE_KIND_SAR, CAPTURE_KIND_MANUAL_NO_STAGE})
+
+
+def _strict_integer(value: Any, *, field_name: str) -> int:
+    """Convert an integer-valued scalar without truncating fractions or booleans."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise CaptureError(f"{field_name} must be an integer")
+    value_f = float(value)
+    if not math.isfinite(value_f) or not value_f.is_integer():
+        raise CaptureError(f"{field_name} must be an integer")
+    return int(value)
 
 
 @dataclass(frozen=True)
@@ -45,8 +61,8 @@ def normalize_capture_metadata(capture_id: int, metadata: Mapping[str, Any] | No
         raise CaptureError("capture metadata must be a mapping")
 
     try:
-        capture_id_i = int(capture_id)
-    except (TypeError, ValueError) as exc:
+        capture_id_i = _strict_integer(capture_id, field_name="capture_id")
+    except CaptureError as exc:
         raise CaptureError("capture_id must be a non-negative integer") from exc
     # Mantiene leggibili gli storici ``position_id`` lineari negativi quando
     # non è stato fornito un identificatore di cattura esplicito.
@@ -54,12 +70,15 @@ def normalize_capture_metadata(capture_id: int, metadata: Mapping[str, Any] | No
         raise CaptureError("capture_id must be a non-negative integer")
     supplied_capture_id = raw.get("capture_id", capture_id_i)
     try:
-        if int(supplied_capture_id) != capture_id_i:
-            raise CaptureError("capture metadata capture_id does not match the CAPTURE command")
-        acquisition_index = int(raw.get("acquisition_index", capture_id_i))
-        legacy_position = int(raw.get("position", capture_id_i))
-    except (TypeError, ValueError) as exc:
+        supplied_capture_id_i = _strict_integer(supplied_capture_id, field_name="capture_id")
+        acquisition_index = _strict_integer(
+            raw.get("acquisition_index", capture_id_i), field_name="acquisition_index"
+        )
+        legacy_position = _strict_integer(raw.get("position", capture_id_i), field_name="position")
+    except CaptureError as exc:
         raise CaptureError("capture_id, acquisition_index and position must be integers") from exc
+    if supplied_capture_id_i != capture_id_i:
+        raise CaptureError("capture metadata capture_id does not match the CAPTURE command")
     if acquisition_index < 0:
         raise CaptureError("acquisition_index must be non-negative")
 
@@ -73,13 +92,25 @@ def normalize_capture_metadata(capture_id: int, metadata: Mapping[str, Any] | No
             carriage_position_mm = float(raw["carriage_position_mm"])
         except (TypeError, ValueError) as exc:
             raise CaptureError("carriage_position_mm must be numeric") from exc
-        if math.isfinite(carriage_position_mm):
-            result["carriage_position_mm"] = carriage_position_mm
+        if not math.isfinite(carriage_position_mm):
+            raise CaptureError("carriage_position_mm must be finite")
+        result["carriage_position_mm"] = carriage_position_mm
     if raw.get("carriage_microsteps") is not None:
-        try:
-            result["carriage_microsteps"] = int(raw["carriage_microsteps"])
-        except (TypeError, ValueError) as exc:
-            raise CaptureError("carriage_microsteps must be an integer") from exc
+        result["carriage_microsteps"] = _strict_integer(
+            raw["carriage_microsteps"], field_name="carriage_microsteps"
+        )
+    default_kind = (
+        CAPTURE_KIND_SAR
+        if result.get("carriage_position_mm") is not None
+        else CAPTURE_KIND_MANUAL_NO_STAGE
+    )
+    capture_kind = str(raw.get("capture_kind", default_kind)).strip().lower()
+    if capture_kind not in CAPTURE_KINDS:
+        allowed = ", ".join(sorted(CAPTURE_KINDS))
+        raise CaptureError(f"capture_kind must be one of: {allowed}")
+    if capture_kind == CAPTURE_KIND_SAR and result.get("carriage_position_mm") is None:
+        raise CaptureError("SAR capture metadata requires a finite carriage_position_mm")
+    result["capture_kind"] = capture_kind
     return result
 
 
@@ -129,6 +160,7 @@ class CaptureTicket:
     position_microsteps: int | None
     capture_id: int
     acquisition_index: int
+    capture_kind: str
 
     @property
     def position(self) -> int:
@@ -179,6 +211,7 @@ class CaptureSessionManager:
         *,
         capture_id: int | None = None,
         acquisition_index: int | None = None,
+        capture_kind: str | None = None,
     ) -> CaptureTicket:
         """Invia una richiesta CAPTURE e restituisce il ticket da attendere."""
         with self._lock:
@@ -186,43 +219,71 @@ class CaptureSessionManager:
                 raise CaptureError("Una cattura SAR è già in corso.")
             if position_id is None and capture_id is None:
                 raise CaptureError("A capture requires capture_id or legacy position_id.")
-            legacy_position = int(capture_id if position_id is None else position_id)
-            effective_capture_id = int(legacy_position if capture_id is None else capture_id)
+            legacy_position = _strict_integer(
+                capture_id if position_id is None else position_id,
+                field_name="position_id",
+            )
+            effective_capture_id = _strict_integer(
+                legacy_position if capture_id is None else capture_id,
+                field_name="capture_id",
+            )
             if effective_capture_id < 0 and capture_id is not None:
                 raise CaptureError("capture_id must be non-negative")
-            effective_acquisition_index = int(
-                effective_capture_id if acquisition_index is None else acquisition_index
+            effective_acquisition_index = _strict_integer(
+                effective_capture_id if acquisition_index is None else acquisition_index,
+                field_name="acquisition_index",
             )
             if effective_acquisition_index < 0:
                 raise CaptureError("acquisition_index must be non-negative")
+            effective_capture_kind = str(
+                capture_kind
+                if capture_kind is not None
+                else (
+                    CAPTURE_KIND_SAR
+                    if position_mm is not None
+                    else CAPTURE_KIND_MANUAL_NO_STAGE
+                )
+            ).strip().lower()
+            if effective_capture_kind not in CAPTURE_KINDS:
+                allowed = ", ".join(sorted(CAPTURE_KINDS))
+                raise CaptureError(f"capture_kind must be one of: {allowed}")
+            if effective_capture_kind == CAPTURE_KIND_SAR and position_mm is None:
+                raise CaptureError("SAR captures require a measured carriage position")
             # Il ticket ricorda l'ID osservato prima del comando. Solo un ID
             # successivo può appartenere a questa richiesta, non a una cattura
             # terminata in ritardo dalla sessione precedente.
             previous_session_id = _read_shared(self._cap_id)
+            if position_mm is not None:
+                try:
+                    position_mm_f = float(position_mm)
+                except (TypeError, ValueError) as exc:
+                    raise CaptureError("position_mm must be a finite number") from exc
+                if not math.isfinite(position_mm_f):
+                    raise CaptureError("position_mm must be a finite number")
+            else:
+                position_mm_f = None
+            position_microsteps_i = (
+                None
+                if position_microsteps is None
+                else _strict_integer(position_microsteps, field_name="position_microsteps")
+            )
             ticket = CaptureTicket(
                 previous_session_id=previous_session_id,
                 position_id=legacy_position,
-                position_mm=None if position_mm is None else float(position_mm),
-                position_microsteps=None if position_microsteps is None else int(position_microsteps),
+                position_mm=position_mm_f,
+                position_microsteps=position_microsteps_i,
                 capture_id=effective_capture_id,
                 acquisition_index=effective_acquisition_index,
+                capture_kind=effective_capture_kind,
             )
             metadata = {
                 "carriage_position_mm": ticket.position_mm,
                 "carriage_microsteps": ticket.position_microsteps,
+                "capture_id": int(ticket.capture_id),
+                "acquisition_index": int(ticket.acquisition_index),
+                "position": int(ticket.position_id),
+                "capture_kind": str(ticket.capture_kind),
             }
-            if (
-                capture_id is not None
-                or acquisition_index is not None
-                or int(ticket.capture_id) != int(ticket.position_id)
-            ):
-                metadata.update(
-                    {
-                        "capture_id": int(ticket.capture_id),
-                        "acquisition_index": int(ticket.acquisition_index),
-                        "position": int(ticket.position_id),
-                    }
-                )
             try:
                 self._cmd_queue.put_nowait(("CAPTURE", int(ticket.capture_id), metadata))
             except queue.Full as exc:

@@ -6,6 +6,7 @@ di shutdown non deve impedire il rilascio delle risorse rimanenti.
 
 from __future__ import annotations
 
+import threading
 from typing import Any, Iterable
 
 
@@ -34,7 +35,7 @@ def cleanup_processes(
     usata anche quando l'avvio parziale ha lasciato oggetti incompleti.
     """
     procs = _as_list(processes)
-    joined = 0
+    join_attempts = 0
     terminated = 0
     closed = 0
 
@@ -43,7 +44,7 @@ def cleanup_processes(
     for proc in procs:
         try:
             proc.join(timeout=float(graceful_timeout_s))
-            joined += 1
+            join_attempts += 1
         except Exception:
             pass
 
@@ -63,7 +64,7 @@ def cleanup_processes(
     for proc in procs:
         try:
             proc.join(timeout=float(terminate_timeout_s))
-            joined += 1
+            join_attempts += 1
         except Exception:
             pass
 
@@ -78,10 +79,40 @@ def cleanup_processes(
             except Exception:
                 pass
 
-    return {"joined": joined, "terminated": terminated, "closed": closed}
+    survivors = sum(1 for proc in procs if process_is_alive(proc))
+    joined = len(procs) - survivors
+    return {
+        "joined": int(joined),
+        "join_attempts": int(join_attempts),
+        "terminated": int(terminated),
+        "survivors": int(survivors),
+        "closed": int(closed),
+    }
 
 
-def close_queues(queues: Iterable[Any]) -> int:
+def _join_queue_thread_with_timeout(queue_obj: Any, timeout_s: float) -> bool:
+    completed = threading.Event()
+
+    def _join() -> None:
+        try:
+            queue_obj.join_thread()
+        except Exception:
+            pass
+        finally:
+            completed.set()
+
+    worker = threading.Thread(target=_join, name="queue-feeder-cleanup", daemon=True)
+    worker.start()
+    if completed.wait(timeout=max(0.0, float(timeout_s))):
+        return True
+    try:
+        queue_obj.cancel_join_thread()
+    except Exception:
+        pass
+    return False
+
+
+def close_queues(queues: Iterable[Any], *, join_timeout_s: float = 0.2) -> int:
     """Chiude le code IPC e aspetta i loro feeder thread quando disponibili."""
     closed = 0
     for queue_obj in _as_list(queues):
@@ -93,10 +124,7 @@ def close_queues(queues: Iterable[Any]) -> int:
             did_close = True
         except Exception:
             pass
-        try:
-            queue_obj.join_thread()
-        except Exception:
-            pass
+        _join_queue_thread_with_timeout(queue_obj, join_timeout_s)
         if did_close:
             closed += 1
     return closed

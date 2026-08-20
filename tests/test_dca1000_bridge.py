@@ -177,3 +177,105 @@ def test_bridge_still_stops_direct_dca_when_stop_frame_fails(monkeypatch, tmp_pa
         bridge.stop_streaming(stop_delay_s=0.0)
 
     assert events == ["stop_frame", "stop_record"]
+    assert bridge.is_streaming
+
+
+def test_bridge_rolls_back_record_when_start_frame_fails(monkeypatch, tmp_path) -> None:
+    events: list[str] = []
+
+    class _Control:
+        def start_record(self) -> int:
+            events.append("start_record")
+            return 0
+
+        def stop_record(self) -> int:
+            events.append("stop_record")
+            return 0
+
+    bridge = dca1000_bridge.MmwaveStudioBridge()
+    bridge._hw_connected = True
+    bridge._dca_record_control = _Control()  # type: ignore[assignment]
+
+    def _failed_start_frame() -> int:
+        events.append("start_frame")
+        raise dca1000_bridge.MmwaveStudioError("RSTD start failed")
+
+    monkeypatch.setattr(bridge, "start_frame", _failed_start_frame)
+
+    with pytest.raises(dca1000_bridge.MmwaveStudioError, match="RSTD start failed"):
+        bridge.start_streaming(tmp_path / "unused.bin", arm_delay_s=0.0)
+
+    assert events == ["start_record", "start_frame", "stop_record"]
+    assert not bridge.is_streaming
+    assert "disarmed" in bridge.get_gui_state().last_error
+
+
+def test_bridge_preserves_primary_stop_error_when_stop_record_also_fails(monkeypatch) -> None:
+    events: list[str] = []
+
+    class _Control:
+        def stop_record(self) -> int:
+            events.append("stop_record")
+            raise RuntimeError("record stop failed")
+
+    bridge = dca1000_bridge.MmwaveStudioBridge()
+    bridge._hw_connected = True
+    bridge._streaming = True
+    bridge._dca_record_control = _Control()  # type: ignore[assignment]
+
+    def _failed_stop_frame() -> int:
+        events.append("stop_frame")
+        raise dca1000_bridge.MmwaveStudioError("frame stop failed")
+
+    monkeypatch.setattr(bridge, "stop_frame", _failed_stop_frame)
+
+    with pytest.raises(dca1000_bridge.MmwaveStudioError, match="frame stop failed") as caught:
+        bridge.stop_streaming(stop_delay_s=0.0)
+
+    assert events == ["stop_frame", "stop_record"]
+    assert bridge.is_streaming
+    assert any("record stop failed" in note for note in getattr(caught.value, "__notes__", ()))
+
+
+def test_capture_once_rolls_back_record_when_start_frame_fails(monkeypatch, tmp_path) -> None:
+    events: list[str] = []
+    bridge = dca1000_bridge.MmwaveStudioBridge()
+    monkeypatch.setattr(bridge, "start_record", lambda *_args, **_kwargs: events.append("start_record") or 0)
+    monkeypatch.setattr(bridge, "stop_record", lambda: events.append("stop_record") or 0)
+
+    def _failed_start_frame() -> int:
+        events.append("start_frame")
+        raise dca1000_bridge.MmwaveStudioError("capture start failed")
+
+    monkeypatch.setattr(bridge, "start_frame", _failed_start_frame)
+
+    with pytest.raises(dca1000_bridge.MmwaveStudioError, match="capture start failed"):
+        bridge.capture_once(tmp_path / "capture.bin", arm_delay_s=0.0)
+
+    assert events == ["start_record", "start_frame", "stop_record"]
+    assert not bridge.is_streaming
+
+
+def test_capture_once_keeps_retryable_state_when_stop_fails(monkeypatch, tmp_path) -> None:
+    events: list[str] = []
+    bridge = dca1000_bridge.MmwaveStudioBridge()
+    monkeypatch.setattr(bridge, "start_record", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(bridge, "start_frame", lambda: 0)
+
+    def _failed_stop_frame() -> int:
+        events.append("stop_frame")
+        raise dca1000_bridge.MmwaveStudioError("capture stop failed")
+
+    monkeypatch.setattr(bridge, "stop_frame", _failed_stop_frame)
+    monkeypatch.setattr(bridge, "stop_record", lambda: events.append("stop_record") or 0)
+
+    with pytest.raises(dca1000_bridge.MmwaveStudioError, match="capture stop failed"):
+        bridge.capture_once(
+            tmp_path / "capture.bin",
+            arm_delay_s=0.0,
+            frame_run_s=0.0,
+            stop_delay_s=0.0,
+        )
+
+    assert events == ["stop_frame", "stop_record"]
+    assert bridge.is_streaming

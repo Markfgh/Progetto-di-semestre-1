@@ -295,6 +295,21 @@ class SARReader:
             n_frames = int(payload_size // int(bytes_per_frame))
             if n_frames <= 0:
                 raise ValueError(f"{path.name}: nessun frame nel payload (offset={data_offset})")
+            # ``frames_per_position`` declares the complete persisted capture,
+            # independently from the smaller prefix optionally selected for
+            # reconstruction by the offline configuration.
+            metadata = self._read_capture_header_metadata(path)
+            capture_metadata = metadata.get("capture")
+            if isinstance(capture_metadata, Mapping) and capture_metadata.get("frames_per_position") is not None:
+                declared_frames = _to_int(
+                    "header.capture.frames_per_position",
+                    capture_metadata.get("frames_per_position"),
+                )
+                if n_frames != int(declared_frames):
+                    raise ValueError(
+                        f"{path.name}: numero frame incoerente "
+                        f"(header={int(declared_frames)}, payload={n_frames})"
+                    )
             if frames_requested is not None and n_frames < int(frames_requested):
                 raise ValueError(
                     f"{capture_label}: n_frames={n_frames}, "
@@ -645,6 +660,19 @@ class SARReader:
 
     def _capture_record_from_header(self, path: Path, meta: Mapping[str, Any]) -> _CaptureFileRecord:
         """Turn one accepted v1 header into an immutable reader record."""
+        capture = meta.get("capture")
+        capture_kind = (
+            str(capture.get("kind", "sar")).strip().lower()
+            if isinstance(capture, Mapping)
+            else "sar"
+        )
+        if capture_kind == "manual_no_stage":
+            raise ValueError(
+                f"{path.name}: cattura manual_no_stage priva di geometria stage; "
+                "non utilizzabile per ricostruzione SAR offline"
+            )
+        if capture_kind != "sar":
+            raise ValueError(f"{path.name}: header.capture.kind non supportato ({capture_kind!r})")
         position_legacy = self._position_legacy_from_metadata(path, meta)
         return _CaptureFileRecord(
             path=path,
@@ -786,7 +814,7 @@ def _validate_radar_profiles_match(
 
 
 def _reconstruction_algorithm_normalize(value: Any) -> str:
-    algorithm = str(value or "backprojection").strip().lower()
+    algorithm = "backprojection" if value is None else str(value).strip().lower()
     if algorithm not in _RECONSTRUCTION_ALGORITHMS:
         raise ValueError(
             "reconstruction.algorithm non valido: "
@@ -915,6 +943,7 @@ def _backprojection_viewport_max_bin(
     dr_m: float,
     available_bins: int,
     range_offset_m: float = 0.0,
+    strict_available: bool = False,
 ) -> int:
     """Return the highest FMCW bin that can be addressed by an active BP ROI.
 
@@ -955,6 +984,13 @@ def _backprojection_viewport_max_bin(
     max_sample_range_m = max(0.0, max_one_way_m + float(range_offset_f))
     # Two guard samples cover the cubic complex interpolation used by BP.
     needed = int(np.ceil(max_sample_range_m / float(dr_m))) + 2
+    if strict_available and needed > available:
+        positive_range_m = float(max(0, available - 2)) * float(dr_m)
+        raise ValueError(
+            "La ROI di backprojection richiede "
+            f"{needed} bin, oltre i {available} bin della metà FFT positiva "
+            f"(range utile circa {positive_range_m:.3f} m)"
+        )
     return max(1, min(needed, available))
 
 
@@ -1194,14 +1230,17 @@ def _resolve_bp_offsets_m(
         bp_cfg.get(f"{key_root}_m", None),
         expected_len=int(expected_len),
     )
-    if offsets_m is not None:
-        return offsets_m.astype(np.float32, copy=False)
-
     offsets_lambda = _parse_float_array(
         f"offline_config: bp.{key_root}_lambda",
         bp_cfg.get(f"{key_root}_lambda", None),
         expected_len=int(expected_len),
     )
+    if offsets_m is not None and offsets_lambda is not None:
+        raise ValueError(
+            f"offline_config: usa bp.{key_root}_m oppure bp.{key_root}_lambda, non entrambi"
+        )
+    if offsets_m is not None:
+        return offsets_m.astype(np.float32, copy=False)
     if offsets_lambda is None:
         return None
     return (offsets_lambda * np.float32(float(wavelength_m))).astype(np.float32, copy=False)
@@ -1307,6 +1346,12 @@ def _read_offline_sar_range_angle_cfg(
             }
         }
     )
+    if projection.projection_mode != "cartesian":
+        filter_warnings.append(
+            "offline synthetic_range_angle pubblica sempre una griglia cartesiana; "
+            f"display.projection_mode={projection.projection_mode!r} viene ignorato"
+        )
+        projection = replace(projection, projection_mode="cartesian")
     return OfflineSyntheticRangeAngleConfig(
         use_realtime_filters=bool(use_realtime_filters),
         window_range=str(window_range),
@@ -1609,6 +1654,24 @@ def _read_bp_runtime_cfg(offline_config_path: str | Path, fallback_capture_cfg: 
         )
         max_memory_bytes = int(max_memory_gib * float(1024**3))
     algorithm = _reconstruction_algorithm_normalize(_pick(reconstruction_cfg.get("algorithm"), "backprojection"))
+    configuration_warnings: list[str] = []
+    range_angle_branch = cfg.get("offline_sar_range_angle", {}) or {}
+    if algorithm == "backprojection" and isinstance(range_angle_branch, dict):
+        ignored = [
+            key
+            for key in (
+                "nfft_angle",
+                "angle_processing",
+                "zero_after_range_fft_bins",
+                "mean_after_range_fft",
+            )
+            if key in range_angle_branch
+        ]
+        if ignored:
+            configuration_warnings.append(
+                "reconstruction.algorithm=backprojection ignora offline_sar_range_angle."
+                + ", offline_sar_range_angle.".join(ignored)
+            )
     background_reference = _read_offline_background_reference_cfg(
         cfg,
         config_path=Path(offline_config_path),
@@ -1640,6 +1703,7 @@ def _read_bp_runtime_cfg(offline_config_path: str | Path, fallback_capture_cfg: 
         "background_reference": background_reference,
         "max_memory_bytes": max_memory_bytes,
         "frame_position_error": _read_bp_frame_position_error_cfg(bp_cfg),
+        "configuration_warnings": tuple(configuration_warnings),
     }
 
 
@@ -2274,8 +2338,9 @@ def _offline_retained_range_bins(
         x_tx_ant_m=np.asarray(x_tx_ant_m, dtype=np.float32),
         x_rx_ant_m=np.asarray(x_rx_ant_m, dtype=np.float32),
         dr_m=float(dr_m),
-        available_bins=int(nfft_range),
+        available_bins=max(1, int(nfft_range) // 2),
         range_offset_m=float(range_offset_m),
+        strict_available=True,
     )
 
 
@@ -2627,8 +2692,9 @@ def _offline_reader_worker(
         )
         geometry_source = str(mimo_geometry["geometry_source"])
 
-        for warning in range_angle_cfg.filter_warnings:
+        for warning in (*bp_runtime_cfg.get("configuration_warnings", ()), *range_angle_cfg.filter_warnings):
             print(f"[OFFLINE WARN] {warning}")
+            _queue_put_latest(status_q, {"type": "warning", "warning": str(warning)})
 
         n_pos = int(stream_layout.positions.size)
         target_frames = int(stream_layout.n_frames_per_position)
@@ -2685,6 +2751,13 @@ def _offline_reader_worker(
                 fc_hz=float(stream_layout.radar_profile.fc_hz),
                 requested_mode=str(range_angle_cfg.angle_processing.mode),
             )
+            if effective_angle_mode != str(range_angle_cfg.angle_processing.mode):
+                warning = (
+                    "synthetic_range_angle: apertura misurata non uniforme; "
+                    "angle_processing.mode=fft viene sostituito con bartlett prima dell'allocazione"
+                )
+                print(f"[OFFLINE WARN] {warning}")
+                _queue_put_latest(status_q, {"type": "warning", "warning": warning})
         max_position_frames = max(
             int(target_frames),
             0 if reference_layout is None else int(reference_layout.n_frames_per_position),

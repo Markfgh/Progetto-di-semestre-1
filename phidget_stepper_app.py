@@ -11,6 +11,7 @@ può essere usato senza GUI, ad esempio dalla scansione SAR integrata.
 from __future__ import annotations
 
 import copy
+import math
 import queue
 import threading
 import time
@@ -159,13 +160,34 @@ class AppConfig:
             raise ConfigError("I canali digitali del 1063 devono essere tra 0 e 3.")
         if device.limit_min_polarity not in {"NO", "NC"} or device.limit_max_polarity not in {"NO", "NC"}:
             raise ConfigError("La polarita' dei finecorsa deve essere NO o NC.")
-        if min(mechanics.belt_pitch_mm, mechanics.pulley_teeth, mechanics.motor_full_steps_per_rev, mechanics.gear_reduction) <= 0:
+        mechanics_values = (
+            mechanics.belt_pitch_mm,
+            mechanics.pulley_teeth,
+            mechanics.motor_full_steps_per_rev,
+            mechanics.gear_reduction,
+        )
+        if not all(math.isfinite(float(value)) for value in mechanics_values) or min(mechanics_values) <= 0:
             raise ConfigError("I parametri meccanici devono essere maggiori di zero.")
-        if min(motor.velocity_microsteps_s, motor.acceleration_microsteps_s2, motor.current_limit_a) <= 0:
+        motor_values = (motor.velocity_microsteps_s, motor.acceleration_microsteps_s2, motor.current_limit_a)
+        if not all(math.isfinite(float(value)) for value in motor_values) or min(motor_values) <= 0:
             raise ConfigError("Velocita', accelerazione e corrente devono essere maggiori di zero.")
-        if min(homing.search_distance_mm, homing.release_distance_mm, homing.velocity_microsteps_s, homing.timeout_seconds) <= 0:
+        homing_values = (
+            homing.search_distance_mm,
+            homing.release_distance_mm,
+            homing.velocity_microsteps_s,
+            homing.timeout_seconds,
+        )
+        if not all(math.isfinite(float(value)) for value in homing_values) or min(homing_values) <= 0:
             raise ConfigError("I parametri HOME devono essere maggiori di zero.")
-        if cycle.step_mm <= 0 or cycle.wait_seconds < 0 or cycle.cycles <= 0:
+        cycle_values = (cycle.step_mm, cycle.wait_seconds, cycle.cycles)
+        if (
+            not all(math.isfinite(float(value)) for value in cycle_values)
+            or isinstance(cycle.cycles, bool)
+            or float(cycle.cycles) != int(cycle.cycles)
+            or cycle.step_mm <= 0
+            or cycle.wait_seconds < 0
+            or cycle.cycles <= 0
+        ):
             raise ConfigError("Passo ciclo e numero cicli devono essere positivi; l'attesa puo' essere zero.")
 
 
@@ -321,6 +343,15 @@ class PhidgetStepperController:
         if self.connected:
             return
         try:
+            with self.lock:
+                # A previous detach may have happened before the Stopped
+                # callback.  Never carry that stale logical motion into a
+                # newly opened hardware session.
+                self.command_direction = 0
+                self.homed = False
+            self.stopped_event.set()
+            self.stop_requested.clear()
+            self.cancel_requested.clear()
             self.config.validate()
             self._configure_addressing()
             self._configure_callbacks()
@@ -507,7 +538,17 @@ class PhidgetStepperController:
         with self.lock:
             self.connected = False
             self.homed = False
+            self.command_direction = 0
+            self.external_scan_active = False
+            if self.cycle_progress:
+                self.cycle_progress.cancel()
         self.cancel_requested.set()
+        # Release any worker waiting for a motion/limit callback that the
+        # detached device can no longer deliver.  _wait_event observes the
+        # cancellation immediately after the wake-up.
+        self.stopped_event.set()
+        self.min_active_event.set()
+        self.min_released_event.set()
         self._set_state(ControllerState.FAULT, "controller scollegato")
         self.log("Controller scollegato: ciclo annullato.")
 
@@ -591,12 +632,24 @@ class PhidgetStepperController:
             side = "MIN" if direction < 0 else "MAX"
             raise MotionError(f"Movimento verso {side} bloccato: finecorsa attivo.")
         self.stopped_event.clear()
-        self.command_direction = direction
-        self._apply_motor_settings()
-        if velocity is not None:
-            self.stepper.setVelocityLimit(velocity)
-        self.stepper.setEngaged(True)
-        self.stepper.setTargetPosition(target)
+        with self.lock:
+            self.command_direction = direction
+        try:
+            self._apply_motor_settings()
+            if velocity is not None:
+                self.stepper.setVelocityLimit(velocity)
+            self.stepper.setEngaged(True)
+            self.stepper.setTargetPosition(target)
+        except Exception:
+            # The command may have failed after only part of the Phidget API
+            # sequence.  Clear the logical motion immediately and invalidate
+            # the open-loop reference; the caller can then reconnect/HOME
+            # instead of remaining blocked by a stale direction forever.
+            with self.lock:
+                self.command_direction = 0
+                self.homed = False
+            self.stopped_event.set()
+            raise
 
     def move_relative_mm(self, distance_mm: float) -> None:
         self._require_manual_motion_allowed()

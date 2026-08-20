@@ -1,7 +1,7 @@
 """Utility CLI per verificare struttura e metadati dei file di cattura RTPBIN.
 
-Legge solo l'header JSON: è quindi utile per diagnosticare file non leggibili
-prima di avviare una ricostruzione offline più costosa.
+Valida l'header JSON e la geometria completa del payload prima di avviare una
+ricostruzione offline più costosa.
 """
 
 from __future__ import annotations
@@ -27,6 +27,9 @@ HEADER_PREFIX_LEN = len(HEADER_MAGIC) + 4
 HEADER_MAX_LEN = 256 * 1024
 CAPTURE_NAME_RE = re.compile(r"^capture_pos(-?\d+)\.bin$")
 SUPPORTED_FORMATS = {"rt_capture_v1"}
+CAPTURE_KIND_SAR = "sar"
+CAPTURE_KIND_MANUAL_NO_STAGE = "manual_no_stage"
+SUPPORTED_CAPTURE_KINDS = {CAPTURE_KIND_SAR, CAPTURE_KIND_MANUAL_NO_STAGE}
 
 
 def _fmt_bytes(n: int) -> str:
@@ -93,7 +96,7 @@ def _required_positive_float(field_name: str, value: Any) -> float:
 
 
 def validate_capture_metadata(meta: dict[str, Any], path: Path) -> None:
-    """Valida i metadati necessari al reader offline lineare."""
+    """Validate capture metadata, including explicitly non-SAR captures."""
     format_name = meta.get("format")
     if format_name not in SUPPORTED_FORMATS:
         supported = ", ".join(sorted(SUPPORTED_FORMATS))
@@ -129,9 +132,55 @@ def validate_capture_metadata(meta: dict[str, Any], path: Path) -> None:
         if capture.get(field) is not None:
             _required_positive_int(f"header.capture.{field}", capture.get(field))
 
+    capture_kind = str(capture.get("kind", CAPTURE_KIND_SAR)).strip().lower()
+    if capture_kind not in SUPPORTED_CAPTURE_KINDS:
+        allowed = ", ".join(sorted(SUPPORTED_CAPTURE_KINDS))
+        raise ValueError(f"header.capture.kind non valido: {capture_kind!r} (attesi: {allowed})")
+    for field in ("capture_id", "acquisition_index"):
+        if capture.get(field) is not None:
+            value = _required_int(f"header.capture.{field}", capture.get(field))
+            if value < 0:
+                raise ValueError(f"header.capture.{field} deve essere >= 0")
+
     # L'asse stage puo' legittimamente avere coordinate <= 0.
-    stage = _required_object(meta, "stage")
-    _required_finite_float("header.stage.position_mm", stage.get("position_mm"))
+    stage = meta.get("stage")
+    if capture_kind == CAPTURE_KIND_SAR:
+        stage = _required_object(meta, "stage")
+        _required_finite_float("header.stage.position_mm", stage.get("position_mm"))
+    elif stage is not None:
+        if not isinstance(stage, dict):
+            raise ValueError("header.stage deve essere un oggetto quando presente")
+        if stage.get("position_mm") is not None:
+            _required_finite_float("header.stage.position_mm", stage.get("position_mm"))
+
+
+def _validate_payload_layout(path: Path, meta: dict[str, Any], data_offset: int) -> int:
+    """Return the complete frame count or reject a truncated/incoherent payload."""
+    capture = _required_object(meta, "capture")
+    samples = _required_positive_int("header.capture.samples", capture.get("samples"))
+    chirps = _required_positive_int("header.capture.chirps", capture.get("chirps"))
+    rx = _required_positive_int("header.capture.rx", capture.get("rx"))
+    bytes_per_frame = int(chirps) * int(samples) * int(rx) * 4
+    payload_size = int(path.stat().st_size) - int(data_offset)
+    remainder = int(payload_size % bytes_per_frame)
+    if remainder != 0:
+        raise ValueError(
+            f"payload non multiplo di bytes_per_frame={bytes_per_frame}: resto={remainder}"
+        )
+    actual_frames = int(payload_size // bytes_per_frame)
+    if actual_frames <= 0:
+        raise ValueError("payload senza frame completi")
+    if capture.get("frames_per_position") is not None:
+        expected_frames = _required_positive_int(
+            "header.capture.frames_per_position",
+            capture.get("frames_per_position"),
+        )
+        if actual_frames != expected_frames:
+            raise ValueError(
+                "numero frame incoerente: "
+                f"header.frames_per_position={expected_frames}, payload={actual_frames}"
+            )
+    return actual_frames
 
 
 def read_capture_header(path: Path) -> tuple[dict, int]:
@@ -170,6 +219,7 @@ def read_capture_header(path: Path) -> tuple[dict, int]:
     if not isinstance(meta, dict):
         raise ValueError("header JSON deve essere un oggetto")
     validate_capture_metadata(meta, path)
+    _validate_payload_layout(path, meta, data_offset)
     return meta, data_offset
 
 
@@ -239,11 +289,15 @@ def main(argv: list[str] | None = None) -> int:
             f"slope={radar.get('slope')} fc={radar.get('fc')}"
         )
     if capture:
+        capture_kind = str(capture.get("kind", CAPTURE_KIND_SAR)).strip().lower()
         print(
             "Capture: "
             f"samples={capture.get('samples')} chirps={capture.get('chirps')} "
-            f"rx={capture.get('rx')} tx={capture.get('tx')} x_frames={capture.get('x_frames')}"
+            f"rx={capture.get('rx')} tx={capture.get('tx')} x_frames={capture.get('x_frames')} "
+            f"kind={capture_kind}"
         )
+        if capture_kind == CAPTURE_KIND_MANUAL_NO_STAGE:
+            print("[WARN] Cattura manuale senza stage: non utilizzabile per ricostruzione SAR offline.")
 
     if args.show_header_json:
         print("Header JSON:")
@@ -255,14 +309,8 @@ def main(argv: list[str] | None = None) -> int:
 
     bytes_per_frame = chirps * samples * rx * 4
     print(f"bytes_per_frame: {bytes_per_frame}")
-    if payload_size % bytes_per_frame != 0:
-        print(
-            "[WARN] Payload non multiplo di bytes_per_frame: "
-            f"resto={payload_size % bytes_per_frame}"
-        )
-    else:
-        n_frames = payload_size // bytes_per_frame
-        print(f"Frame nel payload: {n_frames}")
+    n_frames = payload_size // bytes_per_frame
+    print(f"Frame nel payload: {n_frames}")
 
     return 0
 

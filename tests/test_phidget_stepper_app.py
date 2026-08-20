@@ -32,6 +32,14 @@ def test_config_rejects_invalid_limit_channels():
         config.validate()
 
 
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf")])
+def test_config_rejects_nonfinite_motor_values(invalid: float):
+    config = AppConfig()
+    config.motor.velocity_microsteps_s = invalid
+    with pytest.raises(ConfigError, match="Velocita"):
+        config.validate()
+
+
 def test_legacy_holding_current_setting_is_ignored():
     config = AppConfig.from_dict({"motor": {"holding_current_limit_a": 0.6}})
     assert config.motor.current_limit_a == pytest.approx(0.5)
@@ -112,6 +120,15 @@ class _FakeStepper:
     def setTargetPosition(self, value):
         self.position = float(value)
 
+    def setAcceleration(self, _value):
+        pass
+
+    def setVelocityLimit(self, _value):
+        pass
+
+    def setCurrentLimit(self, _value):
+        pass
+
 
 def test_phidget_error_invalidates_home_and_motion_state():
     controller = PhidgetStepperController(AppConfig())
@@ -126,6 +143,46 @@ def test_phidget_error_invalidates_home_and_motion_state():
     assert controller.command_direction == 0
     assert controller.state == ControllerState.FAULT
     assert not controller.stepper.engaged
+
+
+def test_issue_target_failure_clears_stale_motion_and_invalidates_home():
+    class FailingTargetStepper(_FakeStepper):
+        def setTargetPosition(self, _value):
+            raise RuntimeError("target rejected")
+
+    controller = PhidgetStepperController(AppConfig())
+    controller.stepper = FailingTargetStepper()
+    controller.connected = True
+    controller.homed = True
+    controller.state = ControllerState.READY
+
+    with pytest.raises(RuntimeError, match="target rejected"):
+        controller._issue_target(200, 1)
+
+    assert controller.command_direction == 0
+    assert not controller.homed
+    assert controller.stopped_event.is_set()
+
+
+def test_detach_clears_motion_and_releases_waiters():
+    controller = PhidgetStepperController(AppConfig())
+    controller.stepper = _FakeStepper()
+    controller.connected = True
+    controller.homed = True
+    controller.command_direction = -1
+    controller.external_scan_active = True
+
+    controller._on_detach(controller.stepper)
+
+    assert not controller.connected
+    assert not controller.homed
+    assert controller.command_direction == 0
+    assert not controller.external_scan_active
+    assert controller.cancel_requested.is_set()
+    assert controller.stopped_event.is_set()
+    assert controller.min_active_event.is_set()
+    assert controller.min_released_event.is_set()
+    assert controller.state == ControllerState.FAULT
 
 
 @pytest.mark.parametrize(

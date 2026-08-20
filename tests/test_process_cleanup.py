@@ -147,6 +147,43 @@ def test_cleanup_helpers_are_idempotent() -> None:
         q.put_nowait("closed")
 
 
+def test_cleanup_diagnostics_count_exited_processes_and_survivors() -> None:
+    proc = FakeProcessBase()
+    proc.start()
+    result = cleanup_processes((proc,), graceful_timeout_s=0.0, terminate_timeout_s=0.0)
+
+    assert result == {
+        "joined": 1,
+        "join_attempts": 2,
+        "terminated": 1,
+        "survivors": 0,
+        "closed": 1,
+    }
+
+
+def test_close_queues_does_not_block_on_stuck_feeder() -> None:
+    release = threading.Event()
+
+    class BlockingQueue(FakeQueue):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cancelled = False
+
+        def join_thread(self) -> None:
+            release.wait(timeout=1.0)
+
+        def cancel_join_thread(self) -> None:
+            self.cancelled = True
+            release.set()
+
+    q = BlockingQueue()
+    started = time.perf_counter()
+    assert close_queues((q,), join_timeout_s=0.01) == 1
+    elapsed = time.perf_counter() - started
+    assert elapsed < 0.5
+    assert q.cancelled
+
+
 def test_offline_runtime_fatal_error_is_sticky_across_later_status(
     tmp_path: Path,
 ) -> None:

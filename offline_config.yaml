@@ -1,7 +1,7 @@
 data:
   # Puoi mettere direttamente una run: logs/run_YYYYMMDD_HHMMSS
   # Se lasci "logs", SARReader prende automaticamente l'ultima run con capture_pos*.bin.
-  input_dir: "logs\\immagine_Stanza con oggetti top"
+  input_dir: "logs\\run_20260820_102548"
   # Maximum time allowed to prepare all offline data before reporting a timeout.
   startup_timeout_s: 3600
   # Optional hard cap for the preflight memory estimate; null uses only the
@@ -10,11 +10,11 @@ data:
 
 capture:
   # Usa i primi N frame di ciascuna posizione (1..frame disponibili nella run).
-  frames_per_position: 1
+  frames_per_position: 2
 
 scan:
   x_start: 1
-  x_end: 150
+  x_end: 3
   x_step: 1
   # Nominal scan pitch kept for acquisition/planning compatibility. Both
   # offline reconstructions use measured stage.position_mm from each header.

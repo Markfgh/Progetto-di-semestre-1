@@ -264,10 +264,9 @@ class SyntheticApertureData:
 
 def phase_sign_normalize(value: Any, *, field_name: str = "phase_sign") -> int:
     """Valida il segno della fase di rifocalizzazione bistatica (solo ±1)."""
-    try:
-        phase_sign_i = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field_name} non valido: {value!r}") from exc
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+        raise ValueError(f"{field_name} non valido: {value!r}")
+    phase_sign_i = int(value)
     if phase_sign_i not in (-1, 1):
         raise ValueError(f"{field_name} deve essere +1 o -1, trovato: {value!r}")
     return int(phase_sign_i)
@@ -298,10 +297,9 @@ def residual_video_phase_sign_normalize(
         }
         if normalized in aliases:
             return int(aliases[normalized])
-    try:
-        sign_i = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field_name} non valido: {value!r}; usa off, + o -") from exc
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+        raise ValueError(f"{field_name} non valido: {value!r}; usa off, + o -")
+    sign_i = int(value)
     if sign_i not in (-1, 0, 1):
         raise ValueError(f"{field_name} deve essere off, + o -; trovato: {value!r}")
     return int(sign_i)

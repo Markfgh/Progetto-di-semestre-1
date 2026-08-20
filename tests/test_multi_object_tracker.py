@@ -40,6 +40,7 @@ def _tracker(
     birth_min_separation_m: float = 0.15,
     motion_confirm_frames_stopped: int = 2,
     stopped_memory_s: float = 0.5,
+    max_track_age: int = 0,
 ) -> MultiObjectTracker:
     return MultiObjectTracker(
         TrackingConfig(
@@ -49,6 +50,7 @@ def _tracker(
             min_hits_to_confirm=min_hits,
             max_missed_tentative=max_missed_tentative,
             max_missed_confirmed=max_missed_confirmed,
+            max_track_age=max_track_age,
         ),
         TrackerConfig(
             gating_xy_m=gating_xy_m,
@@ -200,3 +202,23 @@ def test_tracker_max_tracks_birth_order_prefers_moving_and_filters_invalid() -> 
     assert len(tracks) == 2
     assert tracker.last_debug_snapshot.invalid_detections == 1
     assert [track.last_detection_source for track in tracks] == ["moving", "moving"]
+
+
+def test_max_track_age_applies_to_continuously_matched_tracks() -> None:
+    tracker = _tracker(min_hits=1, max_track_age=2, birth_min_separation_m=0.0)
+    first = tracker.step([_det(0.0, 2.0)], timestamp_s=0.0)[0]
+    second = tracker.step([_det(0.0, 2.0)], timestamp_s=0.1)[0]
+    replacement = tracker.step([_det(0.0, 2.0)], timestamp_s=0.2)[0]
+
+    assert second.track_id == first.track_id
+    assert replacement.track_id != first.track_id
+    assert tracker.last_debug_snapshot.deleted_tracks == 1
+
+
+def test_malformed_optional_detection_field_is_discarded() -> None:
+    tracker = _tracker(min_hits=1)
+    malformed = _det(0.0, 2.0)
+    malformed.range_m = "bad"
+
+    assert tracker.step([malformed], timestamp_s=0.0) == []
+    assert tracker.last_debug_snapshot.invalid_detections == 1
